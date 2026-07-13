@@ -82,6 +82,7 @@ static int g_model_registered;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static uint64_t g_model_registered_range_bytes = 0; /* cumulative host-pinned range bytes (WDDM budget) */
+static uint64_t g_model_window_bytes = 0; /* size of the single contiguous host-registered window [0, window) */
 static int g_model_hmm_direct;
 static os_file_t g_model_file;
 static int g_model_file_valid;
@@ -254,12 +255,20 @@ static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
 }
 
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
-    if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
+    if (model_map == g_model_host_base && g_model_device_base &&
+        (g_model_window_bytes == 0 || offset < g_model_window_bytes))
+        return g_model_device_base + offset;
     return (const char *)model_map + offset;
 }
 
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    /* Zero-copy fast path: weight fully inside the registered contiguous host
+     * window -> device pointer + offset (~24 GiB/s DMA, no VRAM). */
+    if (g_model_window_bytes && model_map == g_model_host_base && g_model_device_base &&
+        offset + bytes <= g_model_window_bytes) {
+        return g_model_device_base + offset;
+    }
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
@@ -320,9 +329,10 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                     g_model_registered_range_bytes += reg_bytes;
                     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                        fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
-                                what ? what : "weights",
-                                (double)bytes / 1048576.0);
+                        fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB [view=%p off=%llu reg_addr=%p reg_end=%p reg_bytes=%.2f MiB]\n",
+                                what ? what : "weights", (double)bytes / 1048576.0,
+                                model_map, (unsigned long long)offset, (void *)reg_addr,
+                                (void *)(reg_addr + reg_bytes), (double)reg_bytes / 1048576.0);
                     }
                     return dev_ptr;
                 }
@@ -331,9 +341,17 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                 (void)cudaHostUnregister((void *)reg_addr);
                 (void)cudaGetLastError();
             } else {
+                fprintf(stderr, "ds4: [regdiag] cudaHostRegister FAILED for %s: %s (addr=%p bytes=%.2f MiB cum=%.2f GiB budget=%.2f GiB)\n",
+                        what ? what : "weights", cudaGetErrorString(err), (void *)reg_addr,
+                        (double)reg_bytes / 1048576.0, (double)g_model_registered_range_bytes / 1073741824.0,
+                        (double)cuda_host_register_budget_bytes() / 1073741824.0);
                 if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
                 (void)cudaGetLastError();
             }
+        } else if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr, "ds4: [regdiag] %s SKIPPED register (budget): cum=%.2f GiB + %.2f MiB > budget %.2f GiB\n",
+                    what ? what : "weights", (double)g_model_registered_range_bytes / 1073741824.0,
+                    (double)reg_bytes / 1048576.0, (double)cuda_host_register_budget_bytes() / 1073741824.0);
         }
     }
 
@@ -377,6 +395,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, uint64_t bytes) {
     if (bytes == 0) return 1;
     if (g_model_device_owned || g_model_registered) return 1;
+    if (g_model_window_bytes && model_map == g_model_host_base && g_model_device_base &&
+        offset + bytes <= g_model_window_bytes) return 1; /* served by the contiguous host window */
 
     const uint64_t end = offset + bytes;
     if (end < offset) return 0;
@@ -1498,26 +1518,44 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
      * per-range register / fd-cache / chunked path handles weights. Previously
      * this whole branch was #ifndef _WIN32 with the Windows side setting
      * g_model_range_mapping_supported = 0 (disabling zero-copy entirely). */
-    if (model_size <= cuda_host_register_budget_bytes()) {
-        cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                           cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-        if (err == cudaSuccess) {
-            void *dev = NULL;
-            err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
-            if (err == cudaSuccess && dev) {
-                g_model_device_base = (const char *)dev;
-                g_model_registered = 1;
-                fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
-                        (double)model_size / 1073741824.0);
+    /* Register ONE contiguous host window (up to the WDDM host-pin budget) and
+     * serve every weight whose [offset, offset+bytes) is inside it via a device
+     * pointer + offset (zero-copy, ~24 GiB/s). This replaces per-tensor-span
+     * cudaHostRegister, which fails on Windows: adjacent tensor spans share a
+     * boundary page, so page-align-up(prev)+page-align-down(next) both claim it
+     * -> cudaErrorHostMemoryAlreadyRegistered. One contiguous window has no such
+     * shared-page conflict. Weights beyond the window fall through to fd-cache/copy. */
+    {
+        uint64_t window = model_size;
+        const uint64_t budget = cuda_host_register_budget_bytes();
+        if (window > budget) window = budget;
+        window &= ~(uint64_t)(cuda_page_size() - 1u);
+        if (window > 0) {
+            cudaError_t err = cudaHostRegister((void *)model_map, (size_t)window,
+                                               cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+            if (err == cudaSuccess) {
+                void *dev = NULL;
+                err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
+                if (err == cudaSuccess && dev) {
+                    g_model_device_base = (const char *)dev;
+                    g_model_window_bytes = window;
+                    if (window >= model_size) g_model_registered = 1; /* whole model resident */
+                    fprintf(stderr, "ds4: CUDA registered %.2f GiB contiguous host window (of %.2f GiB model) for zero-copy device access\n",
+                            (double)window / 1073741824.0, (double)model_size / 1073741824.0);
+                } else {
+                    fprintf(stderr, "ds4: CUDA host window devptr lookup failed: %s\n", cudaGetErrorString(err));
+                    (void)cudaHostUnregister((void *)model_map);
+                    (void)cudaGetLastError();
+                }
             } else {
-                fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
+                fprintf(stderr, "ds4: CUDA host window register skipped: %s\n", cudaGetErrorString(err));
                 (void)cudaGetLastError();
             }
-        } else {
-            fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
         }
     }
+#ifdef _WIN32
+    g_model_range_mapping_supported = 0; /* per-span register is broken on Win32 (shared boundary pages); rely on the window + fd-cache */
+#endif
     return 1;
 }
 
