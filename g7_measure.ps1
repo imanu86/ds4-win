@@ -12,6 +12,9 @@ param(
     [int]$ReserveMB = 2048,
     [int]$BudgetGB = 28,
     [ValidateSet(1, 2, 4)][int]$IoQD = 1,
+    [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
+    [ValidateRange(0.0, 6.0)][double]$ExpertCacheReserveGB = 0.5,
+    [switch]$ExpertCacheStats,
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000
 )
@@ -43,6 +46,15 @@ if ($NoSelectedLoad) { $env:DS4_CUDA_MOE_NO_SELECTED_LOAD = "1" }
 else { Remove-Item Env:\DS4_CUDA_MOE_NO_SELECTED_LOAD -ErrorAction SilentlyContinue }
 if ($IoQD -gt 1) { $env:DS4_CUDA_MOE_IO_QD = "$IoQD" }
 else { Remove-Item Env:\DS4_CUDA_MOE_IO_QD -ErrorAction SilentlyContinue }
+if ($ExpertCacheN -gt 0) {
+    $env:DS4_CUDA_STREAMING_EXPERT_CACHE_N = "$ExpertCacheN"
+    $env:DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB = $ExpertCacheReserveGB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+    Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_N -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB -ErrorAction SilentlyContinue
+}
+if ($ExpertCacheStats) { $env:DS4_CUDA_MOE_CACHE_STATS = "1" }
+else { Remove-Item Env:\DS4_CUDA_MOE_CACHE_STATS -ErrorAction SilentlyContinue }
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $existing = Get-Process ds4_server -ErrorAction SilentlyContinue
@@ -140,6 +152,8 @@ Start-Sleep -Milliseconds 250
 # Analyze stderr
 $evicts = 0; $selLoads = 0; $lastSel = ""; $streamsExpert = 0; $streamsHot = 0
 $observedIoQD = 1; $overlappedIoObserved = $false; $overlappedIoFallbacks = 0
+$cacheCalls = 0; $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
+$cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
     $evLine = $lines | Where-Object { $_ -match "evicts=(\d+)" } | Select-Object -Last 1
@@ -156,6 +170,16 @@ if (Test-Path $stderrLog) {
         $overlappedIoObserved = $true
     }
     $overlappedIoFallbacks = ($lines | Where-Object { $_ -match "MoE overlapped read failed; selected-load fallback requested" } | Measure-Object).Count
+    $cacheReadyLine = $lines | Where-Object { $_ -match "resident expert cache ready: (\d+)/(\d+) experts" } | Select-Object -Last 1
+    if ($cacheReadyLine -and $cacheReadyLine -match "resident expert cache ready: (\d+)/(\d+) experts") {
+        $cacheCapacity = [int]$Matches[1]
+    }
+    $cacheLine = $lines | Where-Object { $_ -match "\[moecache\]" } | Select-Object -Last 1
+    if ($cacheLine -and $cacheLine -match "calls=(\d+) cap=(\d+) count=(\d+) hits=(\d+) misses=(\d+).*admissions=(\d+) evictions=(\d+) direct=(\d+)") {
+        $cacheCalls = [long]$Matches[1]; $cacheCapacity = [int]$Matches[2]; $cacheCount = [int]$Matches[3]
+        $cacheHits = [long]$Matches[4]; $cacheMisses = [long]$Matches[5]; $cacheAdmissions = [long]$Matches[6]
+        $cacheEvictions = [long]$Matches[7]; $cacheDirect = [long]$Matches[8]
+    }
 }
 
 $tps = @($results | ForEach-Object { $_.tokens_per_second })
@@ -183,6 +207,17 @@ $summary = [pscustomobject]@{
     moe_io_queue_depth_observed = $observedIoQD
     moe_overlapped_io_observed = $overlappedIoObserved
     moe_overlapped_io_fallbacks = $overlappedIoFallbacks
+    expert_cache_requested = $ExpertCacheN
+    expert_cache_reserve_gb = $ExpertCacheReserveGB
+    expert_cache_stats_enabled = [bool]$ExpertCacheStats
+    expert_cache_calls = $cacheCalls
+    expert_cache_capacity = $cacheCapacity
+    expert_cache_count = $cacheCount
+    expert_cache_hits = $cacheHits
+    expert_cache_misses = $cacheMisses
+    expert_cache_admissions = $cacheAdmissions
+    expert_cache_evictions = $cacheEvictions
+    expert_cache_direct_loads = $cacheDirect
     load_seconds = [math]::Round($loadSec, 6)
     warmup_seconds = [math]::Round($warmSec, 6)
     mean_tokens_per_second = $meanTps
@@ -208,5 +243,7 @@ Write-Host ("streams_hot   : " + $streamsHot)
 Write-Host ("selected_loads: " + $selLoads)
 Write-Host ("moe_io_qd req/observed: " + $IoQD + " / " + $observedIoQD)
 Write-Host ("moe_io_fallbacks: " + $overlappedIoFallbacks)
+Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapacity + " / " + $cacheCount)
+Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="
