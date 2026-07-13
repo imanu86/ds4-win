@@ -9539,6 +9539,7 @@ struct cuda_moe_selected_prepared {
     uint64_t down_expert_bytes;
     uint32_t n_expert;
     uint32_t n_tokens;
+    int full;
     int valid;
 };
 static cuda_moe_selected_prepared g_moe_selected_prepared;
@@ -10046,7 +10047,10 @@ extern "C" int ds4_gpu_routed_moe_prepare_selected(
         const ds4_gpu_tensor *selected, uint32_t n_expert, uint32_t n_tokens) {
     g_moe_selected_prepared.valid = 0;
     const char *env = getenv("DS4_CUDA_MOE_OVERLAP_SHARED");
-    if (!env || !env[0] || strcmp(env, "0") == 0 ||
+    const char *full_env = getenv("DS4_CUDA_MOE_OVERLAP_SHARED_FULL");
+    const int minimal_enabled = env && env[0] && strcmp(env, "0") != 0;
+    const int full_enabled = full_env && full_env[0] && strcmp(full_env, "0") != 0;
+    if ((!minimal_enabled && !full_enabled) ||
         getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") != NULL ||
         cuda_moe_expert_cache_requested() != 0) {
         return 0;
@@ -10091,6 +10095,7 @@ extern "C" int ds4_gpu_routed_moe_prepare_selected(
     g_moe_selected_prepared.down_expert_bytes = down_expert_bytes;
     g_moe_selected_prepared.n_expert = n_expert;
     g_moe_selected_prepared.n_tokens = n_tokens;
+    g_moe_selected_prepared.full = full_enabled;
     g_moe_selected_prepared.valid = 1;
     return 1;
 }
@@ -10132,7 +10137,13 @@ static int cuda_moe_selected_load(
         g_moe_selected_prepared.n_expert == n_expert &&
         g_moe_selected_prepared.n_tokens == n_tokens;
     g_moe_selected_prepared.valid = 0;
-    if (prepared) {
+    if (prepared && g_moe_selected_prepared.full) {
+        static int full_overlap_notice_printed = 0;
+        if (!full_overlap_notice_printed) {
+            fprintf(stderr, "ds4: CUDA MoE full shared-overlap consumed\n");
+            full_overlap_notice_printed = 1;
+        }
+    } else if (prepared) {
         static int overlap_notice_printed = 0;
         if (!overlap_notice_printed) {
             fprintf(stderr, "ds4: CUDA MoE shared-overlap consumed\n");
