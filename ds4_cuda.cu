@@ -81,6 +81,7 @@ static uint64_t g_model_registered_size;
 static int g_model_registered;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
+static uint64_t g_model_registered_range_bytes = 0; /* cumulative host-pinned range bytes (WDDM budget) */
 static int g_model_hmm_direct;
 static os_file_t g_model_file;
 static int g_model_file_valid;
@@ -210,6 +211,23 @@ static uint64_t cuda_page_size(void) {
 #endif
 }
 
+static uint64_t cuda_host_register_budget_bytes(void) {
+    /* Ceiling on cumulative host-pinned (cudaHostRegister) bytes. The 0050 knob
+     * DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB wins on both platforms. Unset:
+     * Linux stays unbounded (prior behavior); native Windows/WDDM caps at ~24 GiB
+     * so the ~80 GiB image is never registered whole (the WDDM host-pin limit). */
+    const char *env = getenv("DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB");
+    if (env && env[0]) {
+        const double v = atof(env);
+        if (v > 0.0) return (uint64_t)(v * 1073741824.0);
+    }
+#ifdef _WIN32
+    return 24ull * 1073741824ull;
+#else
+    return ~(uint64_t)0;
+#endif
+}
+
 static void *cuda_tmp_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_cuda_tmp_bytes >= bytes) return g_cuda_tmp;
@@ -277,40 +295,46 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
 
     cudaError_t err = cudaSuccess;
     if (g_model_range_mapping_supported) {
-#ifdef _WIN32
-        g_model_range_mapping_supported = 0;
-#else
+        /* Register-mmap zero-copy: pin a page-aligned range of the view
+         * (Win32 MapViewOfFile / POSIX mmap) and DMA weights straight to VRAM.
+         * MISURA 2026-07-13: cudaHostRegister(Mapped|ReadOnly) succeeds on the
+         * Windows section view at ~24.4 GiB/s (was previously hard-disabled here
+         * on _WIN32 without ever being tried). Budget-gated so cumulative
+         * registrations never exceed the WDDM ~24 GiB host-pin cap; over budget
+         * falls through to the cudaMalloc copy path below. */
         const uint64_t page_sz = cuda_page_size();
         const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
         const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
         const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
         const uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
-        void *reg_dev = NULL;
-        err = cudaHostRegister((void *)reg_addr,
-                               (size_t)reg_bytes,
-                               cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-        if (err == cudaSuccess) {
-            err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
-            if (err == cudaSuccess && reg_dev) {
-                char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
-                g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
-                if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-                    fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
-                            what ? what : "weights",
-                            (double)bytes / 1048576.0);
+        if (g_model_registered_range_bytes + reg_bytes <= cuda_host_register_budget_bytes()) {
+            void *reg_dev = NULL;
+            err = cudaHostRegister((void *)reg_addr,
+                                   (size_t)reg_bytes,
+                                   cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+            if (err == cudaSuccess) {
+                err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
+                if (err == cudaSuccess && reg_dev) {
+                    char *dev_ptr = (char *)reg_dev + reg_delta;
+                    g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
+                    g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+                    g_model_registered_range_bytes += reg_bytes;
+                    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+                        fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
+                                what ? what : "weights",
+                                (double)bytes / 1048576.0);
+                    }
+                    return dev_ptr;
                 }
-                return dev_ptr;
+                fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
+                        what ? what : "weights", cudaGetErrorString(err));
+                (void)cudaHostUnregister((void *)reg_addr);
+                (void)cudaGetLastError();
+            } else {
+                if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
+                (void)cudaGetLastError();
             }
-            fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
-                    what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaHostUnregister((void *)reg_addr);
-            (void)cudaGetLastError();
-        } else {
-            if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
-            (void)cudaGetLastError();
         }
-#endif
     }
 
     void *dev = NULL;
@@ -1257,6 +1281,7 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    g_model_registered_range_bytes = 0;
     cuda_model_load_progress_reset();
 }
 
@@ -1467,35 +1492,47 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
-#ifndef _WIN32
-    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-    if (err == cudaSuccess) {
-        void *dev = NULL;
-        err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
-        if (err == cudaSuccess && dev) {
-            g_model_device_base = (const char *)dev;
-            g_model_registered = 1;
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
-                    (double)model_size / 1073741824.0);
+    /* Whole-model host-register, both platforms. Budget-gated: never attempt to
+     * pin the entire ~80 GiB image (exceeds the WDDM ~24 GiB cap and would fail).
+     * When it doesn't fit, leave g_model_range_mapping_supported = 1 so the
+     * per-range register / fd-cache / chunked path handles weights. Previously
+     * this whole branch was #ifndef _WIN32 with the Windows side setting
+     * g_model_range_mapping_supported = 0 (disabling zero-copy entirely). */
+    if (model_size <= cuda_host_register_budget_bytes()) {
+        cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
+                                           cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+        if (err == cudaSuccess) {
+            void *dev = NULL;
+            err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
+            if (err == cudaSuccess && dev) {
+                g_model_device_base = (const char *)dev;
+                g_model_registered = 1;
+                fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
+                        (double)model_size / 1073741824.0);
+            } else {
+                fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
+                (void)cudaGetLastError();
+            }
         } else {
-            fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
+            fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
         }
-    } else {
-        fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
-        (void)cudaGetLastError();
     }
-#else
-    g_model_range_mapping_supported = 0;
-#endif
     return 1;
 }
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
 #ifdef _WIN32
-    if (!cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) return 0;
+    /* Findings win-copy-chunked-allocates-full-model-in-vram / -skip-conflated:
+     * cuda_model_copy_chunked does cudaMalloc(model_size) — an ~80 GiB model
+     * cannot fit 12 GiB VRAM (fatal abort), and an intentional env skip also
+     * returns 0. Do NOT treat either as fatal. Mirror Linux: full-model chunked
+     * copy is opt-in; on skip/failure fall through to the per-range register-mmap
+     * / fd-streaming path (now enabled on Windows) so the model still loads. */
+    if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
+        (void)cuda_model_copy_chunked(model_map, model_size, map_offset, map_size);
+    }
 #else
     if (getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL &&
         !cuda_model_copy_chunked(model_map, model_size, map_offset, map_size)) {
