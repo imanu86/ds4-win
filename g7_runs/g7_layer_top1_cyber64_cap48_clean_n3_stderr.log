@@ -1,0 +1,70 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache deferred 69.45 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 11.31 GiB of tensor spans in 4.847s
+ds4: cuda backend initialized for graph diagnostics
+0713 21:54:57 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0713 21:54:58 ds4-server: listening on http://127.0.0.1:8000
+0713 21:54:58 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=8.00 MiB cached=0.00 GiB free=1.43 GiB reserve=4.00 GiB total=12.00 GiB)
+ds4: CUDA resident expert cache ready: 48/48 experts, 6.75 MiB/expert, 0.32 GiB total
+ds4: CUDA loading model tensors 7.84 GiB cached
+ds4: CUDA loading model tensors 7.86 GiB cached
+0713 21:55:14 ds4-server: chat ctx=0..43:43 prompt done 16.534s
+0713 21:55:41 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=1.91 t/s avg=1.91 t/s 26.235s
+0713 21:55:49 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=1.75 t/s avg=1.87 t/s 34.239s
+0713 21:55:49 ds4-server: chat ctx=0..43:43 gen=64 finish=length 50.792s
+0713 21:55:49 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA loading model tensors 7.88 GiB cached
+0713 21:55:57 ds4-server: chat ctx=0..43:43 prompt done 8.642s
+ds4: CUDA loading model tensors 7.88 GiB cached
+0713 21:56:27 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=1.71 t/s avg=1.71 t/s 29.258s
+0713 21:56:35 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=1.77 t/s avg=1.72 t/s 37.154s
+0713 21:56:35 ds4-server: chat ctx=0..43:43 gen=64 finish=length 45.810s
+0713 21:56:35 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA loading model tensors 7.87 GiB cached
+0713 21:56:43 ds4-server: chat ctx=0..43:43 prompt done 8.787s
+ds4: CUDA loading model tensors 7.83 GiB cached
+ds4: CUDA loading model tensors 7.81 GiB cached
+ds4: CUDA loading model tensors 7.76 GiB cached
+ds4: CUDA loading model tensors 7.70 GiB cached
+ds4: CUDA loading model tensors 7.70 GiB cached
+ds4: CUDA loading model tensors 7.70 GiB cached
+ds4: CUDA loading model tensors 7.63 GiB cached
+ds4: CUDA loading model tensors 6.78 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.61 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+0713 21:58:52 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=0.39 t/s avg=0.39 t/s 128.534s
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.62 GiB cached
+ds4: CUDA loading model tensors 7.12 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+0713 21:59:28 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=0.39 t/s avg=0.39 t/s 164.596s
+0713 21:59:28 ds4-server: chat ctx=0..43:43 gen=64 finish=length 173.397s
+0713 21:59:28 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA loading model tensors 7.06 GiB cached
+0713 21:59:41 ds4-server: chat ctx=0..43:43 prompt done 13.132s
+ds4: CUDA loading model tensors 7.65 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.63 GiB cached
+ds4: CUDA loading model tensors 7.23 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 6.78 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.63 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.62 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.09 GiB cached
+0713 22:01:50 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=0.39 t/s avg=0.39 t/s 129.149s
+ds4: CUDA loading model tensors 7.00 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+ds4: CUDA loading model tensors 7.64 GiB cached
+0713 22:02:26 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=0.39 t/s avg=0.39 t/s 165.046s
+0713 22:02:26 ds4-server: chat ctx=0..43:43 gen=64 finish=length 178.192s

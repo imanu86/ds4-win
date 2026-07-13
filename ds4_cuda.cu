@@ -9510,6 +9510,7 @@ struct cuda_moe_gather {
     int32_t *slot; uint64_t slot_cap;
     ds4_gpu_tensor slot_tensor;
     std::vector<int32_t> h_sel;
+    std::vector<float> h_weights;
     std::vector<int32_t> h_expert_to_slot;
     std::vector<int32_t> h_compact_ids;
     std::vector<int32_t> h_slot_ids;
@@ -9524,6 +9525,7 @@ struct cuda_moe_gather {
     std::vector<uint32_t> h_cache_admission_compact;
     std::vector<uint32_t> h_cache_admission_slots;
     std::vector<uint8_t> h_cache_admission_evicted;
+    std::vector<float> h_compact_mass;
 };
 static cuda_moe_gather g_moe_gather;
 
@@ -9541,7 +9543,9 @@ struct cuda_moe_cache_key {
 
 struct cuda_moe_cache_slot {
     cuda_moe_cache_key key;
+    uint64_t layer_key;
     uint64_t age;
+    uint8_t layer_owned;
     cuda_moe_cache_slot_state state;
 };
 
@@ -9576,6 +9580,23 @@ static uint32_t cuda_moe_expert_cache_requested(void) {
     return v > 512ul ? 512u : (uint32_t)v;
 }
 
+static int cuda_moe_expert_cache_layer_top1(void) {
+    const char *env = getenv("DS4_CUDA_MOE_CACHE_POLICY");
+    return env && strcmp(env, "layer-top1") == 0;
+}
+
+static uint64_t cuda_moe_expert_cache_stats_interval(void) {
+    if (getenv("DS4_CUDA_MOE_CACHE_STATS") == NULL) return 0;
+    const char *env = getenv("DS4_CUDA_MOE_CACHE_STATS_INTERVAL");
+    if (!env || !env[0]) return 128;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long v = strtoull(env, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == env || errno != 0 || !end || *end != '\0' || v == 0) return 128;
+    return (uint64_t)v;
+}
+
 static uint64_t cuda_moe_expert_cache_reserve_bytes(void) {
     double gb = 0.5;
     const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB");
@@ -9594,6 +9615,8 @@ static void cuda_moe_expert_cache_invalidate(void) {
     for (cuda_moe_cache_slot &slot : g_moe_expert_cache.slots) {
         slot.state = CUDA_MOE_CACHE_EMPTY;
         slot.age = 0;
+        slot.layer_key = 0;
+        slot.layer_owned = 0;
     }
     g_moe_expert_cache.tick = 0;
     g_moe_expert_cache.count = 0;
@@ -9638,6 +9661,7 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.slot_tensor.bytes = 0;
     g_moe_gather.slot_tensor.owner = 0;
     g_moe_gather.h_sel.clear();
+    g_moe_gather.h_weights.clear();
     g_moe_gather.h_expert_to_slot.clear();
     g_moe_gather.h_compact_ids.clear();
     g_moe_gather.h_slot_ids.clear();
@@ -9647,6 +9671,7 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.h_cache_admission_compact.clear();
     g_moe_gather.h_cache_admission_slots.clear();
     g_moe_gather.h_cache_admission_evicted.clear();
+    g_moe_gather.h_compact_mass.clear();
 }
 
 static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
@@ -10006,7 +10031,8 @@ static int cuda_moe_selected_load(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
-        const ds4_gpu_tensor *selected_arg) {
+        const ds4_gpu_tensor *selected_arg,
+        const ds4_gpu_tensor *weights_arg) {
     (void)model_size;
     if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
     if (!selected_arg || !selected_arg->ptr) return 0;
@@ -10015,12 +10041,31 @@ static int cuda_moe_selected_load(
     const uint32_t slot_count = n_tokens * n_expert;
     if (slot_count == 0) return 0;
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
+    const int layer_top1 =
+        cuda_moe_expert_cache_requested() != 0 && cuda_moe_expert_cache_layer_top1();
+    if (layer_top1 &&
+        (!weights_arg || !weights_arg->ptr ||
+         weights_arg->bytes < (uint64_t)slot_count * sizeof(float))) {
+        return 0;
+    }
 
-    /* 1. router selection -> host (synchronous D2H on stream 0 fences the router) */
+    /* 1. Router outputs -> host. Layer-top1 also consumes the selected weights
+     * to choose residency; selection itself remains unchanged. */
     g_moe_gather.h_sel.resize(slot_count);
-    if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
-                            (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
+    if (layer_top1) {
+        g_moe_gather.h_weights.resize(slot_count);
+        if (!cuda_ok(cudaMemcpyAsync(g_moe_gather.h_sel.data(), selected_arg->ptr,
+                                     (size_t)slot_count * sizeof(int32_t),
+                                     cudaMemcpyDeviceToHost, 0), "moe selected D2H enqueue") ||
+            !cuda_ok(cudaMemcpyAsync(g_moe_gather.h_weights.data(), weights_arg->ptr,
+                                     (size_t)slot_count * sizeof(float),
+                                     cudaMemcpyDeviceToHost, 0), "moe weights D2H enqueue") ||
+            !cuda_ok(cudaStreamSynchronize(0), "moe router D2H sync")) return 0;
+    } else {
+        if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
+                                (size_t)slot_count * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
+    }
 
     /* 2. dedupe -> compact ids (ascending expert order) + per-slot remap */
     std::vector<int32_t> &e2s = g_moe_gather.h_expert_to_slot;
@@ -10081,62 +10126,125 @@ static int cuda_moe_selected_load(
     uint64_t local_evictions = 0;
     uint64_t local_direct = 0;
 
-    if (cache) {
-        for (uint32_t i = 0; i < compact_count; i++) {
-            const uint64_t e = (uint64_t)(uint32_t)compact[i];
-            const cuda_moe_cache_key key = {
-                gate_offset + e * gate_expert_bytes,
-                up_offset + e * gate_expert_bytes,
-                down_offset + e * down_expert_bytes,
-            };
-            const int slot = cuda_moe_expert_cache_find(cache, key);
-            if (slot >= 0 && !claimed[(uint32_t)slot]) {
-                cache_slots[i] = slot;
-                claimed[(uint32_t)slot] = 1;
-                local_hits++;
-            } else {
-                local_misses++;
-            }
-        }
-    }
-
-    for (uint32_t i = 0; i < compact_count; i++) {
-        const uint64_t e = (uint64_t)(uint32_t)compact[i];
-        if (cache_slots[i] >= 0) continue;
-
-        const cuda_moe_cache_key key = {
+    auto expert_key = [&](uint32_t compact_slot) {
+        const uint64_t e = (uint64_t)(uint32_t)compact[compact_slot];
+        return cuda_moe_cache_key{
             gate_offset + e * gate_expert_bytes,
             up_offset + e * gate_expert_bytes,
             down_offset + e * down_expert_bytes,
         };
-        int cache_slot = cache ? cuda_moe_expert_cache_lru_slot(cache, claimed) : -1;
-        if (cache_slot >= 0) {
-            cuda_moe_cache_slot &entry = cache->slots[(uint32_t)cache_slot];
-            const uint8_t evicted = entry.state == CUDA_MOE_CACHE_VALID ? 1u : 0u;
-            entry.state = CUDA_MOE_CACHE_LOADING;
-            entry.key = key;
-            entry.age = 0;
-            claimed[(uint32_t)cache_slot] = 1;
-            cache_slots[i] = cache_slot;
-            admission_compact.push_back(i);
-            admission_slots.push_back((uint32_t)cache_slot);
-            admission_evicted.push_back(evicted);
-            local_evictions += evicted;
-            const uint64_t gate_dst = (uint64_t)(uint32_t)cache_slot * gate_expert_bytes;
-            const uint64_t down_dst = (uint64_t)(uint32_t)cache_slot * down_expert_bytes;
-            spans.push_back({cache->gate + gate_dst, key.gate_src, gate_expert_bytes});
-            spans.push_back({cache->up + gate_dst, key.up_src, gate_expert_bytes});
-            spans.push_back({cache->down + down_dst, key.down_src, down_expert_bytes});
-            continue;
+    };
+    auto append_direct = [&](uint32_t compact_slot, const cuda_moe_cache_key &key) {
+        spans.push_back({g_moe_gather.gate + (uint64_t)compact_slot * gate_expert_bytes,
+                         key.gate_src, gate_expert_bytes});
+        spans.push_back({g_moe_gather.up + (uint64_t)compact_slot * gate_expert_bytes,
+                         key.up_src, gate_expert_bytes});
+        spans.push_back({g_moe_gather.down + (uint64_t)compact_slot * down_expert_bytes,
+                         key.down_src, down_expert_bytes});
+        local_direct++;
+    };
+    auto append_admission = [&](uint32_t compact_slot, uint32_t cache_slot,
+                                 const cuda_moe_cache_key &key) {
+        cuda_moe_cache_slot &entry = cache->slots[cache_slot];
+        const uint8_t evicted = entry.state == CUDA_MOE_CACHE_VALID ? 1u : 0u;
+        entry.state = CUDA_MOE_CACHE_LOADING;
+        entry.key = key;
+        entry.age = 0;
+        claimed[cache_slot] = 1;
+        cache_slots[compact_slot] = (int32_t)cache_slot;
+        admission_compact.push_back(compact_slot);
+        admission_slots.push_back(cache_slot);
+        admission_evicted.push_back(evicted);
+        local_evictions += evicted;
+        const uint64_t gate_dst = (uint64_t)cache_slot * gate_expert_bytes;
+        const uint64_t down_dst = (uint64_t)cache_slot * down_expert_bytes;
+        spans.push_back({cache->gate + gate_dst, key.gate_src, gate_expert_bytes});
+        spans.push_back({cache->up + gate_dst, key.up_src, gate_expert_bytes});
+        spans.push_back({cache->down + down_dst, key.down_src, down_expert_bytes});
+    };
+    auto discard_admissions = [&]() {
+        if (!cache) return;
+        for (size_t i = 0; i < admission_slots.size(); i++) {
+            cuda_moe_cache_slot &entry = cache->slots[admission_slots[i]];
+            if (admission_evicted[i] && cache->count > 0) cache->count--;
+            entry.state = CUDA_MOE_CACHE_EMPTY;
+        }
+    };
+
+    if (cache && layer_top1) {
+        int layer_slot = -1;
+        for (uint32_t i = 0; i < cache->capacity; i++) {
+            if (cache->slots[i].layer_owned && cache->slots[i].layer_key == gate_offset) {
+                layer_slot = (int)i;
+                break;
+            }
+        }
+        if (layer_slot < 0) {
+            for (uint32_t i = 0; i < cache->capacity; i++) {
+                if (cache->slots[i].layer_owned) continue;
+                cache->slots[i].layer_owned = 1;
+                cache->slots[i].layer_key = gate_offset;
+                layer_slot = (int)i;
+                break;
+            }
         }
 
-        local_direct++;
-        spans.push_back({g_moe_gather.gate + (uint64_t)i * gate_expert_bytes,
-                         key.gate_src, gate_expert_bytes});
-        spans.push_back({g_moe_gather.up + (uint64_t)i * gate_expert_bytes,
-                         key.up_src, gate_expert_bytes});
-        spans.push_back({g_moe_gather.down + (uint64_t)i * down_expert_bytes,
-                         key.down_src, down_expert_bytes});
+        if (layer_slot >= 0 && cache->slots[(uint32_t)layer_slot].state == CUDA_MOE_CACHE_VALID) {
+            const cuda_moe_cache_key resident = cache->slots[(uint32_t)layer_slot].key;
+            for (uint32_t i = 0; i < compact_count; i++) {
+                const cuda_moe_cache_key key = expert_key(i);
+                if (key.gate_src == resident.gate_src &&
+                    key.up_src == resident.up_src &&
+                    key.down_src == resident.down_src) {
+                    cache_slots[i] = layer_slot;
+                    claimed[(uint32_t)layer_slot] = 1;
+                    local_hits = 1;
+                    break;
+                }
+            }
+        }
+        local_misses = compact_count - local_hits;
+
+        if (layer_slot >= 0 && local_hits == 0) {
+            std::vector<float> &mass = g_moe_gather.h_compact_mass;
+            mass.assign(compact_count, 0.0f);
+            for (uint32_t i = 0; i < slot_count; i++) {
+                mass[(uint32_t)slots[i]] += g_moe_gather.h_weights[i];
+            }
+            uint32_t candidate = 0;
+            for (uint32_t i = 1; i < compact_count; i++) {
+                if (mass[i] > mass[candidate]) candidate = i;
+            }
+            append_admission(candidate, (uint32_t)layer_slot, expert_key(candidate));
+        }
+        for (uint32_t i = 0; i < compact_count; i++) {
+            if (cache_slots[i] < 0) append_direct(i, expert_key(i));
+        }
+    } else {
+        if (cache) {
+            for (uint32_t i = 0; i < compact_count; i++) {
+                const cuda_moe_cache_key key = expert_key(i);
+                const int slot = cuda_moe_expert_cache_find(cache, key);
+                if (slot >= 0 && !claimed[(uint32_t)slot]) {
+                    cache_slots[i] = slot;
+                    claimed[(uint32_t)slot] = 1;
+                    local_hits++;
+                } else {
+                    local_misses++;
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < compact_count; i++) {
+            if (cache_slots[i] >= 0) continue;
+            const cuda_moe_cache_key key = expert_key(i);
+            const int cache_slot = cache ? cuda_moe_expert_cache_lru_slot(cache, claimed) : -1;
+            if (cache_slot >= 0) {
+                append_admission(i, (uint32_t)cache_slot, key);
+            } else {
+                append_direct(i, key);
+            }
+        }
     }
     int fill_ok = 0;
 #ifdef _WIN32
@@ -10160,9 +10268,7 @@ static int cuda_moe_selected_load(
     }
     if (!fill_ok) {
         (void)cudaStreamSynchronize(g_model_upload_stream);
-        if (cache) {
-            for (uint32_t slot : admission_slots) cache->slots[slot].state = CUDA_MOE_CACHE_EMPTY;
-        }
+        discard_admissions();
         return 0;
     }
 
@@ -10173,7 +10279,7 @@ static int cuda_moe_selected_load(
                     cache, (uint32_t)cache_slots[i], i)) {
                 (void)cudaGetLastError();
                 (void)cudaStreamSynchronize(g_model_upload_stream);
-                for (uint32_t slot : admission_slots) cache->slots[slot].state = CUDA_MOE_CACHE_EMPTY;
+                discard_admissions();
                 return 0;
             }
         }
@@ -10199,7 +10305,8 @@ static int cuda_moe_selected_load(
         cache->admissions += admission_slots.size();
         cache->evictions += local_evictions;
         cache->direct_loads += local_direct;
-        if (getenv("DS4_CUDA_MOE_CACHE_STATS") != NULL && cache->calls % 128u == 0u) {
+        const uint64_t stats_interval = cuda_moe_expert_cache_stats_interval();
+        if (stats_interval != 0 && cache->calls % stats_interval == 0u) {
             const uint64_t lookups = cache->hits + cache->misses;
             fprintf(stderr,
                     "ds4: [moecache] calls=%llu cap=%u count=%u hits=%llu misses=%llu hit_rate=%.3f admissions=%llu evictions=%llu direct=%llu\n",
@@ -10303,7 +10410,7 @@ static int routed_moe_launch(
     if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL &&
         cuda_moe_selected_load(model_map, model_size, gate_offset, up_offset, down_offset,
                                gate_expert_bytes, down_expert_bytes,
-                               n_total_expert, n_expert, n_tokens, selected)) {
+                               n_total_expert, n_expert, n_tokens, selected, weights)) {
         gate_w = g_moe_gather.gate;
         up_w = g_moe_gather.up;
         down_w = g_moe_gather.down;

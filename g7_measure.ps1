@@ -14,7 +14,9 @@ param(
     [ValidateSet(1, 2, 4)][int]$IoQD = 1,
     [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
     [ValidateRange(0.0, 6.0)][double]$ExpertCacheReserveGB = 0.5,
+    [ValidateSet("lru", "layer-top1")][string]$ExpertCachePolicy = "lru",
     [switch]$ExpertCacheStats,
+    [ValidateRange(1, 1000000)][int]$ExpertCacheStatsInterval = 128,
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000
 )
@@ -49,12 +51,19 @@ else { Remove-Item Env:\DS4_CUDA_MOE_IO_QD -ErrorAction SilentlyContinue }
 if ($ExpertCacheN -gt 0) {
     $env:DS4_CUDA_STREAMING_EXPERT_CACHE_N = "$ExpertCacheN"
     $env:DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB = $ExpertCacheReserveGB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+    $env:DS4_CUDA_MOE_CACHE_POLICY = $ExpertCachePolicy
 } else {
     Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_N -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_MOE_CACHE_POLICY -ErrorAction SilentlyContinue
 }
-if ($ExpertCacheStats) { $env:DS4_CUDA_MOE_CACHE_STATS = "1" }
-else { Remove-Item Env:\DS4_CUDA_MOE_CACHE_STATS -ErrorAction SilentlyContinue }
+if ($ExpertCacheStats) {
+    $env:DS4_CUDA_MOE_CACHE_STATS = "1"
+    $env:DS4_CUDA_MOE_CACHE_STATS_INTERVAL = "$ExpertCacheStatsInterval"
+} else {
+    Remove-Item Env:\DS4_CUDA_MOE_CACHE_STATS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_MOE_CACHE_STATS_INTERVAL -ErrorAction SilentlyContinue
+}
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $existing = Get-Process ds4_server -ErrorAction SilentlyContinue
@@ -69,6 +78,8 @@ $worktreeDirtyAtStart = [bool](git -C $PSScriptRoot status --porcelain)
 $sourceHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "ds4_cuda.cu")).Hash.ToLowerInvariant()
 $exeHashAtStart = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 $harnessHashAtStart = (Get-FileHash -Algorithm SHA256 $PSCommandPath).Hash.ToLowerInvariant()
+$promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
+$promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
 
 $argList = @("-m", $model, "--cuda", "-c", "256", "-n", "$MaxTokens", "--host", "127.0.0.1", "--port", "$Port")
 Write-Host ("[g7] launching: " + $exe + " " + ($argList -join " "))
@@ -196,6 +207,8 @@ $summary = [pscustomobject]@{
     harness_sha256 = $harnessHashAtStart
     executable = $exe
     model = $model
+    prompt = $Prompt
+    prompt_sha256 = $promptHash
     requested_max_tokens = $MaxTokens
     repeats = $Repeats
     warmup = [bool]$Warmup
@@ -209,7 +222,9 @@ $summary = [pscustomobject]@{
     moe_overlapped_io_fallbacks = $overlappedIoFallbacks
     expert_cache_requested = $ExpertCacheN
     expert_cache_reserve_gb = $ExpertCacheReserveGB
+    expert_cache_policy = $ExpertCachePolicy
     expert_cache_stats_enabled = [bool]$ExpertCacheStats
+    expert_cache_stats_interval = $ExpertCacheStatsInterval
     expert_cache_calls = $cacheCalls
     expert_cache_capacity = $cacheCapacity
     expert_cache_count = $cacheCount
