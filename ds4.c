@@ -9698,6 +9698,41 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_i32_tensor("ffn_moe_topk", g->router_selected, DS4_N_EXPERT_USED, il, pos);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", g->router_weights, DS4_N_EXPERT_USED, il, pos);
     }
+    const bool fuse_shared_gate_up =
+        !g->quality &&
+        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+    const bool overlap_shared = ok && ds4_gpu_routed_moe_prepare_selected(
+        model->map, model->size,
+        layer->ffn_gate_exps->abs_offset,
+        layer->ffn_up_exps->abs_offset,
+        layer->ffn_down_exps->abs_offset,
+        gate_expert_bytes, down_expert_bytes,
+        g->router_selected, DS4_N_EXPERT_USED, 1) != 0;
+    if (ok && overlap_shared) {
+        if (fuse_shared_gate_up) {
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                             g->shared_up,
+                                                             g->shared_mid,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->ffn_gate_shexp->abs_offset,
+                                                             layer->ffn_up_shexp->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             shared_dim,
+                                                             g->ffn_norm) != 0;
+        } else {
+            ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
+                                              layer->ffn_gate_shexp->abs_offset,
+                                              DS4_N_EMBD, shared_dim,
+                                              g->ffn_norm, 1) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
+                                                      layer->ffn_up_shexp->abs_offset,
+                                                      DS4_N_EMBD, shared_dim,
+                                                      g->ffn_norm, 1) != 0;
+            if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                                 shared_dim, 0.0f, 1.0f) != 0;
+        }
+    }
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
@@ -9716,7 +9751,7 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
-    DS4_METAL_PROFILE_DECODE_STAGE("routed_moe");
+    DS4_METAL_PROFILE_DECODE_STAGE(overlap_shared ? "shared_gate_up+routed_moe" : "routed_moe");
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_gate_clamped", g->routed_gate,
                                       (uint64_t)DS4_N_EXPERT_USED * down_in_dim, il, pos);
@@ -9734,32 +9769,32 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", g->routed_out, DS4_N_EMBD, il, pos);
     }
-    const bool fuse_shared_gate_up =
-        !g->quality &&
-        getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
-    if (ok && fuse_shared_gate_up) {
-        ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
-                                                         g->shared_up,
-                                                         g->shared_mid,
-                                                         model->map,
-                                                         model->size,
-                                                         layer->ffn_gate_shexp->abs_offset,
-                                                         layer->ffn_up_shexp->abs_offset,
-                                                         DS4_N_EMBD,
-                                                         shared_dim,
-                                                         g->ffn_norm) != 0;
-    } else {
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
-                                                  layer->ffn_gate_shexp->abs_offset,
-                                                  DS4_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
-                                                  layer->ffn_up_shexp->abs_offset,
-                                                  DS4_N_EMBD, shared_dim,
-                                                  g->ffn_norm, 1) != 0;
-        if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up, shared_dim, 0.0f, 1.0f) != 0;
+    if (ok && !overlap_shared) {
+        if (fuse_shared_gate_up) {
+            ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
+                                                             g->shared_up,
+                                                             g->shared_mid,
+                                                             model->map,
+                                                             model->size,
+                                                             layer->ffn_gate_shexp->abs_offset,
+                                                             layer->ffn_up_shexp->abs_offset,
+                                                             DS4_N_EMBD,
+                                                             shared_dim,
+                                                             g->ffn_norm) != 0;
+        } else {
+            ok = ds4_gpu_matmul_q8_0_tensor(g->shared_gate, model->map, model->size,
+                                              layer->ffn_gate_shexp->abs_offset,
+                                              DS4_N_EMBD, shared_dim,
+                                              g->ffn_norm, 1) != 0;
+            if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->shared_up, model->map, model->size,
+                                                      layer->ffn_up_shexp->abs_offset,
+                                                      DS4_N_EMBD, shared_dim,
+                                                      g->ffn_norm, 1) != 0;
+            if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                                                 shared_dim, 0.0f, 1.0f) != 0;
+        }
+        DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     }
-    DS4_METAL_PROFILE_DECODE_STAGE("shared_gate_up");
     const bool keep_ffn_out = metal_graph_needs_ffn_out(g, il, pos);
     const bool fuse_shared_down_hc =
         !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();

@@ -642,6 +642,18 @@ int ds4_gpu_routed_moe_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x);
 
+int ds4_gpu_routed_moe_prepare_selected(
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint64_t                gate_expert_bytes,
+        uint64_t                down_expert_bytes,
+        const ds4_gpu_tensor *selected,
+        uint32_t                n_expert,
+        uint32_t                n_tokens);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

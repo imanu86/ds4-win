@@ -17,6 +17,7 @@ param(
     [ValidateSet("lru", "layer-top1")][string]$ExpertCachePolicy = "lru",
     [switch]$ExpertCacheStats,
     [ValidateRange(1, 1000000)][int]$ExpertCacheStatsInterval = 128,
+    [switch]$OverlapShared,
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000
 )
@@ -64,8 +65,12 @@ if ($ExpertCacheStats) {
     Remove-Item Env:\DS4_CUDA_MOE_CACHE_STATS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_MOE_CACHE_STATS_INTERVAL -ErrorAction SilentlyContinue
 }
+if ($OverlapShared) { $env:DS4_CUDA_MOE_OVERLAP_SHARED = "1" }
+else { Remove-Item Env:\DS4_CUDA_MOE_OVERLAP_SHARED -ErrorAction SilentlyContinue }
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
+if ($OverlapShared -and $NoSelectedLoad) { throw "OverlapShared is incompatible with NoSelectedLoad" }
+if ($OverlapShared -and $ExpertCacheN -gt 0) { throw "OverlapShared is incompatible with ExpertCacheN > 0" }
 $existing = Get-Process ds4_server -ErrorAction SilentlyContinue
 if ($existing) {
     throw "Another ds4_server process is active; refusing to stop a server owned by another task."
@@ -165,6 +170,7 @@ $evicts = 0; $selLoads = 0; $lastSel = ""; $streamsExpert = 0; $streamsHot = 0
 $observedIoQD = 1; $overlappedIoObserved = $false; $overlappedIoFallbacks = 0
 $cacheCalls = 0; $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
 $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
+$overlapSharedObserved = $false
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
     $evLine = $lines | Where-Object { $_ -match "evicts=(\d+)" } | Select-Object -Last 1
@@ -181,6 +187,7 @@ if (Test-Path $stderrLog) {
         $overlappedIoObserved = $true
     }
     $overlappedIoFallbacks = ($lines | Where-Object { $_ -match "MoE overlapped read failed; selected-load fallback requested" } | Measure-Object).Count
+    $overlapSharedObserved = [bool]($lines | Where-Object { $_ -match "CUDA MoE shared-overlap consumed" } | Select-Object -First 1)
     $cacheReadyLine = $lines | Where-Object { $_ -match "resident expert cache ready: (\d+)/(\d+) experts" } | Select-Object -Last 1
     if ($cacheReadyLine -and $cacheReadyLine -match "resident expert cache ready: (\d+)/(\d+) experts") {
         $cacheCapacity = [int]$Matches[1]
@@ -225,6 +232,8 @@ $summary = [pscustomobject]@{
     expert_cache_policy = $ExpertCachePolicy
     expert_cache_stats_enabled = [bool]$ExpertCacheStats
     expert_cache_stats_interval = $ExpertCacheStatsInterval
+    overlap_shared_requested = [bool]$OverlapShared
+    overlap_shared_observed = $overlapSharedObserved
     expert_cache_calls = $cacheCalls
     expert_cache_capacity = $cacheCapacity
     expert_cache_count = $cacheCount
@@ -260,5 +269,6 @@ Write-Host ("moe_io_qd req/observed: " + $IoQD + " / " + $observedIoQD)
 Write-Host ("moe_io_fallbacks: " + $overlappedIoFallbacks)
 Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapacity + " / " + $cacheCount)
 Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
+Write-Host ("overlap_shared requested/observed: " + [bool]$OverlapShared + " / " + $overlapSharedObserved)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="

@@ -9529,6 +9529,20 @@ struct cuda_moe_gather {
 };
 static cuda_moe_gather g_moe_gather;
 
+struct cuda_moe_selected_prepared {
+    const void *model_map;
+    const void *selected_ptr;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint32_t n_expert;
+    uint32_t n_tokens;
+    int valid;
+};
+static cuda_moe_selected_prepared g_moe_selected_prepared;
+
 enum cuda_moe_cache_slot_state : uint8_t {
     CUDA_MOE_CACHE_EMPTY = 0,
     CUDA_MOE_CACHE_VALID = 1,
@@ -9645,6 +9659,7 @@ static void cuda_moe_expert_cache_release(void) {
 }
 
 static void cuda_moe_gather_release(void) {
+    g_moe_selected_prepared.valid = 0;
     if (g_moe_gather.gate) (void)cudaFree(g_moe_gather.gate);
     if (g_moe_gather.up) (void)cudaFree(g_moe_gather.up);
     if (g_moe_gather.down) (void)cudaFree(g_moe_gather.down);
@@ -10024,6 +10039,62 @@ static int cuda_moe_gather_ensure_i32(int32_t **ptr, uint64_t *cap, uint32_t cou
     return cuda_moe_gather_ensure((char **)ptr, cap, (uint64_t)count * sizeof(int32_t), what);
 }
 
+extern "C" int ds4_gpu_routed_moe_prepare_selected(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        const ds4_gpu_tensor *selected, uint32_t n_expert, uint32_t n_tokens) {
+    g_moe_selected_prepared.valid = 0;
+    const char *env = getenv("DS4_CUDA_MOE_OVERLAP_SHARED");
+    if (!env || !env[0] || strcmp(env, "0") == 0 ||
+        getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") != NULL ||
+        cuda_moe_expert_cache_requested() != 0) {
+        return 0;
+    }
+    const uint32_t n_total_expert = 256u;
+    if (!model_map || !selected || !selected->ptr || n_expert == 0 || n_tokens == 0 ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        n_tokens > UINT32_MAX / n_expert) {
+        return 0;
+    }
+    const uint32_t slot_count = n_tokens * n_expert;
+    if (selected->bytes < (uint64_t)slot_count * sizeof(int32_t) ||
+        gate_expert_bytes > UINT64_MAX / n_total_expert ||
+        down_expert_bytes > UINT64_MAX / n_total_expert) {
+        return 0;
+    }
+    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
+    if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
+        up_offset > model_size || gate_bytes > model_size - up_offset ||
+        down_offset > model_size || down_bytes > model_size - down_offset) {
+        return 0;
+    }
+    if (cuda_model_range_in_window(model_map, gate_offset, gate_bytes) &&
+        cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
+        cuda_model_range_in_window(model_map, down_offset, down_bytes)) {
+        return 0;
+    }
+
+    g_moe_gather.h_sel.resize(slot_count);
+    if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected->ptr,
+                            (size_t)slot_count * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "moe overlap selected D2H")) {
+        return 0;
+    }
+    g_moe_selected_prepared.model_map = model_map;
+    g_moe_selected_prepared.selected_ptr = selected->ptr;
+    g_moe_selected_prepared.gate_offset = gate_offset;
+    g_moe_selected_prepared.up_offset = up_offset;
+    g_moe_selected_prepared.down_offset = down_offset;
+    g_moe_selected_prepared.gate_expert_bytes = gate_expert_bytes;
+    g_moe_selected_prepared.down_expert_bytes = down_expert_bytes;
+    g_moe_selected_prepared.n_expert = n_expert;
+    g_moe_selected_prepared.n_tokens = n_tokens;
+    g_moe_selected_prepared.valid = 1;
+    return 1;
+}
+
 /* Returns 1 and populates g_moe_gather (compact gate/up/down + remapped slot tensor)
  * on success; 0 on any failure (caller falls back to the whole-256-block path). */
 static int cuda_moe_selected_load(
@@ -10049,10 +10120,32 @@ static int cuda_moe_selected_load(
         return 0;
     }
 
+    const int prepared =
+        g_moe_selected_prepared.valid &&
+        g_moe_selected_prepared.model_map == model_map &&
+        g_moe_selected_prepared.selected_ptr == selected_arg->ptr &&
+        g_moe_selected_prepared.gate_offset == gate_offset &&
+        g_moe_selected_prepared.up_offset == up_offset &&
+        g_moe_selected_prepared.down_offset == down_offset &&
+        g_moe_selected_prepared.gate_expert_bytes == gate_expert_bytes &&
+        g_moe_selected_prepared.down_expert_bytes == down_expert_bytes &&
+        g_moe_selected_prepared.n_expert == n_expert &&
+        g_moe_selected_prepared.n_tokens == n_tokens;
+    g_moe_selected_prepared.valid = 0;
+    if (prepared) {
+        static int overlap_notice_printed = 0;
+        if (!overlap_notice_printed) {
+            fprintf(stderr, "ds4: CUDA MoE shared-overlap consumed\n");
+            overlap_notice_printed = 1;
+        }
+    }
+
     /* 1. Router outputs -> host. Layer-top1 also consumes the selected weights
      * to choose residency; selection itself remains unchanged. */
-    g_moe_gather.h_sel.resize(slot_count);
-    if (layer_top1) {
+    if (prepared) {
+        if (g_moe_gather.h_sel.size() != slot_count) return 0;
+    } else if (layer_top1) {
+        g_moe_gather.h_sel.resize(slot_count);
         g_moe_gather.h_weights.resize(slot_count);
         if (!cuda_ok(cudaMemcpyAsync(g_moe_gather.h_sel.data(), selected_arg->ptr,
                                      (size_t)slot_count * sizeof(int32_t),
@@ -10062,6 +10155,7 @@ static int cuda_moe_selected_load(
                                      cudaMemcpyDeviceToHost, 0), "moe weights D2H enqueue") ||
             !cuda_ok(cudaStreamSynchronize(0), "moe router D2H sync")) return 0;
     } else {
+        g_moe_gather.h_sel.resize(slot_count);
         if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
                                 (size_t)slot_count * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
