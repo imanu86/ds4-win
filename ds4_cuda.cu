@@ -83,6 +83,9 @@ static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static uint64_t g_model_registered_range_bytes = 0; /* cumulative host-pinned range bytes (WDDM budget) */
 static uint64_t g_model_window_bytes = 0; /* size of the single contiguous host-registered window [0, window) */
+static uint64_t g_model_tick = 0;            /* monotonic LRU clock for streamed ranges */
+static int      g_model_streaming_active = 0; /* 0 during pre-cache (defer on VRAM pressure), 1 at inference (evict) */
+static uint64_t g_model_evict_count = 0;      /* diagnostics: streamed ranges evicted */
 static int g_model_hmm_direct;
 static os_file_t g_model_file;
 static int g_model_file_valid;
@@ -133,6 +136,8 @@ struct cuda_model_range {
     uint64_t registered_bytes;
     int host_registered;
     int arena_allocated;
+    int streamed;              /* 1 => device_ptr is an owning cudaMalloc, LRU-evictable */
+    uint64_t last_used_tick;   /* LRU recency stamp (0 for non-streamed) */
 };
 
 struct cuda_model_arena {
@@ -281,11 +286,15 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     const uint64_t end = offset + bytes;
     auto exact = g_model_range_by_offset.find(offset);
     if (exact != g_model_range_by_offset.end()) {
-        const cuda_model_range &r = g_model_ranges[exact->second];
-        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) return r.device_ptr;
+        cuda_model_range &r = g_model_ranges[exact->second];
+        if (r.host_base == model_map && end >= offset && bytes <= r.bytes) {
+            if (r.streamed) r.last_used_tick = ++g_model_tick;
+            return r.device_ptr;
+        }
     }
-    for (const cuda_model_range &r : g_model_ranges) {
+    for (cuda_model_range &r : g_model_ranges) {
         if (r.host_base == model_map && offset >= r.offset && end >= offset && end <= r.offset + r.bytes) {
+            if (r.streamed) r.last_used_tick = ++g_model_tick;
             return r.device_ptr + (offset - r.offset);
         }
         if (r.host_base == model_map && r.host_registered && r.registered_base && r.registered_device_base) {
@@ -354,6 +363,12 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                     (double)reg_bytes / 1048576.0, (double)cuda_host_register_budget_bytes() / 1073741824.0);
         }
     }
+
+    /* Standalone per-span VRAM copy (untracked/non-evictable). During pre-cache
+     * (streaming not yet active) defer beyond-window spans to on-demand streaming
+     * instead of burning the VRAM reserve here. At inference the fd-cache stream
+     * path with eviction handles these, so this legacy fallback isn't reached. */
+    if (!g_model_streaming_active) return NULL;
 
     void *dev = NULL;
     err = cudaMalloc(&dev, (size_t)bytes);
@@ -1104,28 +1119,82 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     return (char *)dev;
 }
 
+/* ---- Streamed-range VRAM allocator with LRU eviction (G6) ---- */
+static uint64_t cuda_model_stream_reserve_bytes(void) {
+    uint64_t mb = 2048;
+    const char *e = getenv("DS4_CUDA_STREAM_RESERVE_MB");
+    if (e && e[0]) { char *end = NULL; unsigned long long v = strtoull(e, &end, 10); if (end != e) mb = (uint64_t)v; }
+    return mb * 1048576ull;
+}
+
+/* Coldest evictable streamed range outside the pin window; -1 if none. */
+static long cuda_model_pick_victim(void) {
+    long best = -1;
+    uint64_t best_tick = UINT64_MAX;
+    const uint64_t pin_floor = (g_model_tick > 4u) ? (g_model_tick - 4u) : 0u; /* protect current MoE working set */
+    for (size_t i = 0; i < g_model_ranges.size(); i++) {
+        const cuda_model_range &r = g_model_ranges[i];
+        if (!r.streamed || !r.device_ptr) continue;
+        if (r.last_used_tick > pin_floor) continue;
+        if (r.last_used_tick < best_tick) { best_tick = r.last_used_tick; best = (long)i; }
+    }
+    return best;
+}
+
+/* Swap-erase range i, cudaFree its owning buffer, repoint the moved entry. */
+static void cuda_model_range_erase(size_t i) {
+    const cuda_model_range v = g_model_ranges[i];
+    g_model_range_by_offset.erase(v.offset);
+    if (v.device_ptr && v.streamed && !v.arena_allocated) (void)cudaFree(v.device_ptr);
+    if (g_model_range_bytes >= v.bytes) g_model_range_bytes -= v.bytes;
+    const size_t last = g_model_ranges.size() - 1u;
+    if (i != last) {
+        g_model_ranges[i] = g_model_ranges[last];
+        g_model_range_by_offset[g_model_ranges[i].offset] = i;
+    }
+    g_model_ranges.pop_back();
+}
+
+/* Allocate `bytes` of VRAM for a streamed range, evicting LRU cold ranges as
+ * needed. allow_evict=0 during pre-cache (returns NULL -> caller defers). */
+static char *cuda_model_stream_alloc(uint64_t bytes, int allow_evict, const char *what) {
+    (void)what;
+    const uint64_t aligned = (bytes + 255u) & ~255ull;
+    const uint64_t reserve = cuda_model_stream_reserve_bytes();
+    for (;;) {
+        size_t freeb = 0, totalb = 0;
+        if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) { (void)cudaGetLastError(); freeb = 0; }
+        if ((uint64_t)freeb >= aligned + reserve) {
+            void *dev = NULL;
+            cudaError_t err = cudaMalloc(&dev, (size_t)aligned);
+            if (err == cudaSuccess) return (char *)dev;
+            (void)cudaGetLastError();
+        }
+        if (!allow_evict) return NULL;
+        const long vi = cuda_model_pick_victim();
+        if (vi < 0) return NULL;
+        (void)cudaDeviceSynchronize();       /* drain stream-0 readers before freeing the victim */
+        cuda_model_range_erase((size_t)vi);
+        g_model_evict_count++;
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+            fprintf(stderr, "ds4: CUDA evicted streamed range (evicts=%llu)\n",
+                    (unsigned long long)g_model_evict_count);
+        }
+    }
+}
+
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
     if (!g_model_file_valid || bytes == 0) return NULL;
-    const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
-        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-            fprintf(stderr, "ds4: CUDA direct %s %.2f MiB (cache budget %.2f GiB exhausted)\n",
-                    what ? what : "weights",
-                    (double)bytes / 1048576.0,
-                    (double)limit / 1073741824.0);
-        }
-        return cuda_model_ptr(model_map, offset);
-    }
 
-    char *dev = cuda_model_arena_alloc(bytes, what);
-    if (!dev) {
-        if (getenv("DS4_CUDA_STRICT_WEIGHT_CACHE") != NULL) return NULL;
-        return cuda_model_ptr(model_map, offset);
-    }
+    /* Dedicated VRAM buffer for this streamed range; evict LRU cold ranges under
+     * pressure (inference only; pre-cache defers). No host-pointer fallback: a host
+     * pointer is not device-accessible on Windows (no HMM) and would crash a kernel. */
+    char *dev = cuda_model_stream_alloc(bytes, g_model_streaming_active, what);
+    if (!dev) return NULL;
     cudaError_t err = cudaSuccess;
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
@@ -1186,7 +1255,7 @@ static const char *cuda_model_range_ptr_from_fd(
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, /*arena_allocated=*/0, /*streamed=*/1, ++g_model_tick});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1618,10 +1687,16 @@ extern "C" int ds4_gpu_set_model_file(const os_file_t *file) {
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
-    if (offset > model_size || bytes > model_size - offset) return 0;
+    if (offset > model_size || bytes > model_size - offset) return -1; /* bad metadata: hard error */
+    /* NULL = couldn't make this span resident now -> DEFER to on-demand streaming
+     * at inference (cuda_model_range_ptr is called again per weight per token). */
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
-    return cuda_model_range_is_cached(model_map, offset, bytes);
+    return cuda_model_range_is_cached(model_map, offset, bytes) ? 1 : 0;
 }
+
+/* Called once after the startup pre-cache completes: from here on,
+ * cuda_model_range_ptr_from_fd may evict LRU cold streamed ranges. */
+extern "C" void ds4_gpu_model_streaming_begin(void) { g_model_streaming_active = 1; }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
     if (!model_map || bytes == 0) return 1;

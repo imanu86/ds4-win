@@ -1405,6 +1405,7 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
     uint64_t cached = 0;
+    uint64_t deferred = 0;
     uint64_t merged = 0;
     for (uint64_t i = 0; i < nspan;) {
         uint64_t off = spans[i].off;
@@ -1419,7 +1420,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
             if (chunk_end - off > max_span) chunk_end = off + max_span;
             char label[96];
             snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
-            if (ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label) == 0) {
+            int rc = ds4_gpu_cache_model_range(m->map, m->size, off, chunk_end - off, label);
+            if (rc < 0) {
                 fprintf(stderr,
                         "ds4: accelerator failed to cache model tensor span %" PRIu64
                         " at offset %" PRIu64 "\n",
@@ -1427,12 +1429,16 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
                 free(spans);
                 return false;
             }
-            cached += chunk_end - off;
+            if (rc == 0) deferred += chunk_end - off;  /* beyond-window: stream on demand at inference */
+            else         cached   += chunk_end - off;
             merged++;
             off = chunk_end;
         }
     }
     free(spans);
+    if (deferred != 0)
+        fprintf(stderr, "ds4: CUDA startup cache deferred %.2f GiB of tensor spans to on-demand streaming\n",
+                (double)deferred / 1073741824.0);
     if (cached_out) *cached_out = cached;
     return true;
 }
@@ -1471,6 +1477,7 @@ static bool accelerator_cache_model_tensors(ds4_backend backend, const ds4_model
                 (double)cached / 1073741824.0,
                 t1 - t0);
     }
+    ds4_gpu_model_streaming_begin(); /* enable LRU eviction for on-demand streaming */
     return true;
 }
 #else
