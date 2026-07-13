@@ -138,6 +138,9 @@ struct cuda_model_range {
     int arena_allocated;
     int streamed;              /* 1 => device_ptr is an owning cudaMalloc, LRU-evictable */
     uint64_t last_used_tick;   /* LRU recency stamp (0 for non-streamed) */
+    int pinned;                /* G7 keep-hot: 1 => non-expert (attn/norm/router) weight,
+                                * evicted only as a last resort so it stays resident and
+                                * isn't re-streamed every token (experts are unpinned). */
 };
 
 struct cuda_model_arena {
@@ -1127,25 +1130,101 @@ static uint64_t cuda_model_stream_reserve_bytes(void) {
     return mb * 1048576ull;
 }
 
-/* Coldest evictable streamed range outside the pin window; -1 if none. */
+/* Coldest evictable streamed range outside the pin window; -1 if none.
+ * G7 keep-hot: two-tier. Pass 1 considers only UNPINNED ranges (experts) so hot
+ * non-expert weights survive; only if there is no evictable expert do we fall back
+ * to evicting the coldest PINNED range (pass 2) -- this guarantees forward progress
+ * without deadlocking when the whole live set is pinned. */
 static long cuda_model_pick_victim(void) {
-    long best = -1;
-    uint64_t best_tick = UINT64_MAX;
     const uint64_t pin_floor = (g_model_tick > 4u) ? (g_model_tick - 4u) : 0u; /* protect current MoE working set */
-    for (size_t i = 0; i < g_model_ranges.size(); i++) {
-        const cuda_model_range &r = g_model_ranges[i];
-        if (!r.streamed || !r.device_ptr) continue;
-        if (r.last_used_tick > pin_floor) continue;
-        if (r.last_used_tick < best_tick) { best_tick = r.last_used_tick; best = (long)i; }
+    for (int tier = 0; tier < 2; tier++) {
+        long best = -1;
+        uint64_t best_tick = UINT64_MAX;
+        for (size_t i = 0; i < g_model_ranges.size(); i++) {
+            const cuda_model_range &r = g_model_ranges[i];
+            if (!r.streamed || !r.device_ptr) continue;
+            if (r.last_used_tick > pin_floor) continue;
+            if (tier == 0 && r.pinned) continue;      /* pass 1: experts only */
+            if (tier == 1 && !r.pinned) continue;     /* pass 2: pinned last resort */
+            if (r.last_used_tick < best_tick) { best_tick = r.last_used_tick; best = (long)i; }
+        }
+        if (best >= 0) return best;
     }
-    return best;
+    return -1;
 }
 
-/* Swap-erase range i, cudaFree its owning buffer, repoint the moved entry. */
-static void cuda_model_range_erase(size_t i) {
+/* ---- Recycled-buffer pool for event-based eviction (G7) ----
+ * The old eviction path did cudaDeviceSynchronize() before every cudaFree to
+ * ensure no in-flight stream-0 kernel read the victim -- a full pipeline drain
+ * per eviction (thousands/token) that dominated decode. Instead of freeing a
+ * victim's owning cudaMalloc, we record a stream-0 event on it (which fences all
+ * prior reads) and park the buffer in a size-bucketed pool. A later same-size
+ * allocation reuses a pooled buffer whose event has already completed (query, no
+ * wait) -- so evictions cost no sync and the cudaMalloc/cudaFree churn disappears.
+ * All streamed-weight readers run on stream 0, so a stream-0 event is a correct
+ * fence. Buffers are drained back to the driver only under real VRAM pressure. */
+struct cuda_stream_pool_buf {
+    char *ptr;
+    uint64_t bytes;      /* the aligned allocation size (exact-bucket reuse) */
+    cudaEvent_t ev;      /* recorded on stream 0 at eviction; ready => safe to reuse/free */
+};
+static std::vector<cuda_stream_pool_buf> g_stream_pool;
+static uint64_t g_stream_pool_bytes;
+
+/* Park an owning buffer for deferred reuse; fences prior stream-0 reads via event.
+ * Falls back to a synchronous free if an event can't be created. */
+static void cuda_stream_pool_push(char *ptr, uint64_t aligned) {
+    if (!ptr) return;
+    cudaEvent_t ev = NULL;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaDeviceSynchronize();
+        (void)cudaFree(ptr);
+        return;
+    }
+    (void)cudaEventRecord(ev, 0);
+    g_stream_pool.push_back({ptr, aligned, ev});
+    g_stream_pool_bytes += aligned;
+}
+
+/* Reuse a ready (event-complete) pooled buffer of the exact size, no wait/malloc. */
+static char *cuda_stream_pool_take(uint64_t aligned) {
+    for (size_t i = 0; i < g_stream_pool.size(); i++) {
+        cuda_stream_pool_buf &b = g_stream_pool[i];
+        if (b.bytes != aligned) continue;
+        if (cudaEventQuery(b.ev) != cudaSuccess) { (void)cudaGetLastError(); continue; }
+        char *ptr = b.ptr;
+        (void)cudaEventDestroy(b.ev);
+        g_stream_pool_bytes -= b.bytes;
+        g_stream_pool.erase(g_stream_pool.begin() + (long)i);
+        return ptr;
+    }
+    return NULL;
+}
+
+/* Free one pooled buffer back to the driver to release VRAM. Prefers a ready
+ * buffer (no wait); waits on the oldest only if forced. Returns bytes freed. */
+static uint64_t cuda_stream_pool_reclaim(void) {
+    if (g_stream_pool.empty()) return 0;
+    size_t idx = 0; int found_ready = 0;
+    for (size_t i = 0; i < g_stream_pool.size(); i++) {
+        if (cudaEventQuery(g_stream_pool[i].ev) == cudaSuccess) { idx = i; found_ready = 1; break; }
+        (void)cudaGetLastError();
+    }
+    cuda_stream_pool_buf b = g_stream_pool[idx];
+    if (!found_ready) (void)cudaEventSynchronize(b.ev);
+    (void)cudaEventDestroy(b.ev);
+    (void)cudaFree(b.ptr);
+    g_stream_pool_bytes -= b.bytes;
+    g_stream_pool.erase(g_stream_pool.begin() + (long)idx);
+    return b.bytes;
+}
+
+/* Swap-erase range i and park its owning buffer in the recycle pool (deferred,
+ * event-fenced free) instead of a synchronous cudaDeviceSynchronize + cudaFree. */
+static void cuda_model_range_evict_to_pool(size_t i) {
     const cuda_model_range v = g_model_ranges[i];
     g_model_range_by_offset.erase(v.offset);
-    if (v.device_ptr && v.streamed && !v.arena_allocated) (void)cudaFree(v.device_ptr);
     if (g_model_range_bytes >= v.bytes) g_model_range_bytes -= v.bytes;
     const size_t last = g_model_ranges.size() - 1u;
     if (i != last) {
@@ -1153,28 +1232,42 @@ static void cuda_model_range_erase(size_t i) {
         g_model_range_by_offset[g_model_ranges[i].offset] = i;
     }
     g_model_ranges.pop_back();
+    if (v.device_ptr && v.streamed && !v.arena_allocated) {
+        cuda_stream_pool_push(v.device_ptr, (v.bytes + 255u) & ~255ull);
+    }
 }
 
-/* Allocate `bytes` of VRAM for a streamed range, evicting LRU cold ranges as
- * needed. allow_evict=0 during pre-cache (returns NULL -> caller defers). */
+/* Allocate `bytes` of VRAM for a streamed range, reusing a recycled buffer or
+ * evicting LRU cold ranges as needed. allow_evict=0 during pre-cache (NULL ->
+ * caller defers). No per-eviction device sync: safety is via the pool's events. */
 static char *cuda_model_stream_alloc(uint64_t bytes, int allow_evict, const char *what) {
     (void)what;
     const uint64_t aligned = (bytes + 255u) & ~255ull;
     const uint64_t reserve = cuda_model_stream_reserve_bytes();
+    /* Fast path: recycle a ready same-size buffer (no sync, no malloc). */
+    char *reuse = cuda_stream_pool_take(aligned);
+    if (reuse) return reuse;
     for (;;) {
         size_t freeb = 0, totalb = 0;
-        if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) { (void)cudaGetLastError(); freeb = 0; }
+        if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) {
+            /* Query failure is not OOM: setting freeb=0 here would mass-evict the
+             * entire cache one range/iter. Bail instead (caller treats NULL as
+             * non-fatal and falls back). */
+            (void)cudaGetLastError();
+            return NULL;
+        }
         if ((uint64_t)freeb >= aligned + reserve) {
             void *dev = NULL;
             cudaError_t err = cudaMalloc(&dev, (size_t)aligned);
             if (err == cudaSuccess) return (char *)dev;
             (void)cudaGetLastError();
         }
+        /* Reclaim VRAM parked in the pool before evicting live ranges. */
+        if (cuda_stream_pool_reclaim() > 0) continue;
         if (!allow_evict) return NULL;
         const long vi = cuda_model_pick_victim();
         if (vi < 0) return NULL;
-        (void)cudaDeviceSynchronize();       /* drain stream-0 readers before freeing the victim */
-        cuda_model_range_erase((size_t)vi);
+        cuda_model_range_evict_to_pool((size_t)vi);   /* event-fenced, no device sync */
         g_model_evict_count++;
         if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
             fprintf(stderr, "ds4: CUDA evicted streamed range (evicts=%llu)\n",
@@ -1199,10 +1292,14 @@ static const char *cuda_model_range_ptr_from_fd(
 
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!cuda_model_stage_pool_alloc(stage_bytes)) return NULL;
-
     uint64_t copied = 0;
     uint64_t chunk_idx = 0;
+    /* All error paths below jump to `fail:` which frees the owning `dev` buffer.
+     * Previously each `return NULL` leaked `dev` (an owning cudaMalloc not yet
+     * tracked in g_model_ranges); with thousands of per-expert fetches a transient
+     * hiccup would leak VRAM until spurious OOM. */
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) goto fail;
+
     while (copied < bytes) {
         const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
         const uint64_t bi = chunk_idx % 4u;
@@ -1212,7 +1309,7 @@ static const char *cuda_model_range_ptr_from_fd(
                 fprintf(stderr, "ds4: CUDA model staging wait failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(err));
                 (void)cudaGetLastError();
-                return NULL;
+                goto fail;
             }
         }
         const char *payload = NULL;
@@ -1222,7 +1319,7 @@ static const char *cuda_model_range_ptr_from_fd(
                     what ? what : "weights",
                     (double)copied / 1048576.0,
                     strerror(errno));
-            return NULL;
+            goto fail;
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
@@ -1232,14 +1329,14 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return NULL;
+            goto fail;
         }
         err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model staging record failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
             (void)cudaGetLastError();
-            return NULL;
+            goto fail;
         }
         cuda_model_drop_file_pages(offset + copied, n);
         cuda_model_discard_source_pages(model_map, g_model_registered_size, offset + copied, n);
@@ -1252,10 +1349,15 @@ static const char *cuda_model_range_ptr_from_fd(
         fprintf(stderr, "ds4: CUDA model range upload sync failed for %s: %s\n",
                 what ? what : "weights", cudaGetErrorString(err));
         (void)cudaGetLastError();
-        return NULL;
+        goto fail;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, /*arena_allocated=*/0, /*streamed=*/1, ++g_model_tick});
+    {
+        /* keep-hot: pin every non-expert weight (attn/norm/router/hc/dense) so it
+         * is not re-streamed each token; expert slices ("moe_*") stay evictable. */
+        const int is_hot = (what == NULL) || (strncmp(what, "moe_", 4) != 0);
+        g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, /*arena_allocated=*/0, /*streamed=*/1, ++g_model_tick, is_hot});
+    }
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -1266,6 +1368,11 @@ static const char *cuda_model_range_ptr_from_fd(
                 (double)g_model_range_bytes / 1073741824.0);
     }
     return (const char *)dev;
+
+fail:
+    (void)cudaDeviceSynchronize();
+    (void)cudaFree(dev);
+    return NULL;
 }
 
 static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
@@ -1363,6 +1470,13 @@ static void cuda_model_range_release_all(void) {
             (void)cudaFree(r.device_ptr);
         }
     }
+    /* Drain the recycled-buffer pool (event-fenced deferred frees). */
+    for (const cuda_stream_pool_buf &b : g_stream_pool) {
+        (void)cudaEventDestroy(b.ev);
+        (void)cudaFree(b.ptr);
+    }
+    g_stream_pool.clear();
+    g_stream_pool_bytes = 0;
     for (const cuda_model_arena &a : g_model_arenas) {
         if (a.device_ptr) (void)cudaFree(a.device_ptr);
     }
@@ -9352,6 +9466,199 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* ---- Selected-expert MoE load (G7): stream/gather ONLY the routed experts ----
+ * ds4-win's routed_moe fetched the whole 256-expert gate/up/down block per layer
+ * even though decode routes top-6. In the beyond-window streaming regime that is
+ * ~42x wasted SSD->VRAM traffic and the source of the eviction thrash. Here we
+ * read the router's selected indices to the host, dedupe them, fetch each routed
+ * expert through the existing per-offset LRU fd-cache (cross-token reuse for free),
+ * gather them into a compact contiguous VRAM buffer, and remap `selected` to
+ * compact slots so the unchanged MoE kernels touch only the routed experts. */
+struct cuda_moe_gather {
+    char *gate; uint64_t gate_cap;
+    char *up;   uint64_t up_cap;
+    char *down; uint64_t down_cap;
+    int32_t *slot; uint64_t slot_cap;
+    ds4_gpu_tensor slot_tensor;
+    std::vector<int32_t> h_sel;
+    std::vector<int32_t> h_expert_to_slot;
+    std::vector<int32_t> h_compact_ids;
+    std::vector<int32_t> h_slot_ids;
+};
+static cuda_moe_gather g_moe_gather;
+
+/* Selected-load profiling accumulators (DS4_CUDA_SEL_PROFILE). */
+static uint64_t g_sel_prof_calls;
+static uint64_t g_sel_prof_experts;
+static double g_sel_prof_fetch_s;
+
+static int cuda_model_range_in_window(const void *model_map, uint64_t offset, uint64_t bytes) {
+    return g_model_window_bytes && model_map == g_model_host_base && g_model_device_base &&
+           offset + bytes <= g_model_window_bytes;
+}
+
+/* Persistent staging rotation so consecutive span uploads pipeline (pread of the
+ * next tensor overlaps the H2D copy of the previous one). */
+static uint64_t g_stream_span_idx = 0;
+
+/* Stream `bytes` from the model file at `offset` DIRECTLY into a caller-owned
+ * device buffer `dst`, async on the upload stream via the pinned staging pool.
+ * No cudaMalloc / eviction / range-cache: this is the fast path for MoE experts
+ * (cross-token reuse ~0, so the per-expert VRAM cache's malloc/evict churn --
+ * ~40 ms/expert on WDDM, disk-independent -- is pure overhead). The caller MUST
+ * cudaStreamSynchronize(g_model_upload_stream) before the data is read elsewhere. */
+static int cuda_model_stream_span_into(char *dst, uint64_t offset, uint64_t bytes) {
+    if (!g_model_file_valid || bytes == 0 || !dst) return 0;
+    const uint64_t chunk = cuda_model_copy_chunk_bytes();
+    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
+    uint64_t copied = 0;
+    while (copied < bytes) {
+        const uint64_t n = (bytes - copied < chunk) ? (bytes - copied) : chunk;
+        const uint64_t bi = g_stream_span_idx % 4u;
+        if (g_stream_span_idx >= 4u) {
+            if (cudaEventSynchronize(g_model_stage_event[bi]) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+        }
+        const char *payload = NULL;
+        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes, offset + copied, n, &payload)) return 0;
+        if (cudaMemcpyAsync(dst + copied, payload, (size_t)n, cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        if (cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
+        cuda_model_drop_file_pages(offset + copied, n);
+        copied += n;
+        g_stream_span_idx++;
+    }
+    return 1;
+}
+
+/* Fill one compact slot for one expert weight (gate/up/down): zero-copy D2D from
+ * the pinned host window when in-window, else stream straight from the file.
+ * All async on the upload stream; caller batches one sync per layer. */
+static int cuda_moe_fill_span(char *dst, const void *model_map, uint64_t offset, uint64_t bytes) {
+    if (cuda_model_range_in_window(model_map, offset, bytes)) {
+        const char *src = g_model_device_base + offset;   /* device-mapped host window */
+        if (cudaMemcpyAsync(dst, src, (size_t)bytes, cudaMemcpyDefault, g_model_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        return 1;
+    }
+    return cuda_model_stream_span_into(dst, offset, bytes);
+}
+
+static int cuda_moe_gather_ensure(char **ptr, uint64_t *cap, uint64_t bytes, const char *what) {
+    if (bytes == 0) return 1;
+    if (*ptr && *cap >= bytes) return 1;
+    if (*ptr) { (void)cudaFree(*ptr); *ptr = NULL; *cap = 0; }
+    char *dev = cuda_model_stream_alloc(bytes, 1, what);
+    if (!dev) return 0;
+    *ptr = dev; *cap = bytes; return 1;
+}
+
+static int cuda_moe_gather_ensure_i32(int32_t **ptr, uint64_t *cap, uint32_t count, const char *what) {
+    return cuda_moe_gather_ensure((char **)ptr, cap, (uint64_t)count * sizeof(int32_t), what);
+}
+
+/* Returns 1 and populates g_moe_gather (compact gate/up/down + remapped slot tensor)
+ * on success; 0 on any failure (caller falls back to the whole-256-block path). */
+static int cuda_moe_selected_load(
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
+        const ds4_gpu_tensor *selected_arg) {
+    (void)model_size;
+    if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
+    if (!selected_arg || !selected_arg->ptr) return 0;
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0) return 0;
+    const uint32_t slot_count = n_tokens * n_expert;
+    if (slot_count == 0) return 0;
+    if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
+
+    /* 1. router selection -> host (synchronous D2H on stream 0 fences the router) */
+    g_moe_gather.h_sel.resize(slot_count);
+    if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
+                            (size_t)slot_count * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
+
+    /* 2. dedupe -> compact ids (ascending expert order) + per-slot remap */
+    std::vector<int32_t> &e2s = g_moe_gather.h_expert_to_slot;
+    e2s.assign(n_total_expert, -1);
+    std::vector<int32_t> &compact = g_moe_gather.h_compact_ids; compact.clear();
+    std::vector<int32_t> &slots = g_moe_gather.h_slot_ids; slots.resize(slot_count);
+    for (uint32_t i = 0; i < slot_count; i++) {
+        const int32_t e = g_moe_gather.h_sel[i];
+        if (e < 0 || (uint32_t)e >= n_total_expert) return 0;
+        e2s[(uint32_t)e] = -2;
+    }
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        if (e2s[e] != -2) continue;
+        e2s[e] = (int32_t)compact.size();
+        compact.push_back((int32_t)e);
+    }
+    for (uint32_t i = 0; i < slot_count; i++)
+        slots[i] = e2s[(uint32_t)g_moe_gather.h_sel[i]];
+    const uint32_t compact_count = (uint32_t)compact.size();
+    if (compact_count == 0 || compact_count > n_total_expert) return 0;
+
+    /* 3. compact device buffers (grow-only, reused across layers/tokens) */
+    const uint64_t cgate = (uint64_t)compact_count * gate_expert_bytes;
+    const uint64_t cdown = (uint64_t)compact_count * down_expert_bytes;
+    if (!cuda_moe_gather_ensure(&g_moe_gather.gate, &g_moe_gather.gate_cap, cgate, "moe gather gate") ||
+        !cuda_moe_gather_ensure(&g_moe_gather.up,   &g_moe_gather.up_cap,   cgate, "moe gather up") ||
+        !cuda_moe_gather_ensure(&g_moe_gather.down, &g_moe_gather.down_cap, cdown, "moe gather down") ||
+        !cuda_moe_gather_ensure_i32(&g_moe_gather.slot, &g_moe_gather.slot_cap, slot_count, "moe gather slots"))
+        return 0;
+
+    /* 4. Fill the pre-allocated compact buffers by streaming each routed expert
+     * DIRECTLY from the window (zero-copy D2D) or the file (staging pipeline) into
+     * its slot -- no per-expert cudaMalloc / eviction / range-cache (that WDDM
+     * churn was ~40 ms/expert, disk-independent). All uploads are async on the
+     * upload stream and drained with a single sync below (pipelines pread vs copy). */
+    const int prof = getenv("DS4_CUDA_SEL_PROFILE") != NULL;
+    const double t_fetch0 = prof ? cuda_wall_sec() : 0.0;
+    int fill_ok = 1;
+    for (uint32_t i = 0; i < compact_count && fill_ok; i++) {
+        const uint64_t e = (uint64_t)(uint32_t)compact[i];
+        fill_ok = cuda_moe_fill_span(g_moe_gather.gate + (uint64_t)i * gate_expert_bytes,
+                                     model_map, gate_offset + e * gate_expert_bytes, gate_expert_bytes) &&
+                  cuda_moe_fill_span(g_moe_gather.up + (uint64_t)i * gate_expert_bytes,
+                                     model_map, up_offset + e * gate_expert_bytes, gate_expert_bytes) &&
+                  cuda_moe_fill_span(g_moe_gather.down + (uint64_t)i * down_expert_bytes,
+                                     model_map, down_offset + e * down_expert_bytes, down_expert_bytes);
+    }
+    if (!fill_ok) { (void)cudaStreamSynchronize(g_model_upload_stream); return 0; }
+    if (!cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) return 0;
+    if (prof) {
+        g_sel_prof_calls++;
+        g_sel_prof_experts += compact_count;
+        g_sel_prof_fetch_s += cuda_wall_sec() - t_fetch0;
+        if (g_sel_prof_calls % 60u == 0u) {
+            fprintf(stderr, "ds4: [selprof] calls=%llu experts=%llu fill=%.3fs (%.2f ms/expert)\n",
+                    (unsigned long long)g_sel_prof_calls, (unsigned long long)g_sel_prof_experts,
+                    g_sel_prof_fetch_s,
+                    g_sel_prof_experts ? 1000.0 * g_sel_prof_fetch_s / (double)g_sel_prof_experts : 0.0);
+        }
+    }
+
+    /* 5. publish the remapped selection (compact-slot indices) */
+    if (!cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
+                            (size_t)slot_count * sizeof(int32_t),
+                            cudaMemcpyHostToDevice), "moe gather slots")) return 0;
+    g_moe_gather.slot_tensor.ptr = g_moe_gather.slot;
+    g_moe_gather.slot_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
+    g_moe_gather.slot_tensor.owner = 0;
+
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr, "ds4: CUDA MoE selected-load slots=%u compact=%u gate/up %.2f MiB down %.2f MiB\n",
+                slot_count, compact_count,
+                (double)cgate / 1048576.0, (double)cdown / 1048576.0);
+    }
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -9393,16 +9700,39 @@ static int routed_moe_launch(
         return 0;
     }
     if (gate_type != 16u || down_type != 10u) return 0;
-    const uint64_t gate_bytes = 256ull * gate_expert_bytes;
-    const uint64_t down_bytes = 256ull * down_expert_bytes;
+    const uint32_t n_total_expert = 256u;
+    const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
         gate_bytes > model_size - up_offset ||
         down_bytes > model_size - down_offset) {
         return 0;
     }
-    const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
-    const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
-    const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    const char *gate_w = NULL;
+    const char *up_w = NULL;
+    const char *down_w = NULL;
+    /* Selected-expert load: when the whole 256-expert block is beyond the pinned
+     * host window (streaming regime), fetch/gather ONLY the routed experts into a
+     * compact VRAM buffer and rebind `selected` to compact slots -- the unchanged
+     * MoE kernels then touch top-6 of 256 (~42x less streamed per layer). Falls
+     * back to the whole-block path on failure or when fully in-window (zero-copy). */
+    const int whole_in_window =
+        cuda_model_range_in_window(model_map, gate_offset, gate_bytes) &&
+        cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
+        cuda_model_range_in_window(model_map, down_offset, down_bytes);
+    if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL &&
+        cuda_moe_selected_load(model_map, model_size, gate_offset, up_offset, down_offset,
+                               gate_expert_bytes, down_expert_bytes,
+                               n_total_expert, n_expert, n_tokens, selected)) {
+        gate_w = g_moe_gather.gate;
+        up_w = g_moe_gather.up;
+        down_w = g_moe_gather.down;
+        selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
+    } else {
+        gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
+        up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
+        down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
+    }
     if (!gate_w || !up_w || !down_w) return 0;
 
     int ok = 1;
