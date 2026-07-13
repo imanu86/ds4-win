@@ -4848,6 +4848,81 @@ int ds4_gpu_indexer_topk_tensor(
     return 1;
 }
 
+int ds4_gpu_spex_hidden_score_tensor(
+        ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_embd,
+        uint32_t n_expert,
+        const ds4_gpu_tensor *hidden) {
+    (void)scores;
+    (void)weights;
+    (void)n_embd;
+    (void)n_expert;
+    (void)hidden;
+    return 0;
+}
+
+ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes) {
+    (void)bytes;
+    return NULL;
+}
+
+void ds4_gpu_async_read_free(ds4_gpu_async_read *readback) {
+    (void)readback;
+}
+
+void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback) {
+    (void)readback;
+    return NULL;
+}
+
+int ds4_gpu_tensor_read_async(ds4_gpu_async_read *readback,
+                              const ds4_gpu_tensor *tensor,
+                              uint64_t offset,
+                              uint64_t bytes) {
+    (void)readback;
+    (void)tensor;
+    (void)offset;
+    (void)bytes;
+    return 0;
+}
+
+int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback) {
+    (void)readback;
+    return 0;
+}
+
+int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback) {
+    (void)readback;
+    return 0;
+}
+
+int ds4_gpu_spex_hidden_topk_tensor(
+        ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_embd,
+        uint32_t n_expert,
+        const ds4_gpu_tensor *hidden,
+        uint32_t top_k) {
+    (void)selected;
+    (void)weights;
+    (void)n_embd;
+    (void)n_expert;
+    (void)hidden;
+    (void)top_k;
+    return 0;
+}
+
+uint32_t ds4_gpu_routed_moe_last_selected(
+        uint64_t gate_offset,
+        int32_t *out_ids,
+        uint32_t out_cap) {
+    (void)gate_offset;
+    (void)out_ids;
+    (void)out_cap;
+    return 0;
+}
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

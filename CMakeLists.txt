@@ -39,7 +39,7 @@ set_target_properties(ds4_cuda PROPERTIES
     CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
 )
 
-add_library(ds4 STATIC ds4.c rax.c)
+add_library(ds4 STATIC ds4.c ds4_spex_predict.c rax.c)
 target_link_libraries(ds4 PUBLIC ds4_platform)
 if(WIN32)
     target_link_libraries(ds4 PUBLIC bcrypt)

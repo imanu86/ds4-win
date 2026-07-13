@@ -16,8 +16,8 @@ PLATFORM_OBJS = os_file.o os_mmap.o os_thread.o
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o $(PLATFORM_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o $(PLATFORM_OBJS)
+CORE_OBJS = ds4.o ds4_spex_predict.o ds4_metal.o $(PLATFORM_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_spex_predict.o $(PLATFORM_OBJS)
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -28,8 +28,8 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_cuda.o $(PLATFORM_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o $(PLATFORM_OBJS)
+CORE_OBJS = ds4.o ds4_spex_predict.o ds4_cuda.o $(PLATFORM_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_spex_predict.o $(PLATFORM_OBJS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -75,6 +75,9 @@ endif
 
 ds4.o: ds4.c ds4.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_spex_predict.o: ds4_spex_predict.c ds4_spex_predict.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_spex_predict.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c

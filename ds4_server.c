@@ -79,6 +79,19 @@ static socket_t g_listen_fd = OS_INVALID_SOCKET;
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
+static void server_request_stop(void) {
+#ifdef _WIN32
+    InterlockedExchange(&g_stop_requested, 1);
+#else
+    g_stop_requested = 1;
+#endif
+    if (g_listen_fd != OS_INVALID_SOCKET) {
+        socket_t fd = g_listen_fd;
+        g_listen_fd = OS_INVALID_SOCKET;
+        close_socket(fd);
+    }
+}
+
 #ifdef _WIN32
 static BOOL WINAPI stop_console_handler(DWORD ctrl) {
     switch (ctrl) {
@@ -4925,11 +4938,31 @@ struct server {
     job *tail;
     bool stopping;
     int clients;
+    int bench_exit_after_requests;
+    int bench_completed_requests;
     uint64_t seq;
     FILE *trace;
     os_mutex_t trace_mu;
     uint64_t trace_seq;
 };
+
+static void server_bench_request_done(server *s) {
+    bool stop = false;
+    os_mutex_lock(&s->mu);
+    if (s->bench_exit_after_requests > 0) {
+        s->bench_completed_requests++;
+        if (s->bench_completed_requests >= s->bench_exit_after_requests) {
+            s->bench_exit_after_requests = 0;
+            stop = true;
+        }
+    }
+    os_mutex_unlock(&s->mu);
+    if (stop) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: benchmark request target reached; shutting down cleanly");
+        server_request_stop();
+    }
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -7944,6 +7977,7 @@ static void *client_main(void *arg) {
     os_cond_destroy(&j.cv);
     os_mutex_destroy(&j.mu);
     request_free(&j.req);
+    server_bench_request_done(s);
 done:
     close_socket(fd);
     client_done(s);
@@ -8351,6 +8385,14 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    const char *bench_exit_env = getenv("DS4_BENCH_EXIT_AFTER_REQUESTS");
+    if (bench_exit_env && bench_exit_env[0]) {
+        char *end = NULL;
+        long value = strtol(bench_exit_env, &end, 10);
+        if (end != bench_exit_env && *end == '\0' && value > 0 && value <= INT_MAX) {
+            s.bench_exit_after_requests = (int)value;
+        }
+    }
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);

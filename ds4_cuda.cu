@@ -55,6 +55,16 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+struct ds4_gpu_async_read {
+    void *host;
+    uint64_t bytes;
+    uint64_t pending_bytes;
+    cudaStream_t stream;
+    cudaEvent_t ready;
+    cudaEvent_t done;
+    int pending;
+};
+
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
     uint8_t qs[CUDA_QK_K / 4];
@@ -1646,6 +1656,92 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+}
+
+extern "C" ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes) {
+    if (bytes == 0) bytes = 1;
+    ds4_gpu_async_read *r = (ds4_gpu_async_read *)calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->bytes = bytes;
+    if (!cuda_ok(cudaHostAlloc(&r->host, (size_t)bytes, cudaHostAllocDefault),
+                 "async read host alloc") ||
+        !cuda_ok(cudaStreamCreateWithFlags(&r->stream, cudaStreamNonBlocking),
+                 "async read stream create") ||
+        !cuda_ok(cudaEventCreateWithFlags(&r->ready, cudaEventDisableTiming),
+                 "async read ready event create") ||
+        !cuda_ok(cudaEventCreateWithFlags(&r->done, cudaEventDisableTiming),
+                 "async read done event create")) {
+        if (r->done) (void)cudaEventDestroy(r->done);
+        if (r->ready) (void)cudaEventDestroy(r->ready);
+        if (r->stream) (void)cudaStreamDestroy(r->stream);
+        if (r->host) (void)cudaFreeHost(r->host);
+        free(r);
+        return NULL;
+    }
+    return r;
+}
+
+extern "C" void ds4_gpu_async_read_free(ds4_gpu_async_read *readback) {
+    if (!readback) return;
+    if (readback->stream) (void)cudaStreamSynchronize(readback->stream);
+    if (readback->done) (void)cudaEventDestroy(readback->done);
+    if (readback->ready) (void)cudaEventDestroy(readback->ready);
+    if (readback->stream) (void)cudaStreamDestroy(readback->stream);
+    if (readback->host) (void)cudaFreeHost(readback->host);
+    free(readback);
+}
+
+extern "C" void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback) {
+    return readback ? readback->host : NULL;
+}
+
+extern "C" int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback) {
+    if (!readback || !readback->pending) return 0;
+    cudaError_t err = cudaEventQuery(readback->done);
+    if (err == cudaSuccess) {
+        readback->pending = 0;
+        return 1;
+    }
+    if (err == cudaErrorNotReady) return 0;
+    readback->pending = 0;
+    return cuda_ok(err, "async read query");
+}
+
+extern "C" int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback) {
+    if (!readback || !readback->pending) return 0;
+    const int ok = cuda_ok(cudaEventSynchronize(readback->done), "async read wait");
+    readback->pending = 0;
+    return ok;
+}
+
+extern "C" int ds4_gpu_tensor_read_async(ds4_gpu_async_read *readback,
+                                          const ds4_gpu_tensor *tensor,
+                                          uint64_t offset,
+                                          uint64_t bytes) {
+    if (!readback || !tensor || offset > tensor->bytes ||
+        bytes > tensor->bytes - offset || bytes > readback->bytes) {
+        return 0;
+    }
+    if (readback->pending && !ds4_gpu_async_read_ready(readback)) return 0;
+    readback->pending = 0;
+    readback->pending_bytes = bytes;
+    if (bytes == 0) return 1;
+    if (!cuda_ok(cudaEventRecord(readback->ready, 0),
+                 "async read dependency event record") ||
+        !cuda_ok(cudaStreamWaitEvent(readback->stream, readback->ready, 0),
+                 "async read stream wait") ||
+        !cuda_ok(cudaMemcpyAsync(readback->host,
+                                 (const char *)tensor->ptr + offset,
+                                 (size_t)bytes,
+                                 cudaMemcpyDeviceToHost,
+                                 readback->stream),
+                 "async tensor read copy") ||
+        !cuda_ok(cudaEventRecord(readback->done, readback->stream),
+                 "async read done event record")) {
+        return 0;
+    }
+    readback->pending = 1;
+    return 1;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -5369,6 +5465,112 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
         float                   scale) {
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
                                  n_head, head_dim, ratio, scale, 1);
+}
+
+__global__ static void spex_hidden_score_kernel(
+        float *__restrict__ scores,
+        const __half *__restrict__ weights,
+        const float *__restrict__ hidden,
+        uint32_t n_embd,
+        uint32_t n_expert) {
+    const uint32_t expert = (uint32_t)blockIdx.x;
+    if (expert >= n_expert) return;
+
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
+        sum += __half2float(weights[(uint64_t)i * n_expert + expert]) * hidden[i];
+    }
+
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) scores[expert] = partial[0];
+}
+
+extern "C" int ds4_gpu_spex_hidden_score_tensor(
+        ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_embd,
+        uint32_t n_expert,
+        const ds4_gpu_tensor *hidden) {
+    if (!scores || !weights || !hidden || n_embd == 0 || n_expert == 0) return 0;
+    const uint64_t weight_elems = (uint64_t)n_embd * n_expert;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t)) return 0;
+    const uint64_t weight_bytes = weight_elems * sizeof(uint16_t);
+    if (weights->bytes < weight_bytes ||
+        hidden->bytes < (uint64_t)n_embd * sizeof(float) ||
+        scores->bytes < (uint64_t)n_expert * sizeof(float)) {
+        return 0;
+    }
+    spex_hidden_score_kernel<<<n_expert, 256>>>((float *)scores->ptr,
+                                                (const __half *)weights->ptr,
+                                                (const float *)hidden->ptr,
+                                                n_embd,
+                                                n_expert);
+    return cuda_ok(cudaGetLastError(), "spex hidden score launch");
+}
+
+__global__ static void spex_hidden_topk_kernel(
+        uint32_t *__restrict__ selected,
+        const __half *__restrict__ weights,
+        const float *__restrict__ hidden,
+        uint32_t n_embd,
+        uint32_t n_expert,
+        uint32_t top_k) {
+    const uint32_t expert = threadIdx.x;
+    __shared__ float scores[256];
+    if (expert < n_expert) {
+        float sum = 0.0f;
+        for (uint32_t i = 0; i < n_embd; i++) {
+            sum += __half2float(weights[(uint64_t)i * n_expert + expert]) * hidden[i];
+        }
+        scores[expert] = sum;
+    }
+    __syncthreads();
+
+    if (expert != 0) return;
+    for (uint32_t k = 0; k < top_k; k++) selected[k] = 0;
+    for (uint32_t candidate = 0; candidate < n_expert; candidate++) {
+        const float value = scores[candidate];
+        for (uint32_t k = 0; k < top_k; k++) {
+            if (k >= candidate || value > scores[selected[k]]) {
+                for (uint32_t j = top_k - 1; j > k; j--) selected[j] = selected[j - 1];
+                selected[k] = candidate;
+                break;
+            }
+        }
+    }
+}
+
+extern "C" int ds4_gpu_spex_hidden_topk_tensor(
+        ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_embd,
+        uint32_t n_expert,
+        const ds4_gpu_tensor *hidden,
+        uint32_t top_k) {
+    if (!selected || !weights || !hidden || n_embd == 0 || n_expert == 0 ||
+        n_expert > 256 || top_k == 0 || top_k > 6 || top_k > n_expert) {
+        return 0;
+    }
+    const uint64_t weight_elems = (uint64_t)n_embd * n_expert;
+    if (weight_elems > UINT64_MAX / sizeof(uint16_t) ||
+        weights->bytes < weight_elems * sizeof(uint16_t) ||
+        hidden->bytes < (uint64_t)n_embd * sizeof(float) ||
+        selected->bytes < (uint64_t)top_k * sizeof(uint32_t)) {
+        return 0;
+    }
+    spex_hidden_topk_kernel<<<1, 256>>>((uint32_t *)selected->ptr,
+                                        (const __half *)weights->ptr,
+                                        (const float *)hidden->ptr,
+                                        n_embd,
+                                        n_expert,
+                                        top_k);
+    return cuda_ok(cudaGetLastError(), "spex hidden fused topk launch");
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
@@ -9544,6 +9746,14 @@ struct cuda_moe_selected_prepared {
 };
 static cuda_moe_selected_prepared g_moe_selected_prepared;
 
+struct cuda_moe_last_selected {
+    uint64_t gate_offset;
+    uint32_t count;
+    int32_t ids[256];
+    int valid;
+};
+static cuda_moe_last_selected g_moe_last_selected;
+
 enum cuda_moe_cache_slot_state : uint8_t {
     CUDA_MOE_CACHE_EMPTY = 0,
     CUDA_MOE_CACHE_VALID = 1,
@@ -9661,6 +9871,7 @@ static void cuda_moe_expert_cache_release(void) {
 
 static void cuda_moe_gather_release(void) {
     g_moe_selected_prepared.valid = 0;
+    g_moe_last_selected.valid = 0;
     if (g_moe_gather.gate) (void)cudaFree(g_moe_gather.gate);
     if (g_moe_gather.up) (void)cudaFree(g_moe_gather.up);
     if (g_moe_gather.down) (void)cudaFree(g_moe_gather.down);
@@ -10109,6 +10320,7 @@ static int cuda_moe_selected_load(
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg,
         const ds4_gpu_tensor *weights_arg) {
+    g_moe_last_selected.valid = 0;
     (void)model_size;
     if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
     if (!selected_arg || !selected_arg->ptr) return 0;
@@ -10448,7 +10660,27 @@ static int cuda_moe_selected_load(
                 slot_count, compact_count,
                 (double)cgate / 1048576.0, (double)cdown / 1048576.0);
     }
+    g_moe_last_selected.gate_offset = gate_offset;
+    g_moe_last_selected.count = compact_count;
+    memcpy(g_moe_last_selected.ids, compact.data(),
+           (size_t)compact_count * sizeof(g_moe_last_selected.ids[0]));
+    g_moe_last_selected.valid = 1;
     return 1;
+}
+
+extern "C" uint32_t ds4_gpu_routed_moe_last_selected(
+        uint64_t gate_offset,
+        int32_t *out_ids,
+        uint32_t out_cap) {
+    if (!out_ids || out_cap == 0 || !g_moe_last_selected.valid ||
+        g_moe_last_selected.gate_offset != gate_offset) {
+        return 0;
+    }
+    uint32_t count = g_moe_last_selected.count;
+    if (count > out_cap) count = out_cap;
+    memcpy(out_ids, g_moe_last_selected.ids,
+           (size_t)count * sizeof(g_moe_last_selected.ids[0]));
+    return count;
 }
 
 static int routed_moe_launch(
@@ -10477,6 +10709,7 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t n_tokens) {
+    g_moe_last_selected.valid = 0;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||

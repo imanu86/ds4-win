@@ -16,6 +16,7 @@
  * buffers stay device-owned across the whole prefill/decode command sequence.
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+typedef struct ds4_gpu_async_read ds4_gpu_async_read;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -27,6 +28,15 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes);
+void ds4_gpu_async_read_free(ds4_gpu_async_read *readback);
+void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback);
+int ds4_gpu_tensor_read_async(ds4_gpu_async_read *readback,
+                              const ds4_gpu_tensor *tensor,
+                              uint64_t offset,
+                              uint64_t bytes);
+int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback);
+int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -114,6 +124,20 @@ int ds4_gpu_indexer_topk_tensor(
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
+        uint32_t                top_k);
+
+int ds4_gpu_spex_hidden_score_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *hidden);
+int ds4_gpu_spex_hidden_topk_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_embd,
+        uint32_t                n_expert,
+        const ds4_gpu_tensor *hidden,
         uint32_t                top_k);
 
 int ds4_gpu_dsv4_topk_mask_tensor(
@@ -653,6 +677,11 @@ int ds4_gpu_routed_moe_prepare_selected(
         const ds4_gpu_tensor *selected,
         uint32_t                n_expert,
         uint32_t                n_tokens);
+
+uint32_t ds4_gpu_routed_moe_last_selected(
+        uint64_t gate_offset,
+        int32_t *out_ids,
+        uint32_t out_cap);
 
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
