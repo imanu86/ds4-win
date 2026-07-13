@@ -8173,11 +8173,13 @@ typedef struct {
     /* Opt-in SPEX hidden-state dry run. Predictions never alter routing. */
     ds4_gpu_tensor *spex_weights;
     ds4_gpu_tensor *spex_scores;
-    ds4_gpu_tensor *spex_topk;
+    ds4_gpu_tensor *spex_topk[8];
     ds4_gpu_async_read *spex_readback;
     uint32_t spex_cap;
-    uint32_t spex_pending_layer;
-    uint32_t spex_pending_count;
+    uint32_t spex_ring_slots;
+    uint32_t spex_next_slot;
+    uint32_t spex_ring_layer[8];
+    uint32_t spex_ring_count[8];
     uint32_t spex_prediction_layer;
     uint32_t spex_prediction_count;
     int32_t spex_prediction_ids[DS4_N_EXPERT_USED];
@@ -8190,11 +8192,14 @@ typedef struct {
     uint64_t spex_hits;
     uint64_t spex_no_actual;
     uint64_t spex_completed_tokens;
+    uint64_t spex_late;
+    uint64_t spex_ring_full;
+    uint64_t spex_stale;
     uint32_t spex_stage;
     bool spex_active;
     bool spex_decode_active;
     bool spex_fused_topk;
-    bool spex_pending;
+    bool spex_ring_pending[8];
     bool spex_prediction_valid;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
@@ -8309,6 +8314,16 @@ static bool metal_graph_spex_fused_topk_requested(void) {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
+static uint32_t metal_graph_spex_ring_slots(void) {
+    const char *value = getenv("DS4_SPEX_RING_SLOTS");
+    if (!value || !value[0]) return 1;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (end == value || *end != '\0') return 1;
+    if (parsed == 2 || parsed == 4 || parsed == 8) return (uint32_t)parsed;
+    return 1;
+}
+
 static const char *metal_graph_spex_stage_name(uint32_t stage) {
     switch (stage) {
     case DS4_SPEX_STAGE_RESIDENT: return "resident";
@@ -8339,7 +8354,8 @@ static void metal_graph_spex_print_stats(const ds4_gpu_graph *g, const char *why
         : 0.0;
     fprintf(stderr,
             "ds4: [spex-dry] %s stage=%s cap=%u scheduled=%llu ready=%llu not_ready=%llu "
-            "layers=%llu actual=%llu predicted=%llu hits=%llu recall=%.4f precision=%.4f no_actual=%llu\n",
+            "layers=%llu actual=%llu predicted=%llu hits=%llu recall=%.4f precision=%.4f no_actual=%llu "
+            "ring=%u late=%llu ring_full=%llu stale=%llu\n",
             why ? why : "stats", metal_graph_spex_stage_name(g->spex_stage), g->spex_cap,
             (unsigned long long)g->spex_scheduled,
             (unsigned long long)g->spex_ready,
@@ -8349,22 +8365,28 @@ static void metal_graph_spex_print_stats(const ds4_gpu_graph *g, const char *why
             (unsigned long long)g->spex_predicted_experts,
             (unsigned long long)g->spex_hits,
             recall, precision,
-            (unsigned long long)g->spex_no_actual);
+            (unsigned long long)g->spex_no_actual,
+            g->spex_ring_slots,
+            (unsigned long long)g->spex_late,
+            (unsigned long long)g->spex_ring_full,
+            (unsigned long long)g->spex_stale);
 }
 
 static void metal_graph_spex_release(ds4_gpu_graph *g) {
     if (!g) return;
     ds4_gpu_async_read_free(g->spex_readback);
-    ds4_gpu_tensor_free(g->spex_topk);
+    for (uint32_t i = 0; i < 8; i++) {
+        ds4_gpu_tensor_free(g->spex_topk[i]);
+        g->spex_topk[i] = NULL;
+        g->spex_ring_pending[i] = false;
+    }
     ds4_gpu_tensor_free(g->spex_scores);
     ds4_gpu_tensor_free(g->spex_weights);
     g->spex_readback = NULL;
-    g->spex_topk = NULL;
     g->spex_scores = NULL;
     g->spex_weights = NULL;
     g->spex_active = false;
     g->spex_decode_active = false;
-    g->spex_pending = false;
     g->spex_prediction_valid = false;
 }
 
@@ -8373,7 +8395,7 @@ static void metal_graph_spex_disable(ds4_gpu_graph *g, const char *reason) {
     fprintf(stderr, "ds4: SPEX hidden dry-run disabled: %s\n",
             reason ? reason : "runtime failure");
     g->spex_active = false;
-    g->spex_pending = false;
+    for (uint32_t i = 0; i < 8; i++) g->spex_ring_pending[i] = false;
     g->spex_prediction_valid = false;
 }
 
@@ -8408,20 +8430,32 @@ static void metal_graph_spex_init(ds4_gpu_graph *g) {
     g->spex_stage = metal_graph_spex_stage();
     g->spex_fused_topk = metal_graph_spex_fused_topk_requested() &&
                          g->spex_stage >= DS4_SPEX_STAGE_TOPK;
+    g->spex_ring_slots = g->spex_stage >= DS4_SPEX_STAGE_FULL
+        ? metal_graph_spex_ring_slots() : 1;
     g->spex_weights = ds4_gpu_tensor_alloc(weight_bytes);
     if (g->spex_stage >= DS4_SPEX_STAGE_SCORE && !g->spex_fused_topk) {
         g->spex_scores = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(float));
     }
     if (g->spex_stage >= DS4_SPEX_STAGE_TOPK) {
-        g->spex_topk = ds4_gpu_tensor_alloc((uint64_t)DS4_N_EXPERT * sizeof(uint32_t));
+        for (uint32_t i = 0; i < g->spex_ring_slots; i++) {
+            g->spex_topk[i] = ds4_gpu_tensor_alloc(
+                (uint64_t)DS4_N_EXPERT * sizeof(uint32_t));
+        }
     }
     if (g->spex_stage >= DS4_SPEX_STAGE_FULL) {
-        g->spex_readback = ds4_gpu_async_read_alloc(
-            (uint64_t)DS4_N_EXPERT_USED * sizeof(uint32_t));
+        g->spex_readback = ds4_gpu_async_read_ring_alloc(
+            (uint64_t)DS4_N_EXPERT_USED * sizeof(uint32_t),
+            g->spex_ring_slots);
+    }
+    bool topk_ready = true;
+    if (g->spex_stage >= DS4_SPEX_STAGE_TOPK) {
+        for (uint32_t i = 0; i < g->spex_ring_slots; i++) {
+            if (!g->spex_topk[i]) topk_ready = false;
+        }
     }
     const bool ready = g->spex_weights &&
                        (g->spex_stage < DS4_SPEX_STAGE_SCORE || g->spex_fused_topk || g->spex_scores) &&
-                       (g->spex_stage < DS4_SPEX_STAGE_TOPK || g->spex_topk) &&
+                       topk_ready &&
                        (g->spex_stage < DS4_SPEX_STAGE_FULL || g->spex_readback) &&
                        ds4_gpu_tensor_write(g->spex_weights, 0,
                                             model.weights, weight_bytes) != 0;
@@ -8433,9 +8467,10 @@ static void metal_graph_spex_init(ds4_gpu_graph *g) {
     }
     g->spex_active = true;
     fprintf(stderr,
-            "ds4: SPEX hidden GPU dry-run active file='%s' stage=%s cap=%u fused=%u weights=%.2f MiB; routing unchanged\n",
+            "ds4: SPEX hidden GPU dry-run active file='%s' stage=%s cap=%u fused=%u ring=%u weights=%.2f MiB; routing unchanged\n",
             path, metal_graph_spex_stage_name(g->spex_stage), g->spex_cap,
             g->spex_fused_topk ? 1u : 0u,
+            g->spex_ring_slots,
             (double)weight_bytes / 1048576.0);
 }
 
@@ -8443,9 +8478,23 @@ static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
     if (!g || !g->spex_active || !g->spex_decode_active ||
         il + 1u >= DS4_N_LAYER) return;
     if (g->spex_stage == DS4_SPEX_STAGE_RESIDENT) return;
-    if (g->spex_pending) {
-        g->spex_not_ready++;
-        return;
+    uint32_t slot = 0;
+    if (g->spex_stage >= DS4_SPEX_STAGE_FULL) {
+        slot = g->spex_next_slot;
+        if (g->spex_ring_pending[slot]) {
+            const int ready = ds4_gpu_async_read_ready_slot(g->spex_readback, slot);
+            if (ready > 0) {
+                g->spex_ring_pending[slot] = false;
+                g->spex_stale++;
+            } else if (ready < 0) {
+                g->spex_ring_pending[slot] = false;
+                metal_graph_spex_disable(g, "topK readback query failed");
+                return;
+            } else {
+                g->spex_ring_full++;
+                return;
+            }
+        }
     }
 
     const uint64_t layer_bytes = (uint64_t)DS4_N_EMBD * DS4_N_EXPERT * sizeof(uint16_t);
@@ -8457,7 +8506,7 @@ static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
     }
     bool ok;
     if (g->spex_fused_topk) {
-        ok = ds4_gpu_spex_hidden_topk_tensor(g->spex_topk,
+        ok = ds4_gpu_spex_hidden_topk_tensor(g->spex_topk[slot],
                                              layer_weights,
                                              DS4_N_EMBD,
                                              DS4_N_EXPERT,
@@ -8471,7 +8520,7 @@ static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
                                                g->ffn_norm) != 0;
     }
     if (ok && g->spex_stage >= DS4_SPEX_STAGE_TOPK && !g->spex_fused_topk) {
-        ok = ds4_gpu_indexer_topk_tensor(g->spex_topk,
+        ok = ds4_gpu_indexer_topk_tensor(g->spex_topk[slot],
                                          g->spex_scores,
                                          DS4_N_EXPERT,
                                          1,
@@ -8479,10 +8528,21 @@ static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
     }
     ds4_gpu_tensor_free(layer_weights);
     if (ok && g->spex_stage >= DS4_SPEX_STAGE_FULL) {
-        ok = ds4_gpu_tensor_read_async(g->spex_readback,
-                                       g->spex_topk,
-                                       0,
-                                       (uint64_t)g->spex_cap * sizeof(uint32_t)) != 0;
+        if (g->spex_ring_slots > 1) {
+            ok = ds4_gpu_tensor_read_async_ordered_slot(
+                g->spex_readback,
+                slot,
+                g->spex_topk[slot],
+                0,
+                (uint64_t)g->spex_cap * sizeof(uint32_t)) != 0;
+        } else {
+            ok = ds4_gpu_tensor_read_async_slot(
+                g->spex_readback,
+                slot,
+                g->spex_topk[slot],
+                0,
+                (uint64_t)g->spex_cap * sizeof(uint32_t)) != 0;
+        }
     }
     if (!ok) {
         metal_graph_spex_disable(g, "GPU score/topK/readback scheduling failed");
@@ -8490,30 +8550,43 @@ static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
     }
     g->spex_scheduled++;
     if (g->spex_stage < DS4_SPEX_STAGE_FULL) return;
-    g->spex_pending = true;
-    g->spex_pending_layer = il + 1u;
-    g->spex_pending_count = g->spex_cap;
+    g->spex_ring_pending[slot] = true;
+    g->spex_ring_layer[slot] = il + 1u;
+    g->spex_ring_count[slot] = g->spex_cap;
+    g->spex_next_slot = (slot + 1u) % g->spex_ring_slots;
 }
 
 static void metal_graph_spex_before_layer(ds4_gpu_graph *g, uint32_t il) {
     if (!g || !g->spex_active || g->spex_stage < DS4_SPEX_STAGE_FULL) return;
-    if (g->spex_pending && g->spex_pending_layer == il) {
-        if (!ds4_gpu_async_read_ready(g->spex_readback)) {
+    for (uint32_t slot = 0; slot < g->spex_ring_slots; slot++) {
+        if (!g->spex_ring_pending[slot] || g->spex_ring_layer[slot] != il) continue;
+        const int ready = ds4_gpu_async_read_ready_slot(g->spex_readback, slot);
+        if (ready < 0) {
+            g->spex_ring_pending[slot] = false;
+            metal_graph_spex_disable(g, "topK readback query failed");
+            return;
+        }
+        if (ready == 0) {
             g->spex_not_ready++;
-            if (!ds4_gpu_async_read_wait(g->spex_readback)) {
-                g->spex_pending = false;
+            if (g->spex_ring_slots > 1) {
+                g->spex_late++;
+                return;
+            }
+            if (!ds4_gpu_async_read_wait_slot(g->spex_readback, slot)) {
+                g->spex_ring_pending[slot] = false;
                 metal_graph_spex_disable(g, "topK readback wait failed");
                 return;
             }
         }
-        g->spex_pending = false;
+        g->spex_ring_pending[slot] = false;
 
-        const uint32_t *ids = (const uint32_t *)ds4_gpu_async_read_host(g->spex_readback);
+        const uint32_t *ids = (const uint32_t *)ds4_gpu_async_read_host_slot(
+            g->spex_readback, slot);
         if (!ids) {
             metal_graph_spex_disable(g, "topK readback returned no host buffer");
             return;
         }
-        uint32_t count = g->spex_pending_count;
+        uint32_t count = g->spex_ring_count[slot];
         if (count > DS4_N_EXPERT_USED) count = DS4_N_EXPERT_USED;
         for (uint32_t i = 0; i < count; i++) {
             if (ids[i] >= DS4_N_EXPERT) {
@@ -8526,6 +8599,7 @@ static void metal_graph_spex_before_layer(ds4_gpu_graph *g, uint32_t il) {
         g->spex_prediction_count = count;
         g->spex_prediction_valid = true;
         g->spex_ready++;
+        return;
     }
 }
 

@@ -29,14 +29,28 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes);
+ds4_gpu_async_read *ds4_gpu_async_read_ring_alloc(uint64_t bytes, uint32_t slots);
 void ds4_gpu_async_read_free(ds4_gpu_async_read *readback);
 void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback);
+void *ds4_gpu_async_read_host_slot(ds4_gpu_async_read *readback, uint32_t slot);
 int ds4_gpu_tensor_read_async(ds4_gpu_async_read *readback,
                               const ds4_gpu_tensor *tensor,
                               uint64_t offset,
                               uint64_t bytes);
+int ds4_gpu_tensor_read_async_slot(ds4_gpu_async_read *readback,
+                                   uint32_t slot,
+                                   const ds4_gpu_tensor *tensor,
+                                   uint64_t offset,
+                                   uint64_t bytes);
+int ds4_gpu_tensor_read_async_ordered_slot(ds4_gpu_async_read *readback,
+                                           uint32_t slot,
+                                           const ds4_gpu_tensor *tensor,
+                                           uint64_t offset,
+                                           uint64_t bytes);
 int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback);
+int ds4_gpu_async_read_ready_slot(ds4_gpu_async_read *readback, uint32_t slot);
 int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback);
+int ds4_gpu_async_read_wait_slot(ds4_gpu_async_read *readback, uint32_t slot);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);

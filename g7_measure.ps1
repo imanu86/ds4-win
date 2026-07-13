@@ -25,12 +25,17 @@ param(
     [ValidateRange(0, 6)][int]$SpexCap = 0,
     [ValidateSet("resident", "score", "topk", "full")][string]$SpexStage = "full",
     [switch]$SpexFusedTopK,
+    [ValidateSet(1, 2, 4, 8)][int]$SpexRingSlots = 1,
     [ValidateRange(1, 1000000)][int]$SpexStatsEvery = 1000000,
+    [string]$ExpectedContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000
 )
 
 $ErrorActionPreference = "Stop"
+if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
+}
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $model = $ModelPath
 $outdir = Join-Path $PSScriptRoot "g7_runs"
@@ -89,6 +94,7 @@ if ($SpexDryRun) {
     $env:DS4_SPEX_AB_STAGE = $SpexStage
     if ($SpexFusedTopK) { $env:DS4_SPEX_FUSED_TOPK = "1" }
     else { Remove-Item Env:\DS4_SPEX_FUSED_TOPK -ErrorAction SilentlyContinue }
+    $env:DS4_SPEX_RING_SLOTS = "$SpexRingSlots"
     $env:DS4_SPEX_DRY_RUN_STATS_EVERY = "$SpexStatsEvery"
 } else {
     Remove-Item Env:\DS4_SPEX_HIDDEN_GPU_DRY_RUN -ErrorAction SilentlyContinue
@@ -96,6 +102,7 @@ if ($SpexDryRun) {
     Remove-Item Env:\DS4_SPEX_CAP -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_AB_STAGE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_FUSED_TOPK -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_SPEX_RING_SLOTS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_DRY_RUN_STATS_EVERY -ErrorAction SilentlyContinue
 }
 
@@ -103,6 +110,7 @@ if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
 if ($SpexFusedTopK -and $SpexStage -notin @("topk", "full")) { throw "SpexFusedTopK requires the topk or full stage" }
+if ($SpexRingSlots -gt 1 -and (-not $SpexDryRun -or $SpexStage -ne "full")) { throw "SpexRingSlots > 1 requires the full SpexDryRun stage" }
 if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap policy" }
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
@@ -222,7 +230,8 @@ $overlapSharedFullObserved = $false
 $spexObserved = $false; $spexObservedStage = ""; $spexObservedCap = 0; $spexScheduled = 0; $spexReady = 0; $spexNotReady = 0
 $spexLayers = 0; $spexActual = 0; $spexPredicted = 0; $spexHits = 0; $spexRecall = 0.0
 $spexPrecision = 0.0; $spexNoActual = 0
-$spexDisabled = $false; $spexFusedObserved = $false
+$spexDisabled = $false; $spexFusedObserved = $false; $spexRingObserved = 0
+$spexLate = 0; $spexRingFull = 0; $spexStale = 0
 $serverRunsAll = @()
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
@@ -285,6 +294,7 @@ if (Test-Path $stderrLog) {
     $spexLine = $lines | Where-Object { $_ -match "\[spex-dry\]" } | Select-Object -Last 1
     $spexActiveLine = $lines | Where-Object { $_ -match "SPEX hidden GPU dry-run active" } | Select-Object -Last 1
     if ($spexActiveLine -and $spexActiveLine -match "fused=(\d+)") { $spexFusedObserved = ([int]$Matches[1] -ne 0) }
+    if ($spexActiveLine -and $spexActiveLine -match "ring=(\d+)") { $spexRingObserved = [int]$Matches[1] }
     $spexDisabled = [bool]($lines | Where-Object { $_ -match "SPEX hidden dry-run disabled" } | Select-Object -First 1)
     if ($spexLine -and $spexLine -match "stage=([a-z]+) cap=(\d+) scheduled=(\d+) ready=(\d+) not_ready=(\d+) layers=(\d+) actual=(\d+) predicted=(\d+) hits=(\d+) recall=([0-9.]+) precision=([0-9.]+) no_actual=(\d+)") {
         $spexObserved = $true; $spexObservedStage = $Matches[1]; $spexObservedCap = [int]$Matches[2]
@@ -292,6 +302,10 @@ if (Test-Path $stderrLog) {
         $spexLayers = [long]$Matches[6]; $spexActual = [long]$Matches[7]; $spexPredicted = [long]$Matches[8]
         $spexHits = [long]$Matches[9]; $spexRecall = [double]$Matches[10]
         $spexPrecision = [double]$Matches[11]; $spexNoActual = [long]$Matches[12]
+    }
+    if ($spexLine -and $spexLine -match "ring=(\d+) late=(\d+) ring_full=(\d+) stale=(\d+)") {
+        $spexRingObserved = [int]$Matches[1]; $spexLate = [long]$Matches[2]
+        $spexRingFull = [long]$Matches[3]; $spexStale = [long]$Matches[4]
     }
     $cacheReadyLine = $lines | Where-Object { $_ -match "resident expert cache ready: (\d+)/(\d+) experts" } | Select-Object -Last 1
     if ($cacheReadyLine -and $cacheReadyLine -match "resident expert cache ready: (\d+)/(\d+) experts") {
@@ -305,18 +319,30 @@ if (Test-Path $stderrLog) {
     }
 }
 
+if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
+if (@($results).Count -ne $Repeats) {
+    throw "Measurement failed: expected $Repeats results, observed $(@($results).Count)"
+}
+
 if ($SpexDryRun) {
     $expectedSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
-    if (-not $httpOk) { throw "SPEX measurement failed: HTTP request did not complete" }
     if (-not $spexObserved) { throw "SPEX measurement failed: no runtime counters observed" }
     if ($spexDisabled) { throw "SPEX measurement failed: runtime disabled itself" }
     if ($spexObservedStage -ne $SpexStage) { throw "SPEX measurement failed: observed stage mismatch" }
     if ($spexFusedObserved -ne [bool]$SpexFusedTopK) { throw "SPEX measurement failed: fused topK mismatch" }
+    if ($spexRingObserved -ne $SpexRingSlots) { throw "SPEX measurement failed: ring slot mismatch" }
     if ($spexObservedCap -ne $expectedSpexCap) { throw "SPEX measurement failed: observed cap mismatch" }
     if ($SpexStage -eq "resident") {
         if ($spexScheduled -ne 0 -or $spexReady -ne 0) { throw "SPEX resident stage unexpectedly scheduled GPU work" }
     } elseif ($SpexStage -eq "full") {
-        if ($spexScheduled -le 0 -or $spexScheduled -ne $spexReady) { throw "SPEX measurement failed: scheduled/ready mismatch" }
+        if ($spexScheduled -le 0 -or $spexReady -le 0 -or $spexReady -gt $spexScheduled) { throw "SPEX measurement failed: scheduled/ready counters are inconsistent" }
+        if ($SpexRingSlots -eq 1 -and $spexScheduled -ne $spexReady) { throw "SPEX blocking measurement failed: scheduled/ready mismatch" }
+        if ($SpexRingSlots -gt 1) {
+            if ($spexRingFull -ne 0) { throw "SPEX ring measurement failed: ring-full events observed" }
+            if (($spexReady + $spexLate) -ne $spexScheduled) { throw "SPEX ring measurement failed: predictions are not fully accounted" }
+            if ($spexStale -ne $spexLate) { throw "SPEX ring measurement failed: late/stale counters differ" }
+            if (($spexReady / [double]$spexScheduled) -lt 0.90) { throw "SPEX ring measurement failed: ready coverage below 90%" }
+        }
         if ($spexNoActual -ne 0) { throw "SPEX measurement failed: router truth was unavailable for one or more layers" }
     } else {
         if ($spexScheduled -le 0 -or $spexReady -ne 0) { throw "SPEX intermediate stage counters are inconsistent" }
@@ -330,11 +356,22 @@ $serverDecodeMinTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecode
 $serverDecodeMaxTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
 $serverPrefillTtft = @($serverRuns | ForEach-Object { $_.server_prefill_ttft_seconds } | Where-Object { $_ -gt 0 })
 $serverPrefillTtftMean = if ($serverPrefillTtft.Count) { [math]::Round(($serverPrefillTtft | Measure-Object -Average).Average, 6) } else { 0.0 }
+$spexReadyCoverage = if ($spexScheduled -gt 0) { [math]::Round($spexReady / [double]$spexScheduled, 6) } else { $null }
+$spexRecallScope = if ($spexScheduled -gt 0) { "ready_predictions_only" } else { "not_applicable" }
 $tps = @($results | ForEach-Object { $_.tokens_per_second })
 $meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Average, 6) } else { 0.0 }
 $minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
 $maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
+if ($Repeats -gt 1 -and $hashes.Count -ne 1) {
+    throw "Measurement failed: repeated outputs were not identical"
+}
+if ($ExpectedContentSHA256) {
+    $unexpected = @($results | Where-Object { $_.content_sha256 -ine $ExpectedContentSHA256 })
+    if ($unexpected.Count -ne 0) {
+        throw "Measurement failed: output hash differs from expected baseline"
+    }
+}
 $summary = [pscustomobject]@{
     tag = $Tag
     head = $headAtStart
@@ -353,6 +390,7 @@ $summary = [pscustomobject]@{
     model_last_write_utc = $modelInfoAtStart.LastWriteTimeUtc.ToString("o")
     prompt = $Prompt
     prompt_sha256 = $promptHash
+    expected_content_sha256 = $ExpectedContentSHA256.ToLowerInvariant()
     requested_max_tokens = $MaxTokens
     repeats = $Repeats
     warmup = [bool]$Warmup
@@ -380,9 +418,11 @@ $summary = [pscustomobject]@{
     spex_cap_requested = $(if ($SpexDryRun) { if ($SpexCap -gt 0) { $SpexCap } else { 6 } } else { 0 })
     spex_stage_requested = $(if ($SpexDryRun) { $SpexStage } else { "off" })
     spex_fused_topk_requested = [bool]$SpexFusedTopK
+    spex_ring_slots_requested = $(if ($SpexDryRun) { $SpexRingSlots } else { 0 })
     spex_observed = $spexObserved
     spex_stage_observed = $spexObservedStage
     spex_fused_topk_observed = $spexFusedObserved
+    spex_ring_slots_observed = $spexRingObserved
     spex_disabled = $spexDisabled
     spex_cap_observed = $spexObservedCap
     spex_scheduled = $spexScheduled
@@ -393,8 +433,13 @@ $summary = [pscustomobject]@{
     spex_predicted_experts = $spexPredicted
     spex_hits = $spexHits
     spex_recall = $spexRecall
+    spex_recall_scope = $spexRecallScope
+    spex_ready_coverage = $spexReadyCoverage
     spex_precision = $spexPrecision
     spex_no_actual = $spexNoActual
+    spex_late = $spexLate
+    spex_ring_full = $spexRingFull
+    spex_stale = $spexStale
     expert_cache_calls = $cacheCalls
     expert_cache_capacity = $cacheCapacity
     expert_cache_count = $cacheCount
@@ -442,5 +487,7 @@ Write-Host ("overlap_shared_full requested/observed: " + [bool]$OverlapSharedFul
 Write-Host ("shared_down_fusion_disabled: " + [bool]$DisableSharedDownFusion)
 Write-Host ("spex requested/observed stage/cap: " + [bool]$SpexDryRun + " / " + $spexObserved + " / " + $spexObservedStage + " / " + $spexObservedCap)
 Write-Host ("spex layers/hits/actual recall: " + $spexLayers + " / " + $spexHits + " / " + $spexActual + " / " + $spexRecall)
+Write-Host ("spex recall scope/ready coverage: " + $spexRecallScope + " / " + $(if ($null -eq $spexReadyCoverage) { "n/a" } else { $spexReadyCoverage }))
+Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLate + " / " + $spexRingFull + " / " + $spexStale)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="

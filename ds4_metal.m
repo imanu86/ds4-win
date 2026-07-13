@@ -4867,12 +4867,24 @@ ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes) {
     return NULL;
 }
 
+ds4_gpu_async_read *ds4_gpu_async_read_ring_alloc(uint64_t bytes, uint32_t slots) {
+    (void)bytes;
+    (void)slots;
+    return NULL;
+}
+
 void ds4_gpu_async_read_free(ds4_gpu_async_read *readback) {
     (void)readback;
 }
 
 void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback) {
     (void)readback;
+    return NULL;
+}
+
+void *ds4_gpu_async_read_host_slot(ds4_gpu_async_read *readback, uint32_t slot) {
+    (void)readback;
+    (void)slot;
     return NULL;
 }
 
@@ -4887,13 +4899,51 @@ int ds4_gpu_tensor_read_async(ds4_gpu_async_read *readback,
     return 0;
 }
 
+int ds4_gpu_tensor_read_async_slot(ds4_gpu_async_read *readback,
+                                   uint32_t slot,
+                                   const ds4_gpu_tensor *tensor,
+                                   uint64_t offset,
+                                   uint64_t bytes) {
+    (void)readback;
+    (void)slot;
+    (void)tensor;
+    (void)offset;
+    (void)bytes;
+    return 0;
+}
+
+int ds4_gpu_tensor_read_async_ordered_slot(ds4_gpu_async_read *readback,
+                                           uint32_t slot,
+                                           const ds4_gpu_tensor *tensor,
+                                           uint64_t offset,
+                                           uint64_t bytes) {
+    (void)readback;
+    (void)slot;
+    (void)tensor;
+    (void)offset;
+    (void)bytes;
+    return 0;
+}
+
 int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback) {
     (void)readback;
     return 0;
 }
 
+int ds4_gpu_async_read_ready_slot(ds4_gpu_async_read *readback, uint32_t slot) {
+    (void)readback;
+    (void)slot;
+    return 0;
+}
+
 int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback) {
     (void)readback;
+    return 0;
+}
+
+int ds4_gpu_async_read_wait_slot(ds4_gpu_async_read *readback, uint32_t slot) {
+    (void)readback;
+    (void)slot;
     return 0;
 }
 

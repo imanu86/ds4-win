@@ -58,12 +58,15 @@ struct ds4_gpu_tensor {
 struct ds4_gpu_async_read {
     void *host;
     uint64_t bytes;
-    uint64_t pending_bytes;
+    uint64_t *pending_bytes;
+    uint32_t slots;
     cudaStream_t stream;
-    cudaEvent_t ready;
-    cudaEvent_t done;
-    int pending;
+    cudaEvent_t *ready;
+    cudaEvent_t *done;
+    int *pending;
 };
+
+extern "C" void ds4_gpu_async_read_free(ds4_gpu_async_read *readback);
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -1658,89 +1661,193 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
-extern "C" ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes) {
+extern "C" ds4_gpu_async_read *ds4_gpu_async_read_ring_alloc(
+        uint64_t bytes,
+        uint32_t slots) {
     if (bytes == 0) bytes = 1;
+    if (slots == 0 || slots > 64u || bytes > UINT64_MAX / slots) return NULL;
     ds4_gpu_async_read *r = (ds4_gpu_async_read *)calloc(1, sizeof(*r));
     if (!r) return NULL;
     r->bytes = bytes;
-    if (!cuda_ok(cudaHostAlloc(&r->host, (size_t)bytes, cudaHostAllocDefault),
-                 "async read host alloc") ||
-        !cuda_ok(cudaStreamCreateWithFlags(&r->stream, cudaStreamNonBlocking),
-                 "async read stream create") ||
-        !cuda_ok(cudaEventCreateWithFlags(&r->ready, cudaEventDisableTiming),
-                 "async read ready event create") ||
-        !cuda_ok(cudaEventCreateWithFlags(&r->done, cudaEventDisableTiming),
-                 "async read done event create")) {
-        if (r->done) (void)cudaEventDestroy(r->done);
-        if (r->ready) (void)cudaEventDestroy(r->ready);
-        if (r->stream) (void)cudaStreamDestroy(r->stream);
-        if (r->host) (void)cudaFreeHost(r->host);
-        free(r);
+    r->slots = slots;
+    r->pending_bytes = (uint64_t *)calloc(slots, sizeof(*r->pending_bytes));
+    r->ready = (cudaEvent_t *)calloc(slots, sizeof(*r->ready));
+    r->done = (cudaEvent_t *)calloc(slots, sizeof(*r->done));
+    r->pending = (int *)calloc(slots, sizeof(*r->pending));
+    int ok = r->pending_bytes && r->ready && r->done && r->pending;
+    if (ok) {
+        ok = cuda_ok(cudaHostAlloc(&r->host, (size_t)(bytes * slots), cudaHostAllocDefault),
+                     "async read host alloc");
+    }
+    if (ok) {
+        ok = cuda_ok(cudaStreamCreateWithFlags(&r->stream, cudaStreamNonBlocking),
+                     "async read stream create");
+    }
+    for (uint32_t i = 0; ok && i < slots; i++) {
+        ok = cuda_ok(cudaEventCreateWithFlags(&r->ready[i], cudaEventDisableTiming),
+                     "async read ready event create") &&
+             cuda_ok(cudaEventCreateWithFlags(&r->done[i], cudaEventDisableTiming),
+                     "async read done event create");
+    }
+    if (!ok) {
+        ds4_gpu_async_read_free(r);
         return NULL;
     }
     return r;
 }
 
+extern "C" ds4_gpu_async_read *ds4_gpu_async_read_alloc(uint64_t bytes) {
+    return ds4_gpu_async_read_ring_alloc(bytes, 1);
+}
+
 extern "C" void ds4_gpu_async_read_free(ds4_gpu_async_read *readback) {
     if (!readback) return;
+    /* Ordered readbacks use stream 0. Fence it even if enqueue failed before
+     * pending[] could be published. This is teardown-only. */
+    (void)cudaStreamSynchronize(0);
     if (readback->stream) (void)cudaStreamSynchronize(readback->stream);
-    if (readback->done) (void)cudaEventDestroy(readback->done);
-    if (readback->ready) (void)cudaEventDestroy(readback->ready);
+    for (uint32_t i = 0; i < readback->slots; i++) {
+        if (readback->pending && readback->pending[i] &&
+            readback->done && readback->done[i]) {
+            (void)cudaEventSynchronize(readback->done[i]);
+            readback->pending[i] = 0;
+        }
+    }
+    for (uint32_t i = 0; i < readback->slots; i++) {
+        if (readback->done && readback->done[i]) (void)cudaEventDestroy(readback->done[i]);
+        if (readback->ready && readback->ready[i]) (void)cudaEventDestroy(readback->ready[i]);
+    }
     if (readback->stream) (void)cudaStreamDestroy(readback->stream);
     if (readback->host) (void)cudaFreeHost(readback->host);
+    free(readback->pending_bytes);
+    free(readback->ready);
+    free(readback->done);
+    free(readback->pending);
     free(readback);
 }
 
-extern "C" void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback) {
-    return readback ? readback->host : NULL;
+extern "C" void *ds4_gpu_async_read_host_slot(
+        ds4_gpu_async_read *readback,
+        uint32_t slot) {
+    if (!readback || slot >= readback->slots) return NULL;
+    return (char *)readback->host + (uint64_t)slot * readback->bytes;
 }
 
-extern "C" int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback) {
-    if (!readback || !readback->pending) return 0;
-    cudaError_t err = cudaEventQuery(readback->done);
+extern "C" void *ds4_gpu_async_read_host(ds4_gpu_async_read *readback) {
+    return ds4_gpu_async_read_host_slot(readback, 0);
+}
+
+extern "C" int ds4_gpu_async_read_ready_slot(
+        ds4_gpu_async_read *readback,
+        uint32_t slot) {
+    if (!readback || slot >= readback->slots || !readback->pending[slot]) return 0;
+    cudaError_t err = cudaEventQuery(readback->done[slot]);
     if (err == cudaSuccess) {
-        readback->pending = 0;
+        readback->pending[slot] = 0;
         return 1;
     }
     if (err == cudaErrorNotReady) return 0;
-    readback->pending = 0;
-    return cuda_ok(err, "async read query");
+    readback->pending[slot] = 0;
+    (void)cuda_ok(err, "async read query");
+    return -1;
+}
+
+extern "C" int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback) {
+    return ds4_gpu_async_read_ready_slot(readback, 0);
+}
+
+extern "C" int ds4_gpu_async_read_wait_slot(
+        ds4_gpu_async_read *readback,
+        uint32_t slot) {
+    if (!readback || slot >= readback->slots || !readback->pending[slot]) return 0;
+    const int ok = cuda_ok(cudaEventSynchronize(readback->done[slot]), "async read wait");
+    readback->pending[slot] = 0;
+    return ok;
 }
 
 extern "C" int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback) {
-    if (!readback || !readback->pending) return 0;
-    const int ok = cuda_ok(cudaEventSynchronize(readback->done), "async read wait");
-    readback->pending = 0;
-    return ok;
+    return ds4_gpu_async_read_wait_slot(readback, 0);
+}
+
+extern "C" int ds4_gpu_tensor_read_async_slot(
+        ds4_gpu_async_read *readback,
+        uint32_t slot,
+        const ds4_gpu_tensor *tensor,
+        uint64_t offset,
+        uint64_t bytes) {
+    if (!readback || !tensor || offset > tensor->bytes ||
+        slot >= readback->slots || bytes > tensor->bytes - offset ||
+        bytes > readback->bytes) {
+        return 0;
+    }
+    if (readback->pending[slot]) {
+        const int ready = ds4_gpu_async_read_ready_slot(readback, slot);
+        if (ready <= 0) return 0;
+    }
+    readback->pending[slot] = 0;
+    readback->pending_bytes[slot] = bytes;
+    if (bytes == 0) return 1;
+    if (!cuda_ok(cudaEventRecord(readback->ready[slot], 0),
+                 "async read dependency event record") ||
+        !cuda_ok(cudaStreamWaitEvent(readback->stream, readback->ready[slot], 0),
+                 "async read stream wait") ||
+        !cuda_ok(cudaMemcpyAsync((char *)readback->host + (uint64_t)slot * readback->bytes,
+                                 (const char *)tensor->ptr + offset,
+                                 (size_t)bytes,
+                                 cudaMemcpyDeviceToHost,
+                                 readback->stream),
+                 "async tensor read copy")) {
+        return 0;
+    }
+    if (!cuda_ok(cudaEventRecord(readback->done[slot], readback->stream),
+                 "async read done event record")) {
+        (void)cudaStreamSynchronize(readback->stream);
+        return 0;
+    }
+    readback->pending[slot] = 1;
+    return 1;
 }
 
 extern "C" int ds4_gpu_tensor_read_async(ds4_gpu_async_read *readback,
                                           const ds4_gpu_tensor *tensor,
                                           uint64_t offset,
                                           uint64_t bytes) {
+    return ds4_gpu_tensor_read_async_slot(readback, 0, tensor, offset, bytes);
+}
+
+extern "C" int ds4_gpu_tensor_read_async_ordered_slot(
+        ds4_gpu_async_read *readback,
+        uint32_t slot,
+        const ds4_gpu_tensor *tensor,
+        uint64_t offset,
+        uint64_t bytes) {
     if (!readback || !tensor || offset > tensor->bytes ||
-        bytes > tensor->bytes - offset || bytes > readback->bytes) {
+        slot >= readback->slots || bytes > tensor->bytes - offset ||
+        bytes > readback->bytes) {
         return 0;
     }
-    if (readback->pending && !ds4_gpu_async_read_ready(readback)) return 0;
-    readback->pending = 0;
-    readback->pending_bytes = bytes;
+    if (readback->pending[slot]) {
+        const int ready = ds4_gpu_async_read_ready_slot(readback, slot);
+        if (ready <= 0) return 0;
+    }
+    readback->pending[slot] = 0;
+    readback->pending_bytes[slot] = bytes;
     if (bytes == 0) return 1;
-    if (!cuda_ok(cudaEventRecord(readback->ready, 0),
-                 "async read dependency event record") ||
-        !cuda_ok(cudaStreamWaitEvent(readback->stream, readback->ready, 0),
-                 "async read stream wait") ||
-        !cuda_ok(cudaMemcpyAsync(readback->host,
-                                 (const char *)tensor->ptr + offset,
-                                 (size_t)bytes,
-                                 cudaMemcpyDeviceToHost,
-                                 readback->stream),
-                 "async tensor read copy") ||
-        !cuda_ok(cudaEventRecord(readback->done, readback->stream),
-                 "async read done event record")) {
+    if (!cuda_ok(cudaMemcpyAsync(
+                     (char *)readback->host + (uint64_t)slot * readback->bytes,
+                     (const char *)tensor->ptr + offset,
+                     (size_t)bytes,
+                     cudaMemcpyDeviceToHost,
+                     0),
+                 "ordered async tensor read copy")) {
         return 0;
     }
-    readback->pending = 1;
+    if (!cuda_ok(cudaEventRecord(readback->done[slot], 0),
+                 "ordered async read done event record")) {
+        (void)cudaStreamSynchronize(0);
+        return 0;
+    }
+    readback->pending[slot] = 1;
     return 1;
 }
 
