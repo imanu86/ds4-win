@@ -179,8 +179,49 @@ $cacheCalls = 0; $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMiss
 $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
 $overlapSharedObserved = $false
 $overlapSharedFullObserved = $false
+$serverRunsAll = @()
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
+
+    # Keep server-reported decode throughput separate from HTTP wall time, which
+    # also includes prefill/TTFT. A request block starts at "prompt start" and
+    # the last decoding line in that block is the cumulative decode average.
+    $serverBlock = $null
+    foreach ($line in $lines) {
+        if ($line -match "prompt start") {
+            if ($null -ne $serverBlock -and $serverBlock.generated_tokens -gt 0) {
+                $serverRunsAll += $serverBlock
+            }
+            $serverBlock = [pscustomobject]@{
+                request_index = $serverRunsAll.Count + 1
+                generated_tokens = 0
+                server_decode_seconds = 0.0
+                server_chunk_tokens_per_second = 0.0
+                server_avg_tokens_per_second = 0.0
+                finish_reason = ""
+                server_total_seconds = 0.0
+                server_prefill_ttft_seconds = 0.0
+            }
+            continue
+        }
+        if ($null -eq $serverBlock) { continue }
+        if ($line -match "gen=(\d+) decoding chunk=([0-9.]+) t/s avg=([0-9.]+) t/s ([0-9.]+)s") {
+            $serverBlock.generated_tokens = [int]$Matches[1]
+            $serverBlock.server_chunk_tokens_per_second = [double]$Matches[2]
+            $serverBlock.server_avg_tokens_per_second = [double]$Matches[3]
+            $serverBlock.server_decode_seconds = [double]$Matches[4]
+        }
+        if ($line -match "gen=(\d+) finish=([^ ]+) ([0-9.]+)s") {
+            $serverBlock.generated_tokens = [int]$Matches[1]
+            $serverBlock.finish_reason = $Matches[2]
+            $serverBlock.server_total_seconds = [double]$Matches[3]
+            $serverBlock.server_prefill_ttft_seconds = [math]::Max(0.0, $serverBlock.server_total_seconds - $serverBlock.server_decode_seconds)
+        }
+    }
+    if ($null -ne $serverBlock -and $serverBlock.generated_tokens -gt 0) {
+        $serverRunsAll += $serverBlock
+    }
+
     $evLine = $lines | Where-Object { $_ -match "evicts=(\d+)" } | Select-Object -Last 1
     if ($evLine -and $evLine -match "evicts=(\d+)") { $evicts = [int]$Matches[1] }
     $selLines = $lines | Where-Object { $_ -match "MoE selected-load" }
@@ -209,6 +250,13 @@ if (Test-Path $stderrLog) {
     }
 }
 
+$serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
+$serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
+$serverDecodeMeanTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Average).Average, 6) } else { 0.0 }
+$serverDecodeMinTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
+$serverDecodeMaxTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
+$serverPrefillTtft = @($serverRuns | ForEach-Object { $_.server_prefill_ttft_seconds } | Where-Object { $_ -gt 0 })
+$serverPrefillTtftMean = if ($serverPrefillTtft.Count) { [math]::Round(($serverPrefillTtft | Measure-Object -Average).Average, 6) } else { 0.0 }
 $tps = @($results | ForEach-Object { $_.tokens_per_second })
 $meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Average, 6) } else { 0.0 }
 $minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
@@ -259,6 +307,11 @@ $summary = [pscustomobject]@{
     mean_tokens_per_second = $meanTps
     min_tokens_per_second = $minTps
     max_tokens_per_second = $maxTps
+    server_decode_mean_tokens_per_second = $serverDecodeMeanTps
+    server_decode_min_tokens_per_second = $serverDecodeMinTps
+    server_decode_max_tokens_per_second = $serverDecodeMaxTps
+    server_prefill_ttft_mean_seconds = $serverPrefillTtftMean
+    server_runs = $serverRuns
     outputs_identical = ($hashes.Count -eq 1)
     results = $results
 }
@@ -272,6 +325,8 @@ Write-Host ("content       : [" + $(if ($results.Count) { $results[-1].content }
 Write-Host ("load_sec      : " + [math]::Round($loadSec,1))
 Write-Host ("warm_sec      : " + [math]::Round($warmSec,2) + "  (warmup pass, discarded)")
 Write-Host ("t/s mean/min/max: " + $meanTps + " / " + $minTps + " / " + $maxTps)
+Write-Host ("server decode t/s mean/min/max: " + $serverDecodeMeanTps + " / " + $serverDecodeMinTps + " / " + $serverDecodeMaxTps)
+Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
