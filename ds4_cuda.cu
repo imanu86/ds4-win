@@ -188,6 +188,11 @@ static uint64_t g_cuda_tmp_bytes;
 static void *g_model_stage_raw[4];
 static void *g_model_stage[4];
 static cudaEvent_t g_model_stage_event[4];
+#ifdef _WIN32
+static OVERLAPPED g_moe_io_ov[4];
+static HANDLE g_moe_io_event[4];
+static int g_moe_io_stage_used[4];
+#endif
 static uint64_t g_model_stage_bytes;
 
 static int cuda_ok(cudaError_t err, const char *what);
@@ -967,6 +972,14 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     if (g_model_stage_bytes >= bytes) return 1;
     for (size_t i = 0; i < 4; i++) {
+#ifdef _WIN32
+        if (g_moe_io_event[i]) {
+            (void)CloseHandle(g_moe_io_event[i]);
+            g_moe_io_event[i] = NULL;
+        }
+        memset(&g_moe_io_ov[i], 0, sizeof(g_moe_io_ov[i]));
+        g_moe_io_stage_used[i] = 0;
+#endif
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
             g_model_stage_event[i] = NULL;
@@ -1537,6 +1550,14 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cuda_tmp_bytes = 0;
     }
     for (size_t i = 0; i < 4; i++) {
+#ifdef _WIN32
+        if (g_moe_io_event[i]) {
+            (void)CloseHandle(g_moe_io_event[i]);
+            g_moe_io_event[i] = NULL;
+        }
+        memset(&g_moe_io_ov[i], 0, sizeof(g_moe_io_ov[i]));
+        g_moe_io_stage_used[i] = 0;
+#endif
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
             g_model_stage_event[i] = NULL;
@@ -9484,6 +9505,12 @@ struct cuda_moe_gather {
     std::vector<int32_t> h_expert_to_slot;
     std::vector<int32_t> h_compact_ids;
     std::vector<int32_t> h_slot_ids;
+    struct span {
+        char *dst;
+        uint64_t offset;
+        uint64_t bytes;
+    };
+    std::vector<span> h_spans;
 };
 static cuda_moe_gather g_moe_gather;
 
@@ -9532,6 +9559,137 @@ static int cuda_model_stream_span_into(char *dst, uint64_t offset, uint64_t byte
     }
     return 1;
 }
+
+#ifdef _WIN32
+static uint32_t cuda_moe_io_queue_depth(void) {
+    uint32_t qd = 1;
+    const char *env = getenv("DS4_CUDA_MOE_IO_QD");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long v = strtoul(env, &end, 10);
+        if (end != env && v > 0) qd = (uint32_t)v;
+    }
+    if (qd > 4u) qd = 4u;
+    return qd;
+}
+
+static int cuda_moe_io_events_ensure(void) {
+    for (uint32_t i = 0; i < 4u; i++) {
+        if (g_moe_io_event[i]) continue;
+        g_moe_io_event[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!g_moe_io_event[i]) {
+            fprintf(stderr, "ds4: CUDA MoE overlapped I/O event creation failed: %lu\n",
+                    (unsigned long)GetLastError());
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void cuda_moe_io_cancel_pending(const int pending[4], uint32_t count) {
+    for (uint32_t i = 0; i < count; i++) {
+        if (pending[i]) (void)CancelIoEx(g_model_file.h, &g_moe_io_ov[i]);
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!pending[i]) continue;
+        DWORD ignored = 0;
+        (void)GetOverlappedResult(g_model_file.h, &g_moe_io_ov[i], &ignored, TRUE);
+    }
+}
+
+/* Batch selected-expert file spans through the existing pinned staging ring.
+ * ReadFile operations are submitted concurrently; completed buffers are then
+ * uploaded on the existing nonblocking CUDA stream. The caller retains the
+ * layer-level upload sync, so this path changes only host I/O concurrency. */
+static int cuda_moe_fill_spans_overlapped(
+        const void *model_map,
+        const std::vector<cuda_moe_gather::span> &spans,
+        uint32_t qd) {
+    if (qd < 2u || qd > 4u || !g_model_file_valid) return 0;
+    const uint64_t stage_bytes = cuda_model_copy_chunk_bytes() +
+        (g_model_direct_align > 1 ? g_model_direct_align : 1);
+    if (!cuda_model_stage_pool_alloc(stage_bytes) || !cuda_moe_io_events_ensure()) return 0;
+
+    size_t base = 0;
+    while (base < spans.size()) {
+        const uint32_t count = (uint32_t)((spans.size() - base < qd) ?
+            spans.size() - base : qd);
+        int pending[4] = {0, 0, 0, 0};
+
+        for (uint32_t i = 0; i < count; i++) {
+            const cuda_moe_gather::span &s = spans[base + i];
+            if (cuda_model_range_in_window(model_map, s.offset, s.bytes)) {
+                const char *src = g_model_device_base + s.offset;
+                if (cudaMemcpyAsync(s.dst, src, (size_t)s.bytes, cudaMemcpyDefault,
+                                    g_model_upload_stream) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    cuda_moe_io_cancel_pending(pending, count);
+                    return 0;
+                }
+                continue;
+            }
+            if (s.bytes == 0 || s.bytes > g_model_stage_bytes || s.bytes > 0xffffffffull) {
+                cuda_moe_io_cancel_pending(pending, count);
+                return 0;
+            }
+            if (g_moe_io_stage_used[i]) {
+                if (cudaEventSynchronize(g_model_stage_event[i]) != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    cuda_moe_io_cancel_pending(pending, count);
+                    return 0;
+                }
+            }
+
+            OVERLAPPED &ov = g_moe_io_ov[i];
+            memset(&ov, 0, sizeof(ov));
+            ov.Offset = (DWORD)(s.offset & 0xffffffffu);
+            ov.OffsetHigh = (DWORD)(s.offset >> 32);
+            ov.hEvent = g_moe_io_event[i];
+            (void)ResetEvent(ov.hEvent);
+            const BOOL started = ReadFile(g_model_file.h, g_model_stage[i],
+                                          (DWORD)s.bytes, NULL, &ov);
+            if (!started && GetLastError() != ERROR_IO_PENDING) {
+                fprintf(stderr, "ds4: CUDA MoE overlapped read submit failed at %llu: %lu\n",
+                        (unsigned long long)s.offset, (unsigned long)GetLastError());
+                cuda_moe_io_cancel_pending(pending, count);
+                return 0;
+            }
+            pending[i] = 1;
+        }
+
+        for (uint32_t i = 0; i < count; i++) {
+            if (!pending[i]) continue;
+            const cuda_moe_gather::span &s = spans[base + i];
+            DWORD got = 0;
+            if (!GetOverlappedResult(g_model_file.h, &g_moe_io_ov[i], &got, TRUE) ||
+                got != (DWORD)s.bytes) {
+                fprintf(stderr, "ds4: CUDA MoE overlapped read completion failed at %llu: %lu (%lu/%llu bytes)\n",
+                        (unsigned long long)s.offset, (unsigned long)GetLastError(),
+                        (unsigned long)got, (unsigned long long)s.bytes);
+                cuda_moe_io_cancel_pending(pending, count);
+                return 0;
+            }
+            pending[i] = 0;
+            if (cudaMemcpyAsync(s.dst, g_model_stage[i], (size_t)s.bytes,
+                                cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
+                cudaEventRecord(g_model_stage_event[i], g_model_upload_stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cuda_moe_io_cancel_pending(pending, count);
+                return 0;
+            }
+            g_moe_io_stage_used[i] = 1;
+            cuda_model_drop_file_pages(s.offset, s.bytes);
+        }
+        base += count;
+    }
+    static int notice_printed = 0;
+    if (!notice_printed) {
+        fprintf(stderr, "ds4: CUDA MoE overlapped read succeeded queue depth=%u\n", qd);
+        notice_printed = 1;
+    }
+    return 1;
+}
+#endif
 
 /* Fill one compact slot for one expert weight (gate/up/down): zero-copy D2D from
  * the pinned host window when in-window, else stream straight from the file.
@@ -9619,15 +9777,37 @@ static int cuda_moe_selected_load(
      * upload stream and drained with a single sync below (pipelines pread vs copy). */
     const int prof = getenv("DS4_CUDA_SEL_PROFILE") != NULL;
     const double t_fetch0 = prof ? cuda_wall_sec() : 0.0;
-    int fill_ok = 1;
-    for (uint32_t i = 0; i < compact_count && fill_ok; i++) {
+    std::vector<cuda_moe_gather::span> &spans = g_moe_gather.h_spans;
+    spans.clear();
+    spans.reserve((size_t)compact_count * 3u);
+    for (uint32_t i = 0; i < compact_count; i++) {
         const uint64_t e = (uint64_t)(uint32_t)compact[i];
-        fill_ok = cuda_moe_fill_span(g_moe_gather.gate + (uint64_t)i * gate_expert_bytes,
-                                     model_map, gate_offset + e * gate_expert_bytes, gate_expert_bytes) &&
-                  cuda_moe_fill_span(g_moe_gather.up + (uint64_t)i * gate_expert_bytes,
-                                     model_map, up_offset + e * gate_expert_bytes, gate_expert_bytes) &&
-                  cuda_moe_fill_span(g_moe_gather.down + (uint64_t)i * down_expert_bytes,
-                                     model_map, down_offset + e * down_expert_bytes, down_expert_bytes);
+        spans.push_back({g_moe_gather.gate + (uint64_t)i * gate_expert_bytes,
+                         gate_offset + e * gate_expert_bytes, gate_expert_bytes});
+        spans.push_back({g_moe_gather.up + (uint64_t)i * gate_expert_bytes,
+                         up_offset + e * gate_expert_bytes, gate_expert_bytes});
+        spans.push_back({g_moe_gather.down + (uint64_t)i * down_expert_bytes,
+                         down_offset + e * down_expert_bytes, down_expert_bytes});
+    }
+    int fill_ok = 0;
+#ifdef _WIN32
+    const uint32_t io_qd = cuda_moe_io_queue_depth();
+    if (io_qd > 1u) {
+        fill_ok = cuda_moe_fill_spans_overlapped(model_map, spans, io_qd);
+        if (!fill_ok) {
+            fprintf(stderr, "ds4: CUDA MoE overlapped read failed; selected-load fallback requested\n");
+        }
+    }
+    else
+#endif
+    {
+        fill_ok = 1;
+        for (const cuda_moe_gather::span &s : spans) {
+            if (!cuda_moe_fill_span(s.dst, model_map, s.offset, s.bytes)) {
+                fill_ok = 0;
+                break;
+            }
+        }
     }
     if (!fill_ok) { (void)cudaStreamSynchronize(g_model_upload_stream); return 0; }
     if (!cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) return 0;

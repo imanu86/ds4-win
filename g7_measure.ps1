@@ -11,6 +11,7 @@ param(
     [switch]$Diagnostics,
     [int]$ReserveMB = 2048,
     [int]$BudgetGB = 28,
+    [ValidateSet(1, 2, 4)][int]$IoQD = 1,
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000
 )
@@ -40,12 +41,22 @@ if ($Diagnostics) {
 }
 if ($NoSelectedLoad) { $env:DS4_CUDA_MOE_NO_SELECTED_LOAD = "1" }
 else { Remove-Item Env:\DS4_CUDA_MOE_NO_SELECTED_LOAD -ErrorAction SilentlyContinue }
+if ($IoQD -gt 1) { $env:DS4_CUDA_MOE_IO_QD = "$IoQD" }
+else { Remove-Item Env:\DS4_CUDA_MOE_IO_QD -ErrorAction SilentlyContinue }
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $existing = Get-Process ds4_server -ErrorAction SilentlyContinue
 if ($existing) {
     throw "Another ds4_server process is active; refusing to stop a server owned by another task."
 }
+
+# Capture provenance before the process starts so a concurrent edit cannot be
+# attributed retroactively to a completed measurement.
+$headAtStart = git -C $PSScriptRoot rev-parse HEAD
+$worktreeDirtyAtStart = [bool](git -C $PSScriptRoot status --porcelain)
+$sourceHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "ds4_cuda.cu")).Hash.ToLowerInvariant()
+$exeHashAtStart = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
+$harnessHashAtStart = (Get-FileHash -Algorithm SHA256 $PSCommandPath).Hash.ToLowerInvariant()
 
 $argList = @("-m", $model, "--cuda", "-c", "256", "-n", "$MaxTokens", "--host", "127.0.0.1", "--port", "$Port")
 Write-Host ("[g7] launching: " + $exe + " " + ($argList -join " "))
@@ -122,10 +133,13 @@ try {
 }
 
 if (-not $proc.HasExited) { $proc.Kill() }
-Start-Sleep -Milliseconds 500
+$stopped = $proc.WaitForExit(60000)
+if (-not $stopped) { throw "Owned ds4_server process did not exit within 60 seconds" }
+Start-Sleep -Milliseconds 250
 
 # Analyze stderr
 $evicts = 0; $selLoads = 0; $lastSel = ""; $streamsExpert = 0; $streamsHot = 0
+$observedIoQD = 1; $overlappedIoObserved = $false; $overlappedIoFallbacks = 0
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
     $evLine = $lines | Where-Object { $_ -match "evicts=(\d+)" } | Select-Object -Last 1
@@ -136,6 +150,12 @@ if (Test-Path $stderrLog) {
     $fd = $lines | Where-Object { $_ -match "fd-cached " }
     $streamsExpert = ($fd | Where-Object { $_ -match "fd-cached moe_" } | Measure-Object).Count
     $streamsHot = ($fd | Measure-Object).Count - $streamsExpert
+    $ioLine = $lines | Where-Object { $_ -match "MoE overlapped read succeeded queue depth=(\d+)" } | Select-Object -Last 1
+    if ($ioLine -and $ioLine -match "MoE overlapped read succeeded queue depth=(\d+)") {
+        $observedIoQD = [int]$Matches[1]
+        $overlappedIoObserved = $true
+    }
+    $overlappedIoFallbacks = ($lines | Where-Object { $_ -match "MoE overlapped read failed; selected-load fallback requested" } | Measure-Object).Count
 }
 
 $tps = @($results | ForEach-Object { $_.tokens_per_second })
@@ -145,7 +165,11 @@ $maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maxim
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
 $summary = [pscustomobject]@{
     tag = $Tag
-    head = (git -C $PSScriptRoot rev-parse HEAD)
+    head = $headAtStart
+    worktree_dirty = $worktreeDirtyAtStart
+    ds4_cuda_sha256 = $sourceHashAtStart
+    executable_sha256 = $exeHashAtStart
+    harness_sha256 = $harnessHashAtStart
     executable = $exe
     model = $model
     requested_max_tokens = $MaxTokens
@@ -155,6 +179,10 @@ $summary = [pscustomobject]@{
     reserve_mb = $ReserveMB
     no_selected_load = [bool]$NoSelectedLoad
     diagnostics = [bool]$Diagnostics
+    moe_io_queue_depth = $IoQD
+    moe_io_queue_depth_observed = $observedIoQD
+    moe_overlapped_io_observed = $overlappedIoObserved
+    moe_overlapped_io_fallbacks = $overlappedIoFallbacks
     load_seconds = [math]::Round($loadSec, 6)
     warmup_seconds = [math]::Round($warmSec, 6)
     mean_tokens_per_second = $meanTps
@@ -178,5 +206,7 @@ Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
 Write-Host ("streams_hot   : " + $streamsHot)
 Write-Host ("selected_loads: " + $selLoads)
+Write-Host ("moe_io_qd req/observed: " + $IoQD + " / " + $observedIoQD)
+Write-Host ("moe_io_fallbacks: " + $overlappedIoFallbacks)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="
