@@ -2,10 +2,13 @@
 # Usage: powershell -File g7_measure.ps1 -MaxTokens 8 -TimeoutSec 900 -Tag new [-NoSelectedLoad]
 param(
     [int]$MaxTokens = 8,
+    [int]$Repeats = 1,
     [int]$TimeoutSec = 900,
     [string]$Tag = "run",
+    [string]$Prompt = "Hi",
     [switch]$NoSelectedLoad,
     [switch]$Warmup,
+    [switch]$Diagnostics,
     [int]$ReserveMB = 2048,
     [int]$BudgetGB = 28,
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
@@ -13,9 +16,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$exe   = "C:\Users\imanu\AppData\Local\ds4-win-work\build\Release\ds4_server.exe"
+$exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $model = $ModelPath
-$outdir = "C:\Users\imanu\AppData\Local\ds4-win-work\g7_runs"
+$outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 $stderrLog = Join-Path $outdir ("g7_" + $Tag + "_stderr.log")
 $stdoutLog = Join-Path $outdir ("g7_" + $Tag + "_stdout.log")
@@ -26,13 +29,23 @@ $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
-$env:DS4_CUDA_WEIGHT_CACHE_VERBOSE = "1"
+if ($Diagnostics) {
+    $env:DS4_CUDA_WEIGHT_CACHE_VERBOSE = "1"
+    $env:DS4_CUDA_SEL_PROFILE = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_WEIGHT_CACHE_VERBOSE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_SEL_PROFILE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_METAL_DECODE_STAGE_PROFILE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_MOE_PROFILE -ErrorAction SilentlyContinue
+}
 if ($NoSelectedLoad) { $env:DS4_CUDA_MOE_NO_SELECTED_LOAD = "1" }
 else { Remove-Item Env:\DS4_CUDA_MOE_NO_SELECTED_LOAD -ErrorAction SilentlyContinue }
 
-# Kill any lingering server holding the port/exe
-Get-Process ds4_server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 500
+if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
+$existing = Get-Process ds4_server -ErrorAction SilentlyContinue
+if ($existing) {
+    throw "Another ds4_server process is active; refusing to stop a server owned by another task."
+}
 
 $argList = @("-m", $model, "--cuda", "-c", "256", "-n", "$MaxTokens", "--host", "127.0.0.1", "--port", "$Port")
 Write-Host ("[g7] launching: " + $exe + " " + ($argList -join " "))
@@ -65,14 +78,13 @@ Write-Host ("[g7] server READY in " + [int]$loadSec + "s")
 
 $body = @{
     model = "deepseek-chat"
-    messages = @(@{ role = "user"; content = "Hi" })
+    messages = @(@{ role = "user"; content = $Prompt })
     max_tokens = $MaxTokens
     temperature = 0
     think = $false
 } | ConvertTo-Json -Depth 5
 
-$content = ""
-$genSec = 0.0
+$results = @()
 $httpOk = $false
 $warmSec = 0.0
 $uri = "http://127.0.0.1:" + $Port + "/v1/chat/completions"
@@ -83,10 +95,27 @@ try {
         $warmSec = ((Get-Date) - $tw).TotalSeconds
         Write-Host ("[g7] warmup pass done in " + [math]::Round($warmSec,2) + "s")
     }
-    $t0 = Get-Date
-    $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec
-    $genSec = ((Get-Date) - $t0).TotalSeconds
-    $content = $resp.choices[0].message.content
+    for ($i = 1; $i -le $Repeats; $i++) {
+        $t0 = Get-Date
+        $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec
+        $genSec = ((Get-Date) - $t0).TotalSeconds
+        $content = [string]$resp.choices[0].message.content
+        $completionTokens = [int]$resp.usage.completion_tokens
+        if ($completionTokens -le 0) {
+            throw "Response $i did not report a positive usage.completion_tokens value"
+        }
+        $bytes = [Text.Encoding]::UTF8.GetBytes($content)
+        $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
+        $results += [pscustomobject]@{
+            repeat = $i
+            seconds = [math]::Round($genSec, 6)
+            completion_tokens = $completionTokens
+            tokens_per_second = [math]::Round($completionTokens / $genSec, 6)
+            content_sha256 = $sha
+            content = $content
+        }
+        Write-Host ("[g7] repeat " + $i + ": " + $completionTokens + " tokens in " + [math]::Round($genSec, 3) + "s")
+    }
     $httpOk = $true
 } catch {
     Write-Host ("[g7] request FAILED: " + $_.Exception.Message)
@@ -109,18 +138,42 @@ if (Test-Path $stderrLog) {
     $streamsHot = ($fd | Measure-Object).Count - $streamsExpert
 }
 
-$tokPerSec = 0.0
-if ($genSec -gt 0 -and $MaxTokens -gt 0) { $tokPerSec = [math]::Round($MaxTokens / $genSec, 4) }
+$tps = @($results | ForEach-Object { $_.tokens_per_second })
+$meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Average, 6) } else { 0.0 }
+$minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
+$maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
+$hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
+$summary = [pscustomobject]@{
+    tag = $Tag
+    head = (git -C $PSScriptRoot rev-parse HEAD)
+    executable = $exe
+    model = $model
+    requested_max_tokens = $MaxTokens
+    repeats = $Repeats
+    warmup = [bool]$Warmup
+    budget_gb = $BudgetGB
+    reserve_mb = $ReserveMB
+    no_selected_load = [bool]$NoSelectedLoad
+    diagnostics = [bool]$Diagnostics
+    load_seconds = [math]::Round($loadSec, 6)
+    warmup_seconds = [math]::Round($warmSec, 6)
+    mean_tokens_per_second = $meanTps
+    min_tokens_per_second = $minTps
+    max_tokens_per_second = $maxTps
+    outputs_identical = ($hashes.Count -eq 1)
+    results = $results
+}
+$summary | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $outdir ("g7_" + $Tag + "_result.json"))
 
 Write-Host ""
 Write-Host "================ G7 RESULT ($Tag) ================"
 Write-Host ("http_ok       : " + $httpOk)
-Write-Host ("content       : [" + $content + "]")
+Write-Host ("repeats       : " + $Repeats)
+Write-Host ("content       : [" + $(if ($results.Count) { $results[-1].content } else { "" }) + "]")
 Write-Host ("load_sec      : " + [math]::Round($loadSec,1))
 Write-Host ("warm_sec      : " + [math]::Round($warmSec,2) + "  (warmup pass, discarded)")
-Write-Host ("gen_sec       : " + [math]::Round($genSec,2) + "  (for " + $MaxTokens + " tokens)")
-Write-Host ("tokens_per_sec: " + $tokPerSec)
-Write-Host ("sec_per_token : " + [math]::Round(($(if($tokPerSec -gt 0){1/$tokPerSec}else{0})),2))
+Write-Host ("t/s mean/min/max: " + $meanTps + " / " + $minTps + " / " + $maxTps)
+Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
 Write-Host ("streams_hot   : " + $streamsHot)
