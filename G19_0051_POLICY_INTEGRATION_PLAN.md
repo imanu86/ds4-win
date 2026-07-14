@@ -18,6 +18,13 @@ post-publish decode, but its boundary WRAP rereads the observed experts and is
 too expensive. G19B must reuse selected-load's first-fetch bytes before this
 plan enables any dynamic router bias.
 
+G19B is now implemented and measured in
+`G19B_FIRST_FETCH_PRELOAD_RESULTS.md`: W16/min-hits-3 publishes 439 preloaded
+experts with zero boundary loads and improves 128-token decode by 11.0% at n=3,
+with exact output hashes. The remaining work in this plan starts at combined
+residency plus bias publication; the preload transport itself is no longer a
+hypothesis.
+
 ## Checkpoint chain
 
 - `a880b01`: pinned `cudaHostAllocDefault` arena substrate.

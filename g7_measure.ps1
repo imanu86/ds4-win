@@ -13,6 +13,7 @@ param(
     [int]$BudgetGB = 28,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
+    [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
     [ValidateRange(1, 32)][int]$ReapPrefetchThreads = 8,
     [ValidateSet(1, 2, 4)][int]$IoQD = 1,
     [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
@@ -67,8 +68,10 @@ if ($DynamicArenaGiB -gt 0.0) {
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW = "$DynamicArenaObservedWindow"
+    $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_MIN_HITS = "$DynamicArenaObservedMinHits"
 } else {
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_OBSERVED_MIN_HITS -ErrorAction SilentlyContinue
 }
 $env:DS4_REAP_PREFETCH_THREADS = "$ReapPrefetchThreads"
 if ($Diagnostics) {
@@ -280,10 +283,12 @@ $spexPrefetchLate = 0; $spexPrefetchCanceled = 0; $spexPrefetchPoisoned = 0
 $spexPrefetchErrors = 0; $spexPrefetchDisabled = $false
 $spexPrefetchBytesRead = 0; $spexPrefetchBytesUsed = 0
 $arenaObserverArmed = $false; $arenaObserverWindowObserved = 0
+$arenaObserverMinHitsObserved = 0
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
 $arenaWrapSeconds = 0.0; $arenaWrapGeneration = 0
+$arenaWrapPreloaded = 0; $arenaWrapMirrorGiB = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
@@ -389,12 +394,13 @@ if (Test-Path $stderrLog) {
         $cacheHits = [long]$Matches[4]; $cacheMisses = [long]$Matches[5]; $cacheAdmissions = [long]$Matches[6]
         $cacheEvictions = [long]$Matches[7]; $cacheDirect = [long]$Matches[8]
     }
-    $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
-    if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
+    $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+) layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
+    if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+) layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
         $arenaObserverArmed = $true
         $arenaObserverWindowObserved = [int]$Matches[1]
-        $arenaObserverFirstLayer = [int]$Matches[2]
-        $arenaObserverLastLayer = [int]$Matches[3]
+        $arenaObserverMinHitsObserved = [int]$Matches[2]
+        $arenaObserverFirstLayer = [int]$Matches[3]
+        $arenaObserverLastLayer = [int]$Matches[4]
     }
     $arenaWrapLine = $lines | Where-Object { $_ -match "\[arena-observe\] WRAP (published|aborted)" } | Select-Object -Last 1
     if ($arenaWrapLine -and $arenaWrapLine -match "WRAP published tokens=(\d+) resident=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9.]+) generation=(\d+)") {
@@ -403,6 +409,10 @@ if (Test-Path $stderrLog) {
         $arenaWrapLoads = [long]$Matches[3]; $arenaWrapWorkers = [int]$Matches[4]
         $arenaWrapSeconds = [double]::Parse($Matches[5], [Globalization.CultureInfo]::InvariantCulture)
         $arenaWrapGeneration = [long]$Matches[6]
+        if ($arenaWrapLine -match "preloaded=(\d+) mirror=([0-9.]+) GiB") {
+            $arenaWrapPreloaded = [long]$Matches[1]
+            $arenaWrapMirrorGiB = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+        }
     } elseif ($arenaWrapLine -and $arenaWrapLine -match "WRAP aborted tokens=(\d+) resident=(\d+) loads=(\d+) seconds=([0-9.]+)") {
         $arenaWrapObserved = $true
         $arenaObserverTokens = [long]$Matches[1]; $arenaObserverResident = [long]$Matches[2]
@@ -524,10 +534,12 @@ $summary = [pscustomobject]@{
     reserve_mb = $ReserveMB
     dynamic_arena_gib_requested = $DynamicArenaGiB
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
+    dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
     reap_prefetch_threads_requested = $ReapPrefetchThreads
     minimum_available_gib_effective = $effectiveMinimumAvailableGiB
     dynamic_arena_observer_armed = $arenaObserverArmed
     dynamic_arena_observer_window_observed = $arenaObserverWindowObserved
+    dynamic_arena_observer_min_hits_observed = $arenaObserverMinHitsObserved
     dynamic_arena_observer_first_layer = $arenaObserverFirstLayer
     dynamic_arena_observer_last_layer = $arenaObserverLastLayer
     dynamic_arena_observer_tokens = $arenaObserverTokens
@@ -537,6 +549,8 @@ $summary = [pscustomobject]@{
     dynamic_arena_wrap_workers = $arenaWrapWorkers
     dynamic_arena_wrap_seconds = $arenaWrapSeconds
     dynamic_arena_wrap_generation = $arenaWrapGeneration
+    dynamic_arena_wrap_preloaded = $arenaWrapPreloaded
+    dynamic_arena_wrap_mirror_gib = $arenaWrapMirrorGiB
     dynamic_arena_observer_result_observed = $arenaObserverResultObserved
     dynamic_arena_observer_result = $arenaObserverResult
     dynamic_arena_observer_published = ($arenaObserverResult -eq "published")
@@ -643,8 +657,8 @@ Write-Host ("t/s mean/min/max: " + $meanTps + " / " + $minTps + " / " + $maxTps)
 Write-Host ("server decode t/s mean/min/max: " + $serverDecodeMeanTps + " / " + $serverDecodeMinTps + " / " + $serverDecodeMaxTps)
 Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
-Write-Host ("arena observer armed/window/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
-Write-Host ("arena WRAP loads/workers/sec/generation: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration)
+Write-Host ("arena observer armed/window/minhits/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
+Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena result/final hits/misses/fatal/uploaded GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
 Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
