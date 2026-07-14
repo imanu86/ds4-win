@@ -54,6 +54,7 @@ if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{6
 }
 $effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
+$buildManifestPath = Join-Path $PSScriptRoot "build\Release\g7_build_manifest.json"
 $model = $ModelPath
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
@@ -200,10 +201,48 @@ $exeHashAtStart = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 $harnessHashAtStart = (Get-FileHash -Algorithm SHA256 $PSCommandPath).Hash.ToLowerInvariant()
 $memoryPreflightHashAtStart = (Get-FileHash -Algorithm SHA256 $memoryPreflightHelper).Hash.ToLowerInvariant()
 $runtimeMonitorHashAtStart = (Get-FileHash -Algorithm SHA256 $runtimeMonitorHelper).Hash.ToLowerInvariant()
+$buildManifestHashAtStart = if (Test-Path -LiteralPath $buildManifestPath) {
+    (Get-FileHash -Algorithm SHA256 $buildManifestPath).Hash.ToLowerInvariant()
+} else { "" }
 $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPath $SpexFile).Hash.ToLowerInvariant() } else { "" }
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
+$buildManifest = $null
+if (-not (Test-Path -LiteralPath $buildManifestPath -PathType Leaf)) {
+    throw "Build provenance failed closed: run g7_build.ps1 before measuring"
+}
+try { $buildManifest = Get-Content -LiteralPath $buildManifestPath -Raw | ConvertFrom-Json }
+catch { throw "Build provenance failed closed: invalid manifest JSON" }
+if ($buildManifest.schema -ne "g7_native_windows_build_manifest_v1") {
+    throw "Build provenance failed closed: unsupported manifest schema"
+}
+if ($buildManifest.executable_sha256 -ne $exeHashAtStart) {
+    throw "Build provenance failed closed: executable hash does not match manifest"
+}
+$currentBuildInputPaths = @(
+    @(git -C $PSScriptRoot ls-files) +
+    @(git -C $PSScriptRoot ls-files --others --exclude-standard) |
+    Where-Object {
+        $_ -notmatch '^(build|g7_runs)/' -and
+        ($_ -match '\.(c|cc|cpp|cu|h|hpp|cmake)$' -or
+         $_ -match '(^|/)CMakeLists\.txt$')
+    } | Sort-Object -Unique
+)
+$manifestInputPaths = @($buildManifest.inputs | ForEach-Object { $_.path } | Sort-Object -Unique)
+if ((Compare-Object $manifestInputPaths $currentBuildInputPaths).Count -ne 0) {
+    throw "Build provenance failed closed: compile input set changed since build"
+}
+foreach ($input in @($buildManifest.inputs)) {
+    $inputPath = Join-Path $PSScriptRoot ($input.path -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
+        throw "Build provenance failed closed: input missing $($input.path)"
+    }
+    $currentHash = (Get-FileHash -LiteralPath $inputPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($currentHash -ne $input.sha256) {
+        throw "Build provenance failed closed: input hash changed $($input.path)"
+    }
+}
 $gpuIdentity = $null
 try {
     $gpuRaw = & nvidia-smi --query-gpu=name,driver_version,vbios_version,pci.bus_id --format=csv,noheader,nounits 2>$null
@@ -696,6 +735,11 @@ $summary = [pscustomobject]@{
     harness_sha256 = $harnessHashAtStart
     memory_preflight_harness_sha256 = $memoryPreflightHashAtStart
     runtime_monitor_harness_sha256 = $runtimeMonitorHashAtStart
+    build_manifest_path = $buildManifestPath
+    build_manifest_sha256 = $buildManifestHashAtStart
+    build_manifest_input_fingerprint_sha256 = $buildManifest.input_fingerprint_sha256
+    build_manifest_head = $buildManifest.head
+    build_manifest_worktree_dirty_at_build_start = [bool]$buildManifest.worktree_dirty_at_build_start
     executable = $exe
     model = $model
     model_bytes = [long]$modelInfoAtStart.Length
