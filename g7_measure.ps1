@@ -30,10 +30,14 @@ param(
     [ValidateRange(1, 1000000)][int]$SpexStatsEvery = 1000000,
     [string]$ExpectedContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
-    [int]$Port = 8000
+    [int]$Port = 8000,
+    [switch]$SkipMemoryPreflight,
+    [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0
 )
 
 $ErrorActionPreference = "Stop"
+$memoryPreflightHelper = Join-Path $PSScriptRoot "g7_memory_preflight.ps1"
+. $memoryPreflightHelper
 if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
 }
@@ -44,8 +48,10 @@ $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 $stderrLog = Join-Path $outdir ("g7_" + $Tag + "_stderr.log")
 $stdoutLog = Join-Path $outdir ("g7_" + $Tag + "_stdout.log")
+$memoryPreflightLog = Join-Path $outdir ("g7_" + $Tag + "_memory_preflight.json")
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
+if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
 
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
@@ -122,9 +128,26 @@ if ($SpexPrefetchK -gt 0 -and $NoSelectedLoad) { throw "SpexPrefetchK is incompa
 if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap policy" }
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
-$existing = Get-Process ds4_server -ErrorAction SilentlyContinue
-if ($existing) {
-    throw "Another ds4_server process is active; refusing to stop a server owned by another task."
+$effectiveMinimumAvailableGiB = $MinimumAvailableGiB
+if ($effectiveMinimumAvailableGiB -eq 0.0) {
+    $effectiveMinimumAvailableGiB = 4.0
+    $arenaText = $env:DS4_CUDA_DYNAMIC_ARENA_GB
+    if (-not [string]::IsNullOrWhiteSpace($arenaText)) {
+        $arenaGiB = 0.0
+        if (-not [double]::TryParse($arenaText,
+                [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$arenaGiB) -or $arenaGiB -lt 0.0) {
+            throw "DS4_CUDA_DYNAMIC_ARENA_GB must be a non-negative number."
+        }
+        $effectiveMinimumAvailableGiB = [math]::Max(4.0, $arenaGiB + 2.0)
+    }
+}
+$memoryPreflight = Invoke-G7MemoryPreflight -Skip:$SkipMemoryPreflight `
+    -MinimumAvailableGiB $effectiveMinimumAvailableGiB -Label ("g7:" + $Tag)
+Write-G7MemoryPreflightTelemetry -Telemetry $memoryPreflight -Path $memoryPreflightLog
+if (-not $memoryPreflight.ready_to_launch) {
+    throw ("Memory preflight refused launch: " + $memoryPreflight.failure_message)
 }
 
 # Capture provenance before the process starts so a concurrent edit cannot be
@@ -141,6 +164,7 @@ $threadHeaderHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptR
 $cmakeHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "CMakeLists.txt")).Hash.ToLowerInvariant()
 $exeHashAtStart = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 $harnessHashAtStart = (Get-FileHash -Algorithm SHA256 $PSCommandPath).Hash.ToLowerInvariant()
+$memoryPreflightHashAtStart = (Get-FileHash -Algorithm SHA256 $memoryPreflightHelper).Hash.ToLowerInvariant()
 $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPath $SpexFile).Hash.ToLowerInvariant() } else { "" }
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
@@ -437,6 +461,7 @@ $summary = [pscustomobject]@{
     cmake_sha256 = $cmakeHashAtStart
     executable_sha256 = $exeHashAtStart
     harness_sha256 = $harnessHashAtStart
+    memory_preflight_harness_sha256 = $memoryPreflightHashAtStart
     executable = $exe
     model = $model
     model_bytes = [long]$modelInfoAtStart.Length
@@ -451,6 +476,7 @@ $summary = [pscustomobject]@{
     reserve_mb = $ReserveMB
     no_selected_load = [bool]$NoSelectedLoad
     diagnostics = [bool]$Diagnostics
+    memory_preflight = $memoryPreflight
     moe_io_queue_depth = $IoQD
     moe_io_queue_depth_observed = $observedIoQD
     moe_overlapped_io_observed = $overlappedIoObserved

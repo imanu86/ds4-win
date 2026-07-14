@@ -9,11 +9,21 @@ param(
     [ValidateRange(1, 1000)]
     [UInt64] $Iterations = 1,
 
-    [string] $OutputPath
+    [string] $OutputPath,
+
+    [switch] $SkipMemoryPreflight,
+
+    [ValidateRange(0.0, 1024.0)]
+    [double] $MinimumAvailableGiB = 0.0,
+
+    [ValidateRange(0.0, 64.0)]
+    [double] $MemoryReserveGiB = 2.0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$memoryPreflightHelper = Join-Path $PSScriptRoot "g7_memory_preflight.ps1"
+. $memoryPreflightHelper
 
 $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
@@ -41,6 +51,8 @@ if ($SizesGiB.Count -eq 0 -or $SizesGiB.Where({ $_ -eq 0 }).Count -ne 0) {
     throw "SizesGiB must contain at least one positive integer size."
 }
 
+Assert-G7NoActiveServer
+
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     $stamp = [DateTime]::UtcNow.ToString("yyyyMMdd_HHmmss'Z'",
         [Globalization.CultureInfo]::InvariantCulture)
@@ -50,6 +62,8 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 $OutputPath = [IO.Path]::GetFullPath($OutputPath)
 $outputDirectory = Split-Path -Parent $OutputPath
+$memoryPreflightPath = $OutputPath + ".memory_preflight.jsonl"
+$memoryPreflightHash = (Get-FileHash -Algorithm SHA256 $memoryPreflightHelper).Hash.ToLowerInvariant()
 
 $previousCudaPath = $env:CUDA_PATH
 $previousPath = $env:Path
@@ -87,6 +101,7 @@ try {
     }
 
     [IO.File]::WriteAllText($OutputPath, "", $utf8NoBom)
+    [IO.File]::WriteAllText($memoryPreflightPath, "", $utf8NoBom)
     Write-Host ("[g17] Recording JSONL to {0}" -f $OutputPath)
 
     $index = 0
@@ -101,6 +116,17 @@ try {
         )
 
         Write-Host ("[g17] Probing {0} GiB in a fresh process..." -f $sizeGiB)
+        $effectiveMinimumAvailableGiB = [math]::Max(
+            $MinimumAvailableGiB, [double]$sizeGiB + $MemoryReserveGiB)
+        $memoryPreflight = Invoke-G7MemoryPreflight -Skip:$SkipMemoryPreflight `
+            -MinimumAvailableGiB $effectiveMinimumAvailableGiB `
+            -Label ("g17:{0}GiB" -f $sizeGiB)
+        Write-G7MemoryPreflightTelemetry -Telemetry $memoryPreflight `
+            -Path $memoryPreflightPath -Append
+        if (-not $memoryPreflight.ready_to_launch) {
+            throw ("Memory preflight refused {0} GiB launch: {1}" -f `
+                $sizeGiB, $memoryPreflight.failure_message)
+        }
         $process = Start-Process -FilePath $executable -ArgumentList $childArguments `
             -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath
@@ -141,6 +167,10 @@ try {
             -NotePropertyValue "sm_86" -Force
         $record | Add-Member -NotePropertyName cuda_toolkit `
             -NotePropertyValue "12.6" -Force
+        $record | Add-Member -NotePropertyName memory_preflight_harness_sha256 `
+            -NotePropertyValue $memoryPreflightHash -Force
+        $record | Add-Member -NotePropertyName memory_preflight `
+            -NotePropertyValue $memoryPreflight -Force
 
         $line = $record | ConvertTo-Json -Compress -Depth 8
         [IO.File]::AppendAllText($OutputPath, $line + [Environment]::NewLine, $utf8NoBom)
