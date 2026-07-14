@@ -551,6 +551,7 @@ $prefillMassWrapRouter = "not_observed"; $prefillMassWrapMask = "not_observed"
 $reapMassArmed = $false; $reapMassResultObserved = $false
 $reapMassWindowObserved = 0; $reapMassTopObserved = 0
 $reapMassFirstLayer = 0; $reapMassLastLayer = 0
+$reapMassTransport = "not_observed"
 $reapMassTokens = 0; $reapMassObservedSlots = 0; $reapMassUnique = 0
 $reapMassTopMass = 0.0; $reapMassTouched = 0
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
@@ -728,10 +729,11 @@ if (Test-Path $stderrLog) {
         $prefillMassWrapRouter = $Matches[13]; $prefillMassWrapMask = $Matches[14]
     }
     $reapMassArmedLine = $lines | Where-Object { $_ -match "\[reap-mass\] armed" } | Select-Object -Last 1
-    if ($reapMassArmedLine -and $reapMassArmedLine -match "armed window=(\d+) top=(\d+) layers=(\d+)\.\.(\d+) semantics=selected_weight_normalized_per_token sliding_ring_observe_only") {
+    if ($reapMassArmedLine -and $reapMassArmedLine -match "armed window=(\d+) top=(\d+) layers=(\d+)\.\.(\d+) semantics=selected_weight_normalized_per_token sliding_ring_observe_only transport=([a-z0-9-]+)") {
         $reapMassArmed = $true
         $reapMassWindowObserved = [int]$Matches[1]; $reapMassTopObserved = [int]$Matches[2]
         $reapMassFirstLayer = [int]$Matches[3]; $reapMassLastLayer = [int]$Matches[4]
+        $reapMassTransport = $Matches[5]
     }
     $reapMassResultLine = $lines | Where-Object { $_ -match "\[reap-mass\] request-end" } | Select-Object -Last 1
     if ($reapMassResultLine -and $reapMassResultLine -match "request-end tokens=(\d+) observed_slots=(\d+) unique=(\d+) top_mass=([0-9.]+) touched=(\d+)") {
@@ -910,7 +912,7 @@ if ($PrefillMassWrap) {
 }
 if ($ReapMassObserve) {
     if (-not $reapMassArmed -or -not $reapMassResultObserved) { throw "REAP mass measurement failed: observer did not arm/report" }
-    if ($reapMassWindowObserved -ne $ReapMassWindow -or $reapMassTopObserved -le 0) { throw "REAP mass measurement failed: observed policy differs from requested policy" }
+    if ($reapMassWindowObserved -ne $ReapMassWindow -or $reapMassTopObserved -le 0 -or $reapMassTransport -ne "packed-router-d2h") { throw "REAP mass measurement failed: observed policy/transport differs from requested policy" }
     if ($reapMassTokens -le 0 -or $reapMassObservedSlots -le 0 -or $reapMassUnique -le 0 -or $reapMassTopMass -le 0.0) { throw "REAP mass measurement failed: invalid terminal counters" }
 } elseif ($reapMassArmed -or $reapMassResultObserved) {
     throw "REAP mass observer activated while not requested"
@@ -1055,6 +1057,7 @@ $summary = [pscustomobject]@{
     reap_mass_top_observed = $reapMassTopObserved
     reap_mass_armed_first_layer = $reapMassFirstLayer
     reap_mass_armed_last_layer = $reapMassLastLayer
+    reap_mass_transport_observed = $reapMassTransport
     reap_mass_tokens = $reapMassTokens
     reap_mass_observed_slots = $reapMassObservedSlots
     reap_mass_unique_entries = $reapMassUnique
@@ -1258,7 +1261,7 @@ Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [
 Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
 Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
 Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
-Write-Host ("REAP mass requested/armed/window/top/tokens/slots/unique/top mass/touched: " + [bool]$ReapMassObserve + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
+Write-Host ("REAP mass requested/armed/window/top/transport/tokens/slots/unique/top mass/touched: " + [bool]$ReapMassObserve + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTransport + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena carry requested: " + $DynamicArenaCarry)
 Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)

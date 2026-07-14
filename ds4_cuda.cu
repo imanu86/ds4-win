@@ -399,6 +399,11 @@ struct cuda_prefill_mass_observer {
 
 static cuda_prefill_mass_observer g_prefill_mass_observer;
 
+struct cuda_reap_router_trace {
+    int32_t selected[6];
+    float weights[6];
+};
+
 struct cuda_reap_mass_observer {
     int enabled;
     int armed;
@@ -421,6 +426,9 @@ struct cuda_reap_mass_observer {
 };
 
 static cuda_reap_mass_observer g_reap_mass_observer;
+static cuda_reap_router_trace *g_reap_router_trace_device = NULL;
+static cuda_reap_router_trace *g_reap_router_trace_host = NULL;
+static int g_reap_router_trace_valid = 0;
 
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_moe_expert_cache_invalidate(void);
@@ -438,6 +446,7 @@ static void cuda_prefill_mass_observer_release(int report);
 static int cuda_prefill_mass_observer_needs_weights(void);
 static void cuda_reap_mass_observer_reset(void);
 static void cuda_reap_mass_observer_release(int report);
+static void cuda_reap_router_trace_release(void);
 static int cuda_reap_mass_observer_needs_weights(void);
 static void cuda_reap_mass_observe_selected(
         uint32_t layer_index, uint32_t n_tokens,
@@ -2074,6 +2083,7 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
     }
     cuda_prefill_mass_observer_release(1);
     cuda_reap_mass_observer_release(1);
+    cuda_reap_router_trace_release();
     cuda_dynamic_arena_observer_release();
     cuda_dynamic_arena_storage_release();
     g_dynamic_arena.model_map = NULL;
@@ -3290,6 +3300,39 @@ static int cuda_reap_mass_observer_needs_weights(void) {
     return g_reap_mass_observer.enabled;
 }
 
+static void cuda_reap_router_trace_release(void) {
+    g_reap_router_trace_valid = 0;
+    if (g_reap_router_trace_host) {
+        (void)cudaFreeHost(g_reap_router_trace_host);
+        g_reap_router_trace_host = NULL;
+    }
+    if (g_reap_router_trace_device) {
+        (void)cudaFree(g_reap_router_trace_device);
+        g_reap_router_trace_device = NULL;
+    }
+}
+
+static int cuda_reap_router_trace_ensure(void) {
+    if (g_reap_router_trace_device && g_reap_router_trace_host) return 1;
+    cuda_reap_router_trace_release();
+    if (!cuda_ok(cudaMalloc((void **)&g_reap_router_trace_device,
+                            sizeof(*g_reap_router_trace_device)),
+                 "reap router trace device alloc")) {
+        cuda_reap_router_trace_release();
+        return 0;
+    }
+    if (!cuda_ok(cudaHostAlloc((void **)&g_reap_router_trace_host,
+                               sizeof(*g_reap_router_trace_host),
+                               cudaHostAllocDefault),
+                 "reap router trace host alloc")) {
+        cuda_reap_router_trace_release();
+        return 0;
+    }
+    memset(g_reap_router_trace_host, 0, sizeof(*g_reap_router_trace_host));
+    g_reap_router_trace_valid = 0;
+    return 1;
+}
+
 static void cuda_reap_mass_report(const char *reason) {
     cuda_reap_mass_observer &observer = g_reap_mass_observer;
     if (!observer.enabled || !observer.armed || observer.tokens == 0) return;
@@ -3407,6 +3450,11 @@ static void cuda_reap_mass_observer_reset(void) {
                 "ds4: [reap-mass] unavailable reason=dynamic-arena-not-ready\n");
         return;
     }
+    if (!cuda_reap_router_trace_ensure()) {
+        fprintf(stderr,
+                "ds4: [reap-mass] packed router trace unavailable; observer disabled\n");
+        return;
+    }
     const uint32_t layer_max = std::min(42u, g_dynamic_arena.n_layer - 1u);
     if (layer_max < 3) return;
     const uint32_t entry_count =
@@ -3445,7 +3493,7 @@ static void cuda_reap_mass_arm(uint32_t top, uint32_t n_tokens) {
     observer.top = top;
     observer.armed = 1;
     fprintf(stderr,
-            "ds4: [reap-mass] armed window=%u top=%u layers=%u..%u semantics=selected_weight_normalized_per_token sliding_ring_observe_only\n",
+            "ds4: [reap-mass] armed window=%u top=%u layers=%u..%u semantics=selected_weight_normalized_per_token sliding_ring_observe_only transport=packed-router-d2h\n",
             observer.window, observer.top,
             observer.layer_min, observer.layer_max);
 }
@@ -7434,6 +7482,18 @@ __device__ static float softplus_dev(float x) {
     return log1pf(expf(x));
 }
 
+__device__ __forceinline__ static void cuda_reap_router_trace_write(
+        cuda_reap_router_trace *trace,
+        const int32_t *selected,
+        const float *weights) {
+    if (!trace) return;
+    #pragma unroll
+    for (uint32_t i = 0; i < 6u; i++) {
+        trace->selected[i] = selected[i];
+        trace->weights[i] = weights[i];
+    }
+}
+
 __global__ static void router_select_kernel(
         int32_t *selected,
         float *weights,
@@ -7446,7 +7506,8 @@ __global__ static void router_select_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        cuda_reap_router_trace *reap_trace) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
     const float *log = logits + (uint64_t)t * 256;
@@ -7484,6 +7545,7 @@ __global__ static void router_select_kernel(
     }
     sum = fmaxf(sum, 6.103515625e-5f);
     for (int i = 0; i < 6; i++) w[i] = w[i] / sum * 1.5f;
+    if (t == 0) cuda_reap_router_trace_write(reap_trace, sel, w);
 }
 
 __global__ static void router_select_parallel_kernel(
@@ -7498,7 +7560,8 @@ __global__ static void router_select_parallel_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        cuda_reap_router_trace *reap_trace) {
     uint32_t t = blockIdx.x;
     uint32_t i = threadIdx.x;
     if (t >= n_tokens || i >= 256u) return;
@@ -7542,6 +7605,7 @@ __global__ static void router_select_parallel_kernel(
     }
     sum = fmaxf(sum, 6.103515625e-5f);
     for (int j = 0; j < 6; j++) w[j] = w[j] / sum * 1.5f;
+    if (t == 0) cuda_reap_router_trace_write(reap_trace, sel, w);
 }
 
 __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
@@ -7560,7 +7624,8 @@ __global__ static void router_select_warp_topk_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        cuda_reap_router_trace *reap_trace) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
@@ -7602,6 +7667,7 @@ __global__ static void router_select_warp_topk_kernel(
             sum = fmaxf(sum, 6.103515625e-5f);
             #pragma unroll
             for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+            if (t == 0) cuda_reap_router_trace_write(reap_trace, sel, w);
         }
         return;
     }
@@ -7656,6 +7722,7 @@ __global__ static void router_select_warp_topk_kernel(
         sum = fmaxf(sum, 6.103515625e-5f);
         #pragma unroll
         for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+        if (t == 0) cuda_reap_router_trace_write(reap_trace, sel, w);
     }
 }
 
@@ -10367,9 +10434,12 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
     return cuda_ok(cudaGetLastError(), "directional steering launch");
 }
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
+    g_reap_router_trace_valid = 0;
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
     int32_t tok = (int32_t)token;
     int ok = 1;
+    cuda_reap_router_trace *reap_trace =
+        g_reap_mass_observer.enabled ? g_reap_router_trace_device : NULL;
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (ok && has_bias && !hash_mode) {
@@ -10389,21 +10459,26 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                         has_bias && !hash_mode, hash_mode);
+                                                         has_bias && !hash_mode, hash_mode,
+                                                         reap_trace);
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
             router_select_parallel_kernel<<<1, 256>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                      has_bias && !hash_mode, hash_mode);
+                                                      has_bias && !hash_mode, hash_mode,
+                                                      reap_trace);
         } else {
             router_select_kernel<<<1, 1>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                           bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                          has_bias && !hash_mode, hash_mode);
+                                          has_bias && !hash_mode, hash_mode,
+                                          reap_trace);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
+        g_reap_router_trace_valid = ok && reap_trace != NULL;
     }
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_tokens) {
+    g_reap_router_trace_valid = 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
         logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
@@ -10439,7 +10514,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         hash_rows,
                                                                         n_tokens,
                                                                         has_bias && !hash_mode,
-                                                                        hash_mode);
+                                                                        hash_mode,
+                                                                        NULL);
     } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
         router_select_parallel_kernel<<<n_tokens, 256>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
@@ -10452,7 +10528,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                          hash_rows,
                                                          n_tokens,
                                                          has_bias && !hash_mode,
-                                                         hash_mode);
+                                                         hash_mode,
+                                                         NULL);
     } else {
         router_select_kernel<<<n_tokens, 1>>>((int32_t *)selected->ptr,
                                               (float *)weights->ptr,
@@ -10465,7 +10542,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                               hash_rows,
                                               n_tokens,
                                               has_bias && !hash_mode,
-                                              hash_mode);
+                                              hash_mode,
+                                              NULL);
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
@@ -13295,19 +13373,28 @@ static int cuda_moe_selected_load(
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
     const int prefill_mass_weights =
         cuda_prefill_mass_observer_needs_weights();
-    const int reap_mass_weights = n_tokens == 1 &&
-        cuda_reap_mass_observer_needs_weights();
+    const int reap_mass_requested = n_tokens == 1 &&
+        cuda_reap_mass_observer_needs_weights() &&
+        g_reap_router_trace_valid;
     const int weights_available = weights_arg && weights_arg->ptr &&
         weights_arg->bytes >= (uint64_t)slot_count * sizeof(float);
+    const int reap_mass_weights = reap_mass_requested && weights_available;
+    if (reap_mass_requested && !weights_available) {
+        g_reap_router_trace_valid = 0;
+    }
     const int layer_top1 =
         cuda_moe_expert_cache_requested() != 0 && cuda_moe_expert_cache_layer_top1();
     if (layer_top1 &&
         !weights_available) {
         return 0;
     }
+    const int packed_reap_trace = reap_mass_weights && weights_available &&
+        g_reap_router_trace_device && g_reap_router_trace_host;
     const int copy_weights =
         weights_available &&
-        (layer_top1 || prefill_mass_weights || reap_mass_weights);
+        (layer_top1 || prefill_mass_weights ||
+         (reap_mass_weights && !packed_reap_trace));
+    const int host_weights_available = copy_weights || packed_reap_trace;
 
     const int prepared =
         g_moe_selected_prepared.valid &&
@@ -13339,7 +13426,19 @@ static int cuda_moe_selected_load(
      * to choose residency; selection itself remains unchanged. */
     if (prepared) {
         if (g_moe_gather.h_sel.size() != slot_count) return 0;
-        if (copy_weights) {
+        if (packed_reap_trace) {
+            g_moe_gather.h_weights.resize(slot_count);
+            g_reap_router_trace_valid = 0;
+            if (!cuda_ok(cudaMemcpy(
+                    g_reap_router_trace_host, g_reap_router_trace_device,
+                    sizeof(*g_reap_router_trace_host),
+                    cudaMemcpyDeviceToHost), "moe packed router trace D2H")) {
+                return 0;
+            }
+            memcpy(g_moe_gather.h_weights.data(),
+                   g_reap_router_trace_host->weights,
+                   (size_t)slot_count * sizeof(float));
+        } else if (copy_weights) {
             g_moe_gather.h_weights.resize(slot_count);
             if (!cuda_ok(cudaMemcpy(
                     g_moe_gather.h_weights.data(), weights_arg->ptr,
@@ -13348,6 +13447,22 @@ static int cuda_moe_selected_load(
                 return 0;
             }
         }
+    } else if (packed_reap_trace) {
+        g_moe_gather.h_sel.resize(slot_count);
+        g_moe_gather.h_weights.resize(slot_count);
+        g_reap_router_trace_valid = 0;
+        if (!cuda_ok(cudaMemcpy(
+                g_reap_router_trace_host, g_reap_router_trace_device,
+                sizeof(*g_reap_router_trace_host),
+                cudaMemcpyDeviceToHost), "moe packed router trace D2H")) {
+            return 0;
+        }
+        memcpy(g_moe_gather.h_sel.data(),
+               g_reap_router_trace_host->selected,
+               (size_t)slot_count * sizeof(int32_t));
+        memcpy(g_moe_gather.h_weights.data(),
+               g_reap_router_trace_host->weights,
+               (size_t)slot_count * sizeof(float));
     } else if (copy_weights) {
         g_moe_gather.h_sel.resize(slot_count);
         g_moe_gather.h_weights.resize(slot_count);
@@ -13367,10 +13482,13 @@ static int cuda_moe_selected_load(
 
     cuda_prefill_mass_observe_selected(
         layer_index, n_tokens, g_moe_gather.h_sel.data(),
-        copy_weights ? g_moe_gather.h_weights.data() : NULL, slot_count);
-    cuda_reap_mass_observe_selected(
-        layer_index, n_tokens, g_moe_gather.h_sel.data(),
-        copy_weights ? g_moe_gather.h_weights.data() : NULL, slot_count);
+        host_weights_available ? g_moe_gather.h_weights.data() : NULL,
+        slot_count);
+    if (reap_mass_weights) {
+        cuda_reap_mass_observe_selected(
+            layer_index, n_tokens, g_moe_gather.h_sel.data(),
+            g_moe_gather.h_weights.data(), slot_count);
+    }
 
     /* Residency learning consumes the exact selected ids already required by
      * execution. It does not change router scores, top-k, or the active mask. */
