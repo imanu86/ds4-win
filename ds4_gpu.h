@@ -18,6 +18,25 @@
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 typedef struct ds4_gpu_async_read ds4_gpu_async_read;
+typedef struct ds4_gpu_dynamic_arena_txn ds4_gpu_dynamic_arena_txn;
+
+typedef struct {
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t up_expert_bytes;
+    uint64_t down_expert_bytes;
+} ds4_gpu_dynamic_arena_layer;
+
+typedef struct {
+    uint32_t layer;
+    uint32_t expert;
+    uint32_t slot;
+    uint64_t slot_generation;
+    void *host_ptr;
+    uint64_t host_bytes;
+} ds4_gpu_dynamic_arena_load;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
@@ -82,12 +101,27 @@ int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint
  * it is deliberately not device-mapped and consumes no proportional VRAM. */
 int ds4_gpu_dynamic_arena_bind(
         const void *model_map, uint64_t model_size,
-        uint32_t n_layer, uint32_t n_expert,
-        uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+        const ds4_gpu_dynamic_arena_layer *layers,
+        uint32_t n_layer, uint32_t n_expert);
 int ds4_gpu_dynamic_arena_prepare(
         uint64_t requested_bytes,
         uint64_t *allocated_bytes,
         uint32_t *slot_count);
+int ds4_gpu_dynamic_arena_begin(
+        const uint8_t *target_resident,
+        uint32_t entry_count,
+        ds4_gpu_dynamic_arena_txn **out_txn,
+        const ds4_gpu_dynamic_arena_load **out_loads,
+        uint32_t *out_load_count);
+int ds4_gpu_dynamic_arena_finish_load(
+        ds4_gpu_dynamic_arena_txn *txn,
+        uint32_t load_index,
+        uint64_t checksum,
+        int success);
+int ds4_gpu_dynamic_arena_publish(
+        ds4_gpu_dynamic_arena_txn *txn,
+        uint64_t *snapshot_generation);
+void ds4_gpu_dynamic_arena_abort(ds4_gpu_dynamic_arena_txn *txn);
 void ds4_gpu_dynamic_arena_release(void);
 
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
@@ -689,6 +723,7 @@ int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *experts,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer_index,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,
@@ -734,6 +769,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *experts,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer_index,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,

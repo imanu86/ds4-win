@@ -12898,6 +12898,7 @@ int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *experts,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer_index,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,
@@ -12919,6 +12920,7 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_spex_key *spex_key) {
     (void)spex_queue;
     (void)spex_key;
+    (void)layer_index;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_expert == 0 || n_expert > 6) {
@@ -13208,6 +13210,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *experts,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer_index,
         uint64_t                gate_offset,
         uint64_t                up_offset,
         uint64_t                down_offset,
@@ -13227,6 +13230,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         bool                   *mid_is_f16) {
+    (void)layer_index;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_tokens == 0 || n_expert == 0 || n_expert > 6) {

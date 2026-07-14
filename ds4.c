@@ -10275,9 +10275,10 @@ static bool metal_graph_encode_decode_layer(
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
-                                                 g->routed_down,
-                                                 model->map, model->size,
-                                                 layer->ffn_gate_exps->abs_offset,
+                                                  g->routed_down,
+                                                  model->map, model->size,
+                                                  il,
+                                                  layer->ffn_gate_exps->abs_offset,
                                                  layer->ffn_up_exps->abs_offset,
                                                  layer->ffn_down_exps->abs_offset,
                                                  layer->ffn_gate_exps->type,
@@ -13039,9 +13040,10 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    g->batch_routed_up,
                                                    g->batch_routed_mid,
                                                    g->batch_routed_down,
-                                                   model->map,
-                                                   model->size,
-                                                   layer->ffn_gate_exps->abs_offset,
+                                                    model->map,
+                                                    model->size,
+                                                    il,
+                                                    layer->ffn_gate_exps->abs_offset,
                                                    layer->ffn_up_exps->abs_offset,
                                                    layer->ffn_down_exps->abs_offset,
                                                    layer->ffn_gate_exps->type,
@@ -17790,6 +17792,287 @@ void ds4_engine_close(ds4_engine *e) {
     free(e);
 }
 
+#ifndef DS4_NO_GPU
+static bool dynamic_arena_tensor_geometry(
+        const ds4_model  *model,
+        const ds4_tensor *tensor,
+        uint32_t          layer,
+        const char       *part,
+        uint64_t         *offset,
+        uint64_t         *expert_bytes) {
+    if (!model || !model->map || !tensor || !offset || !expert_bytes ||
+        tensor->ndim != 3 || tensor->dim[0] == 0 || tensor->dim[1] == 0 ||
+        tensor->dim[2] != DS4_N_EXPERT ||
+        !tensor_is_routed_expert_type(tensor->type)) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic arena rejected layer %u %s tensor geometry\n",
+                layer, part);
+        return false;
+    }
+
+    const gguf_type_info *info = tensor_type(tensor->type);
+    if (!info || info->block_elems == 0 ||
+        (tensor->dim[0] % info->block_elems) != 0) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic arena rejected layer %u %s quant geometry\n",
+                layer, part);
+        return false;
+    }
+
+    const uint64_t blocks = tensor->dim[0] / info->block_elems;
+    if (blocks > UINT64_MAX / info->block_bytes) return false;
+    const uint64_t row_bytes = blocks * info->block_bytes;
+    if (row_bytes > UINT64_MAX / tensor->dim[1]) return false;
+    const uint64_t one_expert = row_bytes * tensor->dim[1];
+    if (one_expert == 0 || one_expert > UINT64_MAX / DS4_N_EXPERT) return false;
+    const uint64_t tensor_bytes = one_expert * DS4_N_EXPERT;
+
+    if (tensor->bytes != tensor_bytes ||
+        tensor->abs_offset < model->tensor_data_pos ||
+        tensor->abs_offset > model->size ||
+        tensor_bytes > model->size - tensor->abs_offset ||
+        tensor->abs_offset > (uint64_t)SIZE_MAX ||
+        tensor_bytes > (uint64_t)SIZE_MAX - tensor->abs_offset) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic arena rejected out-of-range layer %u %s tensor\n",
+                layer, part);
+        return false;
+    }
+
+    *offset = tensor->abs_offset;
+    *expert_bytes = one_expert;
+    return true;
+}
+
+static bool dynamic_arena_build_layers(
+        ds4_gpu_dynamic_arena_layer layers[DS4_N_LAYER],
+        const ds4_model            *model,
+        const ds4_weights          *weights) {
+    memset(layers, 0, sizeof(layers[0]) * DS4_N_LAYER);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        ds4_gpu_dynamic_arena_layer *geometry = &layers[il];
+        if (!dynamic_arena_tensor_geometry(
+                model, layer->ffn_gate_exps, il, "gate",
+                &geometry->gate_offset, &geometry->gate_expert_bytes) ||
+            !dynamic_arena_tensor_geometry(
+                model, layer->ffn_up_exps, il, "up",
+                &geometry->up_offset, &geometry->up_expert_bytes) ||
+            !dynamic_arena_tensor_geometry(
+                model, layer->ffn_down_exps, il, "down",
+                &geometry->down_offset, &geometry->down_expert_bytes) ||
+            geometry->gate_expert_bytes > UINT64_MAX - geometry->up_expert_bytes ||
+            geometry->gate_expert_bytes + geometry->up_expert_bytes >
+                UINT64_MAX - geometry->down_expert_bytes) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool dynamic_arena_source(
+        const ds4_model *model,
+        uint64_t         tensor_offset,
+        uint64_t         expert_bytes,
+        uint32_t         expert,
+        const uint8_t  **source) {
+    if (!model || !model->map || !source || expert >= DS4_N_EXPERT ||
+        expert_bytes == 0 ||
+        (expert != 0 && expert_bytes > UINT64_MAX / expert)) {
+        return false;
+    }
+    const uint64_t relative = expert_bytes * expert;
+    if (tensor_offset > model->size || relative > model->size - tensor_offset) {
+        return false;
+    }
+    const uint64_t offset = tensor_offset + relative;
+    if (expert_bytes > model->size - offset ||
+        offset > (uint64_t)SIZE_MAX ||
+        expert_bytes > (uint64_t)SIZE_MAX - offset) {
+        return false;
+    }
+    *source = model->map + (size_t)offset;
+    return true;
+}
+
+static uint64_t dynamic_arena_fnv1a64(const uint8_t *data, uint64_t bytes) {
+    uint64_t checksum = UINT64_C(14695981039346656037);
+    for (uint64_t i = 0; i < bytes; i++) {
+        checksum ^= data[i];
+        checksum *= UINT64_C(1099511628211);
+    }
+    return checksum;
+}
+
+static bool dynamic_arena_copy_load(
+        const ds4_model                    *model,
+        const ds4_gpu_dynamic_arena_layer  layers[DS4_N_LAYER],
+        const ds4_gpu_dynamic_arena_load  *load,
+        uint64_t                          *checksum) {
+    if (!load || !load->host_ptr || !checksum ||
+        load->layer >= DS4_N_LAYER || load->expert >= DS4_N_EXPERT) {
+        return false;
+    }
+    const ds4_gpu_dynamic_arena_layer *layer = &layers[load->layer];
+    if (layer->gate_expert_bytes > UINT64_MAX - layer->up_expert_bytes) {
+        return false;
+    }
+    const uint64_t gate_up_bytes =
+        layer->gate_expert_bytes + layer->up_expert_bytes;
+    if (gate_up_bytes > UINT64_MAX - layer->down_expert_bytes) return false;
+    const uint64_t slot_bytes = gate_up_bytes + layer->down_expert_bytes;
+    if (slot_bytes == 0 || load->host_bytes != slot_bytes ||
+        slot_bytes > (uint64_t)SIZE_MAX) {
+        return false;
+    }
+
+    const uint8_t *gate = NULL;
+    const uint8_t *up = NULL;
+    const uint8_t *down = NULL;
+    if (!dynamic_arena_source(model, layer->gate_offset,
+                              layer->gate_expert_bytes, load->expert, &gate) ||
+        !dynamic_arena_source(model, layer->up_offset,
+                              layer->up_expert_bytes, load->expert, &up) ||
+        !dynamic_arena_source(model, layer->down_offset,
+                              layer->down_expert_bytes, load->expert, &down)) {
+        return false;
+    }
+
+    uint8_t *destination = load->host_ptr;
+    memcpy(destination, gate, (size_t)layer->gate_expert_bytes);
+    memcpy(destination + (size_t)layer->gate_expert_bytes,
+           up, (size_t)layer->up_expert_bytes);
+    memcpy(destination + (size_t)gate_up_bytes,
+           down, (size_t)layer->down_expert_bytes);
+    *checksum = dynamic_arena_fnv1a64(destination, slot_bytes);
+    return true;
+}
+
+static uint32_t dynamic_arena_test_keep(void) {
+    const char *env = getenv("DS4_CUDA_DYNAMIC_ARENA_TEST_KEEP");
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' ||
+        value < 1 || value > DS4_N_EXPERT) {
+        return 0;
+    }
+    return (uint32_t)value;
+}
+
+/* Disabled-by-default synchronous WRAP fixture; this is not a residency policy. */
+static bool dynamic_arena_wrap_fixture(
+        const ds4_model                    *model,
+        const ds4_gpu_dynamic_arena_layer  layers[DS4_N_LAYER],
+        uint32_t                            keep) {
+    if (keep < 1 || keep > DS4_N_EXPERT) return false;
+    const uint32_t entry_count = DS4_N_LAYER * DS4_N_EXPERT;
+    uint8_t target_resident[DS4_N_LAYER * DS4_N_EXPERT];
+    memset(target_resident, 0, sizeof(target_resident));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        memset(target_resident + il * DS4_N_EXPERT, 1, keep);
+    }
+
+    ds4_gpu_dynamic_arena_txn *txn = NULL;
+    const ds4_gpu_dynamic_arena_load *loads = NULL;
+    uint32_t load_count = 0;
+    if (!ds4_gpu_dynamic_arena_begin(
+            target_resident, entry_count, &txn, &loads, &load_count) || !txn) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic arena WRAP fixture begin failed (keep=%u)\n",
+                keep);
+        if (txn) ds4_gpu_dynamic_arena_abort(txn);
+        return false;
+    }
+
+    bool all_succeeded = loads != NULL || load_count == 0;
+    for (uint32_t i = 0; i < load_count; i++) {
+        uint64_t checksum = 0;
+        const bool copied = loads &&
+            dynamic_arena_copy_load(model, layers, &loads[i], &checksum);
+        const bool finished = ds4_gpu_dynamic_arena_finish_load(
+            txn, i, checksum, copied ? 1 : 0) != 0;
+        if (!copied || !finished) {
+            all_succeeded = false;
+            fprintf(stderr,
+                    "ds4: CUDA dynamic arena WRAP fixture load %u failed\n", i);
+        }
+    }
+
+    uint64_t snapshot_generation = 0;
+    if (all_succeeded &&
+        ds4_gpu_dynamic_arena_publish(txn, &snapshot_generation)) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic arena WRAP fixture published keep=%u "
+                "loads=%u generation=%" PRIu64 "\n",
+                keep, load_count, snapshot_generation);
+        return true;
+    }
+
+    ds4_gpu_dynamic_arena_abort(txn);
+    fprintf(stderr,
+            "ds4: CUDA dynamic arena WRAP fixture aborted (keep=%u loads=%u)\n",
+            keep, load_count);
+    return false;
+}
+
+static bool dynamic_arena_abort_fixture(
+        const ds4_model                    *model,
+        const ds4_gpu_dynamic_arena_layer  layers[DS4_N_LAYER],
+        uint32_t                            published_keep) {
+    if (published_keep < 1 || published_keep >= DS4_N_EXPERT) return false;
+    const uint32_t entry_count = DS4_N_LAYER * DS4_N_EXPERT;
+    uint8_t target[DS4_N_LAYER * DS4_N_EXPERT];
+    memset(target, 0, sizeof(target));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        memset(target + il * DS4_N_EXPERT, 1, published_keep + 1u);
+    }
+
+    ds4_gpu_dynamic_arena_txn *txn = NULL;
+    const ds4_gpu_dynamic_arena_load *loads = NULL;
+    uint32_t load_count = 0;
+    if (!ds4_gpu_dynamic_arena_begin(
+            target, entry_count, &txn, &loads, &load_count) ||
+        !txn || !loads || load_count == 0) {
+        if (txn) ds4_gpu_dynamic_arena_abort(txn);
+        fprintf(stderr, "ds4: CUDA dynamic arena abort fixture begin failed\n");
+        return false;
+    }
+    uint64_t checksum = 0;
+    const bool copied = dynamic_arena_copy_load(
+        model, layers, &loads[0], &checksum);
+    const bool finished = ds4_gpu_dynamic_arena_finish_load(
+        txn, 0, checksum, copied ? 1 : 0) != 0;
+    ds4_gpu_dynamic_arena_abort(txn);
+    if (!copied || !finished) {
+        fprintf(stderr, "ds4: CUDA dynamic arena abort fixture staged load failed\n");
+        return false;
+    }
+
+    memset(target, 0, sizeof(target));
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        memset(target + il * DS4_N_EXPERT, 1, published_keep);
+    }
+    txn = NULL;
+    loads = NULL;
+    load_count = 0;
+    if (!ds4_gpu_dynamic_arena_begin(
+            target, entry_count, &txn, &loads, &load_count) || !txn) {
+        if (txn) ds4_gpu_dynamic_arena_abort(txn);
+        fprintf(stderr, "ds4: CUDA dynamic arena abort fixture verify failed\n");
+        return false;
+    }
+    const bool preserved = load_count == 0;
+    ds4_gpu_dynamic_arena_abort(txn);
+    fprintf(stderr,
+            "ds4: CUDA dynamic arena abort fixture %s "
+            "(published_keep=%u reloads=%u)\n",
+            preserved ? "passed" : "failed", published_keep, load_count);
+    return preserved;
+}
+#endif
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -17833,21 +18116,29 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         const double arena_gb = arena_gb_env && arena_gb_env[0]
             ? strtod(arena_gb_env, NULL) : 0.0;
         if (arena_gb > 0.0) {
-            const ds4_layer_weights *layer0 = &e->weights.layer[0];
-            const uint64_t gate_expert_bytes = layer0->ffn_gate_exps->dim[1] *
-                routed_expert_row_bytes(layer0->ffn_gate_exps);
-            const uint64_t down_expert_bytes = layer0->ffn_down_exps->dim[1] *
-                routed_expert_row_bytes(layer0->ffn_down_exps);
+            ds4_gpu_dynamic_arena_layer layers[DS4_N_LAYER];
             uint64_t allocated = 0;
             uint32_t slots = 0;
             const uint64_t requested = arena_gb >= (double)UINT64_MAX / 1073741824.0
                 ? UINT64_MAX : (uint64_t)(arena_gb * 1073741824.0);
-            if (!ds4_gpu_dynamic_arena_bind(
-                    e->model.map, e->model.size, DS4_N_LAYER, DS4_N_EXPERT,
-                    gate_expert_bytes, down_expert_bytes) ||
+            if (!dynamic_arena_build_layers(layers, &e->model, &e->weights) ||
+                !ds4_gpu_dynamic_arena_bind(
+                    e->model.map, e->model.size, layers,
+                    DS4_N_LAYER, DS4_N_EXPERT) ||
                 !ds4_gpu_dynamic_arena_prepare(requested, &allocated, &slots)) {
                 fprintf(stderr,
                         "ds4: CUDA dynamic arena requested but unavailable; continuing with pageable fallback\n");
+            } else {
+                const uint32_t keep = dynamic_arena_test_keep();
+                if (keep != 0) {
+                    const bool published = dynamic_arena_wrap_fixture(
+                        &e->model, layers, keep);
+                    if (published &&
+                        getenv("DS4_CUDA_DYNAMIC_ARENA_TEST_ABORT") != NULL) {
+                        (void)dynamic_arena_abort_fixture(
+                            &e->model, layers, keep);
+                    }
+                }
             }
         }
     }
