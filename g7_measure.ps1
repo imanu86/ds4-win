@@ -6,6 +6,7 @@ param(
     [int]$TimeoutSec = 900,
     [string]$Tag = "run",
     [string]$Prompt = "Hi",
+    [string]$WarmupPrompt = "",
     [switch]$NoSelectedLoad,
     [switch]$Warmup,
     [switch]$Diagnostics,
@@ -55,6 +56,10 @@ if (-not (Test-Path -LiteralPath $runtimeMonitorHelper)) {
 if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
 }
+if ($WarmupPrompt -and -not $Warmup) {
+    throw "WarmupPrompt requires -Warmup"
+}
+$effectiveWarmupPrompt = if ($WarmupPrompt) { $WarmupPrompt } else { $Prompt }
 $effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $buildManifestPath = Join-Path $PSScriptRoot "build\Release\g7_build_manifest.json"
@@ -225,6 +230,8 @@ $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPa
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
+$warmupPromptBytes = [Text.Encoding]::UTF8.GetBytes($effectiveWarmupPrompt)
+$warmupPromptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($warmupPromptBytes)).Replace("-", "").ToLowerInvariant()
 $buildManifest = $null
 if (-not (Test-Path -LiteralPath $buildManifestPath -PathType Leaf)) {
     throw "Build provenance failed closed: run g7_build.ps1 before measuring"
@@ -317,6 +324,13 @@ $body = @{
     temperature = 0
     think = $false
 } | ConvertTo-Json -Depth 5
+$warmupBody = @{
+    model = "deepseek-chat"
+    messages = @(@{ role = "user"; content = $effectiveWarmupPrompt })
+    max_tokens = $MaxTokens
+    temperature = 0
+    think = $false
+} | ConvertTo-Json -Depth 5
 
 $results = @()
 $httpOk = $false
@@ -325,7 +339,7 @@ $uri = "http://127.0.0.1:" + $Port + "/v1/chat/completions"
 try {
     if ($Warmup) {
         $tw = Get-Date
-        $null = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec
+        $null = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $warmupBody -TimeoutSec $TimeoutSec
         $warmSec = ((Get-Date) - $tw).TotalSeconds
         Write-Host ("[g7] warmup pass done in " + [math]::Round($warmSec,2) + "s")
     }
@@ -807,6 +821,9 @@ $summary = [pscustomobject]@{
     model_last_write_utc = $modelInfoAtStart.LastWriteTimeUtc.ToString("o")
     prompt = $Prompt
     prompt_sha256 = $promptHash
+    warmup_prompt = $(if ($Warmup) { $effectiveWarmupPrompt } else { "" })
+    warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
+    warmup_prompt_distinct = [bool]($Warmup -and $effectiveWarmupPrompt -ne $Prompt)
     expected_content_sha256 = $ExpectedContentSHA256.ToLowerInvariant()
     requested_max_tokens = $MaxTokens
     context_requested = $Context
