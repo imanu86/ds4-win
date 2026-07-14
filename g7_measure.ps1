@@ -38,6 +38,7 @@ param(
     [ValidateSet(0, 1)][int]$SpexPrefetchK = 0,
     [ValidateRange(1, 1000000)][int]$SpexStatsEvery = 1000000,
     [string]$ExpectedContentSHA256 = "",
+    [string]$ExpectedWarmupContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000,
     [ValidateRange(64, 131072)][int]$Context = 256,
@@ -56,8 +57,14 @@ if (-not (Test-Path -LiteralPath $runtimeMonitorHelper)) {
 if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
 }
+if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedWarmupContentSHA256 must be a 64-character hexadecimal SHA-256"
+}
 if ($WarmupPrompt -and -not $Warmup) {
     throw "WarmupPrompt requires -Warmup"
+}
+if ($ExpectedWarmupContentSHA256 -and -not $Warmup) {
+    throw "ExpectedWarmupContentSHA256 requires -Warmup"
 }
 $effectiveWarmupPrompt = if ($WarmupPrompt) { $WarmupPrompt } else { $Prompt }
 $effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
@@ -70,10 +77,14 @@ $stderrLog = Join-Path $outdir ("g7_" + $Tag + "_stderr.log")
 $stdoutLog = Join-Path $outdir ("g7_" + $Tag + "_stdout.log")
 $memoryPreflightLog = Join-Path $outdir ("g7_" + $Tag + "_memory_preflight.json")
 $runtimeTelemetryLog = Join-Path $outdir ("g7_" + $Tag + "_runtime_telemetry.jsonl")
+$rawOutputsPath = Join-Path $outdir ("g7_" + $Tag + "_raw_outputs.json")
+$resultPath = Join-Path $outdir ("g7_" + $Tag + "_result.json")
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
 if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
 if (Test-Path $runtimeTelemetryLog) { Remove-Item $runtimeTelemetryLog -Force }
+if (Test-Path $rawOutputsPath) { Remove-Item $rawOutputsPath -Force }
+if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
 
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
@@ -333,14 +344,31 @@ $warmupBody = @{
 } | ConvertTo-Json -Depth 5
 
 $results = @()
+$warmupResult = $null
 $httpOk = $false
 $warmSec = 0.0
 $uri = "http://127.0.0.1:" + $Port + "/v1/chat/completions"
 try {
     if ($Warmup) {
         $tw = Get-Date
-        $null = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $warmupBody -TimeoutSec $TimeoutSec
+        $warmResp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $warmupBody -TimeoutSec $TimeoutSec
         $warmSec = ((Get-Date) - $tw).TotalSeconds
+        $warmContent = [string]$warmResp.choices[0].message.content
+        $warmCompletionTokens = [int]$warmResp.usage.completion_tokens
+        if ($warmCompletionTokens -le 0) {
+            throw "Warmup response did not report a positive usage.completion_tokens value"
+        }
+        $warmBytes = [Text.Encoding]::UTF8.GetBytes($warmContent)
+        $warmContentHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($warmBytes)).Replace("-", "").ToLowerInvariant()
+        $warmupResult = [pscustomobject]@{
+            seconds = [math]::Round($warmSec, 6)
+            completion_tokens = $warmCompletionTokens
+            content_sha256 = $warmContentHash
+            content = $warmContent
+        }
+        if ($ExpectedWarmupContentSHA256 -and $warmContentHash -ine $ExpectedWarmupContentSHA256) {
+            throw "Measurement failed: warmup output hash differs from expected baseline"
+        }
         Write-Host ("[g7] warmup pass done in " + [math]::Round($warmSec,2) + "s")
     }
     for ($i = 1; $i -le $Repeats; $i++) {
@@ -485,6 +513,7 @@ $arenaCarryObserved = $false; $arenaCarryLineCount = 0; $arenaCarryRequest = 0
 $arenaCarryModeObserved = "not_observed"; $arenaCarrySnapshot = 0
 $arenaCarryResident = 0; $arenaCarryLookupObserved = "not_observed"
 $arenaCarryObserverObserved = "not_observed"
+$arenaCarryEvents = @()
 $arenaGrowthPublications = 0; $arenaGrowthSkips = 0
 $arenaGrowthEvents = @()
 $contextObserved = 0; $prefillChunkObserved = 0
@@ -667,15 +696,27 @@ if (Test-Path $stderrLog) {
     $arenaGrowthSkips = @($lines | Where-Object { $_ -match "\[arena-observe\] grow skipped" }).Count
     $arenaCarryLines = @($lines | Where-Object { $_ -match "\[arena-carry\]" })
     $arenaCarryLineCount = $arenaCarryLines.Count
-    $arenaCarryLine = $arenaCarryLines | Select-Object -Last 1
-    if ($arenaCarryLine -and $arenaCarryLine -match "\[arena-carry\] request=(\d+) mode=(prime|keep|drop) snapshot=(\d+) resident=(\d+) lookup=(enabled|disabled) observer=(learning|frozen)") {
+    foreach ($arenaCarryLine in $arenaCarryLines) {
+        if ($arenaCarryLine -match "\[arena-carry\] request=(\d+) mode=(prime|keep|drop) snapshot=(\d+) resident=(\d+) lookup=(enabled|disabled) observer=(learning|frozen)") {
+            $arenaCarryEvents += [pscustomobject]@{
+                request = [int]$Matches[1]
+                mode = $Matches[2]
+                snapshot = [long]$Matches[3]
+                resident = [long]$Matches[4]
+                lookup = $Matches[5]
+                observer = $Matches[6]
+            }
+        }
+    }
+    $lastArenaCarryEvent = $arenaCarryEvents | Select-Object -Last 1
+    if ($lastArenaCarryEvent) {
         $arenaCarryObserved = $true
-        $arenaCarryRequest = [int]$Matches[1]
-        $arenaCarryModeObserved = $Matches[2]
-        $arenaCarrySnapshot = [long]$Matches[3]
-        $arenaCarryResident = [long]$Matches[4]
-        $arenaCarryLookupObserved = $Matches[5]
-        $arenaCarryObserverObserved = $Matches[6]
+        $arenaCarryRequest = $lastArenaCarryEvent.request
+        $arenaCarryModeObserved = $lastArenaCarryEvent.mode
+        $arenaCarrySnapshot = $lastArenaCarryEvent.snapshot
+        $arenaCarryResident = $lastArenaCarryEvent.resident
+        $arenaCarryLookupObserved = $lastArenaCarryEvent.lookup
+        $arenaCarryObserverObserved = $lastArenaCarryEvent.observer
     }
     $arenaFinalLine = $lines | Where-Object { $_ -match "\[arena\] final" } | Select-Object -Last 1
     if ($arenaFinalLine -and $arenaFinalLine -match "\[arena\] final hits=(\d+) misses=(\d+) fatal=(\d+) uploaded=([0-9.]+) GiB") {
@@ -751,9 +792,24 @@ if ($DynamicArenaCarry -ne "default") {
     $expectedCarryLookup = if ($DynamicArenaCarry -eq "keep") { "enabled" } else { "disabled" }
     if (-not $arenaCarryObserved) { throw "Dynamic arena carry measurement failed: telemetry was not observed" }
     if ($arenaCarryLineCount -ne ($Repeats + 1)) { throw "Dynamic arena carry measurement failed: expected $($Repeats + 1) request markers, observed $arenaCarryLineCount" }
-    if ($arenaCarryRequest -ne ($Repeats + 1) -or $arenaCarryModeObserved -ne $DynamicArenaCarry) { throw "Dynamic arena carry measurement failed: last request/mode mismatch" }
-    if ($arenaCarrySnapshot -le 0 -or $arenaCarryResident -le 0) { throw "Dynamic arena carry measurement failed: learned snapshot was empty" }
-    if ($arenaCarryLookupObserved -ne $expectedCarryLookup -or $arenaCarryObserverObserved -ne "frozen") { throw "Dynamic arena carry measurement failed: lookup/observer state mismatch" }
+    if ($arenaCarryEvents.Count -ne ($Repeats + 1)) { throw "Dynamic arena carry measurement failed: one or more request markers were malformed" }
+    $prime = $arenaCarryEvents[0]
+    if ($prime.request -ne 1 -or $prime.mode -ne "prime" -or $prime.snapshot -ne 0 -or
+        $prime.resident -ne 0 -or $prime.lookup -ne "enabled" -or $prime.observer -ne "learning") {
+        throw "Dynamic arena carry measurement failed: request 1 was not a clean prime"
+    }
+    for ($carryIndex = 1; $carryIndex -lt $arenaCarryEvents.Count; $carryIndex++) {
+        $event = $arenaCarryEvents[$carryIndex]
+        if ($event.request -ne ($carryIndex + 1) -or $event.mode -ne $DynamicArenaCarry) {
+            throw "Dynamic arena carry measurement failed: request sequence/mode mismatch"
+        }
+        if ($event.snapshot -le 0 -or $event.resident -le 0) {
+            throw "Dynamic arena carry measurement failed: learned snapshot was empty"
+        }
+        if ($event.lookup -ne $expectedCarryLookup -or $event.observer -ne "frozen") {
+            throw "Dynamic arena carry measurement failed: lookup/observer state mismatch"
+        }
+    }
     if ($arenaObserverPublicationCount -ne 1 -or $arenaWrapPublicationCount -ne 1) { throw "Dynamic arena carry measurement failed: learned arena was republished during measured requests" }
 }
 
@@ -771,7 +827,6 @@ $meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Aver
 $minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
 $maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
-$rawOutputsPath = Join-Path $outdir ("g7_" + $Tag + "_raw_outputs.json")
 $rawOutputs = [pscustomobject]@{
     schema = "g7_raw_outputs_v1"
     tag = $Tag
@@ -779,7 +834,10 @@ $rawOutputs = [pscustomobject]@{
     executable_sha256 = $exeHashAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
     prompt_sha256 = $promptHash
+    warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     expected_content_sha256 = if ($ExpectedContentSHA256) { $ExpectedContentSHA256.ToLowerInvariant() } else { "" }
+    expected_warmup_content_sha256 = if ($ExpectedWarmupContentSHA256) { $ExpectedWarmupContentSHA256.ToLowerInvariant() } else { "" }
+    warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
     results = $results
@@ -825,6 +883,8 @@ $summary = [pscustomobject]@{
     warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     warmup_prompt_distinct = [bool]($Warmup -and $effectiveWarmupPrompt -ne $Prompt)
     expected_content_sha256 = $ExpectedContentSHA256.ToLowerInvariant()
+    expected_warmup_content_sha256 = $ExpectedWarmupContentSHA256.ToLowerInvariant()
+    warmup_result = $warmupResult
     requested_max_tokens = $MaxTokens
     context_requested = $Context
     context_observed = $contextObserved
@@ -854,6 +914,7 @@ $summary = [pscustomobject]@{
     dynamic_arena_carry_resident_observed = $arenaCarryResident
     dynamic_arena_carry_lookup_observed = $arenaCarryLookupObserved
     dynamic_arena_carry_observer_observed = $arenaCarryObserverObserved
+    dynamic_arena_carry_events = $arenaCarryEvents
     dynamic_arena_observer_publication_count = $arenaObserverPublicationCount
     dynamic_arena_wrap_publication_count = $arenaWrapPublicationCount
     reap_prefetch_threads_requested = $ReapPrefetchThreads
@@ -980,7 +1041,7 @@ $summary = [pscustomobject]@{
     outputs_identical = ($hashes.Count -eq 1)
     results = $results
 }
-$summary | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $outdir ("g7_" + $Tag + "_result.json"))
+$summary | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $resultPath
 
 Write-Host ""
 Write-Host "================ G7 RESULT ($Tag) ================"
