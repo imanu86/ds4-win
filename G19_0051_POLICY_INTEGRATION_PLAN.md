@@ -12,6 +12,12 @@ K23 is intentionally temporary. Existing quality evidence rejects it as the
 final production width; the current 0051 design targets a substantially wider,
 adaptive current-interaction set, with K154 as the principal capacity point.
 
+G19A is now measured separately in `G19A_OBSERVED_RESIDENCY_RESULTS.md`. It
+proves that current-session residency alone preserves exact output and improves
+post-publish decode, but its boundary WRAP rereads the observed experts and is
+too expensive. G19B must reuse selected-load's first-fetch bytes before this
+plan enables any dynamic router bias.
+
 ## Checkpoint chain
 
 - `a880b01`: pinned `cudaHostAllocDefault` arena substrate.

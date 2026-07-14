@@ -18299,6 +18299,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             ds4_tokens_copy(&s->checkpoint, prompt);
             s->checkpoint_valid = true;
+            ds4_gpu_dynamic_arena_observer_reset();
             return 0;
         }
 
@@ -18314,6 +18315,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
             }
             token_vec_push(&s->checkpoint, prompt->v[i]);
         }
+        ds4_gpu_dynamic_arena_observer_reset();
         return 0;
     }
 
@@ -18343,6 +18345,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->graph.mtp_n_raw = 0;
+    ds4_gpu_dynamic_arena_observer_reset();
     return 0;
 #endif
 }

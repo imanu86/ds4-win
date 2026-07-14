@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
+#include <atomic>
 #include <new>
 #include <unordered_map>
 #include <vector>
@@ -348,6 +350,19 @@ struct ds4_gpu_dynamic_arena_txn {
 
 static cuda_dynamic_arena g_dynamic_arena;
 
+struct cuda_dynamic_arena_observer {
+    uint32_t window;
+    uint32_t completed_tokens;
+    uint32_t unique_entries;
+    uint32_t last_layer;
+    int enabled;
+    int have_last_layer;
+    int settled;
+    std::vector<uint8_t> target;
+};
+
+static cuda_dynamic_arena_observer g_dynamic_arena_observer;
+
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_moe_expert_cache_invalidate(void);
 static void cuda_moe_expert_cache_release(void);
@@ -356,6 +371,13 @@ static uint64_t cuda_model_copy_chunk_bytes(void);
 static int cuda_model_stage_pool_alloc(uint64_t bytes);
 extern "C" void ds4_gpu_dynamic_arena_release(void);
 extern "C" void ds4_gpu_dynamic_arena_abort(ds4_gpu_dynamic_arena_txn *txn);
+extern "C" void ds4_gpu_dynamic_arena_observer_reset(void);
+static void cuda_dynamic_arena_observer_release(void);
+static void cuda_dynamic_arena_observe_selected(
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        const int32_t *selected,
+        uint32_t selected_count);
 static const char *cuda_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
@@ -1973,6 +1995,7 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
                 (unsigned long long)g_dynamic_arena.fatal_errors,
                 (double)g_dynamic_arena.bytes_uploaded / 1073741824.0);
     }
+    cuda_dynamic_arena_observer_release();
     cuda_dynamic_arena_storage_release();
     g_dynamic_arena.model_map = NULL;
     g_dynamic_arena.model_size = 0;
@@ -2138,6 +2161,7 @@ extern "C" int ds4_gpu_dynamic_arena_prepare(
             "ds4: CUDA dynamic arena ready %.2f GiB, %u slots, %.2f MiB/slot, available_ram=%.2f GiB\n",
             (double)bytes / 1073741824.0, (uint32_t)slots64,
             (double)g_dynamic_arena.slot_bytes / 1048576.0, avail_gib);
+    ds4_gpu_dynamic_arena_observer_reset();
     return 1;
 }
 
@@ -2420,6 +2444,298 @@ extern "C" void ds4_gpu_dynamic_arena_abort(
     if (txn->retire_event) (void)cudaEventDestroy(txn->retire_event);
     g_dynamic_arena.txn = NULL;
     delete txn;
+}
+
+static uint32_t cuda_dynamic_arena_observer_window(void) {
+    const char *env = getenv("DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW");
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' ||
+        value == 0 || value > 256) {
+        fprintf(stderr,
+                "ds4: [arena-observe] invalid window '%s'; policy disabled\n",
+                env);
+        return 0;
+    }
+    return (uint32_t)value;
+}
+
+static uint32_t cuda_dynamic_arena_observer_workers(uint32_t load_count) {
+    uint32_t workers = 8;
+    const char *env = getenv("DS4_REAP_PREFETCH_THREADS");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        const unsigned long value = strtoul(env, &end, 10);
+        if (errno == 0 && end != env && *end == '\0' &&
+            value >= 1 && value <= 32) {
+            workers = (uint32_t)value;
+        }
+    }
+    const long cpu_count = os_cpu_count();
+    if (cpu_count > 0 && workers > (uint32_t)cpu_count) {
+        workers = (uint32_t)cpu_count;
+    }
+    if (workers > load_count) workers = load_count;
+    return workers ? workers : 1;
+}
+
+static int cuda_dynamic_arena_copy_load(
+        const ds4_gpu_dynamic_arena_load &load,
+        uint64_t *checksum) {
+    if (!checksum || !load.host_ptr ||
+        load.layer >= g_dynamic_arena.n_layer ||
+        load.expert >= g_dynamic_arena.n_expert) {
+        return 0;
+    }
+    const ds4_gpu_dynamic_arena_layer &layer =
+        g_dynamic_arena.layers[load.layer];
+    if (layer.gate_expert_bytes > UINT64_MAX - layer.up_expert_bytes) {
+        return 0;
+    }
+    const uint64_t gate_up_bytes =
+        layer.gate_expert_bytes + layer.up_expert_bytes;
+    if (gate_up_bytes > UINT64_MAX - layer.down_expert_bytes) return 0;
+    const uint64_t slot_bytes = gate_up_bytes + layer.down_expert_bytes;
+    if (slot_bytes != load.host_bytes ||
+        slot_bytes != g_dynamic_arena.slot_bytes) {
+        return 0;
+    }
+    const uint64_t expert = load.expert;
+    const uint64_t gate_offset =
+        layer.gate_offset + expert * layer.gate_expert_bytes;
+    const uint64_t up_offset =
+        layer.up_offset + expert * layer.up_expert_bytes;
+    const uint64_t down_offset =
+        layer.down_offset + expert * layer.down_expert_bytes;
+    if (gate_offset > g_dynamic_arena.model_size ||
+        layer.gate_expert_bytes > g_dynamic_arena.model_size - gate_offset ||
+        up_offset > g_dynamic_arena.model_size ||
+        layer.up_expert_bytes > g_dynamic_arena.model_size - up_offset ||
+        down_offset > g_dynamic_arena.model_size ||
+        layer.down_expert_bytes > g_dynamic_arena.model_size - down_offset) {
+        return 0;
+    }
+
+    const uint8_t *model = (const uint8_t *)g_dynamic_arena.model_map;
+    uint8_t *destination = (uint8_t *)load.host_ptr;
+    memcpy(destination, model + gate_offset,
+           (size_t)layer.gate_expert_bytes);
+    memcpy(destination + layer.gate_expert_bytes, model + up_offset,
+           (size_t)layer.up_expert_bytes);
+    memcpy(destination + gate_up_bytes, model + down_offset,
+           (size_t)layer.down_expert_bytes);
+    *checksum = cuda_dynamic_arena_fnv1a64(destination, slot_bytes);
+    return 1;
+}
+
+struct cuda_dynamic_arena_wrap_context {
+    const ds4_gpu_dynamic_arena_load *loads;
+    const uint32_t *order;
+    uint32_t load_count;
+    std::atomic<uint32_t> next;
+    uint64_t *checksums;
+    uint8_t *success;
+};
+
+static void *cuda_dynamic_arena_wrap_worker(void *arg) {
+    cuda_dynamic_arena_wrap_context *context =
+        (cuda_dynamic_arena_wrap_context *)arg;
+    for (;;) {
+        const uint32_t cursor =
+            context->next.fetch_add(1, std::memory_order_relaxed);
+        if (cursor >= context->load_count) break;
+        const uint32_t load_index = context->order[cursor];
+        uint64_t checksum = 0;
+        const int copied = cuda_dynamic_arena_copy_load(
+            context->loads[load_index], &checksum);
+        context->checksums[load_index] = checksum;
+        context->success[load_index] = copied ? 1u : 0u;
+    }
+    return NULL;
+}
+
+static int cuda_dynamic_arena_observer_publish(void) {
+    const uint32_t entry_count =
+        g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
+    if (!g_dynamic_arena_observer.enabled ||
+        g_dynamic_arena_observer.target.size() != entry_count) {
+        return 0;
+    }
+
+    ds4_gpu_dynamic_arena_txn *txn = NULL;
+    const ds4_gpu_dynamic_arena_load *loads = NULL;
+    uint32_t load_count = 0;
+    if (!ds4_gpu_dynamic_arena_begin(
+            g_dynamic_arena_observer.target.data(), entry_count,
+            &txn, &loads, &load_count) || !txn) {
+        fprintf(stderr,
+                "ds4: [arena-observe] WRAP begin failed tokens=%u resident=%u slots=%u\n",
+                g_dynamic_arena_observer.completed_tokens,
+                g_dynamic_arena_observer.unique_entries,
+                (uint32_t)g_dynamic_arena.slots.size());
+        if (txn) ds4_gpu_dynamic_arena_abort(txn);
+        return 0;
+    }
+
+    const double started = cuda_wall_sec();
+    uint32_t workers = 0;
+    int all_succeeded = loads != NULL || load_count == 0;
+    std::vector<uint32_t> order;
+    std::vector<uint64_t> checksums;
+    std::vector<uint8_t> success;
+    std::vector<os_thread_t> threads;
+    if (load_count != 0) {
+        try {
+            order.resize(load_count);
+            checksums.assign(load_count, 0);
+            success.assign(load_count, 0);
+            for (uint32_t i = 0; i < load_count; i++) order[i] = i;
+            std::sort(order.begin(), order.end(),
+                [&](uint32_t lhs, uint32_t rhs) {
+                    const ds4_gpu_dynamic_arena_load &a = loads[lhs];
+                    const ds4_gpu_dynamic_arena_load &b = loads[rhs];
+                    const ds4_gpu_dynamic_arena_layer &la =
+                        g_dynamic_arena.layers[a.layer];
+                    const ds4_gpu_dynamic_arena_layer &lb =
+                        g_dynamic_arena.layers[b.layer];
+                    const uint64_t ao = la.gate_offset +
+                        (uint64_t)a.expert * la.gate_expert_bytes;
+                    const uint64_t bo = lb.gate_offset +
+                        (uint64_t)b.expert * lb.gate_expert_bytes;
+                    return ao < bo;
+                });
+            workers = cuda_dynamic_arena_observer_workers(load_count);
+            threads.resize(workers > 1 ? workers - 1 : 0);
+        } catch (...) {
+            all_succeeded = 0;
+        }
+    }
+
+    if (all_succeeded && load_count != 0) {
+        cuda_dynamic_arena_wrap_context context;
+        context.loads = loads;
+        context.order = order.data();
+        context.load_count = load_count;
+        context.next.store(0, std::memory_order_relaxed);
+        context.checksums = checksums.data();
+        context.success = success.data();
+        std::vector<os_thread_t> started;
+        started.reserve(threads.size());
+        for (uint32_t i = 0; i + 1 < workers; i++) {
+            if (os_thread_create(&threads[i],
+                                 cuda_dynamic_arena_wrap_worker,
+                                 &context) == 0) {
+                started.push_back(threads[i]);
+            }
+        }
+        (void)cuda_dynamic_arena_wrap_worker(&context);
+        for (uint32_t i = 0; i < started.size(); i++) {
+            os_thread_join(started[i]);
+        }
+        for (uint32_t i = 0; i < load_count; i++) {
+            const int finished = ds4_gpu_dynamic_arena_finish_load(
+                txn, i, checksums[i], success[i] ? 1 : 0);
+            if (!success[i] || !finished) all_succeeded = 0;
+        }
+    }
+
+    uint64_t generation = 0;
+    if (all_succeeded &&
+        ds4_gpu_dynamic_arena_publish(txn, &generation)) {
+        fprintf(stderr,
+                "ds4: [arena-observe] WRAP published tokens=%u resident=%u loads=%u workers=%u seconds=%.3f generation=%llu\n",
+                g_dynamic_arena_observer.completed_tokens,
+                g_dynamic_arena_observer.unique_entries,
+                load_count, workers, cuda_wall_sec() - started,
+                (unsigned long long)generation);
+        return 1;
+    }
+
+    ds4_gpu_dynamic_arena_abort(txn);
+    fprintf(stderr,
+            "ds4: [arena-observe] WRAP aborted tokens=%u resident=%u loads=%u seconds=%.3f\n",
+            g_dynamic_arena_observer.completed_tokens,
+            g_dynamic_arena_observer.unique_entries,
+            load_count, cuda_wall_sec() - started);
+    return 0;
+}
+
+static void cuda_dynamic_arena_observer_release(void) {
+    g_dynamic_arena_observer.target.clear();
+    g_dynamic_arena_observer.window = 0;
+    g_dynamic_arena_observer.completed_tokens = 0;
+    g_dynamic_arena_observer.unique_entries = 0;
+    g_dynamic_arena_observer.last_layer = 0;
+    g_dynamic_arena_observer.enabled = 0;
+    g_dynamic_arena_observer.have_last_layer = 0;
+    g_dynamic_arena_observer.settled = 0;
+}
+
+extern "C" void ds4_gpu_dynamic_arena_observer_reset(void) {
+    const uint32_t window = cuda_dynamic_arena_observer_window();
+    cuda_dynamic_arena_observer_release();
+    if (window == 0 || !g_dynamic_arena.host_base ||
+        g_dynamic_arena.n_layer <= 3 || g_dynamic_arena.n_expert == 0) {
+        return;
+    }
+    const size_t entry_count =
+        (size_t)g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
+    try {
+        g_dynamic_arena_observer.target.assign(entry_count, 0);
+    } catch (...) {
+        fprintf(stderr,
+                "ds4: [arena-observe] metadata allocation failed; policy disabled\n");
+        return;
+    }
+    g_dynamic_arena_observer.window = window;
+    g_dynamic_arena_observer.enabled = 1;
+    fprintf(stderr,
+            "ds4: [arena-observe] armed window=%u layers=3..%u router=unbiased residency-only\n",
+            window, g_dynamic_arena.n_layer - 1u);
+}
+
+static void cuda_dynamic_arena_observe_selected(
+        uint32_t layer_index,
+        uint32_t n_tokens,
+        const int32_t *selected,
+        uint32_t selected_count) {
+    cuda_dynamic_arena_observer &observer = g_dynamic_arena_observer;
+    if (!observer.enabled || observer.settled || n_tokens != 1 ||
+        !selected || selected_count == 0 ||
+        layer_index < 3 || layer_index >= g_dynamic_arena.n_layer) {
+        return;
+    }
+
+    if (observer.have_last_layer && layer_index <= observer.last_layer) {
+        observer.completed_tokens++;
+        if (observer.completed_tokens >= observer.window) {
+            const int published = cuda_dynamic_arena_observer_publish();
+            observer.settled = 1;
+            fprintf(stderr,
+                    "ds4: [arena-observe] window complete tokens=%u resident=%u result=%s\n",
+                    observer.completed_tokens, observer.unique_entries,
+                    published ? "published" : "fallback");
+            return;
+        }
+    }
+
+    const uint32_t base = layer_index * g_dynamic_arena.n_expert;
+    for (uint32_t i = 0; i < selected_count; i++) {
+        const int32_t expert = selected[i];
+        if (expert < 0 || (uint32_t)expert >= g_dynamic_arena.n_expert) {
+            continue;
+        }
+        uint8_t &entry = observer.target[base + (uint32_t)expert];
+        if (!entry) {
+            entry = 1;
+            observer.unique_entries++;
+        }
+    }
+    observer.last_layer = layer_index;
+    observer.have_last_layer = 1;
 }
 
 extern "C" ds4_gpu_async_read *ds4_gpu_async_read_ring_alloc(
@@ -11689,6 +12005,11 @@ static int cuda_moe_selected_load(
                                 (size_t)slot_count * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
     }
+
+    /* Residency learning consumes the exact selected ids already required by
+     * execution. It does not change router scores, top-k, or the active mask. */
+    cuda_dynamic_arena_observe_selected(
+        layer_index, n_tokens, g_moe_gather.h_sel.data(), slot_count);
 
     /* 2. dedupe -> compact ids (ascending expert order) + per-slot remap */
     std::vector<int32_t> &e2s = g_moe_gather.h_expert_to_slot;
