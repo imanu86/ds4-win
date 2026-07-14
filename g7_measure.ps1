@@ -11,6 +11,8 @@ param(
     [switch]$Diagnostics,
     [int]$ReserveMB = 2048,
     [int]$BudgetGB = 28,
+    [ValidateRange(0, 8192)][int]$Q8F16CacheMB = 0,
+    [ValidateRange(0, 8192)][int]$Q8F16CacheReserveMB = 4096,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
@@ -76,6 +78,12 @@ foreach ($entry in @(Get-ChildItem Env: | Where-Object { $_.Name -like "DS4_*" }
 }
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
+if ($Q8F16CacheMB -gt 0) {
+    $env:DS4_CUDA_Q8_F16_CACHE_MB = "$Q8F16CacheMB"
+} else {
+    Remove-Item Env:\DS4_CUDA_Q8_F16_CACHE_MB -ErrorAction SilentlyContinue
+}
+$env:DS4_CUDA_Q8_F16_CACHE_RESERVE_MB = "$Q8F16CacheReserveMB"
 if ($DynamicArenaGiB -gt 0.0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_GB = $DynamicArenaGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
 } else {
@@ -710,6 +718,20 @@ $meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Aver
 $minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
 $maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
+$rawOutputsPath = Join-Path $outdir ("g7_" + $Tag + "_raw_outputs.json")
+$rawOutputs = [pscustomobject]@{
+    schema = "g7_raw_outputs_v1"
+    tag = $Tag
+    head = $headAtStart
+    executable_sha256 = $exeHashAtStart
+    ds4_cuda_sha256 = $sourceHashAtStart
+    prompt_sha256 = $promptHash
+    expected_content_sha256 = if ($ExpectedContentSHA256) { $ExpectedContentSHA256.ToLowerInvariant() } else { "" }
+    output_hashes = $hashes
+    outputs_identical = ($hashes.Count -eq 1)
+    results = $results
+}
+$rawOutputs | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $rawOutputsPath
 if ($Repeats -gt 1 -and $hashes.Count -ne 1) {
     throw "Measurement failed: repeated outputs were not identical"
 }
@@ -761,6 +783,8 @@ $summary = [pscustomobject]@{
     warmup = [bool]$Warmup
     budget_gb = $BudgetGB
     reserve_mb = $ReserveMB
+    q8_f16_cache_mb_requested = $Q8F16CacheMB
+    q8_f16_cache_reserve_mb_requested = $Q8F16CacheReserveMB
     dynamic_arena_gib_requested = $DynamicArenaGiB
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
@@ -903,6 +927,7 @@ Write-Host ("server decode t/s mean/min/max: " + $serverDecodeMeanTps + " / " + 
 Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
+Write-Host ("Q8-F16 cap/reserve MiB requested: " + $Q8F16CacheMB + " / " + $Q8F16CacheReserveMB)
 Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " / " + $arenaGrowthSkips)

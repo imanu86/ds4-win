@@ -94,14 +94,19 @@ H2D traffic. It is not SSD traffic. Win32 process transfer counters are retained
 but explicitly marked as incomplete for mmap page-ins; no disk-I/O verdict is
 made from them.
 
-## Invalid intermediate result
+## G21 cache-state correction
 
-Two earlier grow-off safety runs at `0.39-0.41 t/s` used executable SHA-256
-`d11ac45980...`. The current source rebuilt as `75ae5a517...` gives `2.07 t/s`
-in the same n=1 safety configuration and `1.97 t/s` median in the controlled
-n=3 arm. Source reconstruction found no grow-off hot-path work capable of a 5x
-regression. The old number is retained as a stale/intermediate-binary failure,
-not used as a baseline or as evidence for growth.
+The earlier attribution of the `0.39-0.41 t/s` grow-off safety runs to a stale
+binary is retracted. Session reconstruction found no rebuild between a slow
+grow-off run, the following grow8 run and a later fast grow-off run. A new
+same-executable discriminator then reproduced the transition: grow8 ran at
+2.02 t/s and the immediately following new-process grow-off arm remained at
+2.05 t/s despite returning to 439 resident experts and a 34.34% arena hit rate.
+
+The Windows memory preflight could not purge the standby list and observed
+about 35-37 GiB of standby pages. G20 therefore remains a valid n=3 comparison
+for the measured warm standby-cache state, but it is not a cold-start verdict.
+See `G21_CACHE_STATE_AND_Q8_GATE_RESULTS.md`.
 
 ## Artifacts
 
@@ -112,10 +117,10 @@ not used as a baseline or as evidence for growth.
 
 ## Next isolated levers
 
-1. Verify a longer decode where growth reaches capacity; do not combine another
+1. Establish and record an explicit cold/primed/uncontrolled cache-state
+   protocol before another throughput verdict.
+2. Verify a longer decode where growth reaches capacity; do not combine another
    lever in that run.
-2. Sweep the separate Q8-F16 VRAM reserve with grow policy fixed, because the
-   current run peaks near 9.95 GiB dedicated while the Q8 path keeps a 4 GiB
-   default reserve.
 3. Test prefill chunk and MoE I/O queue depth independently on long fresh prompts.
-4. Add build-manifest validation so an executable/source mismatch fails closed.
+4. Keep the 256 MiB Q8-F16 / 1,280 MiB reserve arm out of promotion: its G21
+   safety run changed the exact hash and fell to 0.38 t/s.

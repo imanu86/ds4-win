@@ -1,0 +1,42 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache deferred 71.80 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 8.96 GiB of tensor spans in 4.102s
+ds4: cuda backend initialized for graph diagnostics
+0714 09:41:15 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: CUDA dynamic arena ready 12.00 GiB, 1820 slots, 6.75 MiB/slot, available_ram=35.51 GiB bytes=12881756160 slot_bytes=7077888
+ds4: [arena-observe] armed window=16 min_hits=3 grow_interval=0 layers=3..42 router=unbiased residency-only
+0714 09:41:17 ds4-server: listening on http://127.0.0.1:18098
+0714 09:41:18 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=8.00 MiB cached=0.00 GiB limit=0.25 GiB free=1.16 GiB reserve=1.25 GiB total=12.00 GiB)
+ds4: CUDA loading model tensors 7.60 GiB cached
+ds4: CUDA loading model tensors 7.08 GiB cached
+ds4: [arena-observe] armed window=16 min_hits=3 grow_interval=0 layers=3..42 router=unbiased residency-only
+0714 09:41:33 ds4-server: chat ctx=0..43:43 prompt done 15.563s
+ds4: CUDA loading model tensors 7.53 GiB cached
+ds4: CUDA loading model tensors 7.53 GiB cached
+ds4: CUDA loading model tensors 7.55 GiB cached
+ds4: CUDA loading model tensors 7.52 GiB cached
+ds4: [arena] begin base=0 target=447 resident=446 loads=0 slots=1820
+ds4: [arena] publish generation=447 loads=0
+ds4: [arena-observe] WRAP published tokens=16 resident=446 loads=0 workers=0 seconds=0.004 generation=447 preloaded=446 mirror=2.94 GiB verify_workers=8 verify_seconds=0.354
+ds4: [arena-observe] window complete tokens=16 resident=446 growths=0 result=published settled
+ds4: CUDA loading model tensors 7.54 GiB cached
+ds4: CUDA loading model tensors 7.55 GiB cached
+ds4: CUDA loading model tensors 7.52 GiB cached
+ds4: CUDA loading model tensors 7.57 GiB cached
+ds4: CUDA loading model tensors 7.54 GiB cached
+ds4: CUDA loading model tensors 7.60 GiB cached
+ds4: CUDA loading model tensors 7.56 GiB cached
+ds4: CUDA loading model tensors 7.55 GiB cached
+ds4: CUDA loading model tensors 7.54 GiB cached
+0714 09:43:41 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=0.39 t/s avg=0.39 t/s 128.020s
+ds4: CUDA loading model tensors 7.55 GiB cached
+ds4: CUDA loading model tensors 7.52 GiB cached
+ds4: CUDA loading model tensors 6.41 GiB cached
+ds4: CUDA loading model tensors 7.56 GiB cached
+0714 09:44:22 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=0.34 t/s avg=0.38 t/s 168.747s
+0714 09:44:22 ds4-server: chat ctx=0..43:43 gen=64 finish=length 184.326s
+0714 09:44:22 ds4-server: benchmark request target reached; shutting down cleanly
+0714 09:44:22 ds4-server: shutdown requested, draining requests
+ds4: [arena] final hits=4631 misses=7735 fatal=0 uploaded=30.53 GiB
