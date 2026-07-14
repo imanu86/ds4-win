@@ -326,6 +326,7 @@ struct cuda_dynamic_arena {
     uint64_t misses;
     uint64_t fatal_errors;
     uint64_t bytes_uploaded;
+    uint64_t request_sequence;
     uint32_t n_layer;
     uint32_t n_expert;
     int submissions_blocked;
@@ -2017,6 +2018,7 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
     g_dynamic_arena.misses = 0;
     g_dynamic_arena.fatal_errors = 0;
     g_dynamic_arena.bytes_uploaded = 0;
+    g_dynamic_arena.request_sequence = 0;
     g_dynamic_arena.dma_sequence = 0;
     g_dynamic_arena.n_layer = 0;
     g_dynamic_arena.n_expert = 0;
@@ -3117,12 +3119,72 @@ static void cuda_dynamic_arena_observer_release(void) {
     g_dynamic_arena_observer.initial_published = 0;
 }
 
+static int cuda_dynamic_arena_carry_mode(void) {
+    const char *value =
+        getenv("DS4_CUDA_DYNAMIC_ARENA_CARRY_ACROSS_REQUESTS");
+    if (!value || !value[0]) return -1;
+    if (strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-carry] invalid value '%s'; control disabled\n",
+                value);
+        warned = 1;
+    }
+    return -1;
+}
+
+static uint32_t cuda_dynamic_arena_active_count(void) {
+    uint32_t resident = 0;
+    for (uint32_t entry = 0; entry < g_dynamic_arena.active.size(); entry++) {
+        const uint32_t layer = entry / g_dynamic_arena.n_expert;
+        const uint32_t expert = entry % g_dynamic_arena.n_expert;
+        if (cuda_dynamic_arena_binding_valid(
+                g_dynamic_arena.active[entry], layer, expert,
+                g_dynamic_arena.snapshot_generation,
+                DS4_GPU_ARENA_READY)) {
+            resident++;
+        }
+    }
+    return resident;
+}
+
+extern "C" void ds4_gpu_dynamic_arena_request_begin(void) {
+    const int mode = cuda_dynamic_arena_carry_mode();
+    if (mode < 0 || !g_dynamic_arena.host_base) return;
+
+    const uint64_t request = ++g_dynamic_arena.request_sequence;
+    if (g_dynamic_arena.snapshot_generation == 0) {
+        g_dynamic_arena.hits_disabled = 0;
+        fprintf(stderr,
+                "ds4: [arena-carry] request=%llu mode=prime snapshot=0 resident=0 lookup=enabled observer=learning\n",
+                (unsigned long long)request);
+        return;
+    }
+
+    cuda_dynamic_arena_observer_release();
+    g_dynamic_arena.hits_disabled = mode == 0;
+    const uint32_t resident = cuda_dynamic_arena_active_count();
+    fprintf(stderr,
+            "ds4: [arena-carry] request=%llu mode=%s snapshot=%llu resident=%u lookup=%s observer=frozen\n",
+            (unsigned long long)request,
+            mode == 0 ? "drop" : "keep",
+            (unsigned long long)g_dynamic_arena.snapshot_generation,
+            resident,
+            mode == 0 ? "disabled" : "enabled");
+}
+
 extern "C" void ds4_gpu_dynamic_arena_observer_reset(void) {
     const uint32_t window = cuda_dynamic_arena_observer_window();
     const uint32_t min_hits = cuda_dynamic_arena_observer_min_hits();
     const uint32_t grow_interval =
         cuda_dynamic_arena_observer_grow_interval();
     cuda_dynamic_arena_observer_release();
+    if (cuda_dynamic_arena_carry_mode() >= 0 &&
+        g_dynamic_arena.snapshot_generation != 0) {
+        return;
+    }
     if (window == 0 || !g_dynamic_arena.host_base ||
         g_dynamic_arena.n_layer <= 3 || g_dynamic_arena.n_expert == 0) {
         return;

@@ -18264,6 +18264,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #else
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
+    if (e->backend == DS4_BACKEND_CUDA) {
+        ds4_gpu_dynamic_arena_request_begin();
+    }
 
     if (s->checkpoint_valid &&
         prompt->len >= s->checkpoint.len &&

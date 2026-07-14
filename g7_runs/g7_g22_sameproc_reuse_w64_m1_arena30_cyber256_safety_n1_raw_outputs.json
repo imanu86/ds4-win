@@ -1,0 +1,23 @@
+﻿{
+    "schema":  "g7_raw_outputs_v1",
+    "tag":  "g22_sameproc_reuse_w64_m1_arena30_cyber256_safety_n1",
+    "head":  "e6963617d51ded2c965a8a3b6de57b6d292c2b83",
+    "executable_sha256":  "db610b50b6d4652b392c002e73849ff10b279e159425e94a325c11e365ca5180",
+    "ds4_cuda_sha256":  "d222b3d46259d3984d5b12b3b9fac2c04fb223eef2030d10f50e6519a98cb4db",
+    "prompt_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+    "expected_content_sha256":  "f2677447c1a5e95934469c6c8f07ee943ccd9c079ef9350b07c2d0ce8fc1b576",
+    "output_hashes":  [
+                          "f2677447c1a5e95934469c6c8f07ee943ccd9c079ef9350b07c2d0ce8fc1b576"
+                      ],
+    "outputs_identical":  true,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  55.77039,
+                        "completion_tokens":  213,
+                        "tokens_per_second":  3.819231,
+                        "content_sha256":  "f2677447c1a5e95934469c6c8f07ee943ccd9c079ef9350b07c2d0ce8fc1b576",
+                        "content":  "Here is a complete single-file HTML landing page for a cyberpunk AI programming shop. It includes a styled navigation, hero section, request form, and a JavaScript confirmation popup.\n```html\n\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n  \u003cmeta charset=\"UTF-8\" /\u003e\n  \u003cmeta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" /\u003e\n  \u003ctitle\u003eCYBERâ¢AI â¢ SHOP\u003c/title\u003e\n  \u003c!-- Font Awesome for icons --\u003e\n  \u003clink rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css\" /\u003e\n  \u003c!-- Google Fonts: Cyberpunk-ish --\u003e\n  \u003clink href=\"https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900\u0026family=Inter:wght@300;400;600\u0026display=swap\" rel=\"stylesheet\" /\u003e\n  \u003cstyle\u003e\n    /* RESET \u0026 GLOBAL */\n    * {\n      margin"
+                    }
+                ]
+}

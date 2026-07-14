@@ -1,0 +1,43 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache deferred 71.28 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 9.48 GiB of tensor spans in 4.505s
+ds4: cuda backend initialized for graph diagnostics
+0714 10:45:00 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=17.73 GiB bytes=32211468288 slot_bytes=7077888
+ds4: [arena-observe] armed window=64 min_hits=1 grow_interval=0 layers=3..42 router=unbiased residency-only
+0714 10:45:05 ds4-server: listening on http://127.0.0.1:8000
+0714 10:45:05 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [arena-carry] request=1 mode=prime snapshot=0 resident=0 lookup=enabled observer=learning
+ds4: CUDA loading model tensors 9.48 GiB cached
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=8.00 MiB cached=0.00 GiB free=1.49 GiB reserve=4.00 GiB total=12.00 GiB)
+ds4: CUDA loading model tensors 8.10 GiB cached
+ds4: [arena-observe] armed window=64 min_hits=1 grow_interval=0 layers=3..42 router=unbiased residency-only
+0714 10:45:26 ds4-server: chat ctx=0..43:43 prompt done 20.409s
+ds4: CUDA loading model tensors 7.89 GiB cached
+0714 10:46:06 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=1.25 t/s avg=1.25 t/s 40.139s
+ds4: [arena] begin base=0 target=3577 resident=3576 loads=0 slots=4551
+ds4: [arena] publish generation=3577 loads=0
+ds4: [arena-observe] WRAP published tokens=64 resident=3576 loads=0 workers=0 seconds=0.004 generation=3577 preloaded=3576 mirror=23.57 GiB verify_workers=8 verify_seconds=3.001
+ds4: [arena-observe] window complete tokens=64 resident=3576 growths=0 result=published settled
+ds4: CUDA loading model tensors 8.13 GiB cached
+0714 10:46:31 ds4-server: chat ctx=0..43:43 gen=100 decoding chunk=1.94 t/s avg=1.52 t/s 65.877s
+0714 10:46:46 ds4-server: chat ctx=0..43:43 gen=150 decoding chunk=3.44 t/s avg=1.87 t/s 80.392s
+0714 10:46:59 ds4-server: chat ctx=0..43:43 gen=200 decoding chunk=3.77 t/s avg=2.14 t/s 93.649s
+0714 10:47:03 ds4-server: chat ctx=0..43:43 gen=213 decoding chunk=3.68 t/s avg=2.19 t/s 97.180s
+0714 10:47:03 ds4-server: chat ctx=0..43:43 gen=213 finish=length 117.605s
+0714 10:47:03 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [arena-carry] request=2 mode=drop snapshot=3577 resident=3576 lookup=disabled observer=frozen
+ds4: CUDA loading model tensors 8.10 GiB cached
+ds4: CUDA loading model tensors 8.12 GiB cached
+0714 10:47:21 ds4-server: chat ctx=0..43:43 prompt done 18.134s
+0714 10:47:58 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=1.36 t/s avg=1.36 t/s 36.900s
+ds4: CUDA loading model tensors 8.08 GiB cached
+0714 10:48:34 ds4-server: chat ctx=0..43:43 gen=100 decoding chunk=1.40 t/s avg=1.38 t/s 72.601s
+0714 10:49:07 ds4-server: chat ctx=0..43:43 gen=150 decoding chunk=1.48 t/s avg=1.41 t/s 106.325s
+0714 10:49:42 ds4-server: chat ctx=0..43:43 gen=200 decoding chunk=1.46 t/s avg=1.42 t/s 140.597s
+0714 10:49:51 ds4-server: chat ctx=0..43:43 gen=213 decoding chunk=1.43 t/s avg=1.42 t/s 149.707s
+0714 10:49:51 ds4-server: chat ctx=0..43:43 gen=213 finish=length 167.855s
+0714 10:49:51 ds4-server: benchmark request target reached; shutting down cleanly
+0714 10:49:51 ds4-server: shutdown requested, draining requests
+ds4: [arena] final hits=27890 misses=10534 fatal=0 uploaded=183.85 GiB

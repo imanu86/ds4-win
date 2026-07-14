@@ -17,6 +17,7 @@ param(
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
     [ValidateRange(0, 256)][int]$DynamicArenaGrowInterval = 0,
+    [ValidateSet("default", "keep", "drop")][string]$DynamicArenaCarry = "default",
     [ValidateRange(1, 32)][int]$ReapPrefetchThreads = 8,
     [ValidateSet(1, 2, 4)][int]$IoQD = 1,
     [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
@@ -101,6 +102,13 @@ if ($DynamicArenaGrowInterval -gt 0) {
 } else {
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_GROW_INTERVAL -ErrorAction SilentlyContinue
 }
+if ($DynamicArenaCarry -eq "keep") {
+    $env:DS4_CUDA_DYNAMIC_ARENA_CARRY_ACROSS_REQUESTS = "1"
+} elseif ($DynamicArenaCarry -eq "drop") {
+    $env:DS4_CUDA_DYNAMIC_ARENA_CARRY_ACROSS_REQUESTS = "0"
+} else {
+    Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_CARRY_ACROSS_REQUESTS -ErrorAction SilentlyContinue
+}
 $env:DS4_REAP_PREFETCH_THREADS = "$ReapPrefetchThreads"
 if ($Diagnostics) {
     $env:DS4_CUDA_WEIGHT_CACHE_VERBOSE = "1"
@@ -166,6 +174,7 @@ if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
+if ($DynamicArenaCarry -ne "default" -and (-not $Warmup -or $DynamicArenaObservedWindow -le 0)) { throw "DynamicArenaCarry requires Warmup and DynamicArenaObservedWindow > 0" }
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
 if ($SpexFusedTopK -and $SpexStage -notin @("topk", "full")) { throw "SpexFusedTopK requires the topk or full stage" }
 if ($SpexRingSlots -gt 1 -and (-not $SpexDryRun -or $SpexStage -ne "full")) { throw "SpexRingSlots > 1 requires the full SpexDryRun stage" }
@@ -457,6 +466,11 @@ $arenaWrapSeconds = 0.0; $arenaWrapGeneration = 0
 $arenaWrapPreloaded = 0; $arenaWrapMirrorGiB = 0.0
 $arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
+$arenaObserverPublicationCount = 0; $arenaWrapPublicationCount = 0
+$arenaCarryObserved = $false; $arenaCarryLineCount = 0; $arenaCarryRequest = 0
+$arenaCarryModeObserved = "not_observed"; $arenaCarrySnapshot = 0
+$arenaCarryResident = 0; $arenaCarryLookupObserved = "not_observed"
+$arenaCarryObserverObserved = "not_observed"
 $arenaGrowthPublications = 0; $arenaGrowthSkips = 0
 $arenaGrowthEvents = @()
 $contextObserved = 0; $prefillChunkObserved = 0
@@ -588,7 +602,9 @@ if (Test-Path $stderrLog) {
         $arenaObserverFirstLayer = [int]$Matches[4]
         $arenaObserverLastLayer = [int]$Matches[5]
     }
-    $arenaWrapLine = $lines | Where-Object { $_ -match "\[arena-observe\] WRAP (published|aborted)" } | Select-Object -Last 1
+    $arenaWrapLines = @($lines | Where-Object { $_ -match "\[arena-observe\] WRAP (published|aborted)" })
+    $arenaWrapPublicationCount = @($arenaWrapLines | Where-Object { $_ -match "\[arena-observe\] WRAP published" }).Count
+    $arenaWrapLine = $arenaWrapLines | Select-Object -Last 1
     if ($arenaWrapLine -and $arenaWrapLine -match "WRAP published tokens=(\d+) resident=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9.]+) generation=(\d+)") {
         $arenaWrapObserved = $true
         $arenaObserverTokens = [long]$Matches[1]; $arenaObserverResident = [long]$Matches[2]
@@ -609,7 +625,9 @@ if (Test-Path $stderrLog) {
         $arenaWrapLoads = [long]$Matches[3]
         $arenaWrapSeconds = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
-    $arenaResultLine = $lines | Where-Object { $_ -match "\[arena-observe\] window complete" } | Select-Object -Last 1
+    $arenaResultLines = @($lines | Where-Object { $_ -match "\[arena-observe\] window complete" })
+    $arenaObserverPublicationCount = $arenaResultLines.Count
+    $arenaResultLine = $arenaResultLines | Select-Object -Last 1
     if ($arenaResultLine -and $arenaResultLine -match "window complete tokens=(\d+) resident=(\d+)(?: growths=\d+)? result=(published|fallback)") {
         $arenaObserverResultObserved = $true
         $arenaObserverTokens = [long]$Matches[1]; $arenaObserverResident = [long]$Matches[2]
@@ -633,6 +651,18 @@ if (Test-Path $stderrLog) {
         }
     }
     $arenaGrowthSkips = @($lines | Where-Object { $_ -match "\[arena-observe\] grow skipped" }).Count
+    $arenaCarryLines = @($lines | Where-Object { $_ -match "\[arena-carry\]" })
+    $arenaCarryLineCount = $arenaCarryLines.Count
+    $arenaCarryLine = $arenaCarryLines | Select-Object -Last 1
+    if ($arenaCarryLine -and $arenaCarryLine -match "\[arena-carry\] request=(\d+) mode=(prime|keep|drop) snapshot=(\d+) resident=(\d+) lookup=(enabled|disabled) observer=(learning|frozen)") {
+        $arenaCarryObserved = $true
+        $arenaCarryRequest = [int]$Matches[1]
+        $arenaCarryModeObserved = $Matches[2]
+        $arenaCarrySnapshot = [long]$Matches[3]
+        $arenaCarryResident = [long]$Matches[4]
+        $arenaCarryLookupObserved = $Matches[5]
+        $arenaCarryObserverObserved = $Matches[6]
+    }
     $arenaFinalLine = $lines | Where-Object { $_ -match "\[arena\] final" } | Select-Object -Last 1
     if ($arenaFinalLine -and $arenaFinalLine -match "\[arena\] final hits=(\d+) misses=(\d+) fatal=(\d+) uploaded=([0-9.]+) GiB") {
         $arenaFinalObserved = $true
@@ -702,6 +732,15 @@ if ($DynamicArenaObservedWindow -gt 0) {
     if ($MaxTokens -ge $DynamicArenaObservedWindow -and -not $arenaObserverResultObserved) {
         throw "Dynamic arena measurement failed: initial publication result was not observed"
     }
+}
+if ($DynamicArenaCarry -ne "default") {
+    $expectedCarryLookup = if ($DynamicArenaCarry -eq "keep") { "enabled" } else { "disabled" }
+    if (-not $arenaCarryObserved) { throw "Dynamic arena carry measurement failed: telemetry was not observed" }
+    if ($arenaCarryLineCount -ne ($Repeats + 1)) { throw "Dynamic arena carry measurement failed: expected $($Repeats + 1) request markers, observed $arenaCarryLineCount" }
+    if ($arenaCarryRequest -ne ($Repeats + 1) -or $arenaCarryModeObserved -ne $DynamicArenaCarry) { throw "Dynamic arena carry measurement failed: last request/mode mismatch" }
+    if ($arenaCarrySnapshot -le 0 -or $arenaCarryResident -le 0) { throw "Dynamic arena carry measurement failed: learned snapshot was empty" }
+    if ($arenaCarryLookupObserved -ne $expectedCarryLookup -or $arenaCarryObserverObserved -ne "frozen") { throw "Dynamic arena carry measurement failed: lookup/observer state mismatch" }
+    if ($arenaObserverPublicationCount -ne 1 -or $arenaWrapPublicationCount -ne 1) { throw "Dynamic arena carry measurement failed: learned arena was republished during measured requests" }
 }
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
@@ -789,6 +828,17 @@ $summary = [pscustomobject]@{
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
     dynamic_arena_grow_interval_requested = $DynamicArenaGrowInterval
+    dynamic_arena_carry_requested = $DynamicArenaCarry
+    dynamic_arena_carry_observed = $arenaCarryObserved
+    dynamic_arena_carry_line_count = $arenaCarryLineCount
+    dynamic_arena_carry_request_observed = $arenaCarryRequest
+    dynamic_arena_carry_mode_observed = $arenaCarryModeObserved
+    dynamic_arena_carry_snapshot_observed = $arenaCarrySnapshot
+    dynamic_arena_carry_resident_observed = $arenaCarryResident
+    dynamic_arena_carry_lookup_observed = $arenaCarryLookupObserved
+    dynamic_arena_carry_observer_observed = $arenaCarryObserverObserved
+    dynamic_arena_observer_publication_count = $arenaObserverPublicationCount
+    dynamic_arena_wrap_publication_count = $arenaWrapPublicationCount
     reap_prefetch_threads_requested = $ReapPrefetchThreads
     minimum_available_gib_effective = $effectiveMinimumAvailableGiB
     dynamic_arena_allocated_bytes = $arenaAllocatedBytes
@@ -930,6 +980,9 @@ Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + 
 Write-Host ("Q8-F16 cap/reserve MiB requested: " + $Q8F16CacheMB + " / " + $Q8F16CacheReserveMB)
 Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
+Write-Host ("arena carry requested: " + $DynamicArenaCarry)
+Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)
+Write-Host ("arena publication/window+WRAP counts: " + $arenaObserverPublicationCount + " / " + $arenaWrapPublicationCount)
 Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " / " + $arenaGrowthSkips)
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
