@@ -17,7 +17,7 @@ model mapping and Windows standby state are otherwise preserved.
 
 | Parameter | Value |
 |---|---:|
-| Source HEAD at build | `e6963617d51ded2c965a8a3b6de57b6d292c2b83` plus the G22 carry patch |
+| Source HEAD at replicated build | `7d34a2cab20b290b13807c2c912dbb893fbafcd2` |
 | Executable SHA-256 | `b040abe8828878b7e44d762d205c49b0eb536b0d13890842e80381281825f878` |
 | Model | `C:\ds4-models\ds4-2bit.gguf` |
 | Model bytes | 86,720,111,488 |
@@ -64,9 +64,9 @@ KEEP is 3.04x the DROP server decode rate in this paired safety run. This is
 strong mechanism evidence because each compared request occurs after the same
 priming operation and the KEEP/DROP change is inside a preserved process. The
 arms still used separate server processes in a fixed order, with different
-unpurged standby levels. It is n=1 per arm and is not a sustained-performance
-or cold-cache verdict. Independent order-balanced replication remains required
-before promoting a headline number.
+unpurged standby levels. By itself it was n=1 per arm and was not a
+sustained-performance or cold-cache verdict; the independent replication below
+was therefore required before promotion.
 
 The arena final counters are process-cumulative. KEEP records 72,998 hits and
 23,468 misses across both requests. DROP records only the first request's
@@ -74,6 +74,37 @@ The arena final counters are process-cumulative. KEEP records 72,998 hits and
 those counters must not be interpreted as request-2 disk traffic. Win32 process
 read bytes also exclude mmap page-ins, so G22 proves lookup causality, not a
 complete storage-traffic decomposition.
+
+## Independent order-balanced replication
+
+The preregistered campaign used six independent server processes in this exact
+order:
+
+```text
+DROP, KEEP, KEEP, DROP, DROP, KEEP
+```
+
+Each process performed one identical priming request and one measured request.
+All six measured responses produced 213 tokens with the expected content hash.
+
+| Arm | Independent server decode samples (t/s) | Median t/s | Minimum t/s | Median TTFT |
+|---|---|---:|---:|---:|
+| DROP | 1.42, 1.56, 1.57 | 1.56 | 1.42 | 16.142 s |
+| KEEP | 4.55, 4.42, 4.60 | 4.55 | 4.42 | 5.646 s |
+
+The KEEP/DROP median ratio is 2.92x. The preregistered promotion gate passed:
+
+1. three valid independent processes per arm;
+2. KEEP median at least 4.0 t/s;
+3. every KEEP at least 3.8 t/s;
+4. KEEP/DROP median ratio at least 2.0; and
+5. all expected output hashes exact.
+
+Retained learned arena residency is therefore promoted to the Windows-native
+transport baseline for subsequent isolated tests. This result is a causal
+transport and exact-output result on one repeated prompt. It is not evidence
+that a residency set learned from one domain is optimal for another domain,
+and it is not an L0-L3 quality campaign.
 
 ## Harness gate
 
@@ -107,11 +138,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\g7_measure.ps1 `
 - `g7_runs/g7_g22_sameproc_reuse_w64_m1_arena30_cyber256_safety_n1_*`
 - `g7_runs/g7_g22_carry_drop_w64_m1_arena30_cyber256_safety_n1_*`
 - `g7_runs/g7_g22_carry_keep_w64_m1_arena30_cyber256_safety_n1_*`
+- `g7_runs/g7_g22_carry_ab_20260714_{1..6}_*`
+- `g7_runs/g7_g22_carry_ab_20260714_aggregate.json`
 
 ## Next decision
 
-Do not add another performance lever yet. First import all Windows G7 result
-JSON into the existing reap-loop experiment ledger, classify cache state and
-evidence level, and choose the next A/B from the resulting gap analysis. If
-G22 remains the highest-priority gap, run an order-balanced independent n>=3
-KEEP/DROP replication and update the ledger immediately after every arm.
+Do not optimize the repeated-prompt number in isolation. The next measurement
+is a cross-domain request-2 gate using this promoted configuration: request 1
+learns on the Cyber HTML prompt, while request 2 uses a distinct deterministic
+prompt. Compare retained residency with lookup disabled before adding dynamic
+growth or rotation. This establishes whether the current arena is a reusable
+transport cache or merely a same-prompt specialization. If transfer is weak,
+test one adaptation lever at a time, beginning with the already-measured
+grow-only residency mechanism.
