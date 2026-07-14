@@ -15,6 +15,7 @@ param(
     [ValidateRange(0, 8192)][int]$Q8F16CacheMB = 0,
     [ValidateRange(0, 8192)][int]$Q8F16CacheReserveMB = 4096,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
+    [switch]$PrefillMassObserve,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
     [ValidateRange(0, 256)][int]$DynamicArenaGrowInterval = 0,
@@ -106,6 +107,11 @@ if ($DynamicArenaGiB -gt 0.0) {
 } else {
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_GB -ErrorAction SilentlyContinue
 }
+if ($PrefillMassObserve) {
+    $env:DS4_CUDA_PREFILL_MASS_OBSERVE = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_MASS_OBSERVE -ErrorAction SilentlyContinue
+}
 if ($DynamicArenaObservedWindow -gt 0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW = "$DynamicArenaObservedWindow"
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_MIN_HITS = "$DynamicArenaObservedMinHits"
@@ -189,6 +195,7 @@ if ($SpexDryRun) {
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
+if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObserve requires DynamicArenaGiB > 0" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
 if ($DynamicArenaCarry -ne "default" -and (-not $Warmup -or $DynamicArenaObservedWindow -le 0)) { throw "DynamicArenaCarry requires Warmup and DynamicArenaObservedWindow > 0" }
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
@@ -501,6 +508,13 @@ $spexPrefetchErrors = 0; $spexPrefetchDisabled = $false
 $spexPrefetchBytesRead = 0; $spexPrefetchBytesUsed = 0
 $arenaObserverArmed = $false; $arenaObserverWindowObserved = 0
 $arenaObserverMinHitsObserved = 0; $arenaObserverGrowIntervalObserved = 0
+$prefillMassArmed = $false; $prefillMassFinalized = $false
+$prefillMassLayers = 0; $prefillMassRowsMin = 0; $prefillMassRowsMax = 0
+$prefillMassRoutedSlots = 0; $prefillMassUnique = 0
+$prefillMassCandidate = 0; $prefillMassCapacity = 0
+$prefillMassTotal = 0.0; $prefillMassCandidateMass = 0.0
+$prefillMassCoverage = 0.0; $prefillMassCutoff = 0.0
+$prefillMassDecodeTokens = 0; $prefillMassDecodeSlots = 0; $prefillMassDecodeHits = 0; $prefillMassDecodeHitRate = 0.0
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
@@ -635,6 +649,29 @@ if (Test-Path $stderrLog) {
         $arenaAllocatedSlots = [long]$Matches[1]
         $arenaAllocatedBytes = [long]$Matches[2]
         $arenaSlotBytes = [long]$Matches[3]
+    }
+    $prefillMassArmedLine = $lines | Where-Object { $_ -match "\[prefill-mass\] armed" } | Select-Object -Last 1
+    if ($prefillMassArmedLine -and $prefillMassArmedLine -match "armed slots=(\d+) layers=(\d+)\.\.(\d+).*policy=observe-only") {
+        $prefillMassArmed = $true
+    }
+    $prefillMassFinalizeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] finalize layers=" } | Select-Object -Last 1
+    if ($prefillMassFinalizeLine -and $prefillMassFinalizeLine -match "finalize layers=(\d+) rows_min=(\d+) rows_max=(\d+) routed_slots=(\d+) unique=(\d+) candidate=(\d+) capacity=(\d+) mass_total=([0-9.]+) mass_candidate=([0-9.]+) mass_coverage=([0-9.]+) cutoff=([0-9.]+).*(?:residency=unchanged).*policy=observe-only") {
+        $prefillMassFinalized = $true
+        $prefillMassLayers = [int]$Matches[1]; $prefillMassRowsMin = [int]$Matches[2]
+        $prefillMassRowsMax = [int]$Matches[3]; $prefillMassRoutedSlots = [long]$Matches[4]
+        $prefillMassUnique = [long]$Matches[5]; $prefillMassCandidate = [long]$Matches[6]
+        $prefillMassCapacity = [long]$Matches[7]
+        $prefillMassTotal = [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillMassCandidateMass = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillMassCoverage = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillMassCutoff = [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $prefillMassDecodeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" } | Select-Object -Last 1
+    if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=observe-only") {
+        $prefillMassDecodeTokens = [long]$Matches[1]
+        $prefillMassDecodeSlots = [long]$Matches[2]
+        $prefillMassDecodeHits = [long]$Matches[3]
+        $prefillMassDecodeHitRate = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
     $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
     if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
@@ -777,6 +814,12 @@ if ($SpexPrefetchK -gt 0) {
 } elseif ($spexPrefetchObserved -or $spexPrefetchFinalObserved) {
     throw "SPEX prefetch measurement failed: worker activated while not requested"
 }
+if ($PrefillMassObserve) {
+    if (-not $prefillMassArmed -or -not $prefillMassFinalized) { throw "Prefill mass measurement failed: observer did not arm/finalize" }
+    if ($prefillMassCandidate -le 0 -or $prefillMassCandidate -gt $prefillMassCapacity) { throw "Prefill mass measurement failed: invalid candidate size" }
+    if ($prefillMassCoverage -le 0.0 -or $prefillMassCoverage -gt 1.0) { throw "Prefill mass measurement failed: invalid mass coverage" }
+    if ($prefillMassDecodeSlots -le 0 -or $prefillMassDecodeHits -gt $prefillMassDecodeSlots) { throw "Prefill mass measurement failed: invalid decode coverage" }
+}
 if ($DynamicArenaObservedWindow -gt 0) {
     if (-not $arenaObserverArmed) { throw "Dynamic arena measurement failed: observer was not armed" }
     if ($arenaObserverWindowObserved -ne $DynamicArenaObservedWindow -or
@@ -902,6 +945,25 @@ $summary = [pscustomobject]@{
     q8_f16_cache_mb_requested = $Q8F16CacheMB
     q8_f16_cache_reserve_mb_requested = $Q8F16CacheReserveMB
     dynamic_arena_gib_requested = $DynamicArenaGiB
+    prefill_mass_observe_requested = [bool]$PrefillMassObserve
+    prefill_mass_observer_armed = $prefillMassArmed
+    prefill_mass_finalized = $prefillMassFinalized
+    prefill_mass_layers = $prefillMassLayers
+    prefill_mass_rows_min = $prefillMassRowsMin
+    prefill_mass_rows_max = $prefillMassRowsMax
+    prefill_mass_routed_slots = $prefillMassRoutedSlots
+    prefill_mass_unique_entries = $prefillMassUnique
+    prefill_mass_candidate_entries = $prefillMassCandidate
+    prefill_mass_capacity_entries = $prefillMassCapacity
+    prefill_mass_total = $prefillMassTotal
+    prefill_mass_candidate_mass = $prefillMassCandidateMass
+    prefill_mass_coverage = $prefillMassCoverage
+    prefill_mass_cutoff = $prefillMassCutoff
+    prefill_mass_decode_tokens = $prefillMassDecodeTokens
+    prefill_mass_decode_slots = $prefillMassDecodeSlots
+    prefill_mass_decode_candidate_hits = $prefillMassDecodeHits
+    prefill_mass_decode_hit_rate = $prefillMassDecodeHitRate
+    prefill_mass_residency_semantics = "observe-only; no router, mask, arena publication, or residency changes"
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
     dynamic_arena_grow_interval_requested = $DynamicArenaGrowInterval
@@ -1057,6 +1119,8 @@ Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
 Write-Host ("Q8-F16 cap/reserve MiB requested: " + $Q8F16CacheMB + " / " + $Q8F16CacheReserveMB)
 Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
+Write-Host ("prefill mass requested/armed/finalized: " + [bool]$PrefillMassObserve + " / " + $prefillMassArmed + " / " + $prefillMassFinalized)
+Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena carry requested: " + $DynamicArenaCarry)
 Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)
