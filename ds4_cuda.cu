@@ -399,6 +399,29 @@ struct cuda_prefill_mass_observer {
 
 static cuda_prefill_mass_observer g_prefill_mass_observer;
 
+struct cuda_reap_mass_observer {
+    int enabled;
+    int armed;
+    uint32_t window;
+    uint32_t top;
+    uint32_t entry_count;
+    uint32_t layer_min;
+    uint32_t layer_max;
+    uint32_t last_layer;
+    uint32_t unique_entries;
+    uint32_t last_touched;
+    uint64_t tokens;
+    uint64_t observed_slots;
+    double top_mass;
+    std::vector<double> totals;
+    std::vector<double> ring;
+    std::vector<std::vector<std::pair<uint32_t, double>>> pending;
+    std::vector<uint8_t> touched;
+    std::vector<uint32_t> touched_entries;
+};
+
+static cuda_reap_mass_observer g_reap_mass_observer;
+
 static int cuda_ok(cudaError_t err, const char *what);
 static void cuda_moe_expert_cache_invalidate(void);
 static void cuda_moe_expert_cache_release(void);
@@ -413,6 +436,13 @@ static void cuda_prefill_mass_observer_reset(void);
 static void cuda_prefill_mass_observer_finalize(void);
 static void cuda_prefill_mass_observer_release(int report);
 static int cuda_prefill_mass_observer_needs_weights(void);
+static void cuda_reap_mass_observer_reset(void);
+static void cuda_reap_mass_observer_release(int report);
+static int cuda_reap_mass_observer_needs_weights(void);
+static void cuda_reap_mass_observe_selected(
+        uint32_t layer_index, uint32_t n_tokens,
+        const int32_t *selected, const float *weights,
+        uint32_t selected_count);
 static void cuda_prefill_mass_observe_selected(
         uint32_t layer_index, uint32_t n_tokens,
         const int32_t *selected, const float *weights,
@@ -2043,6 +2073,7 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
                 (double)g_dynamic_arena.bytes_uploaded / 1073741824.0);
     }
     cuda_prefill_mass_observer_release(1);
+    cuda_reap_mass_observer_release(1);
     cuda_dynamic_arena_observer_release();
     cuda_dynamic_arena_storage_release();
     g_dynamic_arena.model_map = NULL;
@@ -3226,6 +3257,199 @@ static int cuda_prefill_mass_observer_needs_weights(void) {
         !g_prefill_mass_observer.finalized;
 }
 
+static int cuda_reap_mass_observe_requested(void) {
+    const char *value = getenv("DS4_CUDA_REAP_MASS_OBSERVE");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [reap-mass] invalid observe value '%s'; observer disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0;
+}
+
+static uint32_t cuda_reap_mass_window(void) {
+    const char *value = getenv("DS4_CUDA_REAP_MASS_WINDOW");
+    if (!value || !value[0]) return 16;
+    char *end = NULL;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno == 0 && end && *end == '\0' && parsed >= 1 && parsed <= 256) {
+        return (uint32_t)parsed;
+    }
+    fprintf(stderr,
+            "ds4: [reap-mass] invalid window value '%s'; observer disabled\n",
+            value);
+    return 0;
+}
+
+static int cuda_reap_mass_observer_needs_weights(void) {
+    return g_reap_mass_observer.enabled;
+}
+
+static void cuda_reap_mass_report(const char *reason) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (!observer.enabled || !observer.armed || observer.tokens == 0) return;
+    double top_mass = 0.0;
+    for (double value : observer.totals) {
+        if (value > top_mass) top_mass = value;
+    }
+    observer.top_mass = top_mass;
+    fprintf(stderr,
+            "ds4: [reap-mass] %s tokens=%llu observed_slots=%llu unique=%u top_mass=%.6f touched=%u\n",
+            reason ? reason : "checkpoint",
+            (unsigned long long)observer.tokens,
+            (unsigned long long)observer.observed_slots,
+            observer.unique_entries, observer.top_mass,
+            observer.last_touched);
+}
+
+static void cuda_reap_mass_clear_pending(void) {
+    for (std::vector<std::pair<uint32_t, double>> &row :
+         g_reap_mass_observer.pending) {
+        row.clear();
+    }
+}
+
+static void cuda_reap_mass_mark_touched(uint32_t entry) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (entry >= observer.touched.size() || observer.touched[entry]) return;
+    observer.touched[entry] = 1;
+    observer.touched_entries.push_back(entry);
+}
+
+static void cuda_reap_mass_commit_pending_token(
+        const std::vector<std::pair<uint32_t, double>> &pending) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (!observer.enabled || observer.entry_count == 0 || observer.window == 0) {
+        return;
+    }
+    const uint32_t slot = (uint32_t)(observer.tokens % observer.window);
+    double *ring_row = observer.ring.data() +
+        (uint64_t)slot * observer.entry_count;
+    observer.touched_entries.clear();
+    for (uint32_t entry = 0; entry < observer.entry_count; entry++) {
+        const double old = ring_row[entry];
+        if (old == 0.0) continue;
+        const double before = observer.totals[entry];
+        const double after = before - old;
+        observer.totals[entry] = after;
+        ring_row[entry] = 0.0;
+        if (before > 0.0 && after <= 0.0 && observer.unique_entries > 0) {
+            observer.unique_entries--;
+        }
+        cuda_reap_mass_mark_touched(entry);
+    }
+    for (const std::pair<uint32_t, double> &item : pending) {
+        if (item.first >= observer.entry_count || item.second == 0.0) continue;
+        const double before = observer.totals[item.first];
+        ring_row[item.first] += item.second;
+        observer.totals[item.first] = before + item.second;
+        if (before <= 0.0 && observer.totals[item.first] > 0.0) {
+            observer.unique_entries++;
+        }
+        cuda_reap_mass_mark_touched(item.first);
+    }
+    observer.tokens++;
+    observer.last_touched = (uint32_t)observer.touched_entries.size();
+    for (uint32_t entry : observer.touched_entries) {
+        observer.touched[entry] = 0;
+    }
+    if ((observer.tokens & (observer.tokens - 1ull)) == 0) {
+        cuda_reap_mass_report("checkpoint");
+    }
+}
+
+static void cuda_reap_mass_commit_all_pending(void) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (!observer.enabled) return;
+    for (const std::vector<std::pair<uint32_t, double>> &row :
+         observer.pending) {
+        if (!row.empty()) cuda_reap_mass_commit_pending_token(row);
+    }
+    cuda_reap_mass_clear_pending();
+}
+
+static void cuda_reap_mass_observer_release(int report) {
+    if (report) cuda_reap_mass_commit_all_pending();
+    if (report) cuda_reap_mass_report("request-end");
+    g_reap_mass_observer.totals.clear();
+    g_reap_mass_observer.ring.clear();
+    g_reap_mass_observer.pending.clear();
+    g_reap_mass_observer.touched.clear();
+    g_reap_mass_observer.touched_entries.clear();
+    g_reap_mass_observer.enabled = 0;
+    g_reap_mass_observer.armed = 0;
+    g_reap_mass_observer.window = 0;
+    g_reap_mass_observer.top = 0;
+    g_reap_mass_observer.entry_count = 0;
+    g_reap_mass_observer.layer_min = 3;
+    g_reap_mass_observer.layer_max = 42;
+    g_reap_mass_observer.last_layer = 0;
+    g_reap_mass_observer.unique_entries = 0;
+    g_reap_mass_observer.last_touched = 0;
+    g_reap_mass_observer.tokens = 0;
+    g_reap_mass_observer.observed_slots = 0;
+    g_reap_mass_observer.top_mass = 0.0;
+}
+
+static void cuda_reap_mass_observer_reset(void) {
+    cuda_reap_mass_observer_release(1);
+    if (!cuda_reap_mass_observe_requested()) return;
+    const uint32_t window = cuda_reap_mass_window();
+    if (window == 0) return;
+    if (!g_dynamic_arena.host_base || g_dynamic_arena.n_layer <= 3 ||
+        g_dynamic_arena.n_expert == 0) {
+        fprintf(stderr,
+                "ds4: [reap-mass] unavailable reason=dynamic-arena-not-ready\n");
+        return;
+    }
+    const uint32_t layer_max = std::min(42u, g_dynamic_arena.n_layer - 1u);
+    if (layer_max < 3) return;
+    const uint32_t entry_count =
+        g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
+    try {
+        g_reap_mass_observer.totals.assign(entry_count, 0.0);
+        g_reap_mass_observer.ring.assign(
+            (uint64_t)window * entry_count, 0.0);
+        g_reap_mass_observer.pending.clear();
+        g_reap_mass_observer.touched.assign(entry_count, 0);
+        g_reap_mass_observer.touched_entries.reserve(entry_count);
+    } catch (...) {
+        cuda_reap_mass_observer_release(0);
+        fprintf(stderr,
+                "ds4: [reap-mass] metadata allocation failed; observer disabled\n");
+        return;
+    }
+    g_reap_mass_observer.enabled = 1;
+    g_reap_mass_observer.window = window;
+    g_reap_mass_observer.entry_count = entry_count;
+    g_reap_mass_observer.layer_min = 3;
+    g_reap_mass_observer.layer_max = layer_max;
+}
+
+static void cuda_reap_mass_arm(uint32_t top, uint32_t n_tokens) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (observer.armed) return;
+    try {
+        observer.pending.assign(n_tokens, {});
+    } catch (...) {
+        fprintf(stderr,
+                "ds4: [reap-mass] pending allocation failed; observer disabled\n");
+        cuda_reap_mass_observer_release(0);
+        return;
+    }
+    observer.top = top;
+    observer.armed = 1;
+    fprintf(stderr,
+            "ds4: [reap-mass] armed window=%u top=%u layers=%u..%u semantics=selected_weight_normalized_per_token sliding_ring_observe_only\n",
+            observer.window, observer.top,
+            observer.layer_min, observer.layer_max);
+}
+
 static void cuda_prefill_mass_observer_report_decode(const char *reason) {
     const cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
     if (!observer.enabled || !observer.finalized ||
@@ -3554,6 +3778,96 @@ static void cuda_prefill_mass_observe_selected(
     observer.have_decode_layer = 1;
 }
 
+static void cuda_reap_mass_observe_selected(
+        uint32_t layer_index, uint32_t n_tokens,
+        const int32_t *selected, const float *weights,
+        uint32_t selected_count) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (!observer.enabled || !selected || selected_count == 0 ||
+        n_tokens != 1 || layer_index < observer.layer_min ||
+        layer_index > observer.layer_max ||
+        layer_index >= g_dynamic_arena.n_layer) {
+        return;
+    }
+    if (!weights) {
+        fprintf(stderr,
+                "ds4: [reap-mass] weights unavailable; observer disabled\n");
+        cuda_reap_mass_observer_release(0);
+        return;
+    }
+    if (selected_count % n_tokens != 0) {
+        fprintf(stderr,
+                "ds4: [reap-mass] invalid selected geometry; observer disabled\n");
+        cuda_reap_mass_observer_release(0);
+        return;
+    }
+    const uint32_t top = selected_count / n_tokens;
+    if (top == 0) return;
+    if (!observer.armed) {
+        cuda_reap_mass_arm(top, n_tokens);
+        if (!observer.enabled || !observer.armed) return;
+    } else if (observer.top != top) {
+        fprintf(stderr,
+                "ds4: [reap-mass] top changed old=%u new=%u; observer disabled\n",
+                observer.top, top);
+        cuda_reap_mass_observer_release(0);
+        return;
+    } else if (observer.pending.size() != n_tokens) {
+        cuda_reap_mass_commit_all_pending();
+        try {
+            observer.pending.assign(n_tokens, {});
+        } catch (...) {
+            fprintf(stderr,
+                    "ds4: [reap-mass] pending resize failed; observer disabled\n");
+            cuda_reap_mass_observer_release(0);
+            return;
+        }
+    } else if (observer.last_layer != 0 &&
+               layer_index <= observer.last_layer) {
+        cuda_reap_mass_commit_all_pending();
+    }
+
+    const uint32_t base = layer_index * g_dynamic_arena.n_expert;
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t row = t * top;
+        double sum = 0.0;
+        for (uint32_t k = 0; k < top; k++) {
+            const int32_t expert = selected[row + k];
+            const float weight = weights[row + k];
+            if (expert < 0 || (uint32_t)expert >= g_dynamic_arena.n_expert ||
+                !isfinite(weight) || weight <= 0.0f) {
+                continue;
+            }
+            sum += (double)weight;
+        }
+        if (sum <= 0.0) continue;
+        std::vector<std::pair<uint32_t, double>> &pending =
+            observer.pending[t];
+        try {
+            for (uint32_t k = 0; k < top; k++) {
+                const int32_t expert = selected[row + k];
+                const float weight = weights[row + k];
+                if (expert < 0 ||
+                    (uint32_t)expert >= g_dynamic_arena.n_expert ||
+                    !isfinite(weight) || weight <= 0.0f) {
+                    continue;
+                }
+                pending.push_back({
+                    base + (uint32_t)expert,
+                    (double)weight / sum
+                });
+                observer.observed_slots++;
+            }
+        } catch (...) {
+            fprintf(stderr,
+                    "ds4: [reap-mass] pending append failed; observer disabled\n");
+            cuda_reap_mass_observer_release(0);
+            return;
+        }
+    }
+    observer.last_layer = layer_index;
+}
+
 static int cuda_dynamic_arena_carry_mode(void) {
     const char *value =
         getenv("DS4_CUDA_DYNAMIC_ARENA_CARRY_ACROSS_REQUESTS");
@@ -3587,6 +3901,7 @@ static uint32_t cuda_dynamic_arena_active_count(void) {
 
 extern "C" void ds4_gpu_dynamic_arena_request_begin(void) {
     cuda_prefill_mass_observer_reset();
+    cuda_reap_mass_observer_reset();
     const int mode = cuda_dynamic_arena_carry_mode();
     if (mode < 0 || !g_dynamic_arena.host_base) return;
 
@@ -12980,6 +13295,8 @@ static int cuda_moe_selected_load(
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
     const int prefill_mass_weights =
         cuda_prefill_mass_observer_needs_weights();
+    const int reap_mass_weights = n_tokens == 1 &&
+        cuda_reap_mass_observer_needs_weights();
     const int weights_available = weights_arg && weights_arg->ptr &&
         weights_arg->bytes >= (uint64_t)slot_count * sizeof(float);
     const int layer_top1 =
@@ -12989,7 +13306,8 @@ static int cuda_moe_selected_load(
         return 0;
     }
     const int copy_weights =
-        weights_available && (layer_top1 || prefill_mass_weights);
+        weights_available &&
+        (layer_top1 || prefill_mass_weights || reap_mass_weights);
 
     const int prepared =
         g_moe_selected_prepared.valid &&
@@ -13048,6 +13366,9 @@ static int cuda_moe_selected_load(
     }
 
     cuda_prefill_mass_observe_selected(
+        layer_index, n_tokens, g_moe_gather.h_sel.data(),
+        copy_weights ? g_moe_gather.h_weights.data() : NULL, slot_count);
+    cuda_reap_mass_observe_selected(
         layer_index, n_tokens, g_moe_gather.h_sel.data(),
         copy_weights ? g_moe_gather.h_weights.data() : NULL, slot_count);
 

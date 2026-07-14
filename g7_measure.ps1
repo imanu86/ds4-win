@@ -17,6 +17,8 @@ param(
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
+    [switch]$ReapMassObserve,
+    [ValidateRange(1, 256)][int]$ReapMassWindow = 16,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
     [ValidateRange(0, 256)][int]$DynamicArenaGrowInterval = 0,
@@ -91,9 +93,10 @@ if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
 $inheritedDs4Environment = [ordered]@{}
-foreach ($entry in @(Get-ChildItem Env: | Where-Object { $_.Name -like "DS4_*" } | Sort-Object Name)) {
-    $inheritedDs4Environment[$entry.Name] = $entry.Value
-    Remove-Item -LiteralPath ("Env:\" + $entry.Name) -ErrorAction SilentlyContinue
+$_processEnvironment = [System.Environment]::GetEnvironmentVariables()
+foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | Where-Object { $_ -like "DS4_*" } | Sort-Object)) {
+    $inheritedDs4Environment[$name] = [string]$_processEnvironment[$name]
+    [System.Environment]::SetEnvironmentVariable($name, $null, [System.EnvironmentVariableTarget]::Process)
 }
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
@@ -117,6 +120,13 @@ if ($PrefillMassWrap) {
     $env:DS4_CUDA_PREFILL_MASS_WRAP = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_MASS_WRAP -ErrorAction SilentlyContinue
+}
+if ($ReapMassObserve) {
+    $env:DS4_CUDA_REAP_MASS_OBSERVE = "1"
+    $env:DS4_CUDA_REAP_MASS_WINDOW = "$ReapMassWindow"
+} else {
+    Remove-Item Env:\DS4_CUDA_REAP_MASS_OBSERVE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_REAP_MASS_WINDOW -ErrorAction SilentlyContinue
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW = "$DynamicArenaObservedWindow"
@@ -203,6 +213,7 @@ $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Re
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
 if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObserve requires DynamicArenaGiB > 0" }
 if ($PrefillMassWrap -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassWrap requires DynamicArenaGiB > 0" }
+if ($ReapMassObserve -and $DynamicArenaGiB -le 0.0) { throw "ReapMassObserve requires DynamicArenaGiB > 0" }
 if ($PrefillMassWrap -and $DynamicArenaObservedWindow -gt 0) { throw "PrefillMassWrap must be isolated from the decode observer" }
 if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassWrap must be isolated from arena growth" }
 if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
@@ -221,8 +232,9 @@ if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap pol
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
 $effectiveDs4Environment = [ordered]@{}
-foreach ($entry in @(Get-ChildItem Env: | Where-Object { $_.Name -like "DS4_*" } | Sort-Object Name)) {
-    $effectiveDs4Environment[$entry.Name] = $entry.Value
+$_processEnvironment = [System.Environment]::GetEnvironmentVariables()
+foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | Where-Object { $_ -like "DS4_*" } | Sort-Object)) {
+    $effectiveDs4Environment[$name] = [string]$_processEnvironment[$name]
 }
 $effectiveMinimumAvailableGiB = $MinimumAvailableGiB
 if ($effectiveMinimumAvailableGiB -eq 0.0) {
@@ -536,6 +548,11 @@ $prefillMassWrapSeconds = 0.0; $prefillMassWrapSnapshotBefore = 0; $prefillMassW
 $prefillMassWrapResidentBefore = 0; $prefillMassWrapResidentAfter = 0
 $prefillMassWrapGeneration = 0; $prefillMassWrapPreloaded = -1
 $prefillMassWrapRouter = "not_observed"; $prefillMassWrapMask = "not_observed"
+$reapMassArmed = $false; $reapMassResultObserved = $false
+$reapMassWindowObserved = 0; $reapMassTopObserved = 0
+$reapMassFirstLayer = 0; $reapMassLastLayer = 0
+$reapMassTokens = 0; $reapMassObservedSlots = 0; $reapMassUnique = 0
+$reapMassTopMass = 0.0; $reapMassTouched = 0
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
@@ -710,6 +727,20 @@ if (Test-Path $stderrLog) {
         $prefillMassWrapGeneration = [long]$Matches[11]; $prefillMassWrapPreloaded = [int]$Matches[12]
         $prefillMassWrapRouter = $Matches[13]; $prefillMassWrapMask = $Matches[14]
     }
+    $reapMassArmedLine = $lines | Where-Object { $_ -match "\[reap-mass\] armed" } | Select-Object -Last 1
+    if ($reapMassArmedLine -and $reapMassArmedLine -match "armed window=(\d+) top=(\d+) layers=(\d+)\.\.(\d+) semantics=selected_weight_normalized_per_token sliding_ring_observe_only") {
+        $reapMassArmed = $true
+        $reapMassWindowObserved = [int]$Matches[1]; $reapMassTopObserved = [int]$Matches[2]
+        $reapMassFirstLayer = [int]$Matches[3]; $reapMassLastLayer = [int]$Matches[4]
+    }
+    $reapMassResultLine = $lines | Where-Object { $_ -match "\[reap-mass\] request-end" } | Select-Object -Last 1
+    if ($reapMassResultLine -and $reapMassResultLine -match "request-end tokens=(\d+) observed_slots=(\d+) unique=(\d+) top_mass=([0-9.]+) touched=(\d+)") {
+        $reapMassResultObserved = $true
+        $reapMassTokens = [long]$Matches[1]; $reapMassObservedSlots = [long]$Matches[2]
+        $reapMassUnique = [long]$Matches[3]
+        $reapMassTopMass = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
+        $reapMassTouched = [long]$Matches[5]
+    }
     $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
     if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
         $arenaObserverArmed = $true
@@ -877,6 +908,13 @@ if ($PrefillMassWrap) {
 } elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
     throw "Prefill mass WRAP activated while not requested"
 }
+if ($ReapMassObserve) {
+    if (-not $reapMassArmed -or -not $reapMassResultObserved) { throw "REAP mass measurement failed: observer did not arm/report" }
+    if ($reapMassWindowObserved -ne $ReapMassWindow -or $reapMassTopObserved -le 0) { throw "REAP mass measurement failed: observed policy differs from requested policy" }
+    if ($reapMassTokens -le 0 -or $reapMassObservedSlots -le 0 -or $reapMassUnique -le 0 -or $reapMassTopMass -le 0.0) { throw "REAP mass measurement failed: invalid terminal counters" }
+} elseif ($reapMassArmed -or $reapMassResultObserved) {
+    throw "REAP mass observer activated while not requested"
+}
 if ($DynamicArenaObservedWindow -gt 0) {
     if (-not $arenaObserverArmed) { throw "Dynamic arena measurement failed: observer was not armed" }
     if ($arenaObserverWindowObserved -ne $DynamicArenaObservedWindow -or
@@ -1009,6 +1047,20 @@ $summary = [pscustomobject]@{
     dynamic_arena_gib_requested = $DynamicArenaGiB
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
+    reap_mass_observe_requested = [bool]$ReapMassObserve
+    reap_mass_window_requested = $ReapMassWindow
+    reap_mass_observer_armed = $reapMassArmed
+    reap_mass_result_observed = $reapMassResultObserved
+    reap_mass_window_observed = $reapMassWindowObserved
+    reap_mass_top_observed = $reapMassTopObserved
+    reap_mass_armed_first_layer = $reapMassFirstLayer
+    reap_mass_armed_last_layer = $reapMassLastLayer
+    reap_mass_tokens = $reapMassTokens
+    reap_mass_observed_slots = $reapMassObservedSlots
+    reap_mass_unique_entries = $reapMassUnique
+    reap_mass_top_mass = $reapMassTopMass
+    reap_mass_touched_entries = $reapMassTouched
+    reap_mass_semantics = "decode-only selected gate weight normalized per token and layer; exact sliding window; observe-only"
     prefill_mass_observer_armed = $prefillMassArmed
     prefill_mass_finalized = $prefillMassFinalized
     prefill_mass_policy_observed = $prefillMassPolicy
@@ -1206,6 +1258,7 @@ Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [
 Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
 Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
 Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
+Write-Host ("REAP mass requested/armed/window/top/tokens/slots/unique/top mass/touched: " + [bool]$ReapMassObserve + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena carry requested: " + $DynamicArenaCarry)
 Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)
