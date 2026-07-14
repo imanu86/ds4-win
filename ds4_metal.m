@@ -4947,6 +4947,46 @@ int ds4_gpu_async_read_wait_slot(ds4_gpu_async_read *readback, uint32_t slot) {
     return 0;
 }
 
+ds4_gpu_spex_queue *ds4_gpu_spex_queue_create(
+        const os_file_t *model_file,
+        uint64_t model_size,
+        uint32_t slots,
+        uint32_t expert_cap,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    (void)model_file;
+    (void)model_size;
+    (void)slots;
+    (void)expert_cap;
+    (void)gate_expert_bytes;
+    (void)down_expert_bytes;
+    return NULL;
+}
+
+void ds4_gpu_spex_queue_destroy(ds4_gpu_spex_queue *queue) {
+    (void)queue;
+}
+
+void ds4_gpu_spex_queue_reset(ds4_gpu_spex_queue *queue, uint64_t epoch) {
+    (void)queue;
+    (void)epoch;
+}
+
+int ds4_gpu_spex_queue_submit(
+        ds4_gpu_spex_queue *queue,
+        const ds4_gpu_spex_job *job) {
+    (void)queue;
+    (void)job;
+    return 0;
+}
+
+void ds4_gpu_spex_queue_cancel(
+        ds4_gpu_spex_queue *queue,
+        const ds4_gpu_spex_key *key) {
+    (void)queue;
+    (void)key;
+}
+
 int ds4_gpu_spex_hidden_topk_tensor(
         ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
@@ -12874,7 +12914,11 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        ds4_gpu_spex_queue   *spex_queue,
+        const ds4_gpu_spex_key *spex_key) {
+    (void)spex_queue;
+    (void)spex_key;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_expert == 0 || n_expert > 6) {

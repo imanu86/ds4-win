@@ -26,6 +26,7 @@ param(
     [ValidateSet("resident", "score", "topk", "full")][string]$SpexStage = "full",
     [switch]$SpexFusedTopK,
     [ValidateSet(1, 2, 4, 8)][int]$SpexRingSlots = 1,
+    [ValidateSet(0, 1)][int]$SpexPrefetchK = 0,
     [ValidateRange(1, 1000000)][int]$SpexStatsEvery = 1000000,
     [string]$ExpectedContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
@@ -36,6 +37,7 @@ $ErrorActionPreference = "Stop"
 if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
 }
+$effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $model = $ModelPath
 $outdir = Join-Path $PSScriptRoot "g7_runs"
@@ -90,12 +92,14 @@ if ($SpexDryRun) {
     }
     $env:DS4_SPEX_HIDDEN_GPU_DRY_RUN = "1"
     $env:DS4_SPEX_FILE = $SpexFile
-    $env:DS4_SPEX_CAP = "$(if ($SpexCap -gt 0) { $SpexCap } else { 6 })"
+    $env:DS4_SPEX_CAP = "$effectiveSpexCap"
     $env:DS4_SPEX_AB_STAGE = $SpexStage
     if ($SpexFusedTopK) { $env:DS4_SPEX_FUSED_TOPK = "1" }
     else { Remove-Item Env:\DS4_SPEX_FUSED_TOPK -ErrorAction SilentlyContinue }
     $env:DS4_SPEX_RING_SLOTS = "$SpexRingSlots"
     $env:DS4_SPEX_DRY_RUN_STATS_EVERY = "$SpexStatsEvery"
+    if ($SpexPrefetchK -gt 0) { $env:DS4_SPEX_PREFETCH_K = "$SpexPrefetchK" }
+    else { Remove-Item Env:\DS4_SPEX_PREFETCH_K -ErrorAction SilentlyContinue }
 } else {
     Remove-Item Env:\DS4_SPEX_HIDDEN_GPU_DRY_RUN -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_FILE -ErrorAction SilentlyContinue
@@ -104,6 +108,7 @@ if ($SpexDryRun) {
     Remove-Item Env:\DS4_SPEX_FUSED_TOPK -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_RING_SLOTS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_DRY_RUN_STATS_EVERY -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_SPEX_PREFETCH_K -ErrorAction SilentlyContinue
 }
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
@@ -111,6 +116,9 @@ $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Re
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
 if ($SpexFusedTopK -and $SpexStage -notin @("topk", "full")) { throw "SpexFusedTopK requires the topk or full stage" }
 if ($SpexRingSlots -gt 1 -and (-not $SpexDryRun -or $SpexStage -ne "full")) { throw "SpexRingSlots > 1 requires the full SpexDryRun stage" }
+if ($SpexPrefetchK -gt 0 -and (-not $SpexDryRun -or $SpexStage -ne "full" -or $effectiveSpexCap -lt $SpexPrefetchK)) { throw "SpexPrefetchK requires full SpexDryRun with SpexCap >= SpexPrefetchK" }
+if ($SpexPrefetchK -gt 0 -and $ExpertCacheN -gt 0) { throw "SpexPrefetchK is incompatible with ExpertCacheN > 0" }
+if ($SpexPrefetchK -gt 0 -and $NoSelectedLoad) { throw "SpexPrefetchK is incompatible with NoSelectedLoad" }
 if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap policy" }
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
@@ -128,6 +136,8 @@ $ds4SourceHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot
 $serverSourceHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "ds4_server.c")).Hash.ToLowerInvariant()
 $spexSourceHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "ds4_spex_predict.c")).Hash.ToLowerInvariant()
 $gpuHeaderHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "ds4_gpu.h")).Hash.ToLowerInvariant()
+$spexQueueHeaderHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "ds4_spex_queue.h")).Hash.ToLowerInvariant()
+$threadHeaderHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "src\platform\os_thread.h")).Hash.ToLowerInvariant()
 $cmakeHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "CMakeLists.txt")).Hash.ToLowerInvariant()
 $exeHashAtStart = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 $harnessHashAtStart = (Get-FileHash -Algorithm SHA256 $PSCommandPath).Hash.ToLowerInvariant()
@@ -232,6 +242,12 @@ $spexLayers = 0; $spexActual = 0; $spexPredicted = 0; $spexHits = 0; $spexRecall
 $spexPrecision = 0.0; $spexNoActual = 0
 $spexDisabled = $false; $spexFusedObserved = $false; $spexRingObserved = 0
 $spexLate = 0; $spexRingFull = 0; $spexStale = 0
+$spexPrefetchObserved = $false; $spexPrefetchKObserved = 0; $spexPrefetchSlotsObserved = 0
+$spexPrefetchFinalObserved = $false; $spexPrefetchSubmitted = 0; $spexPrefetchDropped = 0
+$spexPrefetchLoaded = 0; $spexPrefetchMatched = 0; $spexPrefetchHits = 0; $spexPrefetchNoHits = 0
+$spexPrefetchLate = 0; $spexPrefetchCanceled = 0; $spexPrefetchPoisoned = 0
+$spexPrefetchErrors = 0; $spexPrefetchDisabled = $false
+$spexPrefetchBytesRead = 0; $spexPrefetchBytesUsed = 0
 $serverRunsAll = @()
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
@@ -307,6 +323,23 @@ if (Test-Path $stderrLog) {
         $spexRingObserved = [int]$Matches[1]; $spexLate = [long]$Matches[2]
         $spexRingFull = [long]$Matches[3]; $spexStale = [long]$Matches[4]
     }
+    $spexPrefetchActiveLine = $lines | Where-Object { $_ -match "SPEX prefetch active k=(\d+) slots=(\d+)" } | Select-Object -Last 1
+    if ($spexPrefetchActiveLine -and $spexPrefetchActiveLine -match "SPEX prefetch active k=(\d+) slots=(\d+)") {
+        $spexPrefetchObserved = $true
+        $spexPrefetchKObserved = [int]$Matches[1]
+        $spexPrefetchSlotsObserved = [int]$Matches[2]
+    }
+    $spexPrefetchFinalLine = $lines | Where-Object { $_ -match "\[spex-prefetch\] final" } | Select-Object -Last 1
+    if ($spexPrefetchFinalLine -and $spexPrefetchFinalLine -match "submitted=(\d+) dropped=(\d+) loaded=(\d+) matched=(\d+) consumed=(\d+) no_hits=(\d+) late=(\d+) canceled=(\d+) poisoned=(\d+) errors=(\d+) disabled=(\d+) bytes_read=(\d+) bytes_used=(\d+)") {
+        $spexPrefetchFinalObserved = $true
+        $spexPrefetchSubmitted = [long]$Matches[1]; $spexPrefetchDropped = [long]$Matches[2]
+        $spexPrefetchLoaded = [long]$Matches[3]; $spexPrefetchMatched = [long]$Matches[4]
+        $spexPrefetchHits = [long]$Matches[5]; $spexPrefetchNoHits = [long]$Matches[6]
+        $spexPrefetchLate = [long]$Matches[7]; $spexPrefetchCanceled = [long]$Matches[8]
+        $spexPrefetchPoisoned = [long]$Matches[9]; $spexPrefetchErrors = [long]$Matches[10]
+        $spexPrefetchDisabled = ([int]$Matches[11] -ne 0)
+        $spexPrefetchBytesRead = [long]$Matches[12]; $spexPrefetchBytesUsed = [long]$Matches[13]
+    }
     $cacheReadyLine = $lines | Where-Object { $_ -match "resident expert cache ready: (\d+)/(\d+) experts" } | Select-Object -Last 1
     if ($cacheReadyLine -and $cacheReadyLine -match "resident expert cache ready: (\d+)/(\d+) experts") {
         $cacheCapacity = [int]$Matches[1]
@@ -325,7 +358,7 @@ if (@($results).Count -ne $Repeats) {
 }
 
 if ($SpexDryRun) {
-    $expectedSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
+    $expectedSpexCap = $effectiveSpexCap
     if (-not $spexObserved) { throw "SPEX measurement failed: no runtime counters observed" }
     if ($spexDisabled) { throw "SPEX measurement failed: runtime disabled itself" }
     if ($spexObservedStage -ne $SpexStage) { throw "SPEX measurement failed: observed stage mismatch" }
@@ -347,6 +380,24 @@ if ($SpexDryRun) {
     } else {
         if ($spexScheduled -le 0 -or $spexReady -ne 0) { throw "SPEX intermediate stage counters are inconsistent" }
     }
+}
+if ($SpexPrefetchK -gt 0) {
+    if (-not $spexPrefetchObserved -or $spexPrefetchKObserved -ne $SpexPrefetchK) { throw "SPEX prefetch measurement failed: requested worker was not activated" }
+    if (-not $spexPrefetchFinalObserved) { throw "SPEX prefetch measurement failed: final counters were not observed" }
+    if ($spexPrefetchSubmitted -le 0) { throw "SPEX prefetch measurement failed: no jobs were submitted" }
+    if ($spexPrefetchLoaded -le 0 -or $spexPrefetchHits -le 0) { throw "SPEX prefetch measurement failed: no functional loads were consumed" }
+    if ($spexPrefetchErrors -ne 0 -or $spexPrefetchPoisoned -ne 0 -or $spexPrefetchDisabled) { throw "SPEX prefetch measurement failed: worker error/quarantine observed" }
+    if ($spexPrefetchDropped -ne 0 -or $spexPrefetchCanceled -ne 0) { throw "SPEX prefetch measurement failed: dropped/canceled jobs observed" }
+    if ($spexPrefetchSubmitted -ne ($spexPrefetchLoaded + $spexPrefetchLate)) { throw "SPEX prefetch measurement failed: submitted jobs are not fully accounted" }
+    if ($spexPrefetchLoaded -ne ($spexPrefetchMatched + $spexPrefetchNoHits)) { throw "SPEX prefetch measurement failed: loaded jobs are not fully classified" }
+    if ($spexPrefetchMatched -ne $spexPrefetchHits) { throw "SPEX prefetch measurement failed: matched jobs did not all reach consumption" }
+    if ($spexReady -ne $spexLayers) { throw "SPEX prefetch measurement failed: ready predictions and compared layers differ" }
+    if ($spexPrefetchHits -ne $spexHits) { throw "SPEX prefetch measurement failed: consumed jobs differ from predictor hits" }
+    if ($spexPrefetchBytesRead -le 0 -or $spexPrefetchBytesUsed -le 0 -or $spexPrefetchBytesUsed -gt $spexPrefetchBytesRead) { throw "SPEX prefetch measurement failed: byte counters are inconsistent" }
+    if (($spexPrefetchBytesRead % $spexPrefetchLoaded) -ne 0 -or ($spexPrefetchBytesUsed % $spexPrefetchHits) -ne 0) { throw "SPEX prefetch measurement failed: byte counters are not whole experts" }
+    if (($spexPrefetchBytesRead / $spexPrefetchLoaded) -ne ($spexPrefetchBytesUsed / $spexPrefetchHits)) { throw "SPEX prefetch measurement failed: read/consumed expert sizes differ" }
+} elseif ($spexPrefetchObserved -or $spexPrefetchFinalObserved) {
+    throw "SPEX prefetch measurement failed: worker activated while not requested"
 }
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
@@ -381,6 +432,8 @@ $summary = [pscustomobject]@{
     ds4_server_c_sha256 = $serverSourceHashAtStart
     ds4_spex_predict_c_sha256 = $spexSourceHashAtStart
     ds4_gpu_h_sha256 = $gpuHeaderHashAtStart
+    ds4_spex_queue_h_sha256 = $spexQueueHeaderHashAtStart
+    os_thread_h_sha256 = $threadHeaderHashAtStart
     cmake_sha256 = $cmakeHashAtStart
     executable_sha256 = $exeHashAtStart
     harness_sha256 = $harnessHashAtStart
@@ -415,10 +468,28 @@ $summary = [pscustomobject]@{
     spex_dry_run_requested = [bool]$SpexDryRun
     spex_file = $SpexFile
     spex_file_sha256 = $spexHashAtStart
-    spex_cap_requested = $(if ($SpexDryRun) { if ($SpexCap -gt 0) { $SpexCap } else { 6 } } else { 0 })
+    spex_cap_requested = $(if ($SpexDryRun) { $effectiveSpexCap } else { 0 })
     spex_stage_requested = $(if ($SpexDryRun) { $SpexStage } else { "off" })
     spex_fused_topk_requested = [bool]$SpexFusedTopK
     spex_ring_slots_requested = $(if ($SpexDryRun) { $SpexRingSlots } else { 0 })
+    spex_prefetch_k_requested = $SpexPrefetchK
+    spex_prefetch_observed = $spexPrefetchObserved
+    spex_prefetch_k_observed = $spexPrefetchKObserved
+    spex_prefetch_slots_observed = $spexPrefetchSlotsObserved
+    spex_prefetch_final_observed = $spexPrefetchFinalObserved
+    spex_prefetch_submitted = $spexPrefetchSubmitted
+    spex_prefetch_dropped = $spexPrefetchDropped
+    spex_prefetch_loaded = $spexPrefetchLoaded
+    spex_prefetch_matched = $spexPrefetchMatched
+    spex_prefetch_hits = $spexPrefetchHits
+    spex_prefetch_no_hits = $spexPrefetchNoHits
+    spex_prefetch_late = $spexPrefetchLate
+    spex_prefetch_canceled = $spexPrefetchCanceled
+    spex_prefetch_poisoned = $spexPrefetchPoisoned
+    spex_prefetch_errors = $spexPrefetchErrors
+    spex_prefetch_disabled = $spexPrefetchDisabled
+    spex_prefetch_bytes_read = $spexPrefetchBytesRead
+    spex_prefetch_bytes_used = $spexPrefetchBytesUsed
     spex_observed = $spexObserved
     spex_stage_observed = $spexObservedStage
     spex_fused_topk_observed = $spexFusedObserved
@@ -489,5 +560,6 @@ Write-Host ("spex requested/observed stage/cap: " + [bool]$SpexDryRun + " / " + 
 Write-Host ("spex layers/hits/actual recall: " + $spexLayers + " / " + $spexHits + " / " + $spexActual + " / " + $spexRecall)
 Write-Host ("spex recall scope/ready coverage: " + $spexRecallScope + " / " + $(if ($null -eq $spexReadyCoverage) { "n/a" } else { $spexReadyCoverage }))
 Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLate + " / " + $spexRingFull + " / " + $spexStale)
+Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="

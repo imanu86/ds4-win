@@ -8175,6 +8175,10 @@ typedef struct {
     ds4_gpu_tensor *spex_scores;
     ds4_gpu_tensor *spex_topk[8];
     ds4_gpu_async_read *spex_readback;
+    ds4_gpu_spex_queue *spex_prefetch;
+    const ds4_weights *spex_model_weights;
+    uint64_t spex_epoch;
+    uint64_t spex_decode_seq;
     uint32_t spex_cap;
     uint32_t spex_ring_slots;
     uint32_t spex_next_slot;
@@ -8183,6 +8187,9 @@ typedef struct {
     uint32_t spex_prediction_layer;
     uint32_t spex_prediction_count;
     int32_t spex_prediction_ids[DS4_N_EXPERT_USED];
+    uint32_t spex_early_prediction_count[DS4_N_LAYER];
+    int32_t spex_early_prediction_ids[DS4_N_LAYER][DS4_N_EXPERT_USED];
+    bool spex_early_prediction_valid[DS4_N_LAYER];
     uint64_t spex_scheduled;
     uint64_t spex_ready;
     uint64_t spex_not_ready;
@@ -8374,6 +8381,7 @@ static void metal_graph_spex_print_stats(const ds4_gpu_graph *g, const char *why
 
 static void metal_graph_spex_release(ds4_gpu_graph *g) {
     if (!g) return;
+    ds4_gpu_spex_queue_destroy(g->spex_prefetch);
     ds4_gpu_async_read_free(g->spex_readback);
     for (uint32_t i = 0; i < 8; i++) {
         ds4_gpu_tensor_free(g->spex_topk[i]);
@@ -8383,11 +8391,15 @@ static void metal_graph_spex_release(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->spex_scores);
     ds4_gpu_tensor_free(g->spex_weights);
     g->spex_readback = NULL;
+    g->spex_prefetch = NULL;
+    g->spex_model_weights = NULL;
     g->spex_scores = NULL;
     g->spex_weights = NULL;
     g->spex_active = false;
     g->spex_decode_active = false;
     g->spex_prediction_valid = false;
+    memset(g->spex_early_prediction_valid, 0,
+           sizeof(g->spex_early_prediction_valid));
 }
 
 static void metal_graph_spex_disable(ds4_gpu_graph *g, const char *reason) {
@@ -8395,11 +8407,26 @@ static void metal_graph_spex_disable(ds4_gpu_graph *g, const char *reason) {
     fprintf(stderr, "ds4: SPEX hidden dry-run disabled: %s\n",
             reason ? reason : "runtime failure");
     g->spex_active = false;
+    g->spex_epoch++;
+    ds4_gpu_spex_queue_reset(g->spex_prefetch, g->spex_epoch);
     for (uint32_t i = 0; i < 8; i++) g->spex_ring_pending[i] = false;
     g->spex_prediction_valid = false;
+    memset(g->spex_early_prediction_valid, 0,
+           sizeof(g->spex_early_prediction_valid));
 }
 
-static void metal_graph_spex_init(ds4_gpu_graph *g) {
+static uint32_t metal_graph_spex_prefetch_k(void) {
+    const char *value = getenv("DS4_SPEX_PREFETCH_K");
+    if (!value || !value[0]) return 0;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    return end != value && *end == '\0' && parsed == 1ul ? 1u : 0u;
+}
+
+static void metal_graph_spex_init(
+        ds4_gpu_graph *g,
+        const ds4_model *base_model,
+        const ds4_weights *base_weights) {
     if (!g || !metal_graph_spex_dry_run_requested()) return;
     const char *path = getenv("DS4_SPEX_FILE");
     if (!path || !path[0]) {
@@ -8407,25 +8434,25 @@ static void metal_graph_spex_init(ds4_gpu_graph *g) {
         return;
     }
 
-    ds4_spex_model model;
-    const int load_rc = ds4_spex_load(path, &model);
+    ds4_spex_model spex_model;
+    const int load_rc = ds4_spex_load(path, &spex_model);
     if (load_rc != 0) {
         fprintf(stderr, "ds4: SPEX hidden dry-run could not load '%s' (rc=%d); disabled\n",
                 path, load_rc);
         return;
     }
-    if (model.n_layer != DS4_N_LAYER || model.n_embd != DS4_N_EMBD ||
-        model.n_expert != DS4_N_EXPERT) {
+    if (spex_model.n_layer != DS4_N_LAYER || spex_model.n_embd != DS4_N_EMBD ||
+        spex_model.n_expert != DS4_N_EXPERT) {
         fprintf(stderr,
                 "ds4: SPEX hidden dry-run shape mismatch file=%ux%ux%u runtime=%ux%ux%u; disabled\n",
-                model.n_layer, model.n_embd, model.n_expert,
+                spex_model.n_layer, spex_model.n_embd, spex_model.n_expert,
                 DS4_N_LAYER, DS4_N_EMBD, DS4_N_EXPERT);
-        ds4_spex_free(&model);
+        ds4_spex_free(&spex_model);
         return;
     }
 
-    const uint64_t weight_bytes = (uint64_t)model.n_layer * model.n_embd *
-                                  model.n_expert * sizeof(uint16_t);
+    const uint64_t weight_bytes = (uint64_t)spex_model.n_layer * spex_model.n_embd *
+                                  spex_model.n_expert * sizeof(uint16_t);
     g->spex_cap = metal_graph_spex_cap();
     g->spex_stage = metal_graph_spex_stage();
     g->spex_fused_topk = metal_graph_spex_fused_topk_requested() &&
@@ -8458,12 +8485,39 @@ static void metal_graph_spex_init(ds4_gpu_graph *g) {
                        topk_ready &&
                        (g->spex_stage < DS4_SPEX_STAGE_FULL || g->spex_readback) &&
                        ds4_gpu_tensor_write(g->spex_weights, 0,
-                                            model.weights, weight_bytes) != 0;
-    ds4_spex_free(&model);
+                                            spex_model.weights, weight_bytes) != 0;
+    ds4_spex_free(&spex_model);
     if (!ready) {
         fprintf(stderr, "ds4: SPEX hidden dry-run allocation/upload failed; disabled\n");
         metal_graph_spex_release(g);
         return;
+    }
+    g->spex_epoch = 1;
+    g->spex_model_weights = base_weights;
+    const uint32_t prefetch_k = metal_graph_spex_prefetch_k();
+    const char *cache_value = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_N");
+    const bool expert_cache_requested =
+        cache_value && cache_value[0] && strtoul(cache_value, NULL, 10) != 0;
+    const bool selected_load_disabled =
+        getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") != NULL;
+    if (prefetch_k != 0 && g->spex_stage == DS4_SPEX_STAGE_FULL &&
+        g->spex_cap >= prefetch_k && base_model && base_weights &&
+        !expert_cache_requested && !selected_load_disabled) {
+        const ds4_layer_weights *layer0 = &base_weights->layer[0];
+        const uint64_t gate_expert_bytes = layer0->ffn_gate_exps->dim[1] *
+            routed_expert_row_bytes(layer0->ffn_gate_exps);
+        const uint64_t down_expert_bytes = layer0->ffn_down_exps->dim[1] *
+            routed_expert_row_bytes(layer0->ffn_down_exps);
+        g->spex_prefetch = ds4_gpu_spex_queue_create(
+            &base_model->mmap.file, base_model->size, 2, prefetch_k,
+            gate_expert_bytes, down_expert_bytes);
+        if (!g->spex_prefetch) {
+            fprintf(stderr, "ds4: SPEX K1 prefetch allocation failed; dry-run remains active\n");
+        }
+    } else if (prefetch_k != 0 &&
+               (expert_cache_requested || selected_load_disabled)) {
+        fprintf(stderr,
+                "ds4: SPEX K1 prefetch disabled by incompatible selected-load configuration\n");
     }
     g->spex_active = true;
     fprintf(stderr,
@@ -8473,6 +8527,11 @@ static void metal_graph_spex_init(ds4_gpu_graph *g) {
             g->spex_ring_slots,
             (double)weight_bytes / 1048576.0);
 }
+
+static void metal_graph_spex_before_layer(
+        ds4_gpu_graph *g,
+        const ds4_layer_weights *layer,
+        uint32_t il);
 
 static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
     if (!g || !g->spex_active || !g->spex_decode_active ||
@@ -8554,9 +8613,30 @@ static void metal_graph_spex_score_next(ds4_gpu_graph *g, uint32_t il) {
     g->spex_ring_layer[slot] = il + 1u;
     g->spex_ring_count[slot] = g->spex_cap;
     g->spex_next_slot = (slot + 1u) % g->spex_ring_slots;
+
+    /* Ring-1 already has to retire this readback before the target layer.
+     * Retire it here when functional prefetch is enabled so the worker can
+     * overlap the expert load with the remainder of the source layer. */
+    if (g->spex_prefetch && g->spex_model_weights) {
+        const uint32_t target = il + 1u;
+        metal_graph_spex_before_layer(
+            g, &g->spex_model_weights->layer[target], target);
+        if (g->spex_prediction_valid &&
+            g->spex_prediction_layer == target) {
+            g->spex_early_prediction_count[target] = g->spex_prediction_count;
+            memcpy(g->spex_early_prediction_ids[target],
+                   g->spex_prediction_ids,
+                   (size_t)g->spex_prediction_count * sizeof(int32_t));
+            g->spex_early_prediction_valid[target] = true;
+            g->spex_prediction_valid = false;
+        }
+    }
 }
 
-static void metal_graph_spex_before_layer(ds4_gpu_graph *g, uint32_t il) {
+static void metal_graph_spex_before_layer(
+        ds4_gpu_graph *g,
+        const ds4_layer_weights *layer,
+        uint32_t il) {
     if (!g || !g->spex_active || g->spex_stage < DS4_SPEX_STAGE_FULL) return;
     for (uint32_t slot = 0; slot < g->spex_ring_slots; slot++) {
         if (!g->spex_ring_pending[slot] || g->spex_ring_layer[slot] != il) continue;
@@ -8599,6 +8679,26 @@ static void metal_graph_spex_before_layer(ds4_gpu_graph *g, uint32_t il) {
         g->spex_prediction_count = count;
         g->spex_prediction_valid = true;
         g->spex_ready++;
+        if (g->spex_prefetch && layer && count != 0) {
+            const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] *
+                routed_expert_row_bytes(layer->ffn_gate_exps);
+            const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] *
+                routed_expert_row_bytes(layer->ffn_down_exps);
+            ds4_gpu_spex_job job;
+            memset(&job, 0, sizeof(job));
+            job.key.epoch = g->spex_epoch;
+            job.key.decode_seq = g->spex_decode_seq;
+            job.key.source_layer = il ? il - 1u : 0u;
+            job.key.target_layer = il;
+            job.gate_offset = layer->ffn_gate_exps->abs_offset;
+            job.up_offset = layer->ffn_up_exps->abs_offset;
+            job.down_offset = layer->ffn_down_exps->abs_offset;
+            job.expert_count = 1;
+            job.expert_ids[0] = ids[0];
+            if (gate_expert_bytes != 0 && down_expert_bytes != 0) {
+                (void)ds4_gpu_spex_queue_submit(g->spex_prefetch, &job);
+            }
+        }
         return;
     }
 }
@@ -8609,7 +8709,16 @@ static void metal_graph_spex_after_layer(
         uint32_t il) {
     if (!g || !g->spex_active || !layer || !layer->ffn_gate_exps) return;
 
-    if (g->spex_prediction_valid && g->spex_prediction_layer == il) {
+    const bool early_prediction = g->spex_early_prediction_valid[il];
+    const bool regular_prediction =
+        g->spex_prediction_valid && g->spex_prediction_layer == il;
+    if (early_prediction || regular_prediction) {
+        const uint32_t prediction_count = early_prediction
+            ? g->spex_early_prediction_count[il]
+            : g->spex_prediction_count;
+        const int32_t *prediction_ids = early_prediction
+            ? g->spex_early_prediction_ids[il]
+            : g->spex_prediction_ids;
         int32_t actual[DS4_N_EXPERT_USED];
         const uint32_t actual_n = ds4_gpu_routed_moe_last_selected(
             layer->ffn_gate_exps->abs_offset, actual, DS4_N_EXPERT_USED);
@@ -8618,8 +8727,8 @@ static void metal_graph_spex_after_layer(
         } else {
             uint32_t hits = 0;
             for (uint32_t a = 0; a < actual_n; a++) {
-                for (uint32_t p = 0; p < g->spex_prediction_count; p++) {
-                    if (actual[a] == g->spex_prediction_ids[p]) {
+                for (uint32_t p = 0; p < prediction_count; p++) {
+                    if (actual[a] == prediction_ids[p]) {
                         hits++;
                         break;
                     }
@@ -8627,10 +8736,11 @@ static void metal_graph_spex_after_layer(
             }
             g->spex_compared_layers++;
             g->spex_actual_experts += actual_n;
-            g->spex_predicted_experts += g->spex_prediction_count;
+            g->spex_predicted_experts += prediction_count;
             g->spex_hits += hits;
         }
-        g->spex_prediction_valid = false;
+        if (early_prediction) g->spex_early_prediction_valid[il] = false;
+        if (regular_prediction) g->spex_prediction_valid = false;
     }
 
     if (il + 1u == DS4_N_LAYER) {
@@ -8988,6 +9098,7 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
  * weights are not copied here; tensors reference the mapped GGUF. */
 static bool metal_graph_alloc_raw_cap(
         ds4_gpu_graph *g,
+        const ds4_model       *model,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer,
         uint32_t                raw_cap,
@@ -9201,7 +9312,7 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
-    metal_graph_spex_init(g);
+    metal_graph_spex_init(g, model, weights);
 
     bool layer_cache_ok = true;
     for (uint32_t il = 0; layer_cache_ok && il < DS4_N_LAYER; il++) {
@@ -9276,9 +9387,10 @@ static bool metal_graph_alloc_raw_cap(
 
 static bool metal_graph_alloc(
         ds4_gpu_graph *g,
+        const ds4_model       *model,
         const ds4_weights     *weights,
         const ds4_layer_weights *layer) {
-    return metal_graph_alloc_raw_cap(g, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
+    return metal_graph_alloc_raw_cap(g, model, weights, layer, DS4_N_SWA, DS4_N_SWA, 1, false);
 }
 
 static uint32_t metal_graph_raw_span_for_batch(
@@ -10122,6 +10234,12 @@ static bool metal_graph_encode_decode_layer(
         gate_expert_bytes, down_expert_bytes,
         g->router_selected, DS4_N_EXPERT_USED, 1) != 0;
     const bool overlap_shared_full = overlap_shared && overlap_shared_full_requested;
+    ds4_gpu_spex_key spex_key = {
+        g->spex_epoch,
+        g->spex_decode_seq,
+        il ? il - 1u : 0u,
+        il,
+    };
     if (ok && overlap_shared) {
         if (fuse_shared_gate_up) {
             ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
@@ -10170,7 +10288,9 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)down_in_dim,
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
-                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm) != 0;
+                                                 DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
+                                                 g->spex_prefetch,
+                                                 g->spex_prefetch ? &spex_key : NULL) != 0;
     DS4_METAL_PROFILE_DECODE_STAGE(
         overlap_shared_full ? "shared_full+routed_moe" :
         (overlap_shared ? "shared_gate_up+routed_moe" : "routed_moe"));
@@ -10833,7 +10953,7 @@ static int metal_graph_decode_test(
     output_logits_one(cpu_logits, model, weights, cpu_after_ffn_hc);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc(&g, weights, layer);
+    bool ok = metal_graph_alloc(&g, model, weights, layer);
     g.materialize_ffn_out = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds4_gpu_embed_token_hc_tensor(g.cur_hc,
@@ -10981,7 +11101,7 @@ static int metal_graph_first_token_full_test(
     output_logits_one(cpu_logits, model, weights, cpu_hc);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc(&g, weights, &weights->layer[0]);
+    bool ok = metal_graph_alloc(&g, model, weights, &weights->layer[0]);
     const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
     if (trace_layers && ok) {
         g.materialize_ffn_out = true;
@@ -11149,9 +11269,15 @@ static bool metal_graph_encode_token_raw_swa(
         if (end != split_env && v <= DS4_N_LAYER) split_after_layers = (uint32_t)v;
     }
 
+    g->spex_decode_seq++;
+    if (g->spex_decode_seq == 0) {
+        g->spex_epoch++;
+        g->spex_decode_seq = 1;
+        ds4_gpu_spex_queue_reset(g->spex_prefetch, g->spex_epoch);
+    }
     g->spex_decode_active = true;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        metal_graph_spex_before_layer(g, il);
+        metal_graph_spex_before_layer(g, &weights->layer[il], il);
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -14368,7 +14494,7 @@ static int metal_graph_prompt_logits_test(
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, (uint32_t)n_test);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, model, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, (uint32_t)n_test, false);
     if (!ok) {
         metal_graph_free(&g);
@@ -15751,7 +15877,7 @@ static int generate_metal_graph_raw_swa(
                 prompt->len);
     }
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, model, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate GPU graph runtime\n");
@@ -17179,7 +17305,7 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, prefill_cap);
 
     ds4_gpu_graph g;
-    bool ok = metal_graph_alloc_raw_cap(&g, weights, &weights->layer[0],
+    bool ok = metal_graph_alloc_raw_cap(&g, model, weights, &weights->layer[0],
                                         raw_cap, (uint32_t)ctx_size, prefill_cap, false);
     if (!ok) {
         fprintf(stderr, "ds4: failed to allocate imatrix Metal graph runtime\n");
@@ -17685,7 +17811,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
-    if (!metal_graph_alloc_raw_cap(&s->graph, &e->weights, &e->weights.layer[0],
+    if (!metal_graph_alloc_raw_cap(&s->graph, &e->model, &e->weights, &e->weights.layer[0],
                                    raw_cap, (uint32_t)ctx_size, s->prefill_cap, e->mtp_ready))
     {
         free(s);

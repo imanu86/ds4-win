@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "ds4_spex_queue.h"
 #include "src/platform/os_file.h"
 
 /* =========================================================================
@@ -51,6 +52,19 @@ int ds4_gpu_async_read_ready(ds4_gpu_async_read *readback);
 int ds4_gpu_async_read_ready_slot(ds4_gpu_async_read *readback, uint32_t slot);
 int ds4_gpu_async_read_wait(ds4_gpu_async_read *readback);
 int ds4_gpu_async_read_wait_slot(ds4_gpu_async_read *readback, uint32_t slot);
+ds4_gpu_spex_queue *ds4_gpu_spex_queue_create(
+        const os_file_t *model_file,
+        uint64_t model_size,
+        uint32_t slots,
+        uint32_t expert_cap,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes);
+void ds4_gpu_spex_queue_destroy(ds4_gpu_spex_queue *queue);
+void ds4_gpu_spex_queue_reset(ds4_gpu_spex_queue *queue, uint64_t epoch);
+int ds4_gpu_spex_queue_submit(ds4_gpu_spex_queue *queue,
+                              const ds4_gpu_spex_job *job);
+void ds4_gpu_spex_queue_cancel(ds4_gpu_spex_queue *queue,
+                               const ds4_gpu_spex_key *key);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
@@ -678,7 +692,9 @@ int ds4_gpu_routed_moe_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        ds4_gpu_spex_queue   *spex_queue,
+        const ds4_gpu_spex_key *spex_key);
 
 int ds4_gpu_routed_moe_prepare_selected(
         const void             *model_map,

@@ -27,6 +27,8 @@
 
 #include "src/platform/os_clock.h"
 #include "src/platform/os_file.h"
+#include "src/platform/os_thread.h"
+#include "ds4_spex_queue.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -66,7 +68,61 @@ struct ds4_gpu_async_read {
     int *pending;
 };
 
+enum cuda_spex_prefetch_state : uint8_t {
+    CUDA_SPEX_PREFETCH_FREE = 0,
+    CUDA_SPEX_PREFETCH_QUEUED = 1,
+    CUDA_SPEX_PREFETCH_LOADING = 2,
+    CUDA_SPEX_PREFETCH_READY = 3,
+    CUDA_SPEX_PREFETCH_IN_USE = 4,
+    CUDA_SPEX_PREFETCH_RETIRING = 5,
+};
+
+struct cuda_spex_prefetch_slot {
+    ds4_gpu_spex_job job;
+    cuda_spex_prefetch_state state;
+    int discard;
+};
+
+struct ds4_gpu_spex_queue {
+    os_file_t file;
+    uint64_t model_size;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t epoch;
+    uint32_t slots;
+    uint32_t expert_cap;
+    cuda_spex_prefetch_slot *slot;
+    char *host_gate;
+    char *host_up;
+    char *host_down;
+    char *device_gate;
+    char *device_up;
+    char *device_down;
+    cudaStream_t upload_stream;
+    os_mutex_t mutex;
+    os_cond_t cond;
+    os_thread_t thread;
+    int mutex_ready;
+    int cond_ready;
+    int thread_started;
+    int stop;
+    int disabled;
+    uint64_t submitted;
+    uint64_t dropped;
+    uint64_t loaded;
+    uint64_t matched;
+    uint64_t hits;
+    uint64_t no_hits;
+    uint64_t late;
+    uint64_t canceled;
+    uint64_t poisoned;
+    uint64_t errors;
+    uint64_t bytes_read;
+    uint64_t bytes_used;
+};
+
 extern "C" void ds4_gpu_async_read_free(ds4_gpu_async_read *readback);
+extern "C" void ds4_gpu_spex_queue_destroy(ds4_gpu_spex_queue *queue);
 
 typedef struct {
     uint8_t scales[CUDA_QK_K / 16];
@@ -1849,6 +1905,430 @@ extern "C" int ds4_gpu_tensor_read_async_ordered_slot(
     }
     readback->pending[slot] = 1;
     return 1;
+}
+
+static int cuda_spex_key_equal(
+        const ds4_gpu_spex_key *a,
+        const ds4_gpu_spex_key *b) {
+    return a && b &&
+           a->epoch == b->epoch &&
+           a->decode_seq == b->decode_seq &&
+           a->source_layer == b->source_layer &&
+           a->target_layer == b->target_layer;
+}
+
+static char *cuda_spex_host_gate(ds4_gpu_spex_queue *q, uint32_t slot) {
+    return q->host_gate + (uint64_t)slot * q->expert_cap * q->gate_expert_bytes;
+}
+
+static char *cuda_spex_host_up(ds4_gpu_spex_queue *q, uint32_t slot) {
+    return q->host_up + (uint64_t)slot * q->expert_cap * q->gate_expert_bytes;
+}
+
+static char *cuda_spex_host_down(ds4_gpu_spex_queue *q, uint32_t slot) {
+    return q->host_down + (uint64_t)slot * q->expert_cap * q->down_expert_bytes;
+}
+
+static char *cuda_spex_device_gate(ds4_gpu_spex_queue *q, uint32_t slot) {
+    return q->device_gate + (uint64_t)slot * q->expert_cap * q->gate_expert_bytes;
+}
+
+static char *cuda_spex_device_up(ds4_gpu_spex_queue *q, uint32_t slot) {
+    return q->device_up + (uint64_t)slot * q->expert_cap * q->gate_expert_bytes;
+}
+
+static char *cuda_spex_device_down(ds4_gpu_spex_queue *q, uint32_t slot) {
+    return q->device_down + (uint64_t)slot * q->expert_cap * q->down_expert_bytes;
+}
+
+static int cuda_spex_prefetch_read_job(
+        ds4_gpu_spex_queue *q,
+        uint32_t slot,
+        const ds4_gpu_spex_job *job,
+        uint64_t *bytes_read) {
+    uint64_t read_total = 0;
+    for (uint32_t i = 0; i < job->expert_count; i++) {
+        const uint64_t expert = job->expert_ids[i];
+        const uint64_t gate_src = job->gate_offset + expert * q->gate_expert_bytes;
+        const uint64_t up_src = job->up_offset + expert * q->gate_expert_bytes;
+        const uint64_t down_src = job->down_offset + expert * q->down_expert_bytes;
+        char *hg = cuda_spex_host_gate(q, slot) + (uint64_t)i * q->gate_expert_bytes;
+        char *hu = cuda_spex_host_up(q, slot) + (uint64_t)i * q->gate_expert_bytes;
+        char *hd = cuda_spex_host_down(q, slot) + (uint64_t)i * q->down_expert_bytes;
+        if (os_pread(&q->file, hg, q->gate_expert_bytes, gate_src) !=
+                (int64_t)q->gate_expert_bytes ||
+            os_pread(&q->file, hu, q->gate_expert_bytes, up_src) !=
+                (int64_t)q->gate_expert_bytes ||
+            os_pread(&q->file, hd, q->down_expert_bytes, down_src) !=
+                (int64_t)q->down_expert_bytes) {
+            return 0;
+        }
+        read_total += q->gate_expert_bytes * 2u + q->down_expert_bytes;
+    }
+    const uint64_t gate_bytes = (uint64_t)job->expert_count * q->gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)job->expert_count * q->down_expert_bytes;
+    int enqueued = 1;
+    if (cudaMemcpyAsync(cuda_spex_device_gate(q, slot), cuda_spex_host_gate(q, slot),
+                        (size_t)gate_bytes, cudaMemcpyHostToDevice, q->upload_stream) != cudaSuccess) {
+        enqueued = 0;
+    }
+    if (cudaMemcpyAsync(cuda_spex_device_up(q, slot), cuda_spex_host_up(q, slot),
+                        (size_t)gate_bytes, cudaMemcpyHostToDevice, q->upload_stream) != cudaSuccess) {
+        enqueued = 0;
+    }
+    if (cudaMemcpyAsync(cuda_spex_device_down(q, slot), cuda_spex_host_down(q, slot),
+                        (size_t)down_bytes, cudaMemcpyHostToDevice, q->upload_stream) != cudaSuccess) {
+        enqueued = 0;
+    }
+    const cudaError_t fenced = cudaStreamSynchronize(q->upload_stream);
+    if (!enqueued || fenced != cudaSuccess) {
+        (void)cudaGetLastError();
+        return fenced == cudaSuccess ? 0 : -1;
+    }
+    if (bytes_read) *bytes_read = read_total;
+    return 1;
+}
+
+static void *cuda_spex_prefetch_worker(void *arg) {
+    ds4_gpu_spex_queue *q = (ds4_gpu_spex_queue *)arg;
+    for (;;) {
+        uint32_t selected = UINT32_MAX;
+        ds4_gpu_spex_job job;
+        os_mutex_lock(&q->mutex);
+        for (;;) {
+            if (q->stop || q->disabled) break;
+            for (uint32_t i = 0; i < q->slots; i++) {
+                if (q->slot[i].state == CUDA_SPEX_PREFETCH_QUEUED) {
+                    selected = i;
+                    q->slot[i].state = CUDA_SPEX_PREFETCH_LOADING;
+                    job = q->slot[i].job;
+                    break;
+                }
+            }
+            if (selected != UINT32_MAX || q->stop || q->disabled) break;
+            (void)os_cond_wait(&q->cond, &q->mutex);
+        }
+        const int stop = q->stop || q->disabled;
+        os_mutex_unlock(&q->mutex);
+        if (stop) break;
+
+        uint64_t bytes_read = 0;
+        const int read_status = cuda_spex_prefetch_read_job(q, selected, &job, &bytes_read);
+        os_mutex_lock(&q->mutex);
+        cuda_spex_prefetch_slot *slot = &q->slot[selected];
+        if (read_status < 0) {
+            q->errors++;
+            q->poisoned++;
+            q->disabled = 1;
+            slot->state = CUDA_SPEX_PREFETCH_RETIRING;
+            slot->discard = 1;
+        } else if (read_status == 0) {
+            q->errors++;
+            slot->state = CUDA_SPEX_PREFETCH_FREE;
+        } else if (slot->discard || job.key.epoch != q->epoch) {
+            slot->state = CUDA_SPEX_PREFETCH_FREE;
+        } else {
+            q->loaded++;
+            q->bytes_read += bytes_read;
+            slot->state = CUDA_SPEX_PREFETCH_READY;
+        }
+        if (read_status >= 0) slot->discard = 0;
+        os_cond_broadcast(&q->cond);
+        os_mutex_unlock(&q->mutex);
+    }
+    return NULL;
+}
+
+extern "C" ds4_gpu_spex_queue *ds4_gpu_spex_queue_create(
+        const os_file_t *model_file,
+        uint64_t model_size,
+        uint32_t slots,
+        uint32_t expert_cap,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (!model_file || !os_file_valid(model_file) || model_size == 0 ||
+        slots == 0 || slots > 8u || expert_cap != 1u ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) return NULL;
+    ds4_gpu_spex_queue *q = (ds4_gpu_spex_queue *)calloc(1, sizeof(*q));
+    if (!q) return NULL;
+    os_file_init(&q->file);
+    q->model_size = model_size;
+    q->slots = slots;
+    q->expert_cap = expert_cap;
+    q->gate_expert_bytes = gate_expert_bytes;
+    q->down_expert_bytes = down_expert_bytes;
+    q->epoch = 1;
+    q->slot = (cuda_spex_prefetch_slot *)calloc(slots, sizeof(*q->slot));
+    const uint64_t gate_total = (uint64_t)slots * expert_cap * gate_expert_bytes;
+    const uint64_t down_total = (uint64_t)slots * expert_cap * down_expert_bytes;
+    int ok = q->slot && os_file_dup(&q->file, model_file) == 0;
+    if (ok && os_mutex_init(&q->mutex) == 0) q->mutex_ready = 1; else ok = 0;
+    if (ok && os_cond_init(&q->cond) == 0) q->cond_ready = 1; else ok = 0;
+    if (ok) ok = cuda_ok(cudaHostAlloc(&q->host_gate, (size_t)gate_total, cudaHostAllocDefault), "SPEX prefetch host gate") &&
+                 cuda_ok(cudaHostAlloc(&q->host_up, (size_t)gate_total, cudaHostAllocDefault), "SPEX prefetch host up") &&
+                 cuda_ok(cudaHostAlloc(&q->host_down, (size_t)down_total, cudaHostAllocDefault), "SPEX prefetch host down") &&
+                 cuda_ok(cudaMalloc(&q->device_gate, (size_t)gate_total), "SPEX prefetch device gate") &&
+                 cuda_ok(cudaMalloc(&q->device_up, (size_t)gate_total), "SPEX prefetch device up") &&
+                 cuda_ok(cudaMalloc(&q->device_down, (size_t)down_total), "SPEX prefetch device down") &&
+                 cuda_ok(cudaStreamCreateWithFlags(&q->upload_stream, cudaStreamNonBlocking), "SPEX prefetch stream");
+    if (ok && os_thread_create(&q->thread, cuda_spex_prefetch_worker, q) == 0) {
+        q->thread_started = 1;
+    } else {
+        ok = 0;
+    }
+    if (!ok) {
+        ds4_gpu_spex_queue_destroy(q);
+        return NULL;
+    }
+    fprintf(stderr,
+            "ds4: SPEX prefetch active k=%u slots=%u %.2f MiB/expert; fallback is nonblocking\n",
+            expert_cap, slots,
+            (double)(gate_expert_bytes * 2u + down_expert_bytes) / 1048576.0);
+    return q;
+}
+
+extern "C" void ds4_gpu_spex_queue_reset(
+        ds4_gpu_spex_queue *q,
+        uint64_t epoch) {
+    if (!q || !q->mutex_ready) return;
+    os_mutex_lock(&q->mutex);
+    q->epoch = epoch ? epoch : q->epoch + 1u;
+    for (uint32_t i = 0; i < q->slots; i++) {
+        if (q->slot[i].state == CUDA_SPEX_PREFETCH_QUEUED ||
+            q->slot[i].state == CUDA_SPEX_PREFETCH_READY) {
+            q->slot[i].state = CUDA_SPEX_PREFETCH_FREE;
+        } else if (q->slot[i].state == CUDA_SPEX_PREFETCH_LOADING ||
+                   q->slot[i].state == CUDA_SPEX_PREFETCH_IN_USE) {
+            q->slot[i].discard = 1;
+        }
+    }
+    os_cond_broadcast(&q->cond);
+    os_mutex_unlock(&q->mutex);
+}
+
+extern "C" int ds4_gpu_spex_queue_submit(
+        ds4_gpu_spex_queue *q,
+        const ds4_gpu_spex_job *job) {
+    if (!q || !job || job->expert_count == 0 ||
+        job->expert_count > q->expert_cap || job->key.epoch == 0) return 0;
+    for (uint32_t i = 0; i < job->expert_count; i++) {
+        if (job->expert_ids[i] >= 256u) return 0;
+    }
+    const uint64_t max_expert = job->expert_ids[0];
+    if (job->gate_offset > q->model_size || job->up_offset > q->model_size ||
+        job->down_offset > q->model_size ||
+        (max_expert + 1u) * q->gate_expert_bytes > q->model_size - job->gate_offset ||
+        (max_expert + 1u) * q->gate_expert_bytes > q->model_size - job->up_offset ||
+        (max_expert + 1u) * q->down_expert_bytes > q->model_size - job->down_offset) return 0;
+    os_mutex_lock(&q->mutex);
+    if (q->disabled || job->key.epoch != q->epoch) {
+        q->dropped++;
+        os_mutex_unlock(&q->mutex);
+        return 0;
+    }
+    int selected = -1;
+    for (uint32_t i = 0; i < q->slots; i++) {
+        if (q->slot[i].state == CUDA_SPEX_PREFETCH_READY &&
+            q->slot[i].job.key.decode_seq < job->key.decode_seq) {
+            q->slot[i].state = CUDA_SPEX_PREFETCH_FREE;
+        }
+        if (selected < 0 && q->slot[i].state == CUDA_SPEX_PREFETCH_FREE) selected = (int)i;
+    }
+    if (selected < 0) {
+        q->dropped++;
+        os_mutex_unlock(&q->mutex);
+        return 0;
+    }
+    q->slot[(uint32_t)selected].job = *job;
+    q->slot[(uint32_t)selected].discard = 0;
+    q->slot[(uint32_t)selected].state = CUDA_SPEX_PREFETCH_QUEUED;
+    q->submitted++;
+    os_cond_signal(&q->cond);
+    os_mutex_unlock(&q->mutex);
+    return 1;
+}
+
+extern "C" void ds4_gpu_spex_queue_cancel(
+        ds4_gpu_spex_queue *q,
+        const ds4_gpu_spex_key *key) {
+    if (!q || !key || !q->mutex_ready) return;
+    os_mutex_lock(&q->mutex);
+    for (uint32_t i = 0; i < q->slots; i++) {
+        cuda_spex_prefetch_slot *slot = &q->slot[i];
+        if (!cuda_spex_key_equal(&slot->job.key, key)) continue;
+        if (slot->state == CUDA_SPEX_PREFETCH_LOADING ||
+            slot->state == CUDA_SPEX_PREFETCH_IN_USE) {
+            slot->discard = 1;
+        } else if (slot->state == CUDA_SPEX_PREFETCH_QUEUED ||
+                   slot->state == CUDA_SPEX_PREFETCH_READY) {
+            slot->state = CUDA_SPEX_PREFETCH_FREE;
+            slot->discard = 0;
+        }
+        q->canceled++;
+        os_cond_signal(&q->cond);
+        break;
+    }
+    os_mutex_unlock(&q->mutex);
+}
+
+extern "C" void ds4_gpu_spex_queue_destroy(ds4_gpu_spex_queue *q) {
+    if (!q) return;
+    if (q->mutex_ready) {
+        os_mutex_lock(&q->mutex);
+        q->stop = 1;
+        if (q->cond_ready) os_cond_broadcast(&q->cond);
+        os_mutex_unlock(&q->mutex);
+    }
+    if (q->thread_started) os_thread_join(q->thread);
+    if (q->upload_stream) (void)cudaStreamSynchronize(q->upload_stream);
+    (void)cudaDeviceSynchronize();
+    fprintf(stderr,
+            "ds4: [spex-prefetch] final submitted=%llu dropped=%llu loaded=%llu matched=%llu consumed=%llu no_hits=%llu late=%llu canceled=%llu poisoned=%llu errors=%llu disabled=%u bytes_read=%llu bytes_used=%llu\n",
+            (unsigned long long)q->submitted,
+            (unsigned long long)q->dropped,
+            (unsigned long long)q->loaded,
+            (unsigned long long)q->matched,
+            (unsigned long long)q->hits,
+            (unsigned long long)q->no_hits,
+            (unsigned long long)q->late,
+            (unsigned long long)q->canceled,
+            (unsigned long long)q->poisoned,
+            (unsigned long long)q->errors,
+            q->disabled ? 1u : 0u,
+            (unsigned long long)q->bytes_read,
+            (unsigned long long)q->bytes_used);
+    if (q->upload_stream) (void)cudaStreamDestroy(q->upload_stream);
+    if (q->device_gate) (void)cudaFree(q->device_gate);
+    if (q->device_up) (void)cudaFree(q->device_up);
+    if (q->device_down) (void)cudaFree(q->device_down);
+    if (q->host_gate) (void)cudaFreeHost(q->host_gate);
+    if (q->host_up) (void)cudaFreeHost(q->host_up);
+    if (q->host_down) (void)cudaFreeHost(q->host_down);
+    os_file_close(&q->file);
+    if (q->cond_ready) os_cond_destroy(&q->cond);
+    if (q->mutex_ready) os_mutex_destroy(&q->mutex);
+    free(q->slot);
+    free(q);
+}
+
+static int cuda_spex_prefetch_claim(
+        ds4_gpu_spex_queue *q,
+        const ds4_gpu_spex_key *key,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        const std::vector<int32_t> &compact,
+        int *out_slot,
+        uint32_t *out_prediction,
+        uint32_t *out_compact) {
+    if (!q || !key || !out_slot || !out_prediction || !out_compact) return 0;
+    os_mutex_lock(&q->mutex);
+    if (q->disabled) {
+        os_mutex_unlock(&q->mutex);
+        return 0;
+    }
+    for (uint32_t i = 0; i < q->slots; i++) {
+        cuda_spex_prefetch_slot *slot = &q->slot[i];
+        if (!cuda_spex_key_equal(&slot->job.key, key)) continue;
+        if (slot->job.gate_offset != gate_offset ||
+            slot->job.up_offset != up_offset ||
+            slot->job.down_offset != down_offset) {
+            if (slot->state == CUDA_SPEX_PREFETCH_LOADING ||
+                slot->state == CUDA_SPEX_PREFETCH_IN_USE) {
+                slot->discard = 1;
+            } else {
+                slot->state = CUDA_SPEX_PREFETCH_FREE;
+            }
+            q->errors++;
+            os_mutex_unlock(&q->mutex);
+            return 0;
+        }
+        if (slot->state == CUDA_SPEX_PREFETCH_QUEUED) {
+            slot->state = CUDA_SPEX_PREFETCH_FREE;
+            q->late++;
+            os_mutex_unlock(&q->mutex);
+            return 0;
+        }
+        if (slot->state == CUDA_SPEX_PREFETCH_LOADING) {
+            slot->discard = 1;
+            q->late++;
+            os_mutex_unlock(&q->mutex);
+            return 0;
+        }
+        if (slot->state != CUDA_SPEX_PREFETCH_READY) {
+            os_mutex_unlock(&q->mutex);
+            return 0;
+        }
+        for (uint32_t p = 0; p < slot->job.expert_count; p++) {
+            for (uint32_t c = 0; c < compact.size(); c++) {
+                if ((int32_t)slot->job.expert_ids[p] == compact[c]) {
+                    slot->state = CUDA_SPEX_PREFETCH_IN_USE;
+                    q->matched++;
+                    *out_slot = (int)i;
+                    *out_prediction = p;
+                    *out_compact = c;
+                    os_mutex_unlock(&q->mutex);
+                    return 1;
+                }
+            }
+        }
+        slot->state = CUDA_SPEX_PREFETCH_FREE;
+        q->no_hits++;
+        os_cond_signal(&q->cond);
+        os_mutex_unlock(&q->mutex);
+        return 0;
+    }
+    os_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+static int cuda_spex_prefetch_copy_to_compact(
+        ds4_gpu_spex_queue *q,
+        uint32_t slot,
+        uint32_t prediction,
+        char *gate_dst,
+        char *up_dst,
+        char *down_dst) {
+    if (!q || slot >= q->slots || prediction >= q->expert_cap ||
+        !gate_dst || !up_dst || !down_dst) return 0;
+    const uint64_t gate_src = ((uint64_t)slot * q->expert_cap + prediction) *
+        q->gate_expert_bytes;
+    const uint64_t down_src = ((uint64_t)slot * q->expert_cap + prediction) *
+        q->down_expert_bytes;
+    return cudaMemcpyAsync(gate_dst, q->device_gate + gate_src,
+                           (size_t)q->gate_expert_bytes, cudaMemcpyDeviceToDevice,
+                           g_model_upload_stream) == cudaSuccess &&
+           cudaMemcpyAsync(up_dst, q->device_up + gate_src,
+                           (size_t)q->gate_expert_bytes, cudaMemcpyDeviceToDevice,
+                           g_model_upload_stream) == cudaSuccess &&
+           cudaMemcpyAsync(down_dst, q->device_down + down_src,
+                           (size_t)q->down_expert_bytes, cudaMemcpyDeviceToDevice,
+                           g_model_upload_stream) == cudaSuccess;
+}
+
+static void cuda_spex_prefetch_release(
+        ds4_gpu_spex_queue *q,
+        int slot,
+        int reusable,
+        int consumed) {
+    if (!q || slot < 0 || (uint32_t)slot >= q->slots) return;
+    os_mutex_lock(&q->mutex);
+    if (reusable && consumed &&
+        q->slot[(uint32_t)slot].state == CUDA_SPEX_PREFETCH_IN_USE) {
+        q->hits++;
+        q->bytes_used += q->gate_expert_bytes * 2u + q->down_expert_bytes;
+    }
+    if (!reusable) {
+        q->errors++;
+        q->poisoned++;
+        q->disabled = 1;
+    }
+    q->slot[(uint32_t)slot].state = reusable
+        ? CUDA_SPEX_PREFETCH_FREE : CUDA_SPEX_PREFETCH_RETIRING;
+    q->slot[(uint32_t)slot].discard = reusable ? 0 : 1;
+    if (reusable) os_cond_signal(&q->cond);
+    else os_cond_broadcast(&q->cond);
+    os_mutex_unlock(&q->mutex);
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -10426,7 +10906,9 @@ static int cuda_moe_selected_load(
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg,
-        const ds4_gpu_tensor *weights_arg) {
+        const ds4_gpu_tensor *weights_arg,
+        ds4_gpu_spex_queue *spex_queue,
+        const ds4_gpu_spex_key *spex_key) {
     g_moe_last_selected.valid = 0;
     (void)model_size;
     if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
@@ -10519,6 +11001,19 @@ static int cuda_moe_selected_load(
         !cuda_moe_gather_ensure(&g_moe_gather.down, &g_moe_gather.down_cap, cdown, "moe gather down") ||
         !cuda_moe_gather_ensure_i32(&g_moe_gather.slot, &g_moe_gather.slot_cap, slot_count, "moe gather slots"))
         return 0;
+
+    int spex_prefetch_slot = -1;
+    uint32_t spex_prediction_slot = 0;
+    uint32_t spex_compact_slot = UINT32_MAX;
+    if (spex_queue && spex_key && cuda_moe_expert_cache_requested() == 0) {
+        (void)cuda_spex_prefetch_claim(
+            spex_queue, spex_key,
+            gate_offset, up_offset, down_offset,
+            compact,
+            &spex_prefetch_slot,
+            &spex_prediction_slot,
+            &spex_compact_slot);
+    }
 
     /* 4. Resolve exact-byte resident hits, admit misses into persistent VRAM
      * slots when enabled, and stream overflow misses directly into compact
@@ -10642,7 +11137,9 @@ static int cuda_moe_selected_load(
             append_admission(candidate, (uint32_t)layer_slot, expert_key(candidate));
         }
         for (uint32_t i = 0; i < compact_count; i++) {
-            if (cache_slots[i] < 0) append_direct(i, expert_key(i));
+            if (cache_slots[i] < 0 && i != spex_compact_slot) {
+                append_direct(i, expert_key(i));
+            }
         }
     } else {
         if (cache) {
@@ -10661,6 +11158,7 @@ static int cuda_moe_selected_load(
 
         for (uint32_t i = 0; i < compact_count; i++) {
             if (cache_slots[i] >= 0) continue;
+            if (i == spex_compact_slot) continue;
             const cuda_moe_cache_key key = expert_key(i);
             const int cache_slot = cache ? cuda_moe_expert_cache_lru_slot(cache, claimed) : -1;
             if (cache_slot >= 0) {
@@ -10671,6 +11169,22 @@ static int cuda_moe_selected_load(
         }
     }
     int fill_ok = 0;
+    if (spex_prefetch_slot >= 0) {
+        const uint64_t gate_dst = (uint64_t)spex_compact_slot * gate_expert_bytes;
+        const uint64_t down_dst = (uint64_t)spex_compact_slot * down_expert_bytes;
+        if (!cuda_spex_prefetch_copy_to_compact(
+                spex_queue,
+                (uint32_t)spex_prefetch_slot,
+                spex_prediction_slot,
+                g_moe_gather.gate + gate_dst,
+                g_moe_gather.up + gate_dst,
+                g_moe_gather.down + down_dst)) {
+            (void)cudaGetLastError();
+            const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+            cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
+            return 0;
+        }
+    }
 #ifdef _WIN32
     const uint32_t io_qd = cuda_moe_io_queue_depth();
     if (io_qd > 1u) {
@@ -10691,7 +11205,8 @@ static int cuda_moe_selected_load(
         }
     }
     if (!fill_ok) {
-        (void)cudaStreamSynchronize(g_model_upload_stream);
+        const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+        cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
         discard_admissions();
         return 0;
     }
@@ -10702,7 +11217,8 @@ static int cuda_moe_selected_load(
             if (!cuda_moe_expert_cache_copy_to_compact_async(
                     cache, (uint32_t)cache_slots[i], i)) {
                 (void)cudaGetLastError();
-                (void)cudaStreamSynchronize(g_model_upload_stream);
+                const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+                cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
                 discard_admissions();
                 return 0;
             }
@@ -10710,10 +11226,10 @@ static int cuda_moe_selected_load(
     }
 
     if (!cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) {
+        cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 0, 0);
         if (cache) cuda_moe_expert_cache_invalidate();
         return 0;
     }
-
     if (cache) {
         for (size_t i = 0; i < admission_slots.size(); i++) {
             cuda_moe_cache_slot &entry = cache->slots[admission_slots[i]];
@@ -10757,7 +11273,10 @@ static int cuda_moe_selected_load(
     /* 5. publish the remapped selection (compact-slot indices) */
     if (!cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
                             (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyHostToDevice), "moe gather slots")) return 0;
+                            cudaMemcpyHostToDevice), "moe gather slots")) {
+        cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 1, 0);
+        return 0;
+    }
     g_moe_gather.slot_tensor.ptr = g_moe_gather.slot;
     g_moe_gather.slot_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
     g_moe_gather.slot_tensor.owner = 0;
@@ -10772,6 +11291,7 @@ static int cuda_moe_selected_load(
     memcpy(g_moe_last_selected.ids, compact.data(),
            (size_t)compact_count * sizeof(g_moe_last_selected.ids[0]));
     g_moe_last_selected.valid = 1;
+    cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 1, 1);
     return 1;
 }
 
@@ -10815,7 +11335,9 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        ds4_gpu_spex_queue *spex_queue,
+        const ds4_gpu_spex_key *spex_key) {
     g_moe_last_selected.valid = 0;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_expert == 0 ||
@@ -10855,12 +11377,14 @@ static int routed_moe_launch(
     if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL &&
         cuda_moe_selected_load(model_map, model_size, gate_offset, up_offset, down_offset,
                                gate_expert_bytes, down_expert_bytes,
-                               n_total_expert, n_expert, n_tokens, selected, weights)) {
+                               n_total_expert, n_expert, n_tokens, selected, weights,
+                               spex_queue, spex_key)) {
         gate_w = g_moe_gather.gate;
         up_w = g_moe_gather.up;
         down_w = g_moe_gather.down;
         selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
     } else {
+        ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
         gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
         up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
         down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
@@ -11365,14 +11889,15 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x) {
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, ds4_gpu_spex_queue *spex_queue, const ds4_gpu_spex_key *spex_key) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_expert, clamp, x, 1);
+                             selected, weights, n_expert, clamp, x, 1,
+                             spex_queue, spex_key);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
@@ -11381,7 +11906,8 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_expert, clamp, x, n_tokens);
+                             selected, weights, n_expert, clamp, x, n_tokens,
+                             NULL, NULL);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

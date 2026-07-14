@@ -37,11 +37,19 @@ static inline void os_cond_signal(os_cond_t *c) { WakeConditionVariable(c); }
 static inline void os_cond_broadcast(os_cond_t *c) { WakeAllConditionVariable(c); }
 static inline void os_cond_destroy(os_cond_t *c) { (void)c; }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void os_once(os_once_t *once, void (*init_fn)(void));
 int os_thread_create(os_thread_t *t, os_thread_fn fn, void *arg);
 void os_thread_join(os_thread_t t);
 void os_thread_detach(os_thread_t t);
 long os_cpu_count(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #else
 #include <pthread.h>
