@@ -2594,6 +2594,21 @@ struct cuda_dynamic_arena_wrap_context {
     uint8_t *success;
 };
 
+enum cuda_dynamic_arena_mirror_part : uint8_t {
+    CUDA_DYNAMIC_ARENA_MIRROR_GATE = 1u,
+    CUDA_DYNAMIC_ARENA_MIRROR_UP = 2u,
+    CUDA_DYNAMIC_ARENA_MIRROR_DOWN = 4u,
+    CUDA_DYNAMIC_ARENA_MIRROR_COMPLETE = 7u,
+};
+
+struct cuda_dynamic_arena_verify_context {
+    const uint32_t *entries;
+    uint32_t entry_count;
+    std::atomic<uint32_t> next;
+    uint64_t *checksums;
+    uint8_t *success;
+};
+
 static void *cuda_dynamic_arena_wrap_worker(void *arg) {
     cuda_dynamic_arena_wrap_context *context =
         (cuda_dynamic_arena_wrap_context *)arg;
@@ -2609,6 +2624,141 @@ static void *cuda_dynamic_arena_wrap_worker(void *arg) {
         context->success[load_index] = copied ? 1u : 0u;
     }
     return NULL;
+}
+
+static void *cuda_dynamic_arena_verify_worker(void *arg) {
+    cuda_dynamic_arena_verify_context *context =
+        (cuda_dynamic_arena_verify_context *)arg;
+    for (;;) {
+        const uint32_t cursor =
+            context->next.fetch_add(1, std::memory_order_relaxed);
+        if (cursor >= context->entry_count) break;
+        const uint32_t entry = context->entries[cursor];
+        if (entry >= g_dynamic_arena.preloaded.size() ||
+            entry >= g_dynamic_arena.preloaded_parts.size()) {
+            continue;
+        }
+        const uint32_t layer = entry / g_dynamic_arena.n_expert;
+        const uint32_t expert = entry % g_dynamic_arena.n_expert;
+        const cuda_dynamic_arena_binding &binding =
+            g_dynamic_arena.preloaded[entry];
+        if (g_dynamic_arena.preloaded_parts[entry] !=
+                CUDA_DYNAMIC_ARENA_MIRROR_COMPLETE ||
+            !cuda_dynamic_arena_binding_valid(
+                binding, layer, expert, 0,
+                DS4_GPU_ARENA_LOADING)) {
+            continue;
+        }
+        const cuda_dynamic_arena_slot &slot =
+            g_dynamic_arena.slots[binding.slot];
+        context->checksums[cursor] = cuda_dynamic_arena_fnv1a64(
+            (const uint8_t *)slot.host_ptr,
+            g_dynamic_arena.slot_bytes);
+        context->success[cursor] = 1;
+    }
+    return NULL;
+}
+
+static int cuda_dynamic_arena_observer_finalize_preloads(
+        uint32_t *workers_out,
+        double *seconds_out) {
+    if (workers_out) *workers_out = 0;
+    if (seconds_out) *seconds_out = 0.0;
+    cuda_dynamic_arena_observer &observer = g_dynamic_arena_observer;
+    std::vector<uint32_t> entries;
+    try {
+        entries.reserve(observer.unique_entries);
+        for (uint32_t entry = 0; entry < observer.target.size(); entry++) {
+            if (!observer.target[entry]) continue;
+            const cuda_dynamic_arena_binding &binding =
+                g_dynamic_arena.preloaded[entry];
+            const uint32_t layer = entry / g_dynamic_arena.n_expert;
+            const uint32_t expert = entry % g_dynamic_arena.n_expert;
+            if (cuda_dynamic_arena_binding_valid(
+                    binding, layer, expert, 0,
+                    DS4_GPU_ARENA_STAGED)) {
+                continue;
+            }
+            if (g_dynamic_arena.preloaded_parts[entry] ==
+                    CUDA_DYNAMIC_ARENA_MIRROR_COMPLETE &&
+                cuda_dynamic_arena_binding_valid(
+                    binding, layer, expert, 0,
+                    DS4_GPU_ARENA_LOADING)) {
+                entries.push_back(entry);
+            }
+        }
+    } catch (...) {
+        return 0;
+    }
+    if (entries.empty()) return 1;
+
+    const double started = cuda_wall_sec();
+    const uint32_t workers =
+        cuda_dynamic_arena_observer_workers((uint32_t)entries.size());
+    std::vector<uint64_t> checksums;
+    std::vector<uint8_t> success;
+    std::vector<os_thread_t> threads;
+    try {
+        checksums.assign(entries.size(), 0);
+        success.assign(entries.size(), 0);
+        threads.resize(workers > 1 ? workers - 1 : 0);
+    } catch (...) {
+        return 0;
+    }
+
+    cuda_dynamic_arena_verify_context context;
+    context.entries = entries.data();
+    context.entry_count = (uint32_t)entries.size();
+    context.next.store(0, std::memory_order_relaxed);
+    context.checksums = checksums.data();
+    context.success = success.data();
+    std::vector<os_thread_t> started_threads;
+    try {
+        started_threads.reserve(threads.size());
+    } catch (...) {
+        return 0;
+    }
+    for (uint32_t i = 0; i + 1 < workers; i++) {
+        if (os_thread_create(&threads[i],
+                             cuda_dynamic_arena_verify_worker,
+                             &context) == 0) {
+            started_threads.push_back(threads[i]);
+        }
+    }
+    (void)cuda_dynamic_arena_verify_worker(&context);
+    for (uint32_t i = 0; i < started_threads.size(); i++) {
+        os_thread_join(started_threads[i]);
+    }
+
+    for (uint32_t i = 0; i < entries.size(); i++) {
+        if (!success[i]) return 0;
+        const uint32_t entry = entries[i];
+        const uint32_t layer = entry / g_dynamic_arena.n_expert;
+        const uint32_t expert = entry % g_dynamic_arena.n_expert;
+        const cuda_dynamic_arena_binding &binding =
+            g_dynamic_arena.preloaded[entry];
+        if (!cuda_dynamic_arena_binding_valid(
+                binding, layer, expert, 0,
+                DS4_GPU_ARENA_LOADING)) {
+            return 0;
+        }
+    }
+    for (uint32_t i = 0; i < entries.size(); i++) {
+        const uint32_t entry = entries[i];
+        cuda_dynamic_arena_binding &binding =
+            g_dynamic_arena.preloaded[entry];
+        cuda_dynamic_arena_slot &slot =
+            g_dynamic_arena.slots[binding.slot];
+        slot.checksum = checksums[i];
+        slot.state = DS4_GPU_ARENA_STAGED;
+        binding.state = DS4_GPU_ARENA_STAGED;
+    }
+    observer.preloaded_entries += (uint32_t)entries.size();
+    if (workers_out) {
+        *workers_out = (uint32_t)started_threads.size() + 1u;
+    }
+    if (seconds_out) *seconds_out = cuda_wall_sec() - started;
+    return 1;
 }
 
 static int cuda_dynamic_arena_observer_publish(void) {
@@ -2630,6 +2780,17 @@ static int cuda_dynamic_arena_observer_publish(void) {
         resident++;
     }
     g_dynamic_arena_observer.unique_entries = resident;
+
+    uint32_t verify_workers = 0;
+    double verify_seconds = 0.0;
+    if (!cuda_dynamic_arena_observer_finalize_preloads(
+            &verify_workers, &verify_seconds)) {
+        fprintf(stderr,
+                "ds4: [arena-observe] preload verification failed tokens=%u resident=%u\n",
+                g_dynamic_arena_observer.completed_tokens,
+                g_dynamic_arena_observer.unique_entries);
+        return 0;
+    }
 
     ds4_gpu_dynamic_arena_txn *txn = NULL;
     const ds4_gpu_dynamic_arena_load *loads = NULL;
@@ -2712,13 +2873,14 @@ static int cuda_dynamic_arena_observer_publish(void) {
     if (all_succeeded &&
         ds4_gpu_dynamic_arena_publish(txn, &generation)) {
         fprintf(stderr,
-                "ds4: [arena-observe] WRAP published tokens=%u resident=%u loads=%u workers=%u seconds=%.3f generation=%llu preloaded=%u mirror=%.2f GiB\n",
+                "ds4: [arena-observe] WRAP published tokens=%u resident=%u loads=%u workers=%u seconds=%.3f generation=%llu preloaded=%u mirror=%.2f GiB verify_workers=%u verify_seconds=%.3f\n",
                 g_dynamic_arena_observer.completed_tokens,
                 g_dynamic_arena_observer.unique_entries,
                 load_count, workers, cuda_wall_sec() - started,
                 (unsigned long long)generation,
                 g_dynamic_arena_observer.preloaded_entries,
-                (double)g_dynamic_arena_observer.mirrored_bytes / 1073741824.0);
+                (double)g_dynamic_arena_observer.mirrored_bytes / 1073741824.0,
+                verify_workers, verify_seconds);
         return 1;
     }
 
@@ -2730,13 +2892,6 @@ static int cuda_dynamic_arena_observer_publish(void) {
             load_count, cuda_wall_sec() - started);
     return 0;
 }
-
-enum cuda_dynamic_arena_mirror_part : uint8_t {
-    CUDA_DYNAMIC_ARENA_MIRROR_GATE = 1u,
-    CUDA_DYNAMIC_ARENA_MIRROR_UP = 2u,
-    CUDA_DYNAMIC_ARENA_MIRROR_DOWN = 4u,
-    CUDA_DYNAMIC_ARENA_MIRROR_COMPLETE = 7u,
-};
 
 static char *cuda_dynamic_arena_observer_mirror_ptr(
         const void *model_map,
@@ -2860,13 +3015,8 @@ static void cuda_dynamic_arena_observer_mirror_done(
     g_dynamic_arena_observer.mirrored_bytes += bytes;
     if (parts != CUDA_DYNAMIC_ARENA_MIRROR_COMPLETE) return;
 
-    cuda_dynamic_arena_slot &slot =
-        g_dynamic_arena.slots[binding.slot];
-    slot.checksum = cuda_dynamic_arena_fnv1a64(
-        (const uint8_t *)slot.host_ptr, g_dynamic_arena.slot_bytes);
-    slot.state = DS4_GPU_ARENA_STAGED;
-    binding.state = DS4_GPU_ARENA_STAGED;
-    g_dynamic_arena_observer.preloaded_entries++;
+    /* Keep the completed slot inactive. The observer finalizes checksums in a
+     * bounded parallel pass at the publication boundary, off the token path. */
 }
 
 static void cuda_dynamic_arena_observer_release(void) {

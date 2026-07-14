@@ -25,6 +25,13 @@ with exact output hashes. The remaining work in this plan starts at combined
 residency plus bias publication; the preload transport itself is no longer a
 hypothesis.
 
+`G19B2_PARALLEL_PRELOAD_VERIFY_RESULTS.md` moves checksum verification out of
+the token path. A wide W64 mechanism run reached 4.26 t/s in the final chunk,
+but its expensive bootstrap and n=1 protocol prevent a performance verdict.
+Before router bias is enabled, the transport track will grow the current-session
+arena after the first publication so unused pinned capacity converts recurring
+misses into later hits.
+
 ## Checkpoint chain
 
 - `a880b01`: pinned `cudaHostAllocDefault` arena substrate.

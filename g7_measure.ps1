@@ -289,6 +289,7 @@ $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
 $arenaWrapSeconds = 0.0; $arenaWrapGeneration = 0
 $arenaWrapPreloaded = 0; $arenaWrapMirrorGiB = 0.0
+$arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
@@ -412,6 +413,10 @@ if (Test-Path $stderrLog) {
         if ($arenaWrapLine -match "preloaded=(\d+) mirror=([0-9.]+) GiB") {
             $arenaWrapPreloaded = [long]$Matches[1]
             $arenaWrapMirrorGiB = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+        }
+        if ($arenaWrapLine -match "verify_workers=(\d+) verify_seconds=([0-9.]+)") {
+            $arenaVerifyWorkers = [int]$Matches[1]
+            $arenaVerifySeconds = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
         }
     } elseif ($arenaWrapLine -and $arenaWrapLine -match "WRAP aborted tokens=(\d+) resident=(\d+) loads=(\d+) seconds=([0-9.]+)") {
         $arenaWrapObserved = $true
@@ -551,6 +556,8 @@ $summary = [pscustomobject]@{
     dynamic_arena_wrap_generation = $arenaWrapGeneration
     dynamic_arena_wrap_preloaded = $arenaWrapPreloaded
     dynamic_arena_wrap_mirror_gib = $arenaWrapMirrorGiB
+    dynamic_arena_verify_workers = $arenaVerifyWorkers
+    dynamic_arena_verify_seconds = $arenaVerifySeconds
     dynamic_arena_observer_result_observed = $arenaObserverResultObserved
     dynamic_arena_observer_result = $arenaObserverResult
     dynamic_arena_observer_published = ($arenaObserverResult -eq "published")
@@ -659,6 +666,7 @@ Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("arena observer armed/window/minhits/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
+Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/uploaded GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
 Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
