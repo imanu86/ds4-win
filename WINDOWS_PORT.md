@@ -30,15 +30,18 @@ validated non-destructive abort, and measured 2.706667 t/s mean decode. This is 
 transport/lifetime proof, not a residency-policy performance verdict.
 
 The standalone G17 capacity probe measured successful pinned allocations from
-16 through 31 GiB and 20.75-24.46 GiB/s H2D. Allocations of 32 and 36 GiB failed
-when the host had only about 30.8 GiB available. Every successful `cudaFreeHost`
-returned available memory to at least its pre-allocation value. Consequently:
+16 through 31 GiB and 20.75-24.46 GiB/s H2D. A clean post-restart control then
+measured 31 GiB pass 3/3 and 32 GiB fail 3/3 with about 55 GiB available. Every
+successful `cudaFreeHost` returned available memory to its pre-allocation band.
+Consequently:
 
-- native Windows has not shown a fixed WSL-style 31 GiB pin ceiling;
-- the observed 31/32 boundary coincided with that six-day-old host state and
-  cannot yet distinguish available-RAM pressure from a CUDA/WDDM limit;
+- this native Windows/WDDM host has a reproducible single-allocation boundary
+  between 31 and 32 GiB, independent of ordinary available-RAM pressure;
+- segmented controls passed `2 x 15 GiB` 3/3 but failed `2 x 25 GiB` 3/3 on
+  the second allocation, establishing that the measured pin budget is global;
 - the data does not prove a CUDA or NVIDIA memory-retention leak;
-- a clean post-restart sweep is required before claiming the 50 GiB target.
+- a 50 GiB pinned arena is not available on this 64 GiB host; the runtime design
+  must use a <=31 GiB pinned tier plus pageable cold storage.
 
 See `G17_PINNED_ARENA_CAPACITY_RESULTS.md` and
 `G18_DYNAMIC_ARENA_WRAP_RESULTS.md` for commands, caveats, and raw-result names.
