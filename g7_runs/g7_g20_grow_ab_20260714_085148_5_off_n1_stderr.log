@@ -1,0 +1,25 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache deferred 71.28 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 9.48 GiB of tensor spans in 4.477s
+ds4: cuda backend initialized for graph diagnostics
+0714 08:55:50 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: CUDA dynamic arena ready 12.00 GiB, 1820 slots, 6.75 MiB/slot, available_ram=36.34 GiB bytes=12881756160 slot_bytes=7077888
+ds4: [arena-observe] armed window=16 min_hits=3 grow_interval=0 layers=3..42 router=unbiased residency-only
+0714 08:55:52 ds4-server: listening on http://127.0.0.1:8000
+0714 08:55:53 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=8.00 MiB cached=0.00 GiB free=1.02 GiB reserve=4.00 GiB total=12.00 GiB)
+ds4: CUDA loading model tensors 7.81 GiB cached
+ds4: CUDA loading model tensors 7.42 GiB cached
+ds4: [arena-observe] armed window=16 min_hits=3 grow_interval=0 layers=3..42 router=unbiased residency-only
+0714 08:56:08 ds4-server: chat ctx=0..43:43 prompt done 15.258s
+ds4: [arena] begin base=0 target=440 resident=439 loads=0 slots=1820
+ds4: [arena] publish generation=440 loads=0
+ds4: [arena-observe] WRAP published tokens=16 resident=439 loads=0 workers=0 seconds=0.004 generation=440 preloaded=439 mirror=2.89 GiB verify_workers=8 verify_seconds=0.342
+ds4: [arena-observe] window complete tokens=16 resident=439 growths=0 result=published settled
+0714 08:56:34 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=1.95 t/s avg=1.95 t/s 25.594s
+0714 08:56:41 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=2.01 t/s avg=1.97 t/s 32.564s
+0714 08:56:41 ds4-server: chat ctx=0..43:43 gen=64 finish=length 47.839s
+0714 08:56:41 ds4-server: benchmark request target reached; shutting down cleanly
+0714 08:56:41 ds4-server: shutdown requested, draining requests
+ds4: [arena] final hits=4247 misses=8119 fatal=0 uploaded=28.00 GiB

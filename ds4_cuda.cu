@@ -355,7 +355,11 @@ static cuda_dynamic_arena g_dynamic_arena;
 struct cuda_dynamic_arena_observer {
     uint32_t window;
     uint32_t min_hits;
+    uint32_t grow_interval;
     uint32_t completed_tokens;
+    uint32_t last_publish_tokens;
+    uint32_t growth_publications;
+    uint32_t published_entries;
     uint32_t unique_entries;
     uint32_t preloaded_entries;
     uint32_t last_layer;
@@ -363,6 +367,7 @@ struct cuda_dynamic_arena_observer {
     int enabled;
     int have_last_layer;
     int settled;
+    int initial_published;
     std::vector<uint8_t> target;
     std::vector<uint16_t> counts;
 };
@@ -2170,9 +2175,11 @@ extern "C" int ds4_gpu_dynamic_arena_prepare(
     const double avail_gib = -1.0;
 #endif
     fprintf(stderr,
-            "ds4: CUDA dynamic arena ready %.2f GiB, %u slots, %.2f MiB/slot, available_ram=%.2f GiB\n",
+            "ds4: CUDA dynamic arena ready %.2f GiB, %u slots, %.2f MiB/slot, available_ram=%.2f GiB bytes=%llu slot_bytes=%llu\n",
             (double)bytes / 1073741824.0, (uint32_t)slots64,
-            (double)g_dynamic_arena.slot_bytes / 1048576.0, avail_gib);
+            (double)g_dynamic_arena.slot_bytes / 1048576.0, avail_gib,
+            (unsigned long long)bytes,
+            (unsigned long long)g_dynamic_arena.slot_bytes);
     ds4_gpu_dynamic_arena_observer_reset();
     return 1;
 }
@@ -2516,6 +2523,22 @@ static uint32_t cuda_dynamic_arena_observer_min_hits(void) {
     return (uint32_t)value;
 }
 
+static uint32_t cuda_dynamic_arena_observer_grow_interval(void) {
+    const char *env = getenv("DS4_CUDA_DYNAMIC_ARENA_GROW_INTERVAL");
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' ||
+        value == 0 || value > 256) {
+        fprintf(stderr,
+                "ds4: [arena-observe] invalid grow interval '%s'; growth disabled\n",
+                env);
+        return 0;
+    }
+    return (uint32_t)value;
+}
+
 static uint32_t cuda_dynamic_arena_observer_workers(uint32_t load_count) {
     uint32_t workers = 8;
     const char *env = getenv("DS4_REAP_PREFETCH_THREADS");
@@ -2761,6 +2784,53 @@ static int cuda_dynamic_arena_observer_finalize_preloads(
     return 1;
 }
 
+static void cuda_dynamic_arena_observer_discard_preloads(void) {
+    if (g_dynamic_arena.txn) return;
+    for (uint32_t entry = 0;
+         entry < g_dynamic_arena.preloaded.size(); entry++) {
+        const cuda_dynamic_arena_binding &binding =
+            g_dynamic_arena.preloaded[entry];
+        if (binding.slot < g_dynamic_arena.slots.size()) {
+            cuda_dynamic_arena_slot &slot =
+                g_dynamic_arena.slots[binding.slot];
+            if (slot.layer == entry / g_dynamic_arena.n_expert &&
+                slot.expert == entry % g_dynamic_arena.n_expert &&
+                slot.content_generation == binding.slot_generation &&
+                (slot.state == DS4_GPU_ARENA_LOADING ||
+                 slot.state == DS4_GPU_ARENA_STAGED)) {
+                slot.state = DS4_GPU_ARENA_FREE;
+                slot.layer = UINT32_MAX;
+                slot.expert = UINT32_MAX;
+                slot.checksum = 0;
+                slot.last_dma_sequence = 0;
+            }
+        }
+        g_dynamic_arena.preloaded[entry] =
+            cuda_dynamic_arena_empty_binding();
+        g_dynamic_arena.preloaded_parts[entry] = 0;
+    }
+}
+
+static uint32_t cuda_dynamic_arena_observer_new_eligible(void) {
+    cuda_dynamic_arena_observer &observer = g_dynamic_arena_observer;
+    uint32_t count = 0;
+    for (uint32_t entry = 0; entry < observer.target.size(); entry++) {
+        if (!observer.target[entry] ||
+            observer.counts[entry] < observer.min_hits) {
+            continue;
+        }
+        const uint32_t layer = entry / g_dynamic_arena.n_expert;
+        const uint32_t expert = entry % g_dynamic_arena.n_expert;
+        if (!cuda_dynamic_arena_binding_valid(
+                g_dynamic_arena.active[entry], layer, expert,
+                g_dynamic_arena.snapshot_generation,
+                DS4_GPU_ARENA_READY)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 static int cuda_dynamic_arena_observer_publish(void) {
     const uint32_t entry_count =
         g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
@@ -2780,6 +2850,13 @@ static int cuda_dynamic_arena_observer_publish(void) {
         resident++;
     }
     g_dynamic_arena_observer.unique_entries = resident;
+    if (resident > g_dynamic_arena.slots.size()) {
+        fprintf(stderr,
+                "ds4: [arena-observe] grow capacity reached tokens=%u resident=%u slots=%u\n",
+                g_dynamic_arena_observer.completed_tokens, resident,
+                (uint32_t)g_dynamic_arena.slots.size());
+        return -1;
+    }
 
     uint32_t verify_workers = 0;
     double verify_seconds = 0.0;
@@ -3020,34 +3097,16 @@ static void cuda_dynamic_arena_observer_mirror_done(
 }
 
 static void cuda_dynamic_arena_observer_release(void) {
-    if (!g_dynamic_arena.txn) {
-        for (uint32_t entry = 0;
-             entry < g_dynamic_arena.preloaded.size(); entry++) {
-            const cuda_dynamic_arena_binding &binding =
-                g_dynamic_arena.preloaded[entry];
-            if (binding.slot >= g_dynamic_arena.slots.size()) continue;
-            cuda_dynamic_arena_slot &slot =
-                g_dynamic_arena.slots[binding.slot];
-            if (slot.layer == entry / g_dynamic_arena.n_expert &&
-                slot.expert == entry % g_dynamic_arena.n_expert &&
-                slot.content_generation == binding.slot_generation &&
-                (slot.state == DS4_GPU_ARENA_LOADING ||
-                 slot.state == DS4_GPU_ARENA_STAGED)) {
-                slot.state = DS4_GPU_ARENA_FREE;
-                slot.layer = UINT32_MAX;
-                slot.expert = UINT32_MAX;
-                slot.checksum = 0;
-            }
-            g_dynamic_arena.preloaded[entry] =
-                cuda_dynamic_arena_empty_binding();
-            g_dynamic_arena.preloaded_parts[entry] = 0;
-        }
-    }
+    cuda_dynamic_arena_observer_discard_preloads();
     g_dynamic_arena_observer.target.clear();
     g_dynamic_arena_observer.counts.clear();
     g_dynamic_arena_observer.window = 0;
     g_dynamic_arena_observer.min_hits = 1;
+    g_dynamic_arena_observer.grow_interval = 0;
     g_dynamic_arena_observer.completed_tokens = 0;
+    g_dynamic_arena_observer.last_publish_tokens = 0;
+    g_dynamic_arena_observer.growth_publications = 0;
+    g_dynamic_arena_observer.published_entries = 0;
     g_dynamic_arena_observer.unique_entries = 0;
     g_dynamic_arena_observer.preloaded_entries = 0;
     g_dynamic_arena_observer.last_layer = 0;
@@ -3055,11 +3114,14 @@ static void cuda_dynamic_arena_observer_release(void) {
     g_dynamic_arena_observer.enabled = 0;
     g_dynamic_arena_observer.have_last_layer = 0;
     g_dynamic_arena_observer.settled = 0;
+    g_dynamic_arena_observer.initial_published = 0;
 }
 
 extern "C" void ds4_gpu_dynamic_arena_observer_reset(void) {
     const uint32_t window = cuda_dynamic_arena_observer_window();
     const uint32_t min_hits = cuda_dynamic_arena_observer_min_hits();
+    const uint32_t grow_interval =
+        cuda_dynamic_arena_observer_grow_interval();
     cuda_dynamic_arena_observer_release();
     if (window == 0 || !g_dynamic_arena.host_base ||
         g_dynamic_arena.n_layer <= 3 || g_dynamic_arena.n_expert == 0) {
@@ -3077,10 +3139,12 @@ extern "C" void ds4_gpu_dynamic_arena_observer_reset(void) {
     }
     g_dynamic_arena_observer.window = window;
     g_dynamic_arena_observer.min_hits = min_hits;
+    g_dynamic_arena_observer.grow_interval = grow_interval;
     g_dynamic_arena_observer.enabled = 1;
     fprintf(stderr,
-            "ds4: [arena-observe] armed window=%u min_hits=%u layers=3..%u router=unbiased residency-only\n",
-            window, min_hits, g_dynamic_arena.n_layer - 1u);
+            "ds4: [arena-observe] armed window=%u min_hits=%u grow_interval=%u layers=3..%u router=unbiased residency-only\n",
+            window, min_hits, grow_interval,
+            g_dynamic_arena.n_layer - 1u);
 }
 
 static void cuda_dynamic_arena_observe_selected(
@@ -3097,14 +3161,44 @@ static void cuda_dynamic_arena_observe_selected(
 
     if (observer.have_last_layer && layer_index <= observer.last_layer) {
         observer.completed_tokens++;
-        if (observer.completed_tokens >= observer.window) {
-            const int published = cuda_dynamic_arena_observer_publish();
-            observer.settled = 1;
-            fprintf(stderr,
-                    "ds4: [arena-observe] window complete tokens=%u resident=%u result=%s\n",
-                    observer.completed_tokens, observer.unique_entries,
-                    published ? "published" : "fallback");
-            return;
+        const int initial_due = !observer.initial_published &&
+            observer.completed_tokens >= observer.window;
+        const int growth_due = observer.initial_published &&
+            observer.grow_interval != 0 &&
+            observer.completed_tokens - observer.last_publish_tokens >=
+                observer.grow_interval;
+        if (initial_due || growth_due) {
+            if (growth_due &&
+                cuda_dynamic_arena_observer_new_eligible() == 0) {
+                observer.last_publish_tokens = observer.completed_tokens;
+                fprintf(stderr,
+                        "ds4: [arena-observe] grow skipped tokens=%u resident=%u reason=no-new-eligible\n",
+                        observer.completed_tokens,
+                        observer.published_entries);
+            } else {
+                const int published =
+                    cuda_dynamic_arena_observer_publish();
+                if (published > 0) {
+                    observer.initial_published = 1;
+                    observer.last_publish_tokens = observer.completed_tokens;
+                    observer.published_entries = observer.unique_entries;
+                    if (growth_due) observer.growth_publications++;
+                    observer.settled = observer.grow_interval == 0 ||
+                        observer.published_entries >=
+                            g_dynamic_arena.slots.size();
+                } else {
+                    observer.settled = 1;
+                    cuda_dynamic_arena_observer_discard_preloads();
+                }
+                fprintf(stderr,
+                        "ds4: [arena-observe] %s tokens=%u resident=%u growths=%u result=%s%s\n",
+                        initial_due ? "window complete" : "grow complete",
+                        observer.completed_tokens, observer.unique_entries,
+                        observer.growth_publications,
+                        published > 0 ? "published" : "fallback",
+                        observer.settled ? " settled" : "");
+            }
+            if (observer.settled) return;
         }
     }
 

@@ -14,6 +14,7 @@ param(
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
+    [ValidateRange(0, 256)][int]$DynamicArenaGrowInterval = 0,
     [ValidateRange(1, 32)][int]$ReapPrefetchThreads = 8,
     [ValidateSet(1, 2, 4)][int]$IoQD = 1,
     [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
@@ -35,13 +36,19 @@ param(
     [string]$ExpectedContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000,
+    [ValidateRange(64, 131072)][int]$Context = 256,
+    [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [switch]$SkipMemoryPreflight,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0
 )
 
 $ErrorActionPreference = "Stop"
 $memoryPreflightHelper = Join-Path $PSScriptRoot "g7_memory_preflight.ps1"
+$runtimeMonitorHelper = Join-Path $PSScriptRoot "g7_runtime_monitor.ps1"
 . $memoryPreflightHelper
+if (-not (Test-Path -LiteralPath $runtimeMonitorHelper)) {
+    throw "Required runtime monitor not found: $runtimeMonitorHelper"
+}
 if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
 }
@@ -53,12 +60,19 @@ New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 $stderrLog = Join-Path $outdir ("g7_" + $Tag + "_stderr.log")
 $stdoutLog = Join-Path $outdir ("g7_" + $Tag + "_stdout.log")
 $memoryPreflightLog = Join-Path $outdir ("g7_" + $Tag + "_memory_preflight.json")
+$runtimeTelemetryLog = Join-Path $outdir ("g7_" + $Tag + "_runtime_telemetry.jsonl")
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
 if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
+if (Test-Path $runtimeTelemetryLog) { Remove-Item $runtimeTelemetryLog -Force }
 
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
+$inheritedDs4Environment = [ordered]@{}
+foreach ($entry in @(Get-ChildItem Env: | Where-Object { $_.Name -like "DS4_*" } | Sort-Object Name)) {
+    $inheritedDs4Environment[$entry.Name] = $entry.Value
+    Remove-Item -LiteralPath ("Env:\" + $entry.Name) -ErrorAction SilentlyContinue
+}
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
 if ($DynamicArenaGiB -gt 0.0) {
@@ -72,6 +86,11 @@ if ($DynamicArenaObservedWindow -gt 0) {
 } else {
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_OBSERVED_MIN_HITS -ErrorAction SilentlyContinue
+}
+if ($DynamicArenaGrowInterval -gt 0) {
+    $env:DS4_CUDA_DYNAMIC_ARENA_GROW_INTERVAL = "$DynamicArenaGrowInterval"
+} else {
+    Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_GROW_INTERVAL -ErrorAction SilentlyContinue
 }
 $env:DS4_REAP_PREFETCH_THREADS = "$ReapPrefetchThreads"
 if ($Diagnostics) {
@@ -137,6 +156,7 @@ if ($SpexDryRun) {
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
+if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
 if ($SpexFusedTopK -and $SpexStage -notin @("topk", "full")) { throw "SpexFusedTopK requires the topk or full stage" }
 if ($SpexRingSlots -gt 1 -and (-not $SpexDryRun -or $SpexStage -ne "full")) { throw "SpexRingSlots > 1 requires the full SpexDryRun stage" }
@@ -146,6 +166,10 @@ if ($SpexPrefetchK -gt 0 -and $NoSelectedLoad) { throw "SpexPrefetchK is incompa
 if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap policy" }
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
+$effectiveDs4Environment = [ordered]@{}
+foreach ($entry in @(Get-ChildItem Env: | Where-Object { $_.Name -like "DS4_*" } | Sort-Object Name)) {
+    $effectiveDs4Environment[$entry.Name] = $entry.Value
+}
 $effectiveMinimumAvailableGiB = $MinimumAvailableGiB
 if ($effectiveMinimumAvailableGiB -eq 0.0) {
     $effectiveMinimumAvailableGiB = 4.0
@@ -175,17 +199,38 @@ $cmakeHashAtStart = (Get-FileHash -Algorithm SHA256 (Join-Path $PSScriptRoot "CM
 $exeHashAtStart = (Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()
 $harnessHashAtStart = (Get-FileHash -Algorithm SHA256 $PSCommandPath).Hash.ToLowerInvariant()
 $memoryPreflightHashAtStart = (Get-FileHash -Algorithm SHA256 $memoryPreflightHelper).Hash.ToLowerInvariant()
+$runtimeMonitorHashAtStart = (Get-FileHash -Algorithm SHA256 $runtimeMonitorHelper).Hash.ToLowerInvariant()
 $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPath $SpexFile).Hash.ToLowerInvariant() } else { "" }
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
+$gpuIdentity = $null
+try {
+    $gpuRaw = & nvidia-smi --query-gpu=name,driver_version,vbios_version,pci.bus_id --format=csv,noheader,nounits 2>$null
+    if ($LASTEXITCODE -eq 0 -and $gpuRaw) {
+        $gpuParts = @((@($gpuRaw)[0]).Split(',') | ForEach-Object { $_.Trim() })
+        if ($gpuParts.Count -ge 4) {
+            $gpuIdentity = [pscustomobject]@{
+                name = $gpuParts[0]
+                driver_version = $gpuParts[1]
+                vbios_version = $gpuParts[2]
+                pci_bus_id = $gpuParts[3]
+            }
+        }
+    }
+} catch { $gpuIdentity = $null }
 
-$argList = @("-m", $model, "--cuda", "-c", "256", "-n", "$MaxTokens", "--host", "127.0.0.1", "--port", "$Port")
+$argList = @("-m", $model, "--cuda", "-c", "$Context", "-n", "$MaxTokens", "--host", "127.0.0.1", "--port", "$Port")
 Write-Host ("[g7] launching: " + $exe + " " + ($argList -join " "))
 Write-Host ("[g7] NoSelectedLoad=" + $NoSelectedLoad + " MaxTokens=" + $MaxTokens)
 
 $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -PassThru `
     -RedirectStandardError $stderrLog -RedirectStandardOutput $stdoutLog
+$telemetryProc = Start-Process -FilePath powershell.exe -ArgumentList @(
+    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runtimeMonitorHelper,
+    "-TargetProcessId", "$($proc.Id)", "-OutputPath", $runtimeTelemetryLog,
+    "-IntervalMs", "$TelemetryIntervalMs"
+) -WindowStyle Hidden -PassThru
 $launchTime = Get-Date
 
 # Poll TCP for ready (server opens the port only after model load)
@@ -263,6 +308,80 @@ if (-not $stopped) {
     if (-not $stopped) { throw "Owned ds4_server process did not exit after forced shutdown" }
 }
 Start-Sleep -Milliseconds 250
+if ($telemetryProc -and -not $telemetryProc.HasExited) {
+    $telemetryProc.WaitForExit(10000) | Out-Null
+}
+if ($telemetryProc -and -not $telemetryProc.HasExited) {
+    $telemetryProc.Kill()
+    $telemetryProc.WaitForExit(10000) | Out-Null
+}
+
+$runtimeSamples = @()
+if (Test-Path -LiteralPath $runtimeTelemetryLog) {
+    foreach ($line in Get-Content -LiteralPath $runtimeTelemetryLog) {
+        if (-not $line.Trim()) { continue }
+        try { $runtimeSamples += ($line | ConvertFrom-Json) } catch {}
+    }
+}
+if ($runtimeSamples.Count -lt 2) {
+    throw "Runtime telemetry failed closed: fewer than two valid samples"
+}
+function Get-G7Median([object[]]$Values) {
+    $ordered = @($Values | Where-Object { $null -ne $_ } | Sort-Object)
+    if ($ordered.Count -eq 0) { return $null }
+    $middle = [int][math]::Floor($ordered.Count / 2)
+    if (($ordered.Count % 2) -eq 1) { return [double]$ordered[$middle] }
+    return ([double]$ordered[$middle - 1] + [double]$ordered[$middle]) / 2.0
+}
+$sharedSamples = @($runtimeSamples | ForEach-Object { $_.gpu_process_shared_bytes } | Where-Object { $null -ne $_ })
+$dedicatedSamples = @($runtimeSamples | ForEach-Object { $_.gpu_process_dedicated_bytes } | Where-Object { $null -ne $_ })
+$workingSamples = @($runtimeSamples | ForEach-Object { $_.working_set_bytes } | Where-Object { $null -ne $_ })
+$privateSamples = @($runtimeSamples | ForEach-Object { $_.private_bytes } | Where-Object { $null -ne $_ })
+$availableSamples = @($runtimeSamples | ForEach-Object { $_.windows_available_bytes } | Where-Object { $null -ne $_ })
+$gpuUtilSamples = @($runtimeSamples | ForEach-Object { if ($_.nvidia) { $_.nvidia.utilization_percent } } | Where-Object { $null -ne $_ })
+$vramSamples = @($runtimeSamples | ForEach-Object { if ($_.nvidia) { $_.nvidia.vram_used_mib } } | Where-Object { $null -ne $_ })
+$powerSamples = @($runtimeSamples | ForEach-Object { if ($_.nvidia) { $_.nvidia.power_watts } } | Where-Object { $null -ne $_ })
+if ($sharedSamples.Count -eq 0 -or $dedicatedSamples.Count -eq 0 -or
+    $gpuUtilSamples.Count -eq 0 -or $vramSamples.Count -eq 0) {
+    throw "Runtime telemetry failed closed: required WDDM/NVIDIA counters are missing"
+}
+$firstRuntimeSample = $runtimeSamples[0]
+$lastRuntimeSample = $runtimeSamples[-1]
+$runtimeElapsedSeconds = [double]$lastRuntimeSample.elapsed_seconds - [double]$firstRuntimeSample.elapsed_seconds
+$runtimeSampleIntervals = @()
+for ($sampleIndex = 1; $sampleIndex -lt $runtimeSamples.Count; $sampleIndex++) {
+    $runtimeSampleIntervals += [double]$runtimeSamples[$sampleIndex].elapsed_seconds -
+        [double]$runtimeSamples[$sampleIndex - 1].elapsed_seconds
+}
+$runtimeEffectiveIntervalSeconds = if ($runtimeSamples.Count -gt 1) {
+    $runtimeElapsedSeconds / ($runtimeSamples.Count - 1)
+} else { $null }
+$runtimeTelemetry = [pscustomobject]@{
+    path = $runtimeTelemetryLog
+    requested_interval_ms = $TelemetryIntervalMs
+    effective_interval_seconds = $runtimeEffectiveIntervalSeconds
+    interval_median_seconds = Get-G7Median $runtimeSampleIntervals
+    interval_min_seconds = if ($runtimeSampleIntervals.Count) { [double]($runtimeSampleIntervals | Measure-Object -Minimum).Minimum } else { $null }
+    interval_max_seconds = if ($runtimeSampleIntervals.Count) { [double]($runtimeSampleIntervals | Measure-Object -Maximum).Maximum } else { $null }
+    samples = $runtimeSamples.Count
+    elapsed_seconds = [double]$lastRuntimeSample.elapsed_seconds
+    gpu_process_shared_peak_bytes = if ($sharedSamples.Count) { [Int64]($sharedSamples | Measure-Object -Maximum).Maximum } else { $null }
+    gpu_process_shared_median_bytes = Get-G7Median $sharedSamples
+    gpu_process_dedicated_peak_bytes = if ($dedicatedSamples.Count) { [Int64]($dedicatedSamples | Measure-Object -Maximum).Maximum } else { $null }
+    gpu_process_dedicated_median_bytes = Get-G7Median $dedicatedSamples
+    process_working_set_peak_bytes = if ($workingSamples.Count) { [Int64]($workingSamples | Measure-Object -Maximum).Maximum } else { $null }
+    process_private_peak_bytes = if ($privateSamples.Count) { [Int64]($privateSamples | Measure-Object -Maximum).Maximum } else { $null }
+    windows_available_min_bytes = if ($availableSamples.Count) { [Int64]($availableSamples | Measure-Object -Minimum).Minimum } else { $null }
+    gpu_utilization_median_percent = Get-G7Median $gpuUtilSamples
+    gpu_utilization_peak_percent = if ($gpuUtilSamples.Count) { [double]($gpuUtilSamples | Measure-Object -Maximum).Maximum } else { $null }
+    vram_used_peak_mib = if ($vramSamples.Count) { [double]($vramSamples | Measure-Object -Maximum).Maximum } else { $null }
+    power_median_watts = Get-G7Median $powerSamples
+    win32_process_read_transfer_delta_bytes = if ($null -ne $firstRuntimeSample.read_transfer_bytes -and $null -ne $lastRuntimeSample.read_transfer_bytes) { [Int64]$lastRuntimeSample.read_transfer_bytes - [Int64]$firstRuntimeSample.read_transfer_bytes } else { $null }
+    win32_process_write_transfer_delta_bytes = if ($null -ne $firstRuntimeSample.write_transfer_bytes -and $null -ne $lastRuntimeSample.write_transfer_bytes) { [Int64]$lastRuntimeSample.write_transfer_bytes - [Int64]$firstRuntimeSample.write_transfer_bytes } else { $null }
+    win32_process_transfer_counters_include_mmap_pageins = $false
+    mmap_backed_file_io_measured = $false
+    page_fault_delta = if ($null -ne $firstRuntimeSample.page_faults -and $null -ne $lastRuntimeSample.page_faults) { [Int64]$lastRuntimeSample.page_faults - [Int64]$firstRuntimeSample.page_faults } else { $null }
+}
 
 # Analyze stderr
 $evicts = 0; $selLoads = 0; $lastSel = ""; $streamsExpert = 0; $streamsHot = 0
@@ -283,7 +402,7 @@ $spexPrefetchLate = 0; $spexPrefetchCanceled = 0; $spexPrefetchPoisoned = 0
 $spexPrefetchErrors = 0; $spexPrefetchDisabled = $false
 $spexPrefetchBytesRead = 0; $spexPrefetchBytesUsed = 0
 $arenaObserverArmed = $false; $arenaObserverWindowObserved = 0
-$arenaObserverMinHitsObserved = 0
+$arenaObserverMinHitsObserved = 0; $arenaObserverGrowIntervalObserved = 0
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
@@ -291,8 +410,13 @@ $arenaWrapSeconds = 0.0; $arenaWrapGeneration = 0
 $arenaWrapPreloaded = 0; $arenaWrapMirrorGiB = 0.0
 $arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
+$arenaGrowthPublications = 0; $arenaGrowthSkips = 0
+$arenaGrowthEvents = @()
+$contextObserved = 0; $prefillChunkObserved = 0
+$rawKvRowsObserved = 0; $compressedKvRowsObserved = 0
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
+$arenaAllocatedBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
 $serverRunsAll = @()
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
@@ -395,13 +519,27 @@ if (Test-Path $stderrLog) {
         $cacheHits = [long]$Matches[4]; $cacheMisses = [long]$Matches[5]; $cacheAdmissions = [long]$Matches[6]
         $cacheEvictions = [long]$Matches[7]; $cacheDirect = [long]$Matches[8]
     }
-    $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+) layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
-    if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+) layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
+    $contextLine = $lines | Where-Object { $_ -match "context buffers .*ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)" } | Select-Object -Last 1
+    if ($contextLine -and $contextLine -match "ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)") {
+        $contextObserved = [int]$Matches[1]
+        $prefillChunkObserved = [int]$Matches[2]
+        $rawKvRowsObserved = [int]$Matches[3]
+        $compressedKvRowsObserved = [int]$Matches[4]
+    }
+    $arenaReadyLine = $lines | Where-Object { $_ -match "CUDA dynamic arena ready" } | Select-Object -Last 1
+    if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready [0-9.]+ GiB, (\d+) slots.*bytes=(\d+) slot_bytes=(\d+)") {
+        $arenaAllocatedSlots = [long]$Matches[1]
+        $arenaAllocatedBytes = [long]$Matches[2]
+        $arenaSlotBytes = [long]$Matches[3]
+    }
+    $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
+    if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
         $arenaObserverArmed = $true
         $arenaObserverWindowObserved = [int]$Matches[1]
         $arenaObserverMinHitsObserved = [int]$Matches[2]
-        $arenaObserverFirstLayer = [int]$Matches[3]
-        $arenaObserverLastLayer = [int]$Matches[4]
+        $arenaObserverGrowIntervalObserved = if ($Matches[3]) { [int]$Matches[3] } else { 0 }
+        $arenaObserverFirstLayer = [int]$Matches[4]
+        $arenaObserverLastLayer = [int]$Matches[5]
     }
     $arenaWrapLine = $lines | Where-Object { $_ -match "\[arena-observe\] WRAP (published|aborted)" } | Select-Object -Last 1
     if ($arenaWrapLine -and $arenaWrapLine -match "WRAP published tokens=(\d+) resident=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9.]+) generation=(\d+)") {
@@ -425,11 +563,29 @@ if (Test-Path $stderrLog) {
         $arenaWrapSeconds = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
     $arenaResultLine = $lines | Where-Object { $_ -match "\[arena-observe\] window complete" } | Select-Object -Last 1
-    if ($arenaResultLine -and $arenaResultLine -match "window complete tokens=(\d+) resident=(\d+) result=(published|fallback)") {
+    if ($arenaResultLine -and $arenaResultLine -match "window complete tokens=(\d+) resident=(\d+)(?: growths=\d+)? result=(published|fallback)") {
         $arenaObserverResultObserved = $true
         $arenaObserverTokens = [long]$Matches[1]; $arenaObserverResident = [long]$Matches[2]
         $arenaObserverResult = $Matches[3]
     }
+    $arenaGrowthLines = @($lines | Where-Object { $_ -match "\[arena-observe\] grow complete" })
+    if ($arenaGrowthLines.Count) {
+        foreach ($arenaGrowthLine in $arenaGrowthLines) {
+            if ($arenaGrowthLine -match "grow complete tokens=(\d+) resident=(\d+) growths=(\d+) result=(published|fallback)") {
+                $arenaObserverTokens = [long]$Matches[1]
+                $arenaObserverResident = [long]$Matches[2]
+                $arenaGrowthPublications = [long]$Matches[3]
+                $arenaGrowthEvents += [pscustomobject]@{
+                    tokens = [long]$Matches[1]
+                    resident_entries = [long]$Matches[2]
+                    resident_bytes = [long]$Matches[2] * [long]$arenaSlotBytes
+                    publication = [long]$Matches[3]
+                    result = $Matches[4]
+                }
+            }
+        }
+    }
+    $arenaGrowthSkips = @($lines | Where-Object { $_ -match "\[arena-observe\] grow skipped" }).Count
     $arenaFinalLine = $lines | Where-Object { $_ -match "\[arena\] final" } | Select-Object -Last 1
     if ($arenaFinalLine -and $arenaFinalLine -match "\[arena\] final hits=(\d+) misses=(\d+) fatal=(\d+) uploaded=([0-9.]+) GiB") {
         $arenaFinalObserved = $true
@@ -442,6 +598,9 @@ if (Test-Path $stderrLog) {
 if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
 if (@($results).Count -ne $Repeats) {
     throw "Measurement failed: expected $Repeats results, observed $(@($results).Count)"
+}
+if ($contextObserved -ne $Context) {
+    throw "Measurement failed: requested context $Context, observed $contextObserved"
 }
 
 if ($SpexDryRun) {
@@ -486,6 +645,17 @@ if ($SpexPrefetchK -gt 0) {
 } elseif ($spexPrefetchObserved -or $spexPrefetchFinalObserved) {
     throw "SPEX prefetch measurement failed: worker activated while not requested"
 }
+if ($DynamicArenaObservedWindow -gt 0) {
+    if (-not $arenaObserverArmed) { throw "Dynamic arena measurement failed: observer was not armed" }
+    if ($arenaObserverWindowObserved -ne $DynamicArenaObservedWindow -or
+        $arenaObserverMinHitsObserved -ne $DynamicArenaObservedMinHits -or
+        $arenaObserverGrowIntervalObserved -ne $DynamicArenaGrowInterval) {
+        throw "Dynamic arena measurement failed: observed policy differs from requested policy"
+    }
+    if ($MaxTokens -ge $DynamicArenaObservedWindow -and -not $arenaObserverResultObserved) {
+        throw "Dynamic arena measurement failed: initial publication result was not observed"
+    }
+}
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
 $serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
@@ -525,6 +695,7 @@ $summary = [pscustomobject]@{
     executable_sha256 = $exeHashAtStart
     harness_sha256 = $harnessHashAtStart
     memory_preflight_harness_sha256 = $memoryPreflightHashAtStart
+    runtime_monitor_harness_sha256 = $runtimeMonitorHashAtStart
     executable = $exe
     model = $model
     model_bytes = [long]$modelInfoAtStart.Length
@@ -533,6 +704,15 @@ $summary = [pscustomobject]@{
     prompt_sha256 = $promptHash
     expected_content_sha256 = $ExpectedContentSHA256.ToLowerInvariant()
     requested_max_tokens = $MaxTokens
+    context_requested = $Context
+    context_observed = $contextObserved
+    prefill_chunk_observed = $prefillChunkObserved
+    raw_kv_rows_observed = $rawKvRowsObserved
+    compressed_kv_rows_observed = $compressedKvRowsObserved
+    server_arguments = $argList
+    inherited_ds4_environment = [pscustomobject]$inheritedDs4Environment
+    effective_ds4_environment = [pscustomobject]$effectiveDs4Environment
+    gpu_identity = $gpuIdentity
     repeats = $Repeats
     warmup = [bool]$Warmup
     budget_gb = $BudgetGB
@@ -540,15 +720,22 @@ $summary = [pscustomobject]@{
     dynamic_arena_gib_requested = $DynamicArenaGiB
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
+    dynamic_arena_grow_interval_requested = $DynamicArenaGrowInterval
     reap_prefetch_threads_requested = $ReapPrefetchThreads
     minimum_available_gib_effective = $effectiveMinimumAvailableGiB
+    dynamic_arena_allocated_bytes = $arenaAllocatedBytes
+    dynamic_arena_allocated_slots = $arenaAllocatedSlots
+    dynamic_arena_slot_bytes = $arenaSlotBytes
     dynamic_arena_observer_armed = $arenaObserverArmed
     dynamic_arena_observer_window_observed = $arenaObserverWindowObserved
     dynamic_arena_observer_min_hits_observed = $arenaObserverMinHitsObserved
+    dynamic_arena_grow_interval_observed = $arenaObserverGrowIntervalObserved
     dynamic_arena_observer_first_layer = $arenaObserverFirstLayer
     dynamic_arena_observer_last_layer = $arenaObserverLastLayer
     dynamic_arena_observer_tokens = $arenaObserverTokens
     dynamic_arena_observer_resident = $arenaObserverResident
+    dynamic_arena_observer_resident_bytes = [long]$arenaObserverResident * [long]$arenaSlotBytes
+    dynamic_arena_occupancy_ratio = if ($arenaAllocatedBytes -gt 0) { ([double]$arenaObserverResident * [double]$arenaSlotBytes) / [double]$arenaAllocatedBytes } else { $null }
     dynamic_arena_wrap_observed = $arenaWrapObserved
     dynamic_arena_wrap_loads = $arenaWrapLoads
     dynamic_arena_wrap_workers = $arenaWrapWorkers
@@ -562,14 +749,21 @@ $summary = [pscustomobject]@{
     dynamic_arena_observer_result = $arenaObserverResult
     dynamic_arena_observer_published = ($arenaObserverResult -eq "published")
     dynamic_arena_observer_fallback = ($arenaObserverResult -eq "fallback")
+    dynamic_arena_growth_publications = $arenaGrowthPublications
+    dynamic_arena_growth_skips = $arenaGrowthSkips
+    dynamic_arena_growth_events = $arenaGrowthEvents
     dynamic_arena_final_observed = $arenaFinalObserved
     dynamic_arena_final_hits = $arenaFinalHits
     dynamic_arena_final_misses = $arenaFinalMisses
     dynamic_arena_final_fatal = $arenaFinalFatal
-    dynamic_arena_final_uploaded_gib = $arenaFinalUploadedGiB
+    dynamic_arena_hit_rate = if (($arenaFinalHits + $arenaFinalMisses) -gt 0) { [double]$arenaFinalHits / [double]($arenaFinalHits + $arenaFinalMisses) } else { $null }
+    dynamic_arena_miss_rate = if (($arenaFinalHits + $arenaFinalMisses) -gt 0) { [double]$arenaFinalMisses / [double]($arenaFinalHits + $arenaFinalMisses) } else { $null }
+    dynamic_arena_h2d_uploaded_gib = $arenaFinalUploadedGiB
+    dynamic_arena_h2d_uploaded_semantics = "Pinned host arena to compact VRAM selected-expert tensors; not SSD or mmap read traffic"
     no_selected_load = [bool]$NoSelectedLoad
     diagnostics = [bool]$Diagnostics
     memory_preflight = $memoryPreflight
+    runtime_telemetry = $runtimeTelemetry
     moe_io_queue_depth = $IoQD
     moe_io_queue_depth_observed = $observedIoQD
     moe_overlapped_io_observed = $overlappedIoObserved
@@ -664,10 +858,22 @@ Write-Host ("t/s mean/min/max: " + $meanTps + " / " + $minTps + " / " + $maxTps)
 Write-Host ("server decode t/s mean/min/max: " + $serverDecodeMeanTps + " / " + $serverDecodeMinTps + " / " + $serverDecodeMaxTps)
 Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
-Write-Host ("arena observer armed/window/minhits/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
+Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
+Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
+Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
+Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " / " + $arenaGrowthSkips)
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
-Write-Host ("arena result/final hits/misses/fatal/uploaded GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
+Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
+Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaObserverResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
+Write-Host ("arena hit/miss rate: " + $summary.dynamic_arena_hit_rate + " / " + $summary.dynamic_arena_miss_rate)
+Write-Host ("runtime telemetry samples/requested ms/effective sec: " + $runtimeTelemetry.samples + " / " + $runtimeTelemetry.requested_interval_ms + " / " + [math]::Round($runtimeTelemetry.effective_interval_seconds, 3))
+Write-Host ("WDDM shared peak/median GiB: " + [math]::Round($runtimeTelemetry.gpu_process_shared_peak_bytes / 1GB, 3) + " / " + [math]::Round($runtimeTelemetry.gpu_process_shared_median_bytes / 1GB, 3))
+Write-Host ("WDDM dedicated peak GiB / VRAM peak MiB: " + [math]::Round($runtimeTelemetry.gpu_process_dedicated_peak_bytes / 1GB, 3) + " / " + $runtimeTelemetry.vram_used_peak_mib)
+Write-Host ("process working/private peak GiB: " + [math]::Round($runtimeTelemetry.process_working_set_peak_bytes / 1GB, 3) + " / " + [math]::Round($runtimeTelemetry.process_private_peak_bytes / 1GB, 3))
+Write-Host ("GPU util median/peak percent: " + $runtimeTelemetry.gpu_utilization_median_percent + " / " + $runtimeTelemetry.gpu_utilization_peak_percent)
+Write-Host ("Win32 process read/write delta GiB (excludes mmap page-ins): " + [math]::Round($runtimeTelemetry.win32_process_read_transfer_delta_bytes / 1GB, 3) + " / " + [math]::Round($runtimeTelemetry.win32_process_write_transfer_delta_bytes / 1GB, 3))
+Write-Host ("process page-fault delta / mmap I/O measured: " + $runtimeTelemetry.page_fault_delta + " / " + $runtimeTelemetry.mmap_backed_file_io_measured)
 Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
 Write-Host ("streams_hot   : " + $streamsHot)

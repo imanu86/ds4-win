@@ -1,0 +1,45 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache deferred 71.28 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 9.48 GiB of tensor spans in 4.348s
+ds4: cuda backend initialized for graph diagnostics
+0714 08:35:03 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: CUDA dynamic arena ready 12.00 GiB, 1820 slots, 6.75 MiB/slot, available_ram=36.94 GiB bytes=12881756160 slot_bytes=7077888
+ds4: [arena-observe] armed window=16 min_hits=3 grow_interval=8 layers=3..42 router=unbiased residency-only
+0714 08:35:06 ds4-server: listening on http://127.0.0.1:8000
+0714 08:35:07 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA q8 fp16 cache budget exhausted; using q8 kernels (request=8.00 MiB cached=0.00 GiB free=1.00 GiB reserve=4.00 GiB total=12.00 GiB)
+ds4: CUDA loading model tensors 8.12 GiB cached
+ds4: CUDA loading model tensors 7.53 GiB cached
+ds4: [arena-observe] armed window=16 min_hits=3 grow_interval=8 layers=3..42 router=unbiased residency-only
+0714 08:35:20 ds4-server: chat ctx=0..43:43 prompt done 13.099s
+ds4: [arena] begin base=0 target=440 resident=439 loads=0 slots=1820
+ds4: [arena] publish generation=440 loads=0
+ds4: [arena-observe] WRAP published tokens=16 resident=439 loads=0 workers=0 seconds=0.005 generation=440 preloaded=439 mirror=2.89 GiB verify_workers=8 verify_seconds=0.338
+ds4: [arena-observe] window complete tokens=16 resident=439 growths=0 result=published
+ds4: [arena] begin base=440 target=610 resident=608 loads=0 slots=1820
+ds4: [arena] publish generation=610 loads=0
+ds4: [arena-observe] WRAP published tokens=24 resident=608 loads=0 workers=0 seconds=0.005 generation=610 preloaded=608 mirror=4.01 GiB verify_workers=8 verify_seconds=0.137
+ds4: [arena-observe] grow complete tokens=24 resident=608 growths=1 result=published
+ds4: [arena] begin base=610 target=787 resident=784 loads=0 slots=1820
+ds4: [arena] publish generation=787 loads=0
+ds4: [arena-observe] WRAP published tokens=32 resident=784 loads=0 workers=0 seconds=0.004 generation=787 preloaded=784 mirror=5.17 GiB verify_workers=8 verify_seconds=0.136
+ds4: [arena-observe] grow complete tokens=32 resident=784 growths=2 result=published
+ds4: [arena] begin base=787 target=945 resident=941 loads=0 slots=1820
+ds4: [arena] publish generation=945 loads=0
+ds4: [arena-observe] WRAP published tokens=40 resident=941 loads=0 workers=0 seconds=0.005 generation=945 preloaded=941 mirror=6.20 GiB verify_workers=8 verify_seconds=0.124
+ds4: [arena-observe] grow complete tokens=40 resident=941 growths=3 result=published
+ds4: [arena] begin base=945 target=1121 resident=1116 loads=0 slots=1820
+ds4: [arena] publish generation=1121 loads=0
+ds4: [arena-observe] WRAP published tokens=48 resident=1116 loads=0 workers=0 seconds=0.004 generation=1121 preloaded=1116 mirror=7.36 GiB verify_workers=8 verify_seconds=0.138
+ds4: [arena-observe] grow complete tokens=48 resident=1116 growths=4 result=published
+0714 08:35:43 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=2.10 t/s avg=2.10 t/s 23.799s
+ds4: [arena] begin base=1121 target=1297 resident=1291 loads=0 slots=1820
+ds4: [arena] publish generation=1297 loads=0
+ds4: [arena-observe] WRAP published tokens=56 resident=1291 loads=0 workers=0 seconds=0.005 generation=1297 preloaded=1291 mirror=8.51 GiB verify_workers=8 verify_seconds=0.135
+ds4: [arena-observe] grow complete tokens=56 resident=1291 growths=5 result=published
+0714 08:35:49 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=2.34 t/s avg=2.15 t/s 29.790s
+0714 08:35:49 ds4-server: chat ctx=0..43:43 gen=64 finish=length 42.904s
+0714 08:35:49 ds4-server: benchmark request target reached; shutting down cleanly
+0714 08:35:49 ds4-server: shutdown requested, draining requests
+ds4: [arena] final hits=6260 misses=6106 fatal=0 uploaded=41.26 GiB
