@@ -17777,11 +17777,13 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
-    if (e->mtp_ready) model_close(&e->mtp_model);
-    model_close(&e->model);
 #ifndef DS4_NO_GPU
+    /* CUDA owns host pointers into the model mmap. Drain and release them
+     * before model_close unmaps either model. */
     ds4_gpu_cleanup();
 #endif
+    if (e->mtp_ready) model_close(&e->mtp_model);
+    model_close(&e->model);
     ds4_release_instance_lock();
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
@@ -17825,6 +17827,29 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         metal_graph_free(&s->graph);
         free(s);
         return 1;
+    }
+    if (e->backend == DS4_BACKEND_CUDA) {
+        const char *arena_gb_env = getenv("DS4_CUDA_DYNAMIC_ARENA_GB");
+        const double arena_gb = arena_gb_env && arena_gb_env[0]
+            ? strtod(arena_gb_env, NULL) : 0.0;
+        if (arena_gb > 0.0) {
+            const ds4_layer_weights *layer0 = &e->weights.layer[0];
+            const uint64_t gate_expert_bytes = layer0->ffn_gate_exps->dim[1] *
+                routed_expert_row_bytes(layer0->ffn_gate_exps);
+            const uint64_t down_expert_bytes = layer0->ffn_down_exps->dim[1] *
+                routed_expert_row_bytes(layer0->ffn_down_exps);
+            uint64_t allocated = 0;
+            uint32_t slots = 0;
+            const uint64_t requested = arena_gb >= (double)UINT64_MAX / 1073741824.0
+                ? UINT64_MAX : (uint64_t)(arena_gb * 1073741824.0);
+            if (!ds4_gpu_dynamic_arena_bind(
+                    e->model.map, e->model.size, DS4_N_LAYER, DS4_N_EXPERT,
+                    gate_expert_bytes, down_expert_bytes) ||
+                !ds4_gpu_dynamic_arena_prepare(requested, &allocated, &slots)) {
+                fprintf(stderr,
+                        "ds4: CUDA dynamic arena requested but unavailable; continuing with pageable fallback\n");
+            }
+        }
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->mtp_ready) {

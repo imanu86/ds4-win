@@ -77,6 +77,19 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_file(const os_file_t *file);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+
+/* Native host-pinned expert arena. The arena is an explicit-copy DMA source;
+ * it is deliberately not device-mapped and consumes no proportional VRAM. */
+int ds4_gpu_dynamic_arena_bind(
+        const void *model_map, uint64_t model_size,
+        uint32_t n_layer, uint32_t n_expert,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes);
+int ds4_gpu_dynamic_arena_prepare(
+        uint64_t requested_bytes,
+        uint64_t *allocated_bytes,
+        uint32_t *slot_count);
+void ds4_gpu_dynamic_arena_release(void);
+
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 void ds4_gpu_model_streaming_begin(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
