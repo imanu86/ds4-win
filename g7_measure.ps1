@@ -18,7 +18,10 @@ param(
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ReapMassObserve,
+    [switch]$ReapMassWrap,
     [ValidateRange(1, 256)][int]$ReapMassWindow = 16,
+    [ValidateRange(1, 256)][int]$ReapMassGrowInterval = 4,
+    [ValidateRange(1.0, 100.0)][double]$ReapMassHysteresis = 1.25,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
     [ValidateRange(0, 256)][int]$DynamicArenaGrowInterval = 0,
@@ -121,12 +124,21 @@ if ($PrefillMassWrap) {
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_MASS_WRAP -ErrorAction SilentlyContinue
 }
-if ($ReapMassObserve) {
+if ($ReapMassObserve -or $ReapMassWrap) {
     $env:DS4_CUDA_REAP_MASS_OBSERVE = "1"
     $env:DS4_CUDA_REAP_MASS_WINDOW = "$ReapMassWindow"
 } else {
     Remove-Item Env:\DS4_CUDA_REAP_MASS_OBSERVE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_REAP_MASS_WINDOW -ErrorAction SilentlyContinue
+}
+if ($ReapMassWrap) {
+    $env:DS4_CUDA_REAP_MASS_WRAP = "1"
+    $env:DS4_CUDA_REAP_MASS_GROW_INTERVAL = "$ReapMassGrowInterval"
+    $env:DS4_CUDA_REAP_MASS_HYSTERESIS = $ReapMassHysteresis.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+    Remove-Item Env:\DS4_CUDA_REAP_MASS_WRAP -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_REAP_MASS_GROW_INTERVAL -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_REAP_MASS_HYSTERESIS -ErrorAction SilentlyContinue
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW = "$DynamicArenaObservedWindow"
@@ -214,6 +226,7 @@ if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "Dy
 if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObserve requires DynamicArenaGiB > 0" }
 if ($PrefillMassWrap -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassWrap requires DynamicArenaGiB > 0" }
 if ($ReapMassObserve -and $DynamicArenaGiB -le 0.0) { throw "ReapMassObserve requires DynamicArenaGiB > 0" }
+if ($ReapMassWrap -and $DynamicArenaGiB -le 0.0) { throw "ReapMassWrap requires DynamicArenaGiB > 0" }
 if ($PrefillMassWrap -and $DynamicArenaObservedWindow -gt 0) { throw "PrefillMassWrap must be isolated from the decode observer" }
 if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassWrap must be isolated from arena growth" }
 if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
@@ -554,6 +567,21 @@ $reapMassFirstLayer = 0; $reapMassLastLayer = 0
 $reapMassTransport = "not_observed"
 $reapMassTokens = 0; $reapMassObservedSlots = 0; $reapMassUnique = 0
 $reapMassTopMass = 0.0; $reapMassTouched = 0
+$reapMassWrapArmed = $false; $reapMassWrapGrowIntervalObserved = 0
+$reapMassWrapHysteresisObserved = 0.0; $reapMassWrapCapacity = 0
+$reapMassWrapRouterArmed = "not_observed"; $reapMassWrapMaskArmed = "not_observed"
+$reapMassWrapPolicyArmed = "not_observed"
+$reapMassWrapObserved = $false; $reapMassWrapEventCount = 0
+$reapMassWrapPublicationCount = 0; $reapMassWrapSkippedCount = 0
+$reapMassWrapFailureCount = 0
+$reapMassWrapEntrants = 0; $reapMassWrapVictims = 0; $reapMassWrapLoads = 0
+$reapMassWrapSeconds = 0.0; $reapMassWrapLastResult = "not_observed"
+$reapMassWrapLastReason = "not_observed"; $reapMassWrapLastResidentBefore = 0
+$reapMassWrapLastResidentAfter = 0; $reapMassWrapLastGeneration = 0
+$reapMassWrapLastTokens = 0; $reapMassWrapLastFreeBefore = 0
+$reapMassWrapLastSnapshotBefore = 0; $reapMassWrapLastSnapshotAfter = 0
+$reapMassWrapLastWorkers = 0; $reapMassWrapLastRouter = "not_observed"
+$reapMassWrapLastMask = "not_observed"
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
@@ -743,6 +771,48 @@ if (Test-Path $stderrLog) {
         $reapMassTopMass = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
         $reapMassTouched = [long]$Matches[5]
     }
+    $reapMassWrapArmedLine = $lines | Where-Object { $_ -match "\[reap-mass-wrap\] armed" } | Select-Object -Last 1
+    if ($reapMassWrapArmedLine -and $reapMassWrapArmedLine -match "^ds4: \[reap-mass-wrap\] armed grow_interval=(\d+) hysteresis=([0-9]+(?:\.[0-9]+)?) capacity=(\d+) router=unbiased mask=off policy=free-then-mass-victim$") {
+        $reapMassWrapArmed = $true
+        $reapMassWrapGrowIntervalObserved = [int]$Matches[1]
+        $reapMassWrapHysteresisObserved = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+        $reapMassWrapCapacity = [long]$Matches[3]
+        $reapMassWrapRouterArmed = "unbiased"
+        $reapMassWrapMaskArmed = "off"
+        $reapMassWrapPolicyArmed = "free-then-mass-victim"
+    }
+    $reapMassWrapEventLines = @($lines | Where-Object { $_ -match "\[reap-mass-wrap\] result=" })
+    foreach ($reapMassWrapEventLine in $reapMassWrapEventLines) {
+        if ($reapMassWrapEventLine -match "^ds4: \[reap-mass-wrap\] result=([a-z-]+) reason=([a-z-]+) tokens=(\d+) entrants=(\d+) victims=(\d+) free_before=(\d+) resident_before=(\d+) resident_after=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9]+(?:\.[0-9]+)?) snapshot_before=(\d+) snapshot_after=(\d+) generation=(\d+) router=unbiased mask=off$") {
+            $reapMassWrapObserved = $true
+            $reapMassWrapEventCount += 1
+            $reapMassWrapLastResult = $Matches[1]
+            $reapMassWrapLastReason = $Matches[2]
+            $reapMassWrapLastTokens = [long]$Matches[3]
+            $reapMassWrapEntrants += [long]$Matches[4]
+            $reapMassWrapVictims += [long]$Matches[5]
+            $reapMassWrapLastFreeBefore = [long]$Matches[6]
+            $reapMassWrapLastResidentBefore = [long]$Matches[7]
+            $reapMassWrapLastResidentAfter = [long]$Matches[8]
+            $reapMassWrapLoads += [long]$Matches[9]
+            $reapMassWrapLastWorkers = [int]$Matches[10]
+            $reapMassWrapSeconds += [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
+            $reapMassWrapLastSnapshotBefore = [long]$Matches[12]
+            $reapMassWrapLastSnapshotAfter = [long]$Matches[13]
+            $reapMassWrapLastGeneration = [long]$Matches[14]
+            $reapMassWrapLastRouter = "unbiased"
+            $reapMassWrapLastMask = "off"
+            if ($reapMassWrapLastResult -eq "published") {
+                $reapMassWrapPublicationCount += 1
+            } elseif ($reapMassWrapLastResult -eq "skipped") {
+                $reapMassWrapSkippedCount += 1
+            } else {
+                $reapMassWrapFailureCount += 1
+            }
+        } else {
+            $reapMassWrapFailureCount += 1
+        }
+    }
     $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
     if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
         $arenaObserverArmed = $true
@@ -910,12 +980,28 @@ if ($PrefillMassWrap) {
 } elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
     throw "Prefill mass WRAP activated while not requested"
 }
-if ($ReapMassObserve) {
+if ($ReapMassObserve -or $ReapMassWrap) {
     if (-not $reapMassArmed -or -not $reapMassResultObserved) { throw "REAP mass measurement failed: observer did not arm/report" }
     if ($reapMassWindowObserved -ne $ReapMassWindow -or $reapMassTopObserved -le 0 -or $reapMassTransport -ne "packed-router-d2h") { throw "REAP mass measurement failed: observed policy/transport differs from requested policy" }
     if ($reapMassTokens -le 0 -or $reapMassObservedSlots -le 0 -or $reapMassUnique -le 0 -or $reapMassTopMass -le 0.0) { throw "REAP mass measurement failed: invalid terminal counters" }
 } elseif ($reapMassArmed -or $reapMassResultObserved) {
     throw "REAP mass observer activated while not requested"
+}
+if ($ReapMassWrap) {
+    if (-not $reapMassWrapArmed -or -not $reapMassWrapArmedLine) { throw "REAP mass WRAP failed: observer/wrap did not arm" }
+    if ($reapMassWrapGrowIntervalObserved -ne $ReapMassGrowInterval -or
+        [math]::Abs($reapMassWrapHysteresisObserved - $ReapMassHysteresis) -gt 1e-9 -or
+        $reapMassWrapCapacity -le 0 -or
+        $reapMassWrapRouterArmed -ne "unbiased" -or
+        $reapMassWrapMaskArmed -ne "off" -or
+        $reapMassWrapPolicyArmed -ne "free-then-mass-victim") {
+        throw "REAP mass WRAP failed: observed config differs from requested policy"
+    }
+    if ($reapMassWrapEventCount -le 0 -or $reapMassWrapPublicationCount -le 0) { throw "REAP mass WRAP failed: no published event observed" }
+    if ($reapMassWrapFailureCount -ne 0) { throw "REAP mass WRAP failed: malformed or unsuccessful event observed" }
+    if ($reapMassWrapLastRouter -ne "unbiased" -or $reapMassWrapLastMask -ne "off") { throw "REAP mass WRAP failed: router/mask telemetry differs" }
+} elseif ($reapMassWrapArmedLine -or $reapMassWrapEventLines.Count -ne 0 -or $reapMassWrapObserved) {
+    throw "REAP mass WRAP activated while not requested"
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     if (-not $arenaObserverArmed) { throw "Dynamic arena measurement failed: observer was not armed" }
@@ -1049,8 +1135,11 @@ $summary = [pscustomobject]@{
     dynamic_arena_gib_requested = $DynamicArenaGiB
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
-    reap_mass_observe_requested = [bool]$ReapMassObserve
+    reap_mass_observe_requested = [bool]($ReapMassObserve -or $ReapMassWrap)
+    reap_mass_wrap_requested = [bool]$ReapMassWrap
     reap_mass_window_requested = $ReapMassWindow
+    reap_mass_wrap_grow_interval_requested = $ReapMassGrowInterval
+    reap_mass_wrap_hysteresis_requested = $ReapMassHysteresis
     reap_mass_observer_armed = $reapMassArmed
     reap_mass_result_observed = $reapMassResultObserved
     reap_mass_window_observed = $reapMassWindowObserved
@@ -1063,7 +1152,35 @@ $summary = [pscustomobject]@{
     reap_mass_unique_entries = $reapMassUnique
     reap_mass_top_mass = $reapMassTopMass
     reap_mass_touched_entries = $reapMassTouched
-    reap_mass_semantics = "decode-only selected gate weight normalized per token and layer; exact sliding window; observe-only"
+    reap_mass_semantics = $(if ($ReapMassWrap) { "decode-only selected gate weight normalized per token and layer; exact sliding window; fail-closed wrap publication" } else { "decode-only selected gate weight normalized per token and layer; exact sliding window; observe-only" })
+    reap_mass_wrap_armed = $reapMassWrapArmed
+    reap_mass_wrap_grow_interval_observed = $reapMassWrapGrowIntervalObserved
+    reap_mass_wrap_hysteresis_observed = $reapMassWrapHysteresisObserved
+    reap_mass_wrap_capacity_entries = $reapMassWrapCapacity
+    reap_mass_wrap_armed_router = $reapMassWrapRouterArmed
+    reap_mass_wrap_armed_mask = $reapMassWrapMaskArmed
+    reap_mass_wrap_armed_policy = $reapMassWrapPolicyArmed
+    reap_mass_wrap_observed = $reapMassWrapObserved
+    reap_mass_wrap_event_count = $reapMassWrapEventCount
+    reap_mass_wrap_publication_count = $reapMassWrapPublicationCount
+    reap_mass_wrap_skipped_count = $reapMassWrapSkippedCount
+    reap_mass_wrap_failure_count = $reapMassWrapFailureCount
+    reap_mass_wrap_sum_entrants = $reapMassWrapEntrants
+    reap_mass_wrap_sum_victims = $reapMassWrapVictims
+    reap_mass_wrap_sum_loads = $reapMassWrapLoads
+    reap_mass_wrap_sum_seconds = $reapMassWrapSeconds
+    reap_mass_wrap_last_result = $reapMassWrapLastResult
+    reap_mass_wrap_last_reason = $reapMassWrapLastReason
+    reap_mass_wrap_last_tokens = $reapMassWrapLastTokens
+    reap_mass_wrap_last_free_before = $reapMassWrapLastFreeBefore
+    reap_mass_wrap_last_resident_before = $reapMassWrapLastResidentBefore
+    reap_mass_wrap_last_resident_after = $reapMassWrapLastResidentAfter
+    reap_mass_wrap_last_snapshot_before = $reapMassWrapLastSnapshotBefore
+    reap_mass_wrap_last_snapshot_after = $reapMassWrapLastSnapshotAfter
+    reap_mass_wrap_last_generation = $reapMassWrapLastGeneration
+    reap_mass_wrap_last_workers = $reapMassWrapLastWorkers
+    reap_mass_wrap_last_router = $reapMassWrapLastRouter
+    reap_mass_wrap_last_mask = $reapMassWrapLastMask
     prefill_mass_observer_armed = $prefillMassArmed
     prefill_mass_finalized = $prefillMassFinalized
     prefill_mass_policy_observed = $prefillMassPolicy
@@ -1261,7 +1378,10 @@ Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [
 Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
 Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
 Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
-Write-Host ("REAP mass requested/armed/window/top/transport/tokens/slots/unique/top mass/touched: " + [bool]$ReapMassObserve + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTransport + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
+Write-Host ("REAP mass requested/armed/window/top/transport/tokens/slots/unique/top mass/touched: " + [bool]($ReapMassObserve -or $ReapMassWrap) + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTransport + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
+Write-Host ("REAP mass WRAP requested/armed/grow/hysteresis/capacity/router/mask/policy: " + [bool]$ReapMassWrap + " / " + $reapMassWrapArmed + " / " + $reapMassWrapGrowIntervalObserved + " / " + $reapMassWrapHysteresisObserved + " / " + $reapMassWrapCapacity + " / " + $reapMassWrapRouterArmed + " / " + $reapMassWrapMaskArmed + " / " + $reapMassWrapPolicyArmed)
+Write-Host ("REAP mass WRAP events/published/skipped/failed/entrants/victims/loads/sec: " + $reapMassWrapEventCount + " / " + $reapMassWrapPublicationCount + " / " + $reapMassWrapSkippedCount + " / " + $reapMassWrapFailureCount + " / " + $reapMassWrapEntrants + " / " + $reapMassWrapVictims + " / " + $reapMassWrapLoads + " / " + $reapMassWrapSeconds)
+Write-Host ("REAP mass WRAP last result/reason/resident before/after/generation: " + $reapMassWrapLastResult + " / " + $reapMassWrapLastReason + " / " + $reapMassWrapLastResidentBefore + " / " + $reapMassWrapLastResidentAfter + " / " + $reapMassWrapLastGeneration)
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena carry requested: " + $DynamicArenaCarry)
 Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)

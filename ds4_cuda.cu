@@ -407,8 +407,10 @@ struct cuda_reap_router_trace {
 struct cuda_reap_mass_observer {
     int enabled;
     int armed;
+    int wrap_requested;
     uint32_t window;
     uint32_t top;
+    uint32_t grow_interval;
     uint32_t entry_count;
     uint32_t layer_min;
     uint32_t layer_max;
@@ -416,13 +418,22 @@ struct cuda_reap_mass_observer {
     uint32_t unique_entries;
     uint32_t last_touched;
     uint64_t tokens;
+    uint64_t last_publish_tokens;
     uint64_t observed_slots;
+    uint64_t wrap_attempts;
+    uint64_t wrap_publications;
+    uint64_t wrap_skips;
+    uint64_t wrap_failures;
+    uint64_t wrap_entrants;
+    uint64_t wrap_victims;
     double top_mass;
+    double hysteresis;
     std::vector<double> totals;
     std::vector<double> ring;
     std::vector<std::vector<std::pair<uint32_t, double>>> pending;
     std::vector<uint8_t> touched;
     std::vector<uint32_t> touched_entries;
+    std::vector<uint8_t> target;
 };
 
 static cuda_reap_mass_observer g_reap_mass_observer;
@@ -3281,6 +3292,20 @@ static int cuda_reap_mass_observe_requested(void) {
     return 0;
 }
 
+static int cuda_reap_mass_wrap_requested(void) {
+    const char *value = getenv("DS4_CUDA_REAP_MASS_WRAP");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [reap-mass-wrap] invalid value '%s'; policy disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0;
+}
+
 static uint32_t cuda_reap_mass_window(void) {
     const char *value = getenv("DS4_CUDA_REAP_MASS_WINDOW");
     if (!value || !value[0]) return 16;
@@ -3294,6 +3319,50 @@ static uint32_t cuda_reap_mass_window(void) {
             "ds4: [reap-mass] invalid window value '%s'; observer disabled\n",
             value);
     return 0;
+}
+
+static uint32_t cuda_reap_mass_grow_interval(void) {
+    const char *value = getenv("DS4_CUDA_REAP_MASS_GROW_INTERVAL");
+    if (!value || !value[0]) return 4;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno == 0 && end && end != value && *end == '\0' &&
+        parsed >= 1 && parsed <= 256) {
+        return (uint32_t)parsed;
+    }
+    fprintf(stderr,
+            "ds4: [reap-mass-wrap] invalid grow interval '%s'; policy disabled\n",
+            value);
+    return 0;
+}
+
+static double cuda_reap_mass_hysteresis(void) {
+    const char *value = getenv("DS4_CUDA_REAP_MASS_HYSTERESIS");
+    if (!value || !value[0]) return 1.25;
+    char *end = NULL;
+    errno = 0;
+    const double parsed = strtod(value, &end);
+    if (errno == 0 && end && end != value && *end == '\0' &&
+        isfinite(parsed) && parsed >= 1.0 && parsed <= 100.0) {
+        return parsed;
+    }
+    fprintf(stderr,
+            "ds4: [reap-mass-wrap] invalid hysteresis '%s'; policy disabled\n",
+            value);
+    return 0.0;
+}
+
+static uint32_t cuda_reap_mass_swap_slots(uint32_t physical_capacity) {
+    if (physical_capacity <= 1) return 0;
+    return std::min(8u, physical_capacity - 1u);
+}
+
+static uint32_t cuda_reap_mass_resident_limit(void) {
+    const uint32_t physical_capacity =
+        (uint32_t)g_dynamic_arena.slots.size();
+    return physical_capacity -
+        cuda_reap_mass_swap_slots(physical_capacity);
 }
 
 static int cuda_reap_mass_observer_needs_weights(void) {
@@ -3416,18 +3485,228 @@ static void cuda_reap_mass_commit_all_pending(void) {
     cuda_reap_mass_clear_pending();
 }
 
+static int cuda_reap_mass_publish_residency(void) {
+    cuda_reap_mass_observer &observer = g_reap_mass_observer;
+    if (!observer.enabled || !observer.armed ||
+        !observer.wrap_requested || observer.tokens == 0 ||
+        observer.grow_interval == 0 ||
+        observer.tokens - observer.last_publish_tokens <
+            observer.grow_interval) {
+        return 0;
+    }
+
+    observer.last_publish_tokens = observer.tokens;
+    observer.wrap_attempts++;
+    const uint64_t snapshot_before = g_dynamic_arena.snapshot_generation;
+    const uint32_t resident_before = cuda_dynamic_arena_active_count();
+    const uint32_t physical_capacity =
+        (uint32_t)g_dynamic_arena.slots.size();
+    const uint32_t resident_limit = cuda_reap_mass_resident_limit();
+    const uint32_t free_before = resident_before < resident_limit ?
+        resident_limit - resident_before : 0;
+    const char *result_name = "skipped";
+    const char *reason = "no-candidate";
+    uint32_t entrants_added = 0;
+    uint32_t victims_removed = 0;
+    cuda_dynamic_arena_wrap_result wrap = {};
+
+    struct ranked_entry {
+        double mass;
+        uint32_t entry;
+    };
+    std::vector<ranked_entry> entrants;
+    std::vector<ranked_entry> victims;
+
+    do {
+        if (!g_dynamic_arena.host_base || resident_limit == 0 ||
+            observer.entry_count == 0 ||
+            observer.entry_count != g_dynamic_arena.active.size() ||
+            observer.totals.size() != observer.entry_count ||
+            observer.target.size() != observer.entry_count) {
+            reason = "arena-not-ready";
+            break;
+        }
+        if (g_dynamic_arena.txn || g_dynamic_arena.submissions_blocked ||
+            g_dynamic_arena.hits_disabled) {
+            reason = "transaction-active";
+            break;
+        }
+        if (g_dynamic_arena_observer.enabled) {
+            reason = "observer-active";
+            break;
+        }
+
+        try {
+            std::fill(observer.target.begin(), observer.target.end(), 0);
+            entrants.reserve(observer.unique_entries);
+            victims.reserve(resident_before);
+            for (uint32_t entry = 0; entry < observer.entry_count; entry++) {
+                const uint32_t layer = entry / g_dynamic_arena.n_expert;
+                const uint32_t expert = entry % g_dynamic_arena.n_expert;
+                const int resident = cuda_dynamic_arena_binding_valid(
+                    g_dynamic_arena.active[entry], layer, expert,
+                    snapshot_before, DS4_GPU_ARENA_READY);
+                const double mass = observer.totals[entry] > 0.0 ?
+                    observer.totals[entry] : 0.0;
+                if (resident) {
+                    observer.target[entry] = 1;
+                    victims.push_back({mass, entry});
+                } else if (mass > 0.0) {
+                    entrants.push_back({mass, entry});
+                }
+            }
+        } catch (...) {
+            result_name = "failed";
+            reason = "allocation";
+            break;
+        }
+
+        std::sort(entrants.begin(), entrants.end(),
+                  [](const ranked_entry &a, const ranked_entry &b) {
+                      if (a.mass != b.mass) return a.mass > b.mass;
+                      return a.entry < b.entry;
+                  });
+        std::sort(victims.begin(), victims.end(),
+                  [](const ranked_entry &a, const ranked_entry &b) {
+                      if (a.mass != b.mass) return a.mass < b.mass;
+                      return a.entry > b.entry;
+                  });
+
+        if (resident_before > resident_limit) {
+            const uint32_t excess = resident_before - resident_limit;
+            if (excess > victims.size()) {
+                result_name = "failed";
+                reason = "resident-invariant";
+                break;
+            }
+            for (uint32_t i = 0; i < excess; i++) {
+                observer.target[victims[i].entry] = 0;
+                victims_removed++;
+            }
+        }
+
+        uint32_t entrant_cursor = 0;
+        if (victims_removed == 0) {
+            const uint32_t free_admissions = std::min(
+                free_before, (uint32_t)entrants.size());
+            for (; entrant_cursor < free_admissions; entrant_cursor++) {
+                observer.target[entrants[entrant_cursor].entry] = 1;
+                entrants_added++;
+            }
+
+            if (free_admissions == 0) {
+                uint32_t victim_cursor = 0;
+                const uint32_t swap_capacity =
+                    resident_before < physical_capacity ?
+                    physical_capacity - resident_before : 0;
+                const double epsilon = 1e-12;
+                while (entrant_cursor < entrants.size() &&
+                       victim_cursor < victims.size() &&
+                       victims_removed < swap_capacity) {
+                    const ranked_entry &entrant = entrants[entrant_cursor];
+                    const ranked_entry &victim = victims[victim_cursor];
+                    const double threshold =
+                        victim.mass * observer.hysteresis + epsilon;
+                    if (entrant.mass <= threshold) break;
+                    observer.target[victim.entry] = 0;
+                    observer.target[entrant.entry] = 1;
+                    entrants_added++;
+                    victims_removed++;
+                    entrant_cursor++;
+                    victim_cursor++;
+                }
+            }
+        }
+
+        if (entrants_added == 0 && victims_removed == 0) {
+            reason = entrants.empty() ?
+                "no-candidate" : "hysteresis";
+            break;
+        }
+
+        if (cuda_dynamic_arena_wrap_publish_target(
+                observer.target.data(), observer.entry_count, &wrap)) {
+            result_name = "published";
+            reason = "ok";
+        } else {
+            result_name = wrap.aborted ? "aborted" : "failed";
+            reason = wrap.reason ? wrap.reason : "publish";
+        }
+    } while (0);
+
+    const uint64_t snapshot_after = g_dynamic_arena.snapshot_generation;
+    const uint32_t resident_after = cuda_dynamic_arena_active_count();
+    if (strcmp(result_name, "published") == 0) {
+        const uint32_t expected_after =
+            resident_before + entrants_added - victims_removed;
+        if (resident_after != expected_after ||
+            snapshot_after == snapshot_before ||
+            wrap.loads > entrants_added) {
+            result_name = "failed";
+            reason = "publish-invariant";
+            g_dynamic_arena.fatal_errors++;
+            observer.wrap_failures++;
+        } else {
+            observer.wrap_publications++;
+            observer.wrap_entrants += entrants_added;
+            observer.wrap_victims += victims_removed;
+        }
+    } else if (strcmp(result_name, "skipped") == 0) {
+        if (snapshot_after != snapshot_before ||
+            resident_after != resident_before) {
+            result_name = "failed";
+            reason = "skip-invariant";
+            g_dynamic_arena.fatal_errors++;
+            observer.wrap_failures++;
+        } else {
+            observer.wrap_skips++;
+        }
+    } else {
+        observer.wrap_failures++;
+        if (snapshot_after != snapshot_before ||
+            resident_after != resident_before) {
+            reason = "rollback-invariant";
+            g_dynamic_arena.fatal_errors++;
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: [reap-mass-wrap] result=%s reason=%s tokens=%llu entrants=%u victims=%u free_before=%u resident_before=%u resident_after=%u loads=%u workers=%u seconds=%.3f snapshot_before=%llu snapshot_after=%llu generation=%llu router=unbiased mask=off\n",
+            result_name, reason, (unsigned long long)observer.tokens,
+            entrants_added, victims_removed, free_before,
+            resident_before, resident_after, wrap.loads, wrap.workers,
+            wrap.seconds, (unsigned long long)snapshot_before,
+            (unsigned long long)snapshot_after,
+            (unsigned long long)wrap.generation);
+    return strcmp(result_name, "published") == 0;
+}
+
 static void cuda_reap_mass_observer_release(int report) {
     if (report) cuda_reap_mass_commit_all_pending();
+    if (report) (void)cuda_reap_mass_publish_residency();
     if (report) cuda_reap_mass_report("request-end");
+    if (report && g_reap_mass_observer.wrap_requested) {
+        fprintf(stderr,
+                "ds4: [reap-mass-wrap] request-end attempts=%llu publications=%llu skips=%llu failures=%llu entrants=%llu victims=%llu\n",
+                (unsigned long long)g_reap_mass_observer.wrap_attempts,
+                (unsigned long long)g_reap_mass_observer.wrap_publications,
+                (unsigned long long)g_reap_mass_observer.wrap_skips,
+                (unsigned long long)g_reap_mass_observer.wrap_failures,
+                (unsigned long long)g_reap_mass_observer.wrap_entrants,
+                (unsigned long long)g_reap_mass_observer.wrap_victims);
+    }
     g_reap_mass_observer.totals.clear();
     g_reap_mass_observer.ring.clear();
     g_reap_mass_observer.pending.clear();
     g_reap_mass_observer.touched.clear();
     g_reap_mass_observer.touched_entries.clear();
+    g_reap_mass_observer.target.clear();
     g_reap_mass_observer.enabled = 0;
     g_reap_mass_observer.armed = 0;
+    g_reap_mass_observer.wrap_requested = 0;
     g_reap_mass_observer.window = 0;
     g_reap_mass_observer.top = 0;
+    g_reap_mass_observer.grow_interval = 0;
     g_reap_mass_observer.entry_count = 0;
     g_reap_mass_observer.layer_min = 3;
     g_reap_mass_observer.layer_max = 42;
@@ -3435,15 +3714,28 @@ static void cuda_reap_mass_observer_release(int report) {
     g_reap_mass_observer.unique_entries = 0;
     g_reap_mass_observer.last_touched = 0;
     g_reap_mass_observer.tokens = 0;
+    g_reap_mass_observer.last_publish_tokens = 0;
     g_reap_mass_observer.observed_slots = 0;
+    g_reap_mass_observer.wrap_attempts = 0;
+    g_reap_mass_observer.wrap_publications = 0;
+    g_reap_mass_observer.wrap_skips = 0;
+    g_reap_mass_observer.wrap_failures = 0;
+    g_reap_mass_observer.wrap_entrants = 0;
+    g_reap_mass_observer.wrap_victims = 0;
     g_reap_mass_observer.top_mass = 0.0;
+    g_reap_mass_observer.hysteresis = 0.0;
 }
 
 static void cuda_reap_mass_observer_reset(void) {
     cuda_reap_mass_observer_release(1);
-    if (!cuda_reap_mass_observe_requested()) return;
+    const int wrap = cuda_reap_mass_wrap_requested();
+    if (!cuda_reap_mass_observe_requested() && !wrap) return;
     const uint32_t window = cuda_reap_mass_window();
     if (window == 0) return;
+    const uint32_t grow_interval = wrap ?
+        cuda_reap_mass_grow_interval() : 0;
+    const double hysteresis = wrap ? cuda_reap_mass_hysteresis() : 0.0;
+    if (wrap && (grow_interval == 0 || hysteresis < 1.0)) return;
     if (!g_dynamic_arena.host_base || g_dynamic_arena.n_layer <= 3 ||
         g_dynamic_arena.n_expert == 0) {
         fprintf(stderr,
@@ -3466,6 +3758,7 @@ static void cuda_reap_mass_observer_reset(void) {
         g_reap_mass_observer.pending.clear();
         g_reap_mass_observer.touched.assign(entry_count, 0);
         g_reap_mass_observer.touched_entries.reserve(entry_count);
+        if (wrap) g_reap_mass_observer.target.assign(entry_count, 0);
     } catch (...) {
         cuda_reap_mass_observer_release(0);
         fprintf(stderr,
@@ -3473,10 +3766,14 @@ static void cuda_reap_mass_observer_reset(void) {
         return;
     }
     g_reap_mass_observer.enabled = 1;
+    g_reap_mass_observer.wrap_requested = wrap;
     g_reap_mass_observer.window = window;
+    g_reap_mass_observer.grow_interval = grow_interval;
+    g_reap_mass_observer.hysteresis = hysteresis;
     g_reap_mass_observer.entry_count = entry_count;
     g_reap_mass_observer.layer_min = 3;
     g_reap_mass_observer.layer_max = layer_max;
+    if (wrap) cuda_dynamic_arena_observer_release();
 }
 
 static void cuda_reap_mass_arm(uint32_t top, uint32_t n_tokens) {
@@ -3496,6 +3793,12 @@ static void cuda_reap_mass_arm(uint32_t top, uint32_t n_tokens) {
             "ds4: [reap-mass] armed window=%u top=%u layers=%u..%u semantics=selected_weight_normalized_per_token sliding_ring_observe_only transport=packed-router-d2h\n",
             observer.window, observer.top,
             observer.layer_min, observer.layer_max);
+    if (observer.wrap_requested) {
+        fprintf(stderr,
+                "ds4: [reap-mass-wrap] armed grow_interval=%u hysteresis=%.9g capacity=%u router=unbiased mask=off policy=free-then-mass-victim\n",
+                observer.grow_interval, observer.hysteresis,
+                cuda_reap_mass_resident_limit());
+    }
 }
 
 static void cuda_prefill_mass_observer_report_decode(const char *reason) {
@@ -3727,8 +4030,12 @@ static void cuda_prefill_mass_observer_finalize(void) {
                   return a.entry < b.entry;
               });
 
+    const size_t residency_capacity =
+        g_reap_mass_observer.wrap_requested ?
+        (size_t)cuda_reap_mass_resident_limit() :
+        g_dynamic_arena.slots.size();
     const uint32_t capacity = (uint32_t)std::min(
-        ranked.size(), g_dynamic_arena.slots.size());
+        ranked.size(), residency_capacity);
     double total_mass = 0.0;
     double candidate_mass = 0.0;
     for (uint32_t i = 0; i < ranked.size(); i++) {
@@ -3862,6 +4169,7 @@ static void cuda_reap_mass_observe_selected(
         return;
     } else if (observer.pending.size() != n_tokens) {
         cuda_reap_mass_commit_all_pending();
+        (void)cuda_reap_mass_publish_residency();
         try {
             observer.pending.assign(n_tokens, {});
         } catch (...) {
@@ -3873,6 +4181,7 @@ static void cuda_reap_mass_observe_selected(
     } else if (observer.last_layer != 0 &&
                layer_index <= observer.last_layer) {
         cuda_reap_mass_commit_all_pending();
+        (void)cuda_reap_mass_publish_residency();
     }
 
     const uint32_t base = layer_index * g_dynamic_arena.n_expert;
@@ -3981,6 +4290,7 @@ extern "C" void ds4_gpu_dynamic_arena_observer_reset(void) {
     const uint32_t grow_interval =
         cuda_dynamic_arena_observer_grow_interval();
     cuda_dynamic_arena_observer_release();
+    if (g_reap_mass_observer.wrap_requested) return;
     if (cuda_dynamic_arena_carry_mode() >= 0 &&
         g_dynamic_arena.snapshot_generation != 0) {
         return;
