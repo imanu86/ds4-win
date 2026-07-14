@@ -16,6 +16,7 @@ param(
     [ValidateRange(0, 8192)][int]$Q8F16CacheReserveMB = 4096,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [switch]$PrefillMassObserve,
+    [switch]$PrefillMassWrap,
     [ValidateRange(0, 256)][int]$DynamicArenaObservedWindow = 0,
     [ValidateRange(1, 256)][int]$DynamicArenaObservedMinHits = 1,
     [ValidateRange(0, 256)][int]$DynamicArenaGrowInterval = 0,
@@ -107,10 +108,15 @@ if ($DynamicArenaGiB -gt 0.0) {
 } else {
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_GB -ErrorAction SilentlyContinue
 }
-if ($PrefillMassObserve) {
+if ($PrefillMassObserve -or $PrefillMassWrap) {
     $env:DS4_CUDA_PREFILL_MASS_OBSERVE = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_MASS_OBSERVE -ErrorAction SilentlyContinue
+}
+if ($PrefillMassWrap) {
+    $env:DS4_CUDA_PREFILL_MASS_WRAP = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_MASS_WRAP -ErrorAction SilentlyContinue
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW = "$DynamicArenaObservedWindow"
@@ -196,6 +202,13 @@ if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
 if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObserve requires DynamicArenaGiB > 0" }
+if ($PrefillMassWrap -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassWrap requires DynamicArenaGiB > 0" }
+if ($PrefillMassWrap -and $DynamicArenaObservedWindow -gt 0) { throw "PrefillMassWrap must be isolated from the decode observer" }
+if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassWrap must be isolated from arena growth" }
+if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
+if ($PrefillMassWrap -and ($ExpertCacheN -gt 0 -or $ExpertCacheStats)) { throw "PrefillMassWrap must be isolated from the expert cache" }
+if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
+if ($PrefillMassWrap -and ($Warmup -or $Repeats -ne 1)) { throw "PrefillMassWrap first-snapshot measurements require one request and no warmup" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
 if ($DynamicArenaCarry -ne "default" -and (-not $Warmup -or $DynamicArenaObservedWindow -le 0)) { throw "DynamicArenaCarry requires Warmup and DynamicArenaObservedWindow > 0" }
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
@@ -514,7 +527,15 @@ $prefillMassRoutedSlots = 0; $prefillMassUnique = 0
 $prefillMassCandidate = 0; $prefillMassCapacity = 0
 $prefillMassTotal = 0.0; $prefillMassCandidateMass = 0.0
 $prefillMassCoverage = 0.0; $prefillMassCutoff = 0.0
+$prefillMassPolicy = "not_observed"; $prefillMassResidency = "not_observed"
 $prefillMassDecodeTokens = 0; $prefillMassDecodeSlots = 0; $prefillMassDecodeHits = 0; $prefillMassDecodeHitRate = 0.0
+$prefillMassWrapObserved = $false; $prefillMassWrapEventCount = 0
+$prefillMassWrapResult = "not_observed"; $prefillMassWrapReason = "not_observed"
+$prefillMassWrapCandidate = 0; $prefillMassWrapLoads = 0; $prefillMassWrapWorkers = 0
+$prefillMassWrapSeconds = 0.0; $prefillMassWrapSnapshotBefore = 0; $prefillMassWrapSnapshotAfter = 0
+$prefillMassWrapResidentBefore = 0; $prefillMassWrapResidentAfter = 0
+$prefillMassWrapGeneration = 0; $prefillMassWrapPreloaded = -1
+$prefillMassWrapRouter = "not_observed"; $prefillMassWrapMask = "not_observed"
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
@@ -651,11 +672,12 @@ if (Test-Path $stderrLog) {
         $arenaSlotBytes = [long]$Matches[3]
     }
     $prefillMassArmedLine = $lines | Where-Object { $_ -match "\[prefill-mass\] armed" } | Select-Object -Last 1
-    if ($prefillMassArmedLine -and $prefillMassArmedLine -match "armed slots=(\d+) layers=(\d+)\.\.(\d+).*policy=observe-only") {
+    if ($prefillMassArmedLine -and $prefillMassArmedLine -match "armed slots=(\d+) layers=(\d+)\.\.(\d+).*residency=([a-z-]+) policy=([a-z-]+)") {
         $prefillMassArmed = $true
+        $prefillMassResidency = $Matches[4]; $prefillMassPolicy = $Matches[5]
     }
     $prefillMassFinalizeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] finalize layers=" } | Select-Object -Last 1
-    if ($prefillMassFinalizeLine -and $prefillMassFinalizeLine -match "finalize layers=(\d+) rows_min=(\d+) rows_max=(\d+) routed_slots=(\d+) unique=(\d+) candidate=(\d+) capacity=(\d+) mass_total=([0-9.]+) mass_candidate=([0-9.]+) mass_coverage=([0-9.]+) cutoff=([0-9.]+).*(?:residency=unchanged).*policy=observe-only") {
+    if ($prefillMassFinalizeLine -and $prefillMassFinalizeLine -match "finalize layers=(\d+) rows_min=(\d+) rows_max=(\d+) routed_slots=(\d+) unique=(\d+) candidate=(\d+) capacity=(\d+) mass_total=([0-9.]+) mass_candidate=([0-9.]+) mass_coverage=([0-9.]+) cutoff=([0-9.]+).*residency=([a-z-]+) policy=([a-z-]+)") {
         $prefillMassFinalized = $true
         $prefillMassLayers = [int]$Matches[1]; $prefillMassRowsMin = [int]$Matches[2]
         $prefillMassRowsMax = [int]$Matches[3]; $prefillMassRoutedSlots = [long]$Matches[4]
@@ -665,13 +687,28 @@ if (Test-Path $stderrLog) {
         $prefillMassCandidateMass = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
         $prefillMassCoverage = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
         $prefillMassCutoff = [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillMassResidency = $Matches[12]; $prefillMassPolicy = $Matches[13]
     }
     $prefillMassDecodeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" } | Select-Object -Last 1
-    if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=observe-only") {
+    if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=([a-z-]+)") {
         $prefillMassDecodeTokens = [long]$Matches[1]
         $prefillMassDecodeSlots = [long]$Matches[2]
         $prefillMassDecodeHits = [long]$Matches[3]
         $prefillMassDecodeHitRate = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $prefillMassWrapLines = @($lines | Where-Object { $_ -match "\[prefill-mass-wrap\] result=" })
+    $prefillMassWrapEventCount = $prefillMassWrapLines.Count
+    $prefillMassWrapLine = $prefillMassWrapLines | Select-Object -Last 1
+    if ($prefillMassWrapLine -and $prefillMassWrapLine -match "result=([a-z-]+) reason=([a-z-]+) candidate=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9.]+) snapshot_before=(\d+) snapshot_after=(\d+) resident_before=(\d+) resident_after=(\d+) generation=(\d+) preloaded=(\d+) router=([a-z-]+) mask=([a-z-]+)") {
+        $prefillMassWrapObserved = $true
+        $prefillMassWrapResult = $Matches[1]; $prefillMassWrapReason = $Matches[2]
+        $prefillMassWrapCandidate = [long]$Matches[3]; $prefillMassWrapLoads = [long]$Matches[4]
+        $prefillMassWrapWorkers = [int]$Matches[5]
+        $prefillMassWrapSeconds = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillMassWrapSnapshotBefore = [long]$Matches[7]; $prefillMassWrapSnapshotAfter = [long]$Matches[8]
+        $prefillMassWrapResidentBefore = [long]$Matches[9]; $prefillMassWrapResidentAfter = [long]$Matches[10]
+        $prefillMassWrapGeneration = [long]$Matches[11]; $prefillMassWrapPreloaded = [int]$Matches[12]
+        $prefillMassWrapRouter = $Matches[13]; $prefillMassWrapMask = $Matches[14]
     }
     $arenaObserverArmedLine = $lines | Where-Object { $_ -match "\[arena-observe\] armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only" } | Select-Object -Last 1
     if ($arenaObserverArmedLine -and $arenaObserverArmedLine -match "armed window=(\d+) min_hits=(\d+)(?: grow_interval=(\d+))? layers=(\d+)\.\.(\d+) router=unbiased residency-only") {
@@ -814,11 +851,31 @@ if ($SpexPrefetchK -gt 0) {
 } elseif ($spexPrefetchObserved -or $spexPrefetchFinalObserved) {
     throw "SPEX prefetch measurement failed: worker activated while not requested"
 }
-if ($PrefillMassObserve) {
+if ($PrefillMassObserve -or $PrefillMassWrap) {
     if (-not $prefillMassArmed -or -not $prefillMassFinalized) { throw "Prefill mass measurement failed: observer did not arm/finalize" }
     if ($prefillMassCandidate -le 0 -or $prefillMassCandidate -gt $prefillMassCapacity) { throw "Prefill mass measurement failed: invalid candidate size" }
     if ($prefillMassCoverage -le 0.0 -or $prefillMassCoverage -gt 1.0) { throw "Prefill mass measurement failed: invalid mass coverage" }
     if ($prefillMassDecodeSlots -le 0 -or $prefillMassDecodeHits -gt $prefillMassDecodeSlots) { throw "Prefill mass measurement failed: invalid decode coverage" }
+    $expectedPrefillMassPolicy = if ($PrefillMassWrap) { "bulk-wrap" } else { "observe-only" }
+    if ($prefillMassPolicy -ne $expectedPrefillMassPolicy) { throw "Prefill mass measurement failed: runtime policy mismatch" }
+}
+if ($PrefillMassWrap) {
+    if ($prefillMassWrapEventCount -ne 1 -or -not $prefillMassWrapObserved) { throw "Prefill mass WRAP failed: expected exactly one well-formed terminal event" }
+    if ($prefillMassWrapResult -ne "published" -or $prefillMassWrapReason -ne "ok") { throw "Prefill mass WRAP failed: publication missing or unsuccessful" }
+    if ($prefillMassWrapCandidate -ne $prefillMassCandidate -or
+        $prefillMassWrapLoads -ne $prefillMassCandidate -or
+        $prefillMassWrapResidentAfter -ne $prefillMassCandidate) {
+        throw "Prefill mass WRAP failed: candidate/load/resident counts differ"
+    }
+    if ($prefillMassWrapSnapshotBefore -ne 0 -or $prefillMassWrapResidentBefore -ne 0 -or
+        $prefillMassWrapSnapshotAfter -le 0 -or $prefillMassWrapGeneration -le 0) {
+        throw "Prefill mass WRAP failed: first-snapshot invariants differ"
+    }
+    if ($prefillMassWrapPreloaded -ne 0 -or $prefillMassWrapRouter -ne "unbiased" -or $prefillMassWrapMask -ne "off") {
+        throw "Prefill mass WRAP failed: isolation telemetry differs"
+    }
+} elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
+    throw "Prefill mass WRAP activated while not requested"
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     if (-not $arenaObserverArmed) { throw "Dynamic arena measurement failed: observer was not armed" }
@@ -895,6 +952,11 @@ if ($ExpectedContentSHA256) {
         throw "Measurement failed: output hash differs from expected baseline"
     }
 }
+$arenaReportedResident = if ($PrefillMassWrap -and $prefillMassWrapResult -eq "published") {
+    $prefillMassWrapResidentAfter
+} else {
+    $arenaObserverResident
+}
 $summary = [pscustomobject]@{
     tag = $Tag
     head = $headAtStart
@@ -946,8 +1008,27 @@ $summary = [pscustomobject]@{
     q8_f16_cache_reserve_mb_requested = $Q8F16CacheReserveMB
     dynamic_arena_gib_requested = $DynamicArenaGiB
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
+    prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     prefill_mass_observer_armed = $prefillMassArmed
     prefill_mass_finalized = $prefillMassFinalized
+    prefill_mass_policy_observed = $prefillMassPolicy
+    prefill_mass_residency_observed = $prefillMassResidency
+    prefill_mass_wrap_observed = $prefillMassWrapObserved
+    prefill_mass_wrap_event_count = $prefillMassWrapEventCount
+    prefill_mass_wrap_result = $prefillMassWrapResult
+    prefill_mass_wrap_reason = $prefillMassWrapReason
+    prefill_mass_wrap_candidate_entries = $prefillMassWrapCandidate
+    prefill_mass_wrap_loads = $prefillMassWrapLoads
+    prefill_mass_wrap_workers = $prefillMassWrapWorkers
+    prefill_mass_wrap_seconds = $prefillMassWrapSeconds
+    prefill_mass_wrap_snapshot_before = $prefillMassWrapSnapshotBefore
+    prefill_mass_wrap_snapshot_after = $prefillMassWrapSnapshotAfter
+    prefill_mass_wrap_resident_before = $prefillMassWrapResidentBefore
+    prefill_mass_wrap_resident_after = $prefillMassWrapResidentAfter
+    prefill_mass_wrap_generation = $prefillMassWrapGeneration
+    prefill_mass_wrap_preloaded = $prefillMassWrapPreloaded
+    prefill_mass_wrap_router = $prefillMassWrapRouter
+    prefill_mass_wrap_mask = $prefillMassWrapMask
     prefill_mass_layers = $prefillMassLayers
     prefill_mass_rows_min = $prefillMassRowsMin
     prefill_mass_rows_max = $prefillMassRowsMax
@@ -963,7 +1044,7 @@ $summary = [pscustomobject]@{
     prefill_mass_decode_slots = $prefillMassDecodeSlots
     prefill_mass_decode_candidate_hits = $prefillMassDecodeHits
     prefill_mass_decode_hit_rate = $prefillMassDecodeHitRate
-    prefill_mass_residency_semantics = "observe-only; no router, mask, arena publication, or residency changes"
+    prefill_mass_residency_semantics = $(if ($PrefillMassWrap) { "ranked prefill candidate published transactionally into pinned RAM; router and mask unchanged" } else { "observe-only; no router, mask, arena publication, or residency changes" })
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
     dynamic_arena_grow_interval_requested = $DynamicArenaGrowInterval
@@ -993,7 +1074,9 @@ $summary = [pscustomobject]@{
     dynamic_arena_observer_tokens = $arenaObserverTokens
     dynamic_arena_observer_resident = $arenaObserverResident
     dynamic_arena_observer_resident_bytes = [long]$arenaObserverResident * [long]$arenaSlotBytes
-    dynamic_arena_occupancy_ratio = if ($arenaAllocatedBytes -gt 0) { ([double]$arenaObserverResident * [double]$arenaSlotBytes) / [double]$arenaAllocatedBytes } else { $null }
+    dynamic_arena_resident_entries_reported = $arenaReportedResident
+    dynamic_arena_resident_bytes_reported = [long]$arenaReportedResident * [long]$arenaSlotBytes
+    dynamic_arena_occupancy_ratio = if ($arenaAllocatedBytes -gt 0) { ([double]$arenaReportedResident * [double]$arenaSlotBytes) / [double]$arenaAllocatedBytes } else { $null }
     dynamic_arena_wrap_observed = $arenaWrapObserved
     dynamic_arena_wrap_loads = $arenaWrapLoads
     dynamic_arena_wrap_workers = $arenaWrapWorkers
@@ -1119,8 +1202,10 @@ Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
 Write-Host ("Q8-F16 cap/reserve MiB requested: " + $Q8F16CacheMB + " / " + $Q8F16CacheReserveMB)
 Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
-Write-Host ("prefill mass requested/armed/finalized: " + [bool]$PrefillMassObserve + " / " + $prefillMassArmed + " / " + $prefillMassFinalized)
+Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [bool]$PrefillMassObserve + " / " + [bool]$PrefillMassWrap + " / " + $prefillMassPolicy + " / " + $prefillMassArmed + " / " + $prefillMassFinalized)
 Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
+Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
+Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
 Write-Host ("arena carry requested: " + $DynamicArenaCarry)
 Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)
@@ -1129,7 +1214,7 @@ Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " /
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
-Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaObserverResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
+Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaReportedResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
 Write-Host ("arena hit/miss rate: " + $summary.dynamic_arena_hit_rate + " / " + $summary.dynamic_arena_miss_rate)
 Write-Host ("runtime telemetry samples/requested ms/effective sec: " + $runtimeTelemetry.samples + " / " + $runtimeTelemetry.requested_interval_ms + " / " + [math]::Round($runtimeTelemetry.effective_interval_seconds, 3))
 Write-Host ("WDDM shared peak/median GiB: " + [math]::Round($runtimeTelemetry.gpu_process_shared_peak_bytes / 1GB, 3) + " / " + [math]::Round($runtimeTelemetry.gpu_process_shared_median_bytes / 1GB, 3))
