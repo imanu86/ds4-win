@@ -61,8 +61,13 @@ This first-expert fixture is transport/lifetime proof, not a useful residency
 policy. It demonstrates that generation-validated hits bypass pread/staging and
 reach the compact execution buffer without changing greedy output.
 
-Probe scripts were added, but the large sweep is still pending.
+The first large standalone sweep is now summarized in
+`G17_PINNED_ARENA_CAPACITY_RESULTS.md`. It demonstrated 31 GiB allocation and
+direct H2D without proportional VRAM consumption, but the host was not clean;
+the 50 GiB certification remains pending a Windows restart.
 
 ## Gate status
 
-Transport/lifetime behavior is demonstrated for this fixture. Policy value and performance remain ungated pending the larger sweep.
+Transport/lifetime behavior is demonstrated for this fixture. Policy value and
+performance remain ungated pending G19's session-learned policy integration and
+a clean-host capacity/performance sequence.

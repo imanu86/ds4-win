@@ -1,68 +1,81 @@
-# ds4 — native Windows port (register-mmap zero-copy)
+# ds4 native Windows port
 
-Native-Windows (no WSL) build of ds4 that recovers RAM→VRAM H2D bandwidth for MoE
-inference on consumer NVIDIA GPUs. Built on the Win32 platform layer from
-[hawkli-1994/ds4-win](https://github.com/hawkli-1994/ds4-win) (`codex/windows-cuda`),
-itself a port of [antirez/ds4](https://github.com/antirez/ds4).
+Native Windows, no WSL, CUDA port of ds4 for the RTX 3060 12 GiB and a 64 GiB
+host. The working branch is `port/windows-dynamic-arena-0051`.
 
-## Why this fork exists
+## Current measured architecture
 
-WSL2 throttles pinned H2D RAM→VRAM to ~3 GiB/s (GPU paravirtualization). Native
-Windows hits **~24 GiB/s** (PCIe 4.0 x16) — an ~8× win that directly unblocks the
-per-token expert streaming that dominates ds4 decode on a 12 GiB card.
+- Win32 file, mmap, and thread platform layer from `hawkli-1994/ds4-win`.
+- Selected expert loading into one preallocated compact device slab. The old
+  per-miss `cudaMalloc` path is gone.
+- Event-based device stream-pool retirement and bounded expert-cache experiments.
+- Functional hidden-state SPEX scoring, top-K, ring, and K1 prefetch experiments.
+- One large `cudaHostAllocDefault` dynamic arena. It is pinned but is not
+  device-mapped and therefore does not consume proportional VRAM.
+- Transactional arena updates: `begin -> WRAP -> finish -> publish/abort`.
+  Published bindings remain valid until a complete replacement is ready.
+- Direct H2D from arena hits into the compact selected-expert buffer, with model,
+  layer, expert, offset, geometry, generation, and checksum validation.
 
-The upstream `ds4-win` port **compiled but was never run with a real model**, and it
-**hard-disabled** the register-mmap zero-copy path on Windows (falling back to pageable
-chunked copies at ~11 GiB/s) — on the untested assumption that `cudaHostRegister` fails
-on a `MapViewOfFile` view. **That assumption is wrong.**
+The earlier mapped-register window is not the production path on this 12 GiB
+card. It consumed proportional VRAM, displaced reusable hot weights, and reduced
+decode throughput. The dynamic arena deliberately uses `cudaHostAllocDefault`
+without `Mapped` or `cudaHostGetDevicePointer`.
 
-## Measured (RTX 3060 12 GiB, driver 596.21, Windows 11)
+## Measured status
 
-`cuMemHostRegister(READ_ONLY|DEVICEMAP)` on a `MapViewOfFile(FILE_MAP_READ)` section
-view **succeeds** and DMAs at **24.44 / 24.39 GiB/s** (512 MiB / 4 GiB), byte-exact.
-The Win32 platform layer (file/mmap/thread) passes a native runtime smoke **12/12**
-(64-bit `OffsetHigh` reads, 4.5 GiB mmap, 8-thread concurrent `pread`). See `tools/`.
+The final G18 correctness fixture used a 1 GiB arena and one retained expert per
+layer. It produced the explicit expected greedy output hash on three repeats,
+validated non-destructive abort, and measured 2.706667 t/s mean decode. This is a
+transport/lifetime proof, not a residency-policy performance verdict.
 
-## What this branch changes vs `ds4-win` @ 2fba7fe
+The standalone G17 capacity probe measured successful pinned allocations from
+16 through 31 GiB and 20.75-24.46 GiB/s H2D. Allocations of 32 and 36 GiB failed
+when the host had only about 30.8 GiB available. Every successful `cudaFreeHost`
+returned available memory to at least its pre-allocation value. Consequently:
 
-`ds4_cuda.cu` (patch `0050win-register-mmap-enable`):
-- **Enables the per-range `cudaHostRegister(Mapped|ReadOnly)` + `cudaHostGetDevicePointer`
-  zero-copy path on Windows**, budget-gated (`cuda_host_register_budget_bytes()`,
-  default 24 GiB on Win32, honoring `DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB`) so
-  cumulative host registrations never exceed the WDDM ~24 GiB host-pin cap.
-- **Fixes two load-blocking crashes**: the Windows model upload no longer `cudaMalloc`s
-  the entire model (an 80 GiB model can't fit 12 GiB VRAM → was a startup abort), and an
-  intentional env-skip of the chunked copy is no longer treated as fatal. The chunked
-  copy is now opt-in (`DS4_CUDA_COPY_MODEL_CHUNKED`) and non-fatal, mirroring Linux, so
-  the model loads and reaches the register-mmap / fd-streaming path.
+- native Windows has not shown a fixed WSL-style 31 GiB pin ceiling;
+- the observed 31/32 boundary coincided with that six-day-old host state and
+  cannot yet distinguish available-RAM pressure from a CUDA/WDDM limit;
+- the data does not prove a CUDA or NVIDIA memory-retention leak;
+- a clean post-restart sweep is required before claiming the 50 GiB target.
 
-**Deferred** (apply with a live compiler): guard `cuda_model_ptr` against returning a host
-pointer as a device pointer on VRAM exhaustion; implement `os_mmap_warm` via
-`PrefetchVirtualMemory`; a `FILE_FLAG_SEQUENTIAL_SCAN` handle for the streaming reads.
+See `G17_PINNED_ARENA_CAPACITY_RESULTS.md` and
+`G18_DYNAMIC_ARENA_WRAP_RESULTS.md` for commands, caveats, and raw-result names.
 
-## Build (MSVC + CUDA 12.6, RTX 3060 = sm_86)
+## 0051 remaining work
 
-Prereqs: VS 2022 "Desktop development with C++" + CMake ≥3.24; CUDA Toolkit 12.6.x with
-the "Visual Studio Integration" component.
+G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
+The policy must observe all 256 unbiased router scores, construct an immutable
+candidate, WRAP every entrant, prepare the matching router-bias rows, and publish
+arena bindings plus mask as one generation. It must never publish a mask before
+its experts are ready and must never narrow K to fit capacity.
+
+K23 is only the integration fixture. The production direction remains a dynamic,
+current-interaction policy with a wider target, not a static domain mask and not
+a prompt-trained mask. See `G19_0051_POLICY_INTEGRATION_PLAN.md`.
+
+Follow-on measured gates are:
+
+1. A mass-pinned VRAM resident tier using the same published generation.
+2. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
+   speculative traffic.
+3. Parallel transfer streams where the trace proves serialization remains.
+4. A separately gated hybrid CPU/GPU cold-expert fallback. External systems make
+   this promising, but it is not yet a result on this engine or machine.
+
+## Build
 
 ```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DDS4_CUDA_ARCHITECTURES=86
-cmake --build build --config Release --parallel
+$env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
+$env:PATH = "$env:CUDA_PATH\bin;$env:PATH"
+$cmake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+& $cmake --build build --config Release --parallel
 ```
-If nvcc rejects a newer MSVC ("unsupported Microsoft Visual Studio version"), add
-`-DCMAKE_CUDA_FLAGS="-allow-unsupported-compiler"` to the configure line.
 
-Output: `build\Release\ds4_server.exe` (copy `cudart64_12.dll`, `cublas64_12.dll`,
-`cublasLt64_12.dll` from `%CUDA_PATH%\bin` next to it).
-
-## Status
-
-- [x] Register-mmap mechanism validated on hardware (24.4 GiB/s) — `tools/mapviewoffile_register_probe_win.cpp`
-- [x] Win32 platform layer runtime-smoke 12/12 — `tools/os_layer_test.c`
-- [x] Register-mmap + load-fix patch authored (this branch)
-- [ ] Native build (`ds4_server.exe`) — pending toolchain
-- [ ] End-to-end model smoke (ds4-2bit.gguf) with measured t/s
-- [ ] Deferred runtime fixes applied + compiled
-
-Research record, bandwidth study, and per-finding verification live in the `reap-loop`
-repo under `docs/PORT_WINDOWS_NATIVE/` and `runs/ds4/`.
+The standard harness is `g7_measure.ps1`. Memory preflight is enabled by default;
+it shuts down WSL, refuses a concurrent `ds4_server`, records host-memory state,
+and enforces an automatic arena-plus-2-GiB available-RAM guard. The standalone
+capacity probe applies the same reserve to every requested size. Performance
+verdicts require at least three repeats and an explicit expected output hash when
+one is available.
