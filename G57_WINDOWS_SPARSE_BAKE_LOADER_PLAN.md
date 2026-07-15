@@ -1,7 +1,7 @@
 # G57 Windows sparse-bake loader plan
 
 Status: parser, payload-coverage validation, and fail-closed runtime guards are
-implemented through commit `4368674`; K60/K75 artifact validation and every GPU
+implemented through commit `31342db`; K60/K75 artifact validation and every GPU
 run remain blocked until the Windows verifier reports `GPU/DISCO LIBERI`.
 
 ## Purpose
@@ -110,7 +110,7 @@ and conflict fail closed with a sparse bake.
 
 ## Implemented state
 
-Commits `b86ef4c` through `4368674` now provide:
+Commits `b86ef4c` through `31342db` now provide:
 
 - strict trailer, manifest, CRC, geometry, bitset, tensor, and extent parsing;
 - a proof that every non-routed GGUF byte range is physically covered and only
@@ -123,6 +123,10 @@ Commits `b86ef4c` through `4368674` now provide:
   that could bypass the sparse allowed set;
 - startup-cache exclusion of complete routed-expert tensor blocks, leaving
   selected-only transport to read retained slices.
+- opt-in safety telemetry that reports CUDA guard installation and, at cleanup,
+  validated route calls/slots plus rejected selections;
+- a fail-closed `g57_sparse_bake_safety.ps1` runner that revalidates footer,
+  manifest, mask/payload SHA-256 and CRC32 before launching one functional run.
 
 Verification performed without loading a model or using the GPU:
 
@@ -197,8 +201,11 @@ plausible-looking but corrupt output.
 4. [done, build-only] CUDA bias installation and pre-staging guard.
 5. [done, build-only] Sparse-aware startup cache enumeration.
 6. K60 startup safety run: manifest identity, retained counts, no absent reads,
-   server exit zero, and coherent temp0/nothink output. This n=1 run is only a
-   functional gate.
+   server exit zero, positive selected-route validation counters, zero rejected
+   selections, and coherent temp0/nothink output. This n=1 run is only a
+   functional gate. It intentionally starts without WRAP/dynamic arena so that
+   transport setup and 30 GiB pinned-memory pressure cannot obscure loader
+   correctness.
 7. K60 quality and performance run under a quiescent machine. Performance and
    quality claims require the existing n>=3 protocol and grading rules.
 8. Consider K75 only after measured Windows memory headroom and K60 results.
