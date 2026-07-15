@@ -1562,7 +1562,10 @@ if ($PrefillMassObserve -or $PrefillMassWrap) {
     if (-not $prefillMassArmed -or -not $prefillMassFinalized) { throw "Prefill mass measurement failed: observer did not arm/finalize" }
     if ($prefillMassCandidate -le 0 -or $prefillMassCandidate -gt $prefillMassCapacity) { throw "Prefill mass measurement failed: invalid candidate size" }
     if ($prefillMassCoverage -le 0.0 -or $prefillMassCoverage -gt 1.0) { throw "Prefill mass measurement failed: invalid mass coverage" }
-    if ($prefillMassDecodeSlots -le 0 -or $prefillMassDecodeHits -gt $prefillMassDecodeSlots) { throw "Prefill mass measurement failed: invalid decode coverage" }
+    if (-not $ComposePrefillMassTiering -and
+        ($prefillMassDecodeSlots -le 0 -or $prefillMassDecodeHits -gt $prefillMassDecodeSlots)) {
+        throw "Prefill mass measurement failed: invalid decode coverage"
+    }
     $expectedPrefillMassPolicy = if ($PrefillMassWrap) { "bulk-wrap" } else { "observe-only" }
     if ($prefillMassPolicy -ne $expectedPrefillMassPolicy) { throw "Prefill mass measurement failed: runtime policy mismatch" }
 }
