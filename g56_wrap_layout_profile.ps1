@@ -318,7 +318,8 @@ foreach ($name in @(
     "arena_wrap_layout_profile_observed",
     "arena_wrap_layout_profile",
     "arena_wrap_part_count",
-    "arena_wrap_file_failures")) {
+    "arena_wrap_file_failures",
+    "prefill_mass_compose_candidate_fnv1a64")) {
     Assert-G56Property -Object $r -Name $name
 }
 
@@ -364,12 +365,15 @@ if ($r.tag -ne $tag -or $r.prompt -ne $prompt -or
     -not $r.prefill_mass_wrap_observed -or
     $r.prefill_mass_wrap_result -ne "published" -or
     $r.prefill_mass_wrap_reason -ne "ok" -or
+    $r.prefill_mass_wrap_mask -ne "request-scoped-closed" -or
     -not $r.compose_prefill_mass_tiering_requested -or
     -not $tier.compose_prefill_mass_tiering_observed -or
     -not $r.gpu_resident_routes_requested -or
     -not $r.gpu_resident_routes_observed -or
     -not $r.route_no_default_sync_requested -or
     $r.gpu_resident_routes_default_sync_calls -ne 0 -or
+    $r.gpu_resident_routes_no_default_sync_calls -ne
+        $r.gpu_resident_routes_calls -or
     $r.gpu_resident_routes_errors -ne 0 -or
     $r.expert_cache_requested -ne 320 -or
     $r.expert_cache_capacity -lt 300 -or
@@ -455,6 +459,8 @@ $summary = [pscustomobject]@{
         ssd_bytes = [uint64]$tier.ssd_bytes
         tier_failures = [uint64]$tier.failures
         arena_wrap_file_failures = [uint64]$r.arena_wrap_file_failures
+        candidate_mask_fnv1a64 =
+            [string]$r.prefill_mass_compose_candidate_fnv1a64
         memory_preflight_ready = [bool]$mem.ready_to_launch
         process_preflight_ready = [bool]$proc.ready_to_launch
         system_preflight_ready = if ($SkipSystemQuiescencePreflight) {
