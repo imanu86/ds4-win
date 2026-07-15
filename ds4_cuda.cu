@@ -269,6 +269,9 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static std::vector<float *> g_reap_router_bias;
+static uint8_t g_sparse_bake_retained[43u * 32u];
+static uint16_t g_sparse_bake_retained_count[43u];
+static int g_sparse_bake_active;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -290,6 +293,27 @@ static const float *cuda_reap_router_bias_ptr(uint32_t layer_index) {
     return layer_index < g_reap_router_bias.size()
         ? g_reap_router_bias[layer_index]
         : NULL;
+}
+
+static int cuda_sparse_bake_expert_retained(
+        uint32_t layer_index,
+        uint32_t expert) {
+    if (!g_sparse_bake_active) return 1;
+    if (layer_index >= 43u || expert >= 256u) return 0;
+    const uint32_t bit = layer_index * 256u + expert;
+    return (g_sparse_bake_retained[bit >> 3] >> (bit & 7u)) & 1u;
+}
+
+static int cuda_sparse_bake_layer_is_sparse(uint32_t layer_index) {
+    return g_sparse_bake_active && layer_index < 43u &&
+        g_sparse_bake_retained_count[layer_index] < 256u;
+}
+
+static void cuda_sparse_bake_reset_state(void) {
+    memset(g_sparse_bake_retained, 0, sizeof(g_sparse_bake_retained));
+    memset(g_sparse_bake_retained_count, 0,
+           sizeof(g_sparse_bake_retained_count));
+    g_sparse_bake_active = 0;
 }
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
@@ -1979,6 +2003,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_moe_expert_cache_release();
     ds4_gpu_dynamic_arena_release();
     cuda_reap_router_bias_release_all();
+    cuda_sparse_bake_reset_state();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -2467,6 +2492,16 @@ extern "C" int ds4_gpu_dynamic_arena_begin(
 
     uint32_t target_count = 0;
     for (uint32_t i = 0; i < entry_count; i++) {
+        if (target_resident[i] && g_sparse_bake_active) {
+            const uint32_t layer = i / g_dynamic_arena.n_expert;
+            const uint32_t expert = i % g_dynamic_arena.n_expert;
+            if (!cuda_sparse_bake_expert_retained(layer, expert)) {
+                fprintf(stderr,
+                        "ds4: sparse bake rejected arena target layer=%u expert=%u\n",
+                        layer, expert);
+                return 0;
+            }
+        }
         target_count += target_resident[i] != 0;
     }
     if (target_count > g_dynamic_arena.slots.size()) return 0;
@@ -6287,7 +6322,9 @@ extern "C" int ds4_gpu_spex_queue_submit(
     if (!q || !job || job->expert_count == 0 ||
         job->expert_count > q->expert_cap || job->key.epoch == 0) return 0;
     for (uint32_t i = 0; i < job->expert_count; i++) {
-        if (job->expert_ids[i] >= 256u) return 0;
+        if (job->expert_ids[i] >= 256u ||
+            !cuda_sparse_bake_expert_retained(
+                job->key.target_layer, job->expert_ids[i])) return 0;
     }
     const uint64_t max_expert = job->expert_ids[0];
     if (job->gate_offset > q->model_size || job->up_offset > q->model_size ||
@@ -6562,6 +6599,11 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_cache_full = 0;
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
+    if (g_sparse_bake_active && copy_env && copy_env[0]) {
+        fprintf(stderr,
+                "ds4: sparse bake rejects DS4_CUDA_COPY_MODEL full-range copy\n");
+        return 0;
+    }
     if (copy_env && copy_env[0]) {
         void *dev = NULL;
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
@@ -6602,7 +6644,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     const char *dynamic_arena_env = getenv("DS4_CUDA_DYNAMIC_ARENA_GB");
     const int dynamic_arena_requested =
         dynamic_arena_env && dynamic_arena_env[0] && atof(dynamic_arena_env) > 0.0;
-    if (!dynamic_arena_requested) {
+    if (!dynamic_arena_requested && !g_sparse_bake_active) {
         uint64_t window = model_size;
         const uint64_t budget = cuda_host_register_budget_bytes();
         if (window > budget) window = budget;
@@ -6641,6 +6683,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size) {
     if (!ds4_gpu_set_model_map(model_map, model_size)) return 0;
+    if (g_sparse_bake_active &&
+        getenv("DS4_CUDA_COPY_MODEL_CHUNKED") != NULL) {
+        fprintf(stderr,
+                "ds4: sparse bake rejects DS4_CUDA_COPY_MODEL_CHUNKED full-range copy\n");
+        return 0;
+    }
 #ifdef _WIN32
     /* Findings win-copy-chunked-allocates-full-model-in-vram / -skip-conflated:
      * cuda_model_copy_chunked does cudaMalloc(model_size) — an ~80 GiB model
@@ -6808,6 +6856,35 @@ extern "C" int ds4_gpu_reap_router_bias_update(
         return 0;
     }
     return created ? 2 : 1;
+}
+
+extern "C" int ds4_gpu_sparse_bake_set_retained_mask(
+        const uint8_t *mask,
+        uint32_t layers,
+        uint32_t experts,
+        uint32_t mask_bytes) {
+    if (!mask || layers != 43u || experts != 256u ||
+        mask_bytes != sizeof(g_sparse_bake_retained)) return 0;
+
+    uint16_t counts[43u] = {0};
+    for (uint32_t layer = 0; layer < layers; layer++) {
+        for (uint32_t expert = 0; expert < experts; expert++) {
+            const uint32_t bit = layer * experts + expert;
+            counts[layer] +=
+                (mask[bit >> 3] >> (bit & 7u)) & 1u;
+        }
+        if (counts[layer] < 6u) return 0;
+    }
+    memcpy(g_sparse_bake_retained, mask,
+           sizeof(g_sparse_bake_retained));
+    memcpy(g_sparse_bake_retained_count, counts,
+           sizeof(g_sparse_bake_retained_count));
+    g_sparse_bake_active = 1;
+    return 1;
+}
+
+extern "C" void ds4_gpu_sparse_bake_reset(void) {
+    cuda_sparse_bake_reset_state();
 }
 
 /* Called once after the startup pre-cache completes: from here on,
@@ -18328,6 +18405,20 @@ static int cuda_moe_selected_load(
             return 0;
         }
     }
+    if (g_sparse_bake_active) {
+        for (uint32_t i = 0; i < slot_count; i++) {
+            const int32_t expert = g_moe_gather.h_sel[i];
+            if (expert < 0 || (uint32_t)expert >= n_total_expert ||
+                !cuda_sparse_bake_expert_retained(
+                    layer_index, (uint32_t)expert)) {
+                fprintf(stderr,
+                        "ds4: sparse bake rejected routed selection "
+                        "layer=%u slot=%u expert=%d\n",
+                        layer_index, i, expert);
+                return 0;
+            }
+        }
+    }
     if (route_prof) route_t_d2h = cuda_wall_sec();
 
     cuda_prefill_mass_observe_selected(
@@ -19306,6 +19397,19 @@ static int routed_moe_launch(
         down_bytes > model_size - down_offset) {
         return 0;
     }
+    const int sparse_bake_layer =
+        cuda_sparse_bake_layer_is_sparse(layer_index);
+    if (sparse_bake_layer &&
+        getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") != NULL) {
+        fprintf(stderr,
+                "ds4: sparse bake requires selected expert loading at layer=%u\n",
+                layer_index);
+        return 0;
+    }
+    if (sparse_bake_layer) {
+        spex_queue = NULL;
+        spex_key = NULL;
+    }
     const char *gate_w = NULL;
     const char *up_w = NULL;
     const char *down_w = NULL;
@@ -19319,11 +19423,13 @@ static int routed_moe_launch(
      * MoE kernels then touch top-6 of 256 (~42x less streamed per layer). Falls
      * back to the whole-block path on failure or when fully in-window (zero-copy). */
     const int whole_in_window =
+        !sparse_bake_layer &&
         cuda_model_range_in_window(model_map, gate_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, down_offset, down_bytes);
     cuda_moe_expert_cache *gpu_route_cache = NULL;
-    if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL) {
+    if (!sparse_bake_layer && !whole_in_window &&
+        getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL) {
         if (cuda_moe_split_hit_miss_requested() &&
             getenv("DS4_CUDA_MOE_PROFILE") == NULL) {
             gpu_route_cache = cuda_moe_gpu_resident_routes_begin(
@@ -19391,6 +19497,12 @@ static int routed_moe_launch(
             selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
         } else {
             ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
+            if (sparse_bake_layer) {
+                fprintf(stderr,
+                        "ds4: sparse bake selected load failed closed at layer=%u\n",
+                        layer_index);
+                return 0;
+            }
             gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
             up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
             down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");

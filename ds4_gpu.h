@@ -130,6 +130,12 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_model_range_update(const void *model_map, uint64_t offset, const void *data, uint64_t bytes);
 void ds4_gpu_reap_router_bias_reset(void);
 int ds4_gpu_reap_router_bias_update(uint32_t layer_index, const float *bias, uint32_t count);
+int ds4_gpu_sparse_bake_set_retained_mask(
+        const uint8_t *mask,
+        uint32_t layers,
+        uint32_t experts,
+        uint32_t mask_bytes);
+void ds4_gpu_sparse_bake_reset(void);
 void ds4_gpu_model_streaming_begin(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);

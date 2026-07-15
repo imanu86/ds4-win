@@ -1518,7 +1518,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     uint64_t nspan = 0;
     uint64_t routed_expert_bytes = 0;
     uint64_t staged_embedding_bytes = 0;
-    const bool dedicated_expert_cache = accelerator_has_dedicated_expert_cache();
+    const bool dedicated_expert_cache =
+        m->bake_embedded || accelerator_has_dedicated_expert_cache();
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
@@ -5401,6 +5402,7 @@ typedef struct {
 
 static bool g_reap_mask_env_checked;
 static bool g_reap_mask_loaded;
+static bool g_reap_mask_embedded;
 static char *g_reap_mask_path;
 static ds4_reap_mask_stamp g_reap_mask_stamp;
 static uint8_t g_reap_mask_pruned[DS4_N_LAYER][DS4_N_EXPERT];
@@ -5414,6 +5416,33 @@ static uint32_t g_reap_mask_range_updates;
 static uint32_t g_reap_mask_range_creates;
 static uint32_t g_reap_mask_range_failures;
 static bool g_reap_mask_gpu_applied;
+
+static void ds4_reap_mask_validate_selected(
+        uint32_t il,
+        const int *selected,
+        uint32_t count);
+
+static void ds4_reap_mask_host_reset(void) {
+    free(g_reap_mask_path);
+    g_reap_mask_path = NULL;
+    g_reap_mask_env_checked = false;
+    g_reap_mask_loaded = false;
+    g_reap_mask_embedded = false;
+    memset(&g_reap_mask_stamp, 0, sizeof(g_reap_mask_stamp));
+    memset(g_reap_mask_pruned, 0, sizeof(g_reap_mask_pruned));
+    memset(g_reap_mask_layer_active, 0, sizeof(g_reap_mask_layer_active));
+    memset(g_reap_bias_masked, 0, sizeof(g_reap_bias_masked));
+    for (uint32_t i = 0; i < DS4_N_LAYER; i++) {
+        g_reap_bias_tensor[i] = NULL;
+    }
+    g_reap_bias_n = 0;
+    g_reap_mask_pruned_count = 0;
+    g_reap_mask_layer_count = 0;
+    g_reap_mask_range_updates = 0;
+    g_reap_mask_range_creates = 0;
+    g_reap_mask_range_failures = 0;
+    g_reap_mask_gpu_applied = false;
+}
 
 static bool ds4_reap_mask_file_stamp(const char *path, ds4_reap_mask_stamp *out) {
     if (!path || !out) return false;
@@ -5515,11 +5544,65 @@ static void ds4_reap_mask_apply(const ds4_model *model, const ds4_weights *weigh
     }
 }
 
+static void ds4_reap_mask_install_bake(
+        const ds4_model *model,
+        const ds4_weights *weights) {
+    if (!model || !weights || !model->bake_embedded) return;
+    const char *external = getenv("DS4_REAP_MASK_FILE");
+    if (external && external[0]) {
+        ds4_die("DS4_REAP_MASK_FILE cannot override an embedded sparse bake mask");
+    }
+
+    char label[96];
+    const int n = snprintf(label, sizeof(label),
+                           "embedded-bake:%.64s", model->bake.mask_sha256);
+    if (n < 0 || (size_t)n >= sizeof(label)) {
+        ds4_die("sparse bake mask label is too long");
+    }
+    g_reap_mask_path = ds4_strdup(label);
+    g_reap_mask_env_checked = true;
+    g_reap_mask_embedded = true;
+    g_reap_mask_loaded = true;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t retained = model->bake.retained_count[il];
+        if (retained < DS4_N_EXPERT_USED || retained > DS4_N_EXPERT) {
+            ds4_die("sparse bake leaves an invalid number of routed experts");
+        }
+        if (weights->layer[il].ffn_gate_tid2eid && retained != DS4_N_EXPERT) {
+            ds4_die("sparse bake must retain every expert in hash-routed layers");
+        }
+        const uint32_t pruned = DS4_N_EXPERT - retained;
+        if (pruned != 0) {
+            g_reap_mask_layer_active[il] = 1;
+            g_reap_mask_layer_count++;
+        }
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            const uint8_t absent = (uint8_t)!ds4_bake_expert_retained(
+                &model->bake, il, expert);
+            g_reap_mask_pruned[il][expert] = absent;
+            g_reap_mask_pruned_count += absent;
+        }
+    }
+    fprintf(stderr,
+            "ds4: sparse bake mask installed mask_sha256=%s pruned=%u layers=%u\n",
+            model->bake.mask_sha256,
+            g_reap_mask_pruned_count,
+            g_reap_mask_layer_count);
+    ds4_reap_mask_apply(model, weights, false);
+}
+
 static void ds4_reap_mask_poll(const ds4_model *model, const ds4_weights *weights, bool update_gpu) {
     if (!g_reap_mask_env_checked) {
         g_reap_mask_env_checked = true;
         const char *p = getenv("DS4_REAP_MASK_FILE");
         if (p && p[0]) g_reap_mask_path = ds4_strdup(p);
+    }
+    if (g_reap_mask_embedded) {
+        if (update_gpu && !g_reap_mask_gpu_applied) {
+            ds4_reap_mask_apply(model, weights, true);
+        }
+        return;
     }
     if (!g_reap_mask_path || !model || !weights) return;
 
@@ -5612,6 +5695,7 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
+        uint32_t               il,
         const float           probs[DS4_N_EXPERT]);
 
 static void layer_topk_selected_experts(
@@ -5619,11 +5703,13 @@ static void layer_topk_selected_experts(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
+        uint32_t               il,
         const float           *x) {
     float probs[DS4_N_EXPERT];
 
     layer_router_probs_one(probs, model, layer, x);
-    layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    layer_topk_selected_experts_from_probs(
+        selected, expert_weight, model, layer, il, probs);
 }
 
 static void layer_topk_selected_experts_from_probs(
@@ -5631,6 +5717,7 @@ static void layer_topk_selected_experts_from_probs(
         float                  expert_weight[DS4_N_EXPERT_USED],
         const ds4_model       *model,
         const ds4_layer_weights *layer,
+        uint32_t               il,
         const float           probs[DS4_N_EXPERT]) {
     float selection[DS4_N_EXPERT];
 
@@ -5641,6 +5728,14 @@ static void layer_topk_selected_experts_from_probs(
         const float *reap_bias = ds4_reap_mask_cpu_bias(layer->ffn_exp_probs_b);
         if (reap_bias) bias = reap_bias;
         for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
+    }
+    if (g_reap_mask_loaded && il < DS4_N_LAYER &&
+        g_reap_mask_layer_active[il]) {
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            if (g_reap_mask_pruned[il][expert]) {
+                selection[expert] = DS4_NEG_INF;
+            }
+        }
     }
 
     topk_desc(selection, DS4_N_EXPERT, DS4_N_EXPERT_USED, selected);
@@ -5653,6 +5748,24 @@ static void layer_topk_selected_experts_from_probs(
     if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
     for (int i = 0; i < DS4_N_EXPERT_USED; i++) {
         expert_weight[i] = expert_weight[i] / sum * DS4_EXPERT_WEIGHT_SCALE;
+    }
+}
+
+static void ds4_reap_mask_validate_selected(
+        uint32_t il,
+        const int *selected,
+        uint32_t count) {
+    if (!g_reap_mask_loaded || !selected || il >= DS4_N_LAYER ||
+        !g_reap_mask_layer_active[il]) return;
+    for (uint32_t i = 0; i < count; i++) {
+        if (selected[i] < 0 || selected[i] >= DS4_N_EXPERT ||
+            g_reap_mask_pruned[il][selected[i]]) {
+            fprintf(stderr,
+                    "ds4: sparse/REAP mask rejected selected expert "
+                    "layer=%u slot=%u expert=%d\n",
+                    il, i, selected[i]);
+            ds4_die("router selected an expert outside the active mask");
+        }
     }
 }
 
@@ -5690,8 +5803,9 @@ static void layer_routed_moe_one(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, il, x);
     }
+    ds4_reap_mask_validate_selected(il, selected, DS4_N_EXPERT_USED);
 
     if (!trace) {
         matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
@@ -5784,8 +5898,9 @@ static void layer_routed_moe_one_prealloc(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, x, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, x);
+        layer_topk_selected_experts(selected, expert_weight, model, layer, il, x);
     }
+    ds4_reap_mask_validate_selected(il, selected, DS4_N_EXPERT_USED);
 
     matvec_iq2_xxs_experts_mid_prequant(mid_all, model,
                                         layer->ffn_gate_exps,
@@ -5850,8 +5965,11 @@ static void layer_routed_moe_batch(
             layer_hash_selected_experts(sel, model, layer, token_ids[t]);
             layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
         } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
+            layer_topk_selected_experts(
+                sel, weights, model, layer, il,
+                norm + (uint64_t)t * expert_in_dim);
         }
+        ds4_reap_mask_validate_selected(il, sel, DS4_N_EXPERT_USED);
 
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
             const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
@@ -8863,6 +8981,11 @@ static void metal_graph_spex_cpu_init(
         const ds4_weights *weights) {
     const uint32_t k = metal_graph_spex_cpu_probe_k();
     if (!g || k == 0) return;
+    if (model && model->bake_embedded) {
+        fprintf(stderr,
+                "ds4: SPEX CPU probe disabled for sparse bake payloads\n");
+        return;
+    }
     if (!model || !weights || g->spex_stage != DS4_SPEX_STAGE_FULL ||
         g->spex_cap < k || g->spex_prefetch) {
         fprintf(stderr,
@@ -11456,8 +11579,10 @@ static void metal_graph_trace_layer_stages(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(
+            selected, expert_weight, model, layer, il, cpu_ffn_norm);
     }
+    ds4_reap_mask_validate_selected(il, selected, DS4_N_EXPERT_USED);
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc, cpu_ffn_out, cpu_after_attn_hc, ffn_post, ffn_comb, DS4_N_EMBD, DS4_N_HC);
 
@@ -11681,8 +11806,11 @@ static int metal_graph_decode_test(
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
-        layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+        layer_topk_selected_experts(
+            selected, expert_weight, model, layer, bench_layer, cpu_ffn_norm);
     }
+    ds4_reap_mask_validate_selected(
+        bench_layer, selected, DS4_N_EXPERT_USED);
     const char *cpu_bench_env = getenv("DS4_MOE_CPU_GATE_BENCH_ITERS");
     if (cpu_bench_env && cpu_bench_env[0]) {
         char *end = NULL;
@@ -18490,6 +18618,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
+    ds4_reap_mask_host_reset();
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, true);
@@ -18499,20 +18628,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
-    if (e->model.bake_embedded) {
-        fprintf(stderr,
-                "ds4: sparse bake runtime guards are not installed yet; "
-                "refusing inference\n");
-        ds4_engine_close(e);
-        *out = NULL;
-        return 1;
-    }
+    ds4_reap_mask_install_bake(&e->model, &e->weights);
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
         return 1;
     }
     if (opt->mtp_path && opt->mtp_path[0]) {
+        if (e->model.bake_embedded) {
+            fprintf(stderr,
+                    "ds4: sparse bake primary models are not compatible with MTP yet\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
         if (e->mtp_model.bake_embedded) {
             fprintf(stderr,
@@ -18555,6 +18684,29 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_quality(e->quality);
+        if (e->model.bake_embedded) {
+#ifdef __APPLE__
+            fprintf(stderr,
+                    "ds4: sparse bake runtime is currently CUDA-only\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+#else
+            if (e->backend != DS4_BACKEND_CUDA ||
+                !ds4_gpu_sparse_bake_set_retained_mask(
+                    e->model.bake.retained_mask,
+                    DS4_N_LAYER,
+                    DS4_N_EXPERT,
+                    DS4_BAKE_MASK_LEN))
+            {
+                fprintf(stderr,
+                        "ds4: failed to install sparse bake CUDA guards\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+#endif
+        }
         (void)ds4_gpu_set_model_file(&e->model.mmap.file);
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
@@ -18583,6 +18735,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* Install the router mask before any startup cache can inspect routed
+         * tensor ranges. The CUDA map setup above resets device-side biases. */
+        ds4_reap_mask_poll(&e->model,
+                           &e->weights,
+                           e->backend == DS4_BACKEND_CUDA);
         if (!e->mtp_ready && !accelerator_cache_model_tensors(e->backend, &e->model)) {
             fprintf(stderr, "ds4: %s failed to prepare startup model cache\n",
                     ds4_backend_name(e->backend));
@@ -18590,12 +18747,6 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        /* Static REAP masks must be resident before a session captures model
-         * pointers in its graph. Reloads then update these persistent bias
-         * buffers in place, so the graph never observes a stale router. */
-        ds4_reap_mask_poll(&e->model,
-                           &e->weights,
-                           e->backend == DS4_BACKEND_CUDA);
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -18627,6 +18778,7 @@ void ds4_engine_close(ds4_engine *e) {
      * before model_close unmaps either model. */
     ds4_gpu_cleanup();
 #endif
+    ds4_reap_mask_host_reset();
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
     ds4_release_instance_lock();
