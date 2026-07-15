@@ -41,7 +41,6 @@ param(
     [switch]$DirectCacheHits,
     [switch]$MixedDirectCache,
     [switch]$RouteProfile,
-    [switch]$RouterMailbox,
     [switch]$ExpertCacheStats,
     [ValidateRange(1, 1000000)][int]$ExpertCacheStatsInterval = 128,
     [switch]$OverlapShared,
@@ -251,17 +250,6 @@ if ($MixedDirectCache) {
 }
 if ($RouteProfile) { $env:DS4_CUDA_MOE_ROUTE_PROFILE = "1" }
 else { Remove-Item Env:\DS4_CUDA_MOE_ROUTE_PROFILE -ErrorAction SilentlyContinue }
-if ($RouterMailbox) {
-    $env:DS4_CUDA_MOE_ROUTER_MAILBOX = "1"
-    if ($Diagnostics -or $RouteProfile) {
-        $env:DS4_CUDA_MOE_ROUTER_MAILBOX_STATS = "1"
-    } else {
-        Remove-Item Env:\DS4_CUDA_MOE_ROUTER_MAILBOX_STATS -ErrorAction SilentlyContinue
-    }
-} else {
-    Remove-Item Env:\DS4_CUDA_MOE_ROUTER_MAILBOX -ErrorAction SilentlyContinue
-    Remove-Item Env:\DS4_CUDA_MOE_ROUTER_MAILBOX_STATS -ErrorAction SilentlyContinue
-}
 if ($ExpertCacheStats) {
     $env:DS4_CUDA_MOE_CACHE_STATS = "1"
     $env:DS4_CUDA_MOE_CACHE_STATS_INTERVAL = "$ExpertCacheStatsInterval"
@@ -647,8 +635,6 @@ $routeProfileObserved = $false; $routeProfileCalls = 0
 $routeProfileD2HMs = 0.0; $routeProfileObserveMs = 0.0
 $routeProfileMapMs = 0.0; $routeProfileTransportMs = 0.0
 $routeProfilePublishMs = 0.0
-$routerMailboxObserved = $false; $routerMailboxCalls = 0
-$routerMailboxFallbacks = 0; $routerMailboxWaitMs = 0.0
 $overlapSharedObserved = $false
 $overlapSharedFullObserved = $false
 $spexObserved = $false; $spexObservedStage = ""; $spexObservedCap = 0; $spexScheduled = 0; $spexReady = 0; $spexNotReady = 0
@@ -846,13 +832,6 @@ if (Test-Path $stderrLog) {
         $routeProfileMapMs = [double]$Matches[4]
         $routeProfileTransportMs = [double]$Matches[5]
         $routeProfilePublishMs = [double]$Matches[6]
-    }
-    $routerMailboxLine = $lines | Where-Object { $_ -match "\[router-mailbox\]" } | Select-Object -Last 1
-    if ($routerMailboxLine -and $routerMailboxLine -match "calls=(\d+) fallbacks=(\d+) wait=([0-9.]+)ms") {
-        $routerMailboxObserved = $true
-        $routerMailboxCalls = [long]$Matches[1]
-        $routerMailboxFallbacks = [long]$Matches[2]
-        $routerMailboxWaitMs = [double]$Matches[3]
     }
     $contextLine = $lines | Where-Object { $_ -match "context buffers .*ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)" } | Select-Object -Last 1
     if ($contextLine -and $contextLine -match "ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)") {
@@ -1508,11 +1487,6 @@ $summary = [pscustomobject]@{
     route_profile_map_ms_per_call = $routeProfileMapMs
     route_profile_transport_ms_per_call = $routeProfileTransportMs
     route_profile_publish_ms_per_call = $routeProfilePublishMs
-    router_mailbox_requested = [bool]$RouterMailbox
-    router_mailbox_observed = $routerMailboxObserved
-    router_mailbox_calls = $routerMailboxCalls
-    router_mailbox_fallbacks = $routerMailboxFallbacks
-    router_mailbox_wait_ms_per_call = $routerMailboxWaitMs
     expert_cache_stats_enabled = [bool]$ExpertCacheStats
     expert_cache_stats_interval = $ExpertCacheStatsInterval
     overlap_shared_requested = [bool]$OverlapShared
@@ -1640,7 +1614,6 @@ Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapac
 Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
-Write-Host ("router mailbox requested/observed/calls/fallbacks/wait ms: " + [bool]$RouterMailbox + " / " + $routerMailboxObserved + " / " + $routerMailboxCalls + " / " + $routerMailboxFallbacks + " / " + $routerMailboxWaitMs)
 Write-Host ("overlap_shared requested/observed: " + [bool]$OverlapShared + " / " + $overlapSharedObserved)
 Write-Host ("overlap_shared_full requested/observed: " + [bool]$OverlapSharedFull + " / " + $overlapSharedFullObserved)
 Write-Host ("shared_down_fusion_disabled: " + [bool]$DisableSharedDownFusion)
