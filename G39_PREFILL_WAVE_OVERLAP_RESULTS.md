@@ -33,7 +33,10 @@ G39 also hardens the shared pinned staging ring:
 
 - resize drains the upload stream before destroying pinned buffers/events;
 - serial and overlapped readers share the same CUDA-event ownership check;
-- parity slabs are allocated only after the parity compute fence.
+- parity slabs are allocated only after both the prior upload fence and parity
+  compute fence;
+- failed mid-wave launches seal already-enqueued parity work, or synchronously
+  drain stream 0 if event publication itself fails.
 
 ## Exactness failures found before the final matrix
 
@@ -51,6 +54,12 @@ from every performance aggregate:
 
 `CUDA_LAUNCH_BLOCKING=1` made the first implementation exact and was used only
 to identify the race. It is not present in any accepted measurement.
+
+A post-matrix review then found two latent error-path ownership gaps: slab
+resize could precede a prior upload fence, and a failed mid-wave launch could
+leave already-enqueued compute without parity ownership. Both were fixed before
+the accepted matrix below was rerun. No failed request was used as performance
+evidence.
 
 ## Protocol
 
@@ -92,24 +101,24 @@ All 18 measured outputs and all six warmups matched the expected hash.
 
 | Arm | TTFT | Client t/s | Decode t/s | Process reads | Peak dedicated VRAM |
 |---|---:|---:|---:|---:|---:|
-| production | 7.592 s | 0.9066 | 2.1267 | 164.55 GiB | 10.900 GiB |
-| serial wave31 | 10.133 s | 0.8389 | 2.8800 | 131.14 GiB | 10.437 GiB |
-| overlap wave31 | 8.577 s | 0.9464 | 2.9283 | 131.31 GiB | 10.642 GiB |
+| production | 7.862 s | 0.8759 | 2.0533 | 164.45 GiB | 10.900 GiB |
+| serial wave31 | 10.388 s | 0.8192 | 2.8200 | 131.32 GiB | 10.437 GiB |
+| overlap wave31 | 8.583 s | 0.9308 | 2.7883 | 131.31 GiB | 10.642 GiB |
 
 Overlap versus the same serial wave path:
 
-- TTFT: `-15.36%`;
-- client throughput: `+12.81%`;
-- short decode throughput: `+1.68%`;
-- process reads: effectively unchanged (`+0.13%`);
+- TTFT: `-17.38%`;
+- client throughput: `+13.62%`;
+- short decode throughput: `-1.12%`, effectively flat for this short request;
+- process reads: effectively unchanged (`-0.04%`);
 - peak dedicated VRAM: `+1.97%`, the expected second slab cost.
 
 Overlap versus production:
 
-- TTFT: `+12.97%` slower;
-- client throughput: `+4.39%` on this short request;
-- short decode throughput: `+37.70%`, directional only;
-- process reads: `-20.20%`;
+- TTFT: `+9.18%` slower;
+- client throughput: `+6.26%` on this short request;
+- short decode throughput: `+35.80%`, directional only;
+- process reads: `-20.15%`;
 - peak dedicated VRAM: `-2.37%`.
 
 Both overlap replications recorded 456 waves, 454 parity-reuse fences, 456
@@ -135,9 +144,9 @@ These are `n=1` mechanism probes, not performance verdicts.
 
 ## Verdict
 
-G39 is an exact positive overlap mechanism: it recovers 15.36% TTFT from G38's
+G39 is an exact positive overlap mechanism: it recovers 17.38% TTFT from G38's
 serial wave implementation while preserving the full expert union. It is not a
-production prefill win yet because generic wave kernels remain 12.97% slower
+production prefill win yet because generic wave kernels remain 9.18% slower
 than the normal optimized path. Keep both G38 and G39 opt-in.
 
 The next isolated prefill lever is tile-capable wave execution. Separately,
@@ -146,25 +155,23 @@ real end-to-end SOTA instead of comparing records from different configurations.
 
 ## Provenance
 
-- measured base HEAD: `32f0292ea4063c81a59387e01d0d43d43ae84100`;
+- measured base HEAD: `78f50cb2855ac959b31526010ecac2f6a419e41b`;
 - executable SHA-256:
-  `5bb481a2ecd7b5270de57bf4e6caec77877fd7ac200f4170d4a092725d40b6c5`;
+  `4a390be7a8e490ef70d14b4f316b7efe04dd9ecd00e09e096eed556d317e49b1`;
 - CUDA source SHA-256:
-  `b04fbdd0f852dba26e5be7c410434475223a0fa77efc746b1142649f7e0b8b98`;
+  `863b26ac3538492bef1b0f38c2f7fe36f7600632a4dfdfad3768f8fc124e014d`;
 - build-input fingerprint:
-  `afaa35af22b1dbafe5ea28aa5f5067b6e612f067ae2ba7006eee51589d9f03a0`;
+  `3a6dd4c946c03229b455811cc7c9bf49fc5ee3f172ace91da07e76237c618d59`;
 - build manifest SHA-256:
-  `1bd8ad6642989c024139ffe5f70a6ef44f2498e703442ac768fd0697b1f3df3f`;
+  `e5f3f6512294b927e7c98a59cf97f08f6d15bf8bb69d91775d38e8f9dc0c2d62`;
 - harness SHA-256:
   `4f951488e1a83a595b5f85829e578c2d3626600d11c1f5a7fe422823c39d52f2`;
 - runner SHA-256:
   `dbd1880bd3edcbdfb9eebf1ca4df68826916be83dbc7c06119d9b19658d5f735`;
 - final matrix SHA-256:
-  `7b0186e54b183bf0748dc73adc427e8b014ef14fab57d61dff0507b4a1c309ad`;
-- hardened `IoQD=2` safety result SHA-256:
-  `c18419a014cc5cb44996e1614b0c7327147b9dc626754d981dce4453235921ec`.
-- hardened default-off safety result SHA-256:
-  `4e30e1b7bc6194d4e025b778983cb1b12d7387a85e1f7f9347ecaa45bf56fef2`.
+  `b1f6ed162a42f772ccb42f60087fdc38aabc87507fd7dcae33b29f2a307fbfd1`;
+- post-review `IoQD=2` safety result SHA-256:
+  `a9737eabe1ff38eea622d09a0b556e1339e1689233234eb2f1cf8ceb943917d1`.
 
 The build manifest records a dirty worktree because source, harness and runner
 were intentionally measured before their experiment commit. Their exact hashes
@@ -173,5 +180,4 @@ and the complete compile-input fingerprint above pin the measured state.
 Raw local artifacts:
 
 - `g7_runs/g39_prefill_wave_overlap_ab_result.json`;
-- `g7_runs/g7_g39_overlap31_hardened_safety_n1_result.json`;
-- `g7_runs/g7_g39_overlap31_hardened_qd2_safety_n1_result.json`.
+- `g7_runs/g7_g39_postreview_qd2_safety_n1_result.json`.

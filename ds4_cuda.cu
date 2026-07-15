@@ -15966,6 +15966,15 @@ static int cuda_moe_selected_stage_wave(
                 cuda_u64_saturating_add(
                     g_prefill_wave_overlap_stats.reuse_waits, 1);
         }
+        /* A staged parity may not have reached compute ownership when a prior
+         * launch failed. Fence its upload before ensure can resize/free the
+         * destination slabs or the pageable metadata vectors are rewritten. */
+        if (g_moe_gather.wave_upload_ready_db[parity] &&
+            !cuda_ok(cudaEventSynchronize(
+                         g_moe_gather.wave_upload_ready_db[parity]),
+                     "moe wave overlap prior upload fence")) {
+            return 0;
+        }
         if (!cuda_moe_wave_slab_ensure(parity, wave_experts, slot_count,
                                        gate_expert_bytes, down_expert_bytes)) {
             return 0;
@@ -15977,13 +15986,6 @@ static int cuda_moe_selected_stage_wave(
         upload_ready = g_moe_gather.wave_upload_ready_db[parity];
         wave_slots_ptr = &g_moe_gather.h_wave_slots_db[parity];
         wave_pairs_ptr = &g_moe_gather.h_wave_pairs_db[parity];
-        /* slot/pair uploads use pageable std::vector storage. Protect that host
-         * source before the parity vector is rewritten; compute remains async
-         * and device-slab reuse is fenced separately by compute_done above. */
-        if (!cuda_ok(cudaEventSynchronize(upload_ready),
-                     "moe wave overlap host source ready")) {
-            return 0;
-        }
     } else {
         if (!cuda_moe_gather_ensure(&g_moe_gather.gate, &g_moe_gather.gate_cap,
                                     cgate, "moe wave gate") ||
@@ -16168,6 +16170,33 @@ static int cuda_moe_selected_stage_wave(
             (uint32_t)wave_pairs.size();
     }
     return 1;
+}
+
+/* Publish ownership of a parity after any of its slabs have been consumed by
+ * stream 0. On the exceptional event-record path, drain stream 0 before
+ * returning failure so later requests cannot reuse in-flight storage. */
+static int cuda_moe_wave_compute_seal(uint32_t parity) {
+    if (parity >= 2u || !g_moe_gather.wave_compute_done[parity]) return 0;
+    cudaError_t err = cudaEventRecord(
+        g_moe_gather.wave_compute_done[parity], 0);
+    if (err == cudaSuccess) {
+        g_moe_gather.wave_compute_recorded[parity] = 1;
+        g_prefill_wave_overlap_stats.compute_records =
+            cuda_u64_saturating_add(
+                g_prefill_wave_overlap_stats.compute_records, 1);
+        return 1;
+    }
+    fprintf(stderr, "ds4: CUDA moe wave overlap compute seal failed: %s\n",
+            cudaGetErrorString(err));
+    (void)cudaGetLastError();
+    err = cudaStreamSynchronize(0);
+    g_moe_gather.wave_compute_recorded[parity] = 0;
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA moe wave overlap failure drain failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+    }
+    return 0;
 }
 
 extern "C" int ds4_gpu_routed_moe_prepare_selected(
@@ -17552,6 +17581,7 @@ static int routed_moe_launch(
                 g_moe_gather.wave_double_buffer != 0;
             for (uint32_t wave = 0; ok && wave < g_moe_gather.wave_count; wave++) {
                 const uint32_t parity = wave & 1u;
+                int wave_work_enqueued = 0;
                 const char *wave_gate_w = gate_w;
                 const char *wave_up_w = up_w;
                 const char *wave_down_w = down_w;
@@ -17633,13 +17663,19 @@ static int routed_moe_launch(
                     clamp);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe wave gate/up launch");
                 if (!ok) break;
+                wave_work_enqueued = 1;
 
                 dim3 midq_grid(midq_blocks, n_tokens * n_expert, 1);
                 q8_K_quantize_kernel<<<midq_grid, 256>>>(
                     midq, (const float *)mid->ptr, expert_mid_dim,
                     n_tokens * n_expert, NULL, 0u, 0u);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe wave mid quantize launch");
-                if (!ok) break;
+                if (!ok) {
+                    if (wave_double_buffer && wave_work_enqueued) {
+                        (void)cuda_moe_wave_compute_seal(parity);
+                    }
+                    break;
+                }
 
                 dim3 dgrid((out_dim + 31u) / 32u, wave_pair_count, 1);
                 moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
@@ -17654,16 +17690,15 @@ static int routed_moe_launch(
                     out_dim,
                     n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe wave down launch");
-                if (!ok) break;
+                if (!ok) {
+                    if (wave_double_buffer && wave_work_enqueued) {
+                        (void)cuda_moe_wave_compute_seal(parity);
+                    }
+                    break;
+                }
                 if (wave_double_buffer) {
-                    ok = cuda_ok(cudaEventRecord(
-                                     g_moe_gather.wave_compute_done[parity], 0),
-                                 "moe wave overlap compute done");
+                    ok = cuda_moe_wave_compute_seal(parity);
                     if (!ok) break;
-                    g_moe_gather.wave_compute_recorded[parity] = 1;
-                    g_prefill_wave_overlap_stats.compute_records =
-                        cuda_u64_saturating_add(
-                            g_prefill_wave_overlap_stats.compute_records, 1);
                 }
 
                 g_prefill_wave_stats.waves =

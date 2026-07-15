@@ -93,10 +93,12 @@ G39 adds opt-in two-parity weight and metadata slabs behind
 `DS4_CUDA_PREFILL_WAVE_DOUBLE_BUFFER=1`. Persistent compute events fence slab
 reuse across both waves and layer boundaries, while the upload stream stages
 wave N+1 after wave N launches. All 18 measured outputs and six warmups were
-exact. TTFT improved from 10.133 to 8.577 seconds versus the same serial wave31
-path (-15.36%), but remained 12.97% slower than production full-chunk prefill at
-7.592 seconds. Reads remained 20.20% below production. Keep G39 opt-in and next
-restore tile-capable wave kernels. See `G39_PREFILL_WAVE_OVERLAP_RESULTS.md`.
+exact. A post-review hardening also fences prior uploads before slab resize and
+seals already-enqueued parity work on failed launches. The accepted rerun moved
+TTFT from 10.388 to 8.583 seconds versus serial wave31 (-17.38%), but remained
+9.18% slower than production full-chunk prefill at 7.862 seconds. Reads remained
+20.15% below production. Keep G39 opt-in and next restore tile-capable wave
+kernels. See `G39_PREFILL_WAVE_OVERLAP_RESULTS.md`.
 
 ## 0051 remaining work
 
@@ -115,8 +117,8 @@ Follow-on measured gates are:
 1. Validate G36 mass/LFRU on a longer exact workload and a domain switch before
    changing the default from `second-touch`.
 2. P4-A batch-union is measured complete in G37. P4-B serial waved prefill is
-   exact but negative in G38. G39 overlap recovered 15.36% versus serial but is
-   still 12.97% behind production; restore tile-capable wave kernels before
+   exact but negative in G38. G39 overlap recovered 17.38% versus serial but is
+   still 9.18% behind production; restore tile-capable wave kernels before
    retesting production promotion.
 3. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
    speculative traffic.
