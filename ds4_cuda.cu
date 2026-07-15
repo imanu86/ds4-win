@@ -2914,7 +2914,7 @@ struct cuda_dynamic_arena_part_copy_context {
     uint64_t *checksums;
     uint8_t *success;
     uint8_t phase_part;
-    int use_sequential_file;
+    const os_file_t *source_file;
     int checksum_parts;
     int profile_parts;
     double slow_part_threshold_seconds;
@@ -3107,8 +3107,8 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
             }
             uint8_t *destination =
                 (uint8_t *)load.host_ptr + part.destination_offset;
-            const int copied = context->use_sequential_file ?
-                cuda_pread_full(&g_model_file_sequential, destination,
+            const int copied = context->source_file ?
+                cuda_pread_full(context->source_file, destination,
                                 part.bytes, part.source_offset) :
                 (memcpy(destination, model + part.source_offset,
                         (size_t)part.bytes) != NULL);
@@ -3154,8 +3154,8 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
         uint8_t *destination =
             (uint8_t *)load.host_ptr + part.destination_offset;
         const double copy_started_at = cuda_wall_sec();
-        const int copied = context->use_sequential_file ?
-            cuda_pread_full(&g_model_file_sequential, destination,
+        const int copied = context->source_file ?
+            cuda_pread_full(context->source_file, destination,
                             part.bytes, part.source_offset) :
             (memcpy(destination, model + part.source_offset,
                     (size_t)part.bytes) != NULL);
@@ -3232,6 +3232,11 @@ cuda_dynamic_arena_wrap_schedule_env(void) {
 
 static int cuda_dynamic_arena_wrap_sequential_file(void) {
     const char *value = getenv("DS4_CUDA_ARENA_WRAP_SEQUENTIAL_FILE");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static int cuda_dynamic_arena_wrap_random_file(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_RANDOM_FILE");
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
@@ -3362,19 +3367,27 @@ static int cuda_dynamic_arena_wrap_publish_target(
         cuda_dynamic_arena_wrap_schedule_env();
     const int sequential_file_requested =
         cuda_dynamic_arena_wrap_sequential_file();
+    const int random_file_requested = cuda_dynamic_arena_wrap_random_file();
     const char *schedule_name =
         schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS ?
         "source-parts" : "expert-major";
-    const char *source_name = sequential_file_requested ?
-        "sequential-file" : "mmap";
+    const char *source_name = sequential_file_requested ? "sequential-file" :
+        (random_file_requested ? "random-file" : "mmap");
     const char *checksum_name = trust_worker_checksum ?
             "fnv1a64-worker-only" :
             "fnv1a64-worker-plus-finish";
-    if (sequential_file_requested &&
+    if (sequential_file_requested && random_file_requested) {
+        local.reason = "multiple-file-sources";
+        local.seconds = cuda_wall_sec() - started_at;
+        if (result) *result = local;
+        return 0;
+    }
+    if ((sequential_file_requested || random_file_requested) &&
         (schedule != CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS ||
-         !g_model_file_sequential_valid)) {
+         (sequential_file_requested && !g_model_file_sequential_valid) ||
+         (random_file_requested && !g_model_file_valid))) {
         local.reason = schedule != CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS ?
-            "sequential-requires-source-parts" : "sequential-file-unavailable";
+            "file-source-requires-source-parts" : "file-source-unavailable";
         local.seconds = cuda_wall_sec() - started_at;
         fprintf(stderr,
                 "ds4: [arena-wrap-profile] result=failed schedule=%s source=%s checksum=%s loads=0 workers=0 begin=0.000 copy_checksum=0.000 finish=0.000 publish=0.000 total=%.3f source_parts_copy=0.000 source_parts_checksum=0.000 parts=0 copy_workers=0 checksum_workers=0 reason=%s\n",
@@ -3472,7 +3485,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
             }
             const uint32_t requested_workers = sequential_file_requested ?
                 cuda_dynamic_arena_wrap_sequential_workers(work_count) :
-                cuda_dynamic_arena_observer_workers(work_count);
+                (random_file_requested ? 1u :
+                 cuda_dynamic_arena_observer_workers(work_count));
             requested_copy_workers = requested_workers;
             threads.resize(requested_workers > 1 ? requested_workers - 1 : 0);
             started_threads.reserve(threads.size());
@@ -3495,7 +3509,9 @@ static int cuda_dynamic_arena_wrap_publish_target(
             context.part_count = (uint32_t)parts.size();
             context.checksums = checksums.data();
             context.success = part_success.data();
-            context.use_sequential_file = sequential_file_requested;
+            context.source_file = sequential_file_requested ?
+                &g_model_file_sequential :
+                (random_file_requested ? &g_model_file : NULL);
             context.checksum_parts = trust_worker_checksum;
             context.profile_parts = part_profile;
             context.slow_part_threshold_seconds = slow_part_threshold_seconds;
@@ -3535,7 +3551,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 if (phase_workers > local.workers) {
                     local.workers = phase_workers;
                 }
-                if (sequential_file_requested &&
+                if ((sequential_file_requested || random_file_requested) &&
                     phase_workers != requested_copy_workers) {
                     local.reason = "copy-workers";
                     source_parts_copy_failed = 1;
