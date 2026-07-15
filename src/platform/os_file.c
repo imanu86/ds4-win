@@ -134,7 +134,17 @@ int os_file_reopen_read_sequential(os_file_t *dst, const os_file_t *src,
 #ifdef _WIN32
     DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
     if (overlapped) flags |= FILE_FLAG_OVERLAPPED;
-    HANDLE h = ReOpenFile(src->h, GENERIC_READ, FILE_SHARE_READ, flags);
+    wchar_t path[OS_MAX_PATH_W];
+    DWORD path_len = GetFinalPathNameByHandleW(
+        src->h, path, OS_MAX_PATH_W,
+        FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (path_len == 0 || path_len >= OS_MAX_PATH_W) {
+        errno = path_len >= OS_MAX_PATH_W ? ENAMETOOLONG :
+            os_win_error_to_errno(GetLastError());
+        return -1;
+    }
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, flags, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         errno = os_win_error_to_errno(GetLastError());
         return -1;
