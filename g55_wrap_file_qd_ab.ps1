@@ -213,6 +213,7 @@ function Invoke-G55Run {
         "arena_wrap_file_submits",
         "arena_wrap_file_completions",
         "arena_wrap_file_failures",
+        "prefill_mass_compose_candidate_fnv1a64",
         "server_exit_code")) {
         Assert-G55Property -Object $r -Name $name -Tag $Tag
     }
@@ -308,6 +309,11 @@ function Invoke-G55Run {
          [uint64]$r.arena_wrap_file_completions -ne [uint64]$r.arena_wrap_part_count -or
          [uint32]$r.arena_wrap_file_failures -ne 0)) {
         throw "G55 file QD counter mismatch: tag=$Tag"
+    } elseif ($FileQD -eq 1 -and
+        ([uint64]$r.arena_wrap_file_submits -ne 0 -or
+         [uint64]$r.arena_wrap_file_completions -ne 0 -or
+         [uint32]$r.arena_wrap_file_failures -ne 0)) {
+        throw "G55 QD1 legacy counter mismatch: tag=$Tag"
     }
 
     $wrapSeconds = if ($null -ne $r.arena_wrap_profile_total_seconds) {
@@ -387,6 +393,8 @@ function Invoke-G55Run {
             [double]$r.gpu_resident_routes_wait_ms_per_call
         route_resolve_ms_per_call =
             [double]$r.gpu_resident_routes_resolve_ms_per_call
+        candidate_mask_fnv1a64 =
+            [string]$r.prefill_mass_compose_candidate_fnv1a64
         windows_available_min_gib =
             Convert-G55BytesToGiB $rt.windows_available_min_bytes
         working_set_peak_gib =
@@ -475,7 +483,7 @@ $provenanceFields = @(
     "expert_cache_capacity", "content_sha256", "copy_workers",
     "sequential_workers_requested", "source_requested", "source_observed",
     "sequential_file_requested", "random_file_requested",
-    "execution_runner_sha256"
+    "execution_runner_sha256", "candidate_mask_fnv1a64"
 )
 foreach ($field in $provenanceFields) {
     $values = @($runs | ForEach-Object { [string]($_.$field) } |
