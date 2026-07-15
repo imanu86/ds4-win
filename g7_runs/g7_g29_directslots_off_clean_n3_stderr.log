@@ -1,0 +1,32 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.856s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 03:10:35 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 03:10:35 ds4-server: listening on http://127.0.0.1:8000
+0715 03:10:36 ds4-server: chat ctx=0..23:23 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 03:10:39 ds4-server: chat ctx=0..23:23 prompt done 3.412s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+0715 03:10:42 ds4-server: chat ctx=0..23:23 gen=10 decoding chunk=3.40 t/s avg=3.40 t/s 2.942s
+0715 03:10:42 ds4-server: chat ctx=0..23:23 gen=10 finish=stop 6.400s
+0715 03:10:42 ds4-server: chat ctx=0..23:23 prompt start
+0715 03:10:46 ds4-server: chat ctx=0..23:23 prompt done 4.018s
+0715 03:10:49 ds4-server: chat ctx=0..23:23 gen=10 decoding chunk=3.43 t/s avg=3.43 t/s 2.912s
+0715 03:10:49 ds4-server: chat ctx=0..23:23 gen=10 finish=stop 6.947s
+0715 03:10:49 ds4-server: chat ctx=0..23:23 prompt start
+0715 03:10:53 ds4-server: chat ctx=0..23:23 prompt done 4.018s
+0715 03:10:56 ds4-server: chat ctx=0..23:23 gen=10 decoding chunk=3.39 t/s avg=3.39 t/s 2.954s
+0715 03:10:56 ds4-server: chat ctx=0..23:23 gen=10 finish=stop 6.988s
+0715 03:10:56 ds4-server: chat ctx=0..23:23 prompt start
+0715 03:11:00 ds4-server: chat ctx=0..23:23 prompt done 3.988s
+0715 03:11:03 ds4-server: chat ctx=0..23:23 gen=10 decoding chunk=3.41 t/s avg=3.41 t/s 2.930s
+0715 03:11:03 ds4-server: chat ctx=0..23:23 gen=10 finish=stop 6.934s
+0715 03:11:03 ds4-server: benchmark request target reached; shutting down cleanly
+0715 03:11:03 ds4-server: shutdown requested, draining requests

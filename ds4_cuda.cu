@@ -13320,6 +13320,7 @@ struct cuda_moe_gather {
     std::vector<uint8_t> h_cache_admission_evicted;
     std::vector<float> h_compact_mass;
     std::vector<uint8_t> h_arena_resident;
+    uint8_t direct_cache_active;
 };
 static cuda_moe_gather g_moe_gather;
 
@@ -13493,6 +13494,7 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.h_cache_admission_evicted.clear();
     g_moe_gather.h_compact_mass.clear();
     g_moe_gather.h_arena_resident.clear();
+    g_moe_gather.direct_cache_active = 0;
 }
 
 static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
@@ -13970,6 +13972,7 @@ static int cuda_moe_selected_load(
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key) {
     g_moe_last_selected.valid = 0;
+    g_moe_gather.direct_cache_active = 0;
     (void)model_size;
     if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
     if (!selected_arg || !selected_arg->ptr) return 0;
@@ -14426,7 +14429,20 @@ static int cuda_moe_selected_load(
         return 0;
     }
 
-    if (cache) {
+    int direct_cache_active = 0;
+    if (getenv("DS4_CUDA_MOE_DIRECT_CACHE_HITS") != NULL &&
+        n_tokens == 1u && cache && spex_prefetch_slot < 0 &&
+        admission_slots.empty() && spans.empty()) {
+        direct_cache_active = 1;
+        for (uint32_t i = 0; i < compact_count; i++) {
+            if (arena_resident[i] || cache_slots[i] < 0) {
+                direct_cache_active = 0;
+                break;
+            }
+        }
+    }
+
+    if (cache && !direct_cache_active) {
         for (uint32_t i = 0; i < compact_count; i++) {
             if (cache_slots[i] < 0) continue;
             if (!cuda_moe_expert_cache_copy_to_compact_async(
@@ -14440,7 +14456,8 @@ static int cuda_moe_selected_load(
         }
     }
 
-    if (!cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) {
+    if (!direct_cache_active &&
+        !cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) {
         cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 0, 0);
         if (cache) cuda_moe_expert_cache_invalidate();
         return 0;
@@ -14486,7 +14503,21 @@ static int cuda_moe_selected_load(
         }
     }
 
-    /* 5. publish the remapped selection (compact-slot indices) */
+    /* 5. Publish either compact slots or stable resident-cache slots. Pure
+     * hits read the persistent quantized bytes in place. Any miss retains the
+     * existing compact-buffer path and its synchronization. */
+    if (direct_cache_active) {
+        for (uint32_t i = 0; i < slot_count; i++) {
+            const uint32_t compact_slot = (uint32_t)slots[i];
+            slots[i] = cache_slots[compact_slot];
+        }
+        g_moe_gather.direct_cache_active = 1;
+        if (getenv("DS4_CUDA_MOE_DIRECT_CACHE_STATS") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA MoE direct resident-cache hit layer=%u slots=%u compact=%u\n",
+                    layer_index, slot_count, compact_count);
+        }
+    }
     if (!cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
                             (size_t)slot_count * sizeof(int32_t),
                             cudaMemcpyHostToDevice), "moe gather slots")) {
@@ -14597,9 +14628,15 @@ static int routed_moe_launch(
                                gate_expert_bytes, down_expert_bytes,
                                n_total_expert, n_expert, n_tokens, selected, weights,
                                spex_queue, spex_key)) {
-        gate_w = g_moe_gather.gate;
-        up_w = g_moe_gather.up;
-        down_w = g_moe_gather.down;
+        if (g_moe_gather.direct_cache_active) {
+            gate_w = g_moe_expert_cache.gate;
+            up_w = g_moe_expert_cache.up;
+            down_w = g_moe_expert_cache.down;
+        } else {
+            gate_w = g_moe_gather.gate;
+            up_w = g_moe_gather.up;
+            down_w = g_moe_gather.down;
+        }
         selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
     } else {
         ds4_gpu_spex_queue_cancel(spex_queue, spex_key);

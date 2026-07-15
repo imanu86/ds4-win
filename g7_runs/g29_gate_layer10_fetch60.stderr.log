@@ -1,0 +1,132 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 1.421s
+ds4: CUDA stream reserve startup=1.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+ds4: MoE gate benchmark pass=1/60
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: CUDA resident expert cache ready: 1/1 experts, 6.75 MiB/expert, 0.01 GiB total
+ds4: CUDA stream runtime reserve activated: 1.00 GiB -> 0.12 GiB
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=2/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=3/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=4/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=5/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=6/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=7/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=8/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=9/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=10/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=11/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=12/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=13/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=14/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=15/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=16/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=17/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=18/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=19/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=20/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=21/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=22/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=23/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=24/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=25/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=26/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=27/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=28/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=29/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=30/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=31/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=32/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=33/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=34/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=35/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=36/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=37/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=38/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=39/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=40/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=41/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=42/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=43/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=44/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=45/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=46/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=47/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=48/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=49/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=50/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=51/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=52/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=53/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=54/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=55/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=56/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=57/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=58/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=59/60
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=60/60
+ds4: [selprof] calls=60 experts=360 fill=0.414s (1.15 ms/expert)
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584

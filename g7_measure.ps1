@@ -38,6 +38,7 @@ param(
     [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
     [ValidateRange(0.0, 6.0)][double]$ExpertCacheReserveGB = 0.5,
     [ValidateSet("lru", "layer-top1")][string]$ExpertCachePolicy = "lru",
+    [switch]$DirectCacheHits,
     [switch]$ExpertCacheStats,
     [ValidateRange(1, 1000000)][int]$ExpertCacheStatsInterval = 128,
     [switch]$OverlapShared,
@@ -222,6 +223,17 @@ if ($ExpertCacheN -gt 0) {
     Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_N -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_MOE_CACHE_POLICY -ErrorAction SilentlyContinue
+}
+if ($DirectCacheHits) {
+    $env:DS4_CUDA_MOE_DIRECT_CACHE_HITS = "1"
+    if ($Diagnostics) {
+        $env:DS4_CUDA_MOE_DIRECT_CACHE_STATS = "1"
+    } else {
+        Remove-Item Env:\DS4_CUDA_MOE_DIRECT_CACHE_STATS -ErrorAction SilentlyContinue
+    }
+} else {
+    Remove-Item Env:\DS4_CUDA_MOE_DIRECT_CACHE_HITS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_MOE_DIRECT_CACHE_STATS -ErrorAction SilentlyContinue
 }
 if ($ExpertCacheStats) {
     $env:DS4_CUDA_MOE_CACHE_STATS = "1"
@@ -1421,6 +1433,7 @@ $summary = [pscustomobject]@{
     expert_cache_requested = $ExpertCacheN
     expert_cache_reserve_gb = $ExpertCacheReserveGB
     expert_cache_policy = $ExpertCachePolicy
+    direct_cache_hits_requested = [bool]$DirectCacheHits
     expert_cache_stats_enabled = [bool]$ExpertCacheStats
     expert_cache_stats_interval = $ExpertCacheStatsInterval
     overlap_shared_requested = [bool]$OverlapShared

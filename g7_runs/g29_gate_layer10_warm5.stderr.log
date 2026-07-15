@@ -1,0 +1,36 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 1.435s
+ds4: CUDA stream reserve startup=1.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+ds4: MoE gate benchmark pass=1/5
+ds4: MoE CPU gate benchmark layer=10 expert=219 iters=5 full_expert_mean=1.072 ms source=mmap_warm threads=12
+ds4: MoE CPU gate benchmark layer=10 experts=6 iters=3 selected_set_mean=11.913 ms source=mmap_warm threads=12
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: CUDA resident expert cache ready: 1/1 experts, 6.75 MiB/expert, 0.01 GiB total
+ds4: CUDA stream runtime reserve activated: 1.00 GiB -> 0.12 GiB
+ds4: CUDA MoE profile tokens=1 pairs=6 xq=0.181 sort=0.004 gateup=0.252 midq=0.006 down=0.085 sum=0.001 total=0.529 ms
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=2/5
+ds4: MoE CPU gate benchmark layer=10 expert=219 iters=5 full_expert_mean=0.970 ms source=mmap_warm threads=12
+ds4: MoE CPU gate benchmark layer=10 experts=6 iters=3 selected_set_mean=5.629 ms source=mmap_warm threads=12
+ds4: CUDA MoE profile tokens=1 pairs=6 xq=0.135 sort=0.004 gateup=0.199 midq=0.006 down=0.078 sum=0.001 total=0.423 ms
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=3/5
+ds4: MoE CPU gate benchmark layer=10 expert=219 iters=5 full_expert_mean=0.985 ms source=mmap_warm threads=12
+ds4: MoE CPU gate benchmark layer=10 experts=6 iters=3 selected_set_mean=5.676 ms source=mmap_warm threads=12
+ds4: CUDA MoE profile tokens=1 pairs=6 xq=0.139 sort=0.008 gateup=0.177 midq=0.006 down=0.080 sum=0.001 total=0.412 ms
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=4/5
+ds4: MoE CPU gate benchmark layer=10 expert=219 iters=5 full_expert_mean=0.962 ms source=mmap_warm threads=12
+ds4: MoE CPU gate benchmark layer=10 experts=6 iters=3 selected_set_mean=5.845 ms source=mmap_warm threads=12
+ds4: CUDA MoE profile tokens=1 pairs=6 xq=0.133 sort=0.004 gateup=0.191 midq=0.006 down=0.079 sum=0.001 total=0.415 ms
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584
+ds4: MoE gate benchmark pass=5/5
+ds4: MoE CPU gate benchmark layer=10 expert=219 iters=5 full_expert_mean=0.979 ms source=mmap_warm threads=12
+ds4: MoE CPU gate benchmark layer=10 experts=6 iters=3 selected_set_mean=5.642 ms source=mmap_warm threads=12
+ds4: CUDA MoE profile tokens=1 pairs=6 xq=0.193 sort=0.007 gateup=0.188 midq=0.005 down=0.080 sum=0.001 total=0.474 ms
+ds4: Metal graph test layer0 diffs: embed_hc=0 hc_pre=8.9407e-08 attn_norm=2.98023e-08 q_rope=1.43051e-06 kv_rope=0.000472426 raw_cache=0 attn_out=0.0258808 after_attn_hc=0.00713009 ffn_cur=0.0100518 ffn_norm=0.00475055 shared=0.00363442 router_w=0.000253797 routed=0.00581959 ffn_out=0.00653669 after_ffn_hc=0.00944561 logits=0.20584

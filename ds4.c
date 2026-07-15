@@ -11119,7 +11119,18 @@ static int metal_graph_decode_test(
     }
 
     const int token = prompt->v[0];
-    const ds4_layer_weights *layer = &weights->layer[0];
+    uint32_t bench_layer = 0;
+    const char *bench_layer_env = getenv("DS4_MOE_GATE_BENCH_LAYER");
+    if (bench_layer_env && bench_layer_env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(bench_layer_env, &end, 10);
+        if (end == bench_layer_env || *end != '\0' || parsed >= DS4_N_LAYER) {
+            fprintf(stderr, "ds4: invalid DS4_MOE_GATE_BENCH_LAYER=%s\n", bench_layer_env);
+            return 1;
+        }
+        bench_layer = (uint32_t)parsed;
+    }
+    const ds4_layer_weights *layer = &weights->layer[bench_layer];
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -11181,12 +11192,12 @@ static int metal_graph_decode_test(
     layer_attn_norm_one(cpu_attn_norm, model, layer, cpu_attn_cur);
     layer_q_projection_with_lora_one(model, layer, cpu_attn_norm, cpu_q, cpu_qr_norm);
     layer_kv_projection_normed_one(model, layer, cpu_attn_norm, cpu_kv);
-    rope_tail_layer_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
-    rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, false);
+    rope_tail_layer_inplace(cpu_q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, bench_layer, false);
+    rope_tail_layer_inplace(cpu_kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, bench_layer, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM, DS4_N_ROT);
     f16_round_inplace_cpu(cpu_kv, DS4_N_HEAD_DIM);
     layer_attention_rows_one(cpu_heads, model, layer, cpu_q, cpu_kv, 1);
-    rope_tail_layer_inplace(cpu_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, 0, true);
+    rope_tail_layer_inplace(cpu_heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, bench_layer, true);
     layer_grouped_out_one(cpu_attn_out, model, layer, cpu_heads);
     hc_post_one(cpu_after_attn_hc, cpu_attn_out, cpu_hc, cpu_post, cpu_comb, DS4_N_EMBD, DS4_N_HC);
     hc_pre_from_state_one(model,
@@ -11196,21 +11207,85 @@ static int metal_graph_decode_test(
                           cpu_after_attn_hc, cpu_ffn_cur, cpu_ffn_post, cpu_ffn_comb);
     rms_norm_weight(cpu_ffn_norm, cpu_ffn_cur, tensor_data(model, layer->ffn_norm), DS4_N_EMBD, DS4_RMS_EPS);
     layer_shared_ffn_one(cpu_shared, model, layer, cpu_ffn_norm);
-    layer_routed_moe_one_prealloc(cpu_routed,
-                                  model,
-                                  layer,
-                                  cpu_ffn_norm,
-                                  0,
-                                  token,
-                                  DS4_SWIGLU_CLAMP_EXP,
-                                  routed_mid_all,
-                                  routed_xq,
-                                  routed_midq);
     if (layer->ffn_gate_tid2eid) {
         layer_hash_selected_experts(selected, model, layer, token);
         layer_hash_router_weights_one(expert_weight, model, layer, cpu_ffn_norm, selected);
     } else {
         layer_topk_selected_experts(selected, expert_weight, model, layer, cpu_ffn_norm);
+    }
+    const char *cpu_bench_env = getenv("DS4_MOE_CPU_GATE_BENCH_ITERS");
+    if (cpu_bench_env && cpu_bench_env[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(cpu_bench_env, &end, 10);
+        uint32_t iters = end != cpu_bench_env && parsed > 0 ? (uint32_t)parsed : 1u;
+        if (iters > 100u) iters = 100u;
+
+        float *bench_gate = xmalloc((size_t)down_in_dim * sizeof(float));
+        float *bench_up = xmalloc((size_t)down_in_dim * sizeof(float));
+        float *bench_mid = xmalloc((size_t)down_in_dim * sizeof(float));
+        float *bench_down = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
+        block_q8_K *bench_xq = xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(block_q8_K));
+        ds4_quantize_row_q8_K(cpu_ffn_norm, bench_xq, (int64_t)expert_in_dim);
+
+        double elapsed = 0.0;
+        for (uint32_t pass = 0; pass <= iters; pass++) {
+            const double t0 = pass ? now_sec() : 0.0;
+            matvec_iq2_xxs_expert_pair_prequant(bench_gate,
+                                                 bench_up,
+                                                 model,
+                                                 layer->ffn_gate_exps,
+                                                 layer->ffn_up_exps,
+                                                 bench_xq,
+                                                 (uint32_t)selected[0]);
+            for (uint64_t j = 0; j < down_in_dim; j++) {
+                float gate_v = bench_gate[j];
+                float up_v = bench_up[j];
+                if (DS4_SWIGLU_CLAMP_EXP > 1.0e-6f) {
+                    if (gate_v > DS4_SWIGLU_CLAMP_EXP) gate_v = DS4_SWIGLU_CLAMP_EXP;
+                    if (up_v > DS4_SWIGLU_CLAMP_EXP) up_v = DS4_SWIGLU_CLAMP_EXP;
+                    if (up_v < -DS4_SWIGLU_CLAMP_EXP) up_v = -DS4_SWIGLU_CLAMP_EXP;
+                }
+                bench_mid[j] = silu(gate_v) * up_v * expert_weight[0];
+            }
+            matvec_q2_k_expert(bench_down,
+                               model,
+                               layer->ffn_down_exps,
+                               bench_mid,
+                               (uint32_t)selected[0]);
+            if (pass) elapsed += now_sec() - t0;
+        }
+        fprintf(stderr,
+                "ds4: MoE CPU gate benchmark layer=%u expert=%d iters=%u full_expert_mean=%.3f ms source=mmap_warm threads=%u\n",
+                bench_layer, selected[0], iters, elapsed * 1000.0 / (double)iters,
+                g_pool.n_threads);
+        free(bench_xq);
+        free(bench_down);
+        free(bench_mid);
+        free(bench_up);
+        free(bench_gate);
+    }
+
+    const uint32_t cpu_set_iters = cpu_bench_env ? 3u : 1u;
+    double cpu_set_elapsed = 0.0;
+    for (uint32_t pass = 0; pass < cpu_set_iters; pass++) {
+        const double t0 = cpu_bench_env ? now_sec() : 0.0;
+        layer_routed_moe_one_prealloc(cpu_routed,
+                                      model,
+                                      layer,
+                                      cpu_ffn_norm,
+                                      bench_layer,
+                                      token,
+                                      DS4_SWIGLU_CLAMP_EXP,
+                                      routed_mid_all,
+                                      routed_xq,
+                                      routed_midq);
+        if (cpu_bench_env) cpu_set_elapsed += now_sec() - t0;
+    }
+    if (cpu_bench_env) {
+        fprintf(stderr,
+                "ds4: MoE CPU gate benchmark layer=%u experts=6 iters=%u selected_set_mean=%.3f ms source=mmap_warm threads=%u\n",
+                bench_layer, cpu_set_iters, cpu_set_elapsed * 1000.0 / (double)cpu_set_iters,
+                g_pool.n_threads);
     }
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) cpu_ffn_out[i] = cpu_shared[i] + cpu_routed[i];
     hc_post_one(cpu_after_ffn_hc,
@@ -11237,7 +11312,7 @@ static int metal_graph_decode_test(
     if (ok) ok = metal_graph_encode_decode_layer(&g,
                                                model,
                                                layer,
-                                               0,
+                                               bench_layer,
                                                0,
                                                g.layer_raw_cache[0],
                                                g.raw_cap,
