@@ -39,6 +39,9 @@ set_target_properties(ds4_cuda PROPERTIES
     CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
 )
 
+add_library(ds4_bake STATIC ds4_bake.c)
+target_include_directories(ds4_bake PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 add_library(ds4 STATIC ds4.c ds4_spex_predict.c rax.c)
 target_link_libraries(ds4 PUBLIC ds4_platform)
 if(WIN32)
@@ -66,6 +69,7 @@ endif()
 
 if(MSVC)
     target_compile_options(ds4_platform PRIVATE /W3)
+    target_compile_options(ds4_bake PRIVATE /W3)
     target_compile_options(ds4 PRIVATE /W3)
     target_compile_options(ds4_server PRIVATE /W3)
     target_compile_options(ds4_moe_gate_bench PRIVATE /W3)

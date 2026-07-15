@@ -8,3 +8,7 @@ if(NOT WIN32)
     )
     add_test(NAME ds4_test COMMAND ds4_test)
 endif()
+
+add_executable(ds4_bake_test ds4_bake_test.c)
+target_link_libraries(ds4_bake_test PRIVATE ds4_bake)
+add_test(NAME ds4_bake_test COMMAND ds4_bake_test)
