@@ -810,6 +810,10 @@ $prefillMassWrapSeconds = 0.0; $prefillMassWrapSnapshotBefore = 0; $prefillMassW
 $prefillMassWrapResidentBefore = 0; $prefillMassWrapResidentAfter = 0
 $prefillMassWrapGeneration = 0; $prefillMassWrapPreloaded = -1
 $prefillMassWrapRouter = "not_observed"; $prefillMassWrapMask = "not_observed"
+$prefillMassComposeObserved = $false; $prefillMassComposeEventCount = 0
+$prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
+$prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
+$prefillMassComposeCapacity = 0
 $reapMassArmed = $false; $reapMassResultObserved = $false
 $reapMassWindowObserved = 0; $reapMassTopObserved = 0
 $reapMassFirstLayer = 0; $reapMassLastLayer = 0
@@ -1193,6 +1197,17 @@ if (Test-Path $stderrLog) {
         $prefillMassCutoff = [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
         $prefillMassResidency = $Matches[12]; $prefillMassPolicy = $Matches[13]
     }
+    $prefillMassComposeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-compose\]" })
+    $prefillMassComposeEventCount = $prefillMassComposeLines.Count
+    $prefillMassComposeLine = $prefillMassComposeLines | Select-Object -Last 1
+    if ($prefillMassComposeLine -and $prefillMassComposeLine -match "hash_layers=(\d+) hash_seed_entries=(\d+) ranked_entries=(\d+) total_candidate=(\d+) capacity=(\d+)") {
+        $prefillMassComposeObserved = $true
+        $prefillMassComposeHashLayers = [int]$Matches[1]
+        $prefillMassComposeHashSeedEntries = [long]$Matches[2]
+        $prefillMassComposeRankedEntries = [long]$Matches[3]
+        $prefillMassComposeTotalCandidate = [long]$Matches[4]
+        $prefillMassComposeCapacity = [long]$Matches[5]
+    }
     $prefillMassDecodeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" } | Select-Object -Last 1
     if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=([a-z-]+)") {
         $prefillMassDecodeTokens = [long]$Matches[1]
@@ -1566,6 +1581,14 @@ if ($PrefillMassWrap) {
     if ($prefillMassWrapPreloaded -ne 0 -or $prefillMassWrapRouter -ne "unbiased" -or $prefillMassWrapMask -ne "off") {
         throw "Prefill mass WRAP failed: isolation telemetry differs"
     }
+    if ($ComposePrefillMassTiering) {
+        if ($prefillMassComposeEventCount -ne 1 -or -not $prefillMassComposeObserved) { throw "Prefill mass compose failed: hash seed telemetry missing" }
+        if ($prefillMassComposeHashLayers -ne 3 -or $prefillMassComposeHashSeedEntries -ne (3 * 256)) { throw "Prefill mass compose failed: hash-routed layer seed differs" }
+        if ($prefillMassComposeTotalCandidate -ne $prefillMassCandidate -or $prefillMassComposeCapacity -ne $prefillMassCapacity) { throw "Prefill mass compose failed: candidate/capacity telemetry differs" }
+        if ($prefillMassComposeRankedEntries + $prefillMassComposeHashSeedEntries -ne $prefillMassComposeTotalCandidate) { throw "Prefill mass compose failed: ranked/hash candidate accounting differs" }
+    } elseif ($prefillMassComposeEventCount -ne 0 -or $prefillMassComposeObserved) {
+        throw "Prefill mass compose telemetry appeared while not requested"
+    }
 } elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
     throw "Prefill mass WRAP activated while not requested"
 }
@@ -1924,6 +1947,13 @@ $summary = [pscustomobject]@{
     prefill_mass_wrap_preloaded = $prefillMassWrapPreloaded
     prefill_mass_wrap_router = $prefillMassWrapRouter
     prefill_mass_wrap_mask = $prefillMassWrapMask
+    prefill_mass_compose_observed = $prefillMassComposeObserved
+    prefill_mass_compose_event_count = $prefillMassComposeEventCount
+    prefill_mass_compose_hash_layers = $prefillMassComposeHashLayers
+    prefill_mass_compose_hash_seed_entries = $prefillMassComposeHashSeedEntries
+    prefill_mass_compose_ranked_entries = $prefillMassComposeRankedEntries
+    prefill_mass_compose_total_candidate = $prefillMassComposeTotalCandidate
+    prefill_mass_compose_capacity = $prefillMassComposeCapacity
     prefill_mass_layers = $prefillMassLayers
     prefill_mass_rows_min = $prefillMassRowsMin
     prefill_mass_rows_max = $prefillMassRowsMax

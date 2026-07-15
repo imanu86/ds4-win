@@ -493,6 +493,7 @@ static void cuda_prefill_mass_observer_reset(void);
 static void cuda_prefill_mass_observer_finalize(void);
 static void cuda_prefill_mass_observer_release(int report);
 static int cuda_prefill_mass_observer_needs_weights(void);
+static int cuda_moe_prefill_tier_compose_requested(void);
 static void cuda_reap_mass_observer_reset(void);
 static void cuda_reap_mass_observer_release(int report);
 static void cuda_reap_router_trace_release(void);
@@ -4173,8 +4174,24 @@ static void cuda_prefill_mass_observer_finalize(void) {
         g_reap_mass_observer.wrap_requested ?
         (size_t)cuda_reap_mass_resident_limit() :
         g_dynamic_arena.slots.size();
+    const int compose_requested = observer.wrap_requested ?
+        cuda_moe_prefill_tier_compose_requested() : 0;
+    const uint32_t hash_layers = compose_requested > 0 ?
+        std::min(3u, g_dynamic_arena.n_layer) : 0u;
+    const size_t hash_entries =
+        (size_t)hash_layers * g_dynamic_arena.n_expert;
+    if (hash_entries > residency_capacity) {
+        fprintf(stderr,
+                "ds4: [prefill-mass-wrap] result=failed reason=compose-hash-capacity candidate=0 loads=0 workers=0 seconds=0.000 snapshot_before=%llu snapshot_after=%llu resident_before=%u resident_after=%u generation=0 preloaded=0 router=unbiased mask=off\n",
+                (unsigned long long)g_dynamic_arena.snapshot_generation,
+                (unsigned long long)g_dynamic_arena.snapshot_generation,
+                cuda_dynamic_arena_active_count(),
+                cuda_dynamic_arena_active_count());
+        return;
+    }
+    const size_t ranked_capacity = residency_capacity - hash_entries;
     const uint32_t capacity = (uint32_t)std::min(
-        ranked.size(), residency_capacity);
+        ranked.size(), ranked_capacity);
     double total_mass = 0.0;
     double candidate_mass = 0.0;
     for (uint32_t i = 0; i < ranked.size(); i++) {
@@ -4184,7 +4201,17 @@ static void cuda_prefill_mass_observer_finalize(void) {
             candidate_mass += ranked[i].mass;
         }
     }
-    observer.candidate_entries = capacity;
+    for (uint32_t entry = 0; entry < hash_entries; entry++) {
+        observer.candidate[entry] = 1;
+    }
+    observer.candidate_entries = capacity + (uint32_t)hash_entries;
+    if (compose_requested > 0) {
+        fprintf(stderr,
+                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u\n",
+                hash_layers, (uint32_t)hash_entries, capacity,
+                observer.candidate_entries,
+                (uint32_t)residency_capacity);
+    }
 
     uint32_t rows_min = UINT32_MAX;
     uint32_t rows_max = 0;
