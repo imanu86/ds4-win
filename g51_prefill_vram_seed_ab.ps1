@@ -726,6 +726,50 @@ foreach ($arm in @("control", "prefill-vram-seed")) {
     }
 }
 
+$observedEffect = $null
+if (-not $SafetyOnly) {
+    $controlSummary = @($armSummary | Where-Object {
+        $_.arm -eq "control"
+    })[0]
+    $seedSummary = @($armSummary | Where-Object {
+        $_.arm -eq "prefill-vram-seed"
+    })[0]
+    $routeH2DSavedGiB = [double]$controlSummary.route_h2d_gib_mean -
+        [double]$seedSummary.route_h2d_gib_mean
+    $seedCostGiB = [double]$seedSummary.prefill_vram_seed_gib_mean
+    $netH2DSavedGiB = $routeH2DSavedGiB - $seedCostGiB
+    $decodeDeltaPercent = if (
+        [double]$controlSummary.decode_tokens_per_second_mean -ne 0.0) {
+        100.0 * (
+            [double]$seedSummary.decode_tokens_per_second_mean -
+            [double]$controlSummary.decode_tokens_per_second_mean
+        ) / [double]$controlSummary.decode_tokens_per_second_mean
+    } else { $null }
+    $observedEffect = [pscustomobject]@{
+        window_generated_tokens = 64
+        control_route_h2d_gib_mean =
+            [double]$controlSummary.route_h2d_gib_mean
+        seed_route_h2d_gib_mean = [double]$seedSummary.route_h2d_gib_mean
+        route_h2d_saved_gib_mean = [math]::Round($routeH2DSavedGiB, 6)
+        one_time_seed_h2d_gib_mean = [math]::Round($seedCostGiB, 6)
+        net_h2d_saved_after_seed_gib_mean =
+            [math]::Round($netH2DSavedGiB, 6)
+        seed_amortized_within_observed_window = ($netH2DSavedGiB -gt 0.0)
+        pinned_ram_routes_delta_mean = [math]::Round(
+            [double]$seedSummary.route_pinned_ram_routes_mean -
+            [double]$controlSummary.route_pinned_ram_routes_mean, 6)
+        vram_routes_delta_mean = [math]::Round(
+            [double]$seedSummary.route_vram_routes_mean -
+            [double]$controlSummary.route_vram_routes_mean, 6)
+        decode_tokens_per_second_delta_percent = if (
+            $null -eq $decodeDeltaPercent) { $null } else {
+            [math]::Round($decodeDeltaPercent, 6)
+        }
+        interpretation =
+            "Measured n=3-per-arm deltas only; route H2D excludes the explicit one-time seed upload."
+    }
+}
+
 $summary = [pscustomobject]@{
     schema = if ($SafetyOnly) {
         "g51_prefill_vram_seed_safety_v1"
@@ -818,6 +862,7 @@ $summary = [pscustomobject]@{
     }
     runs = $runs
     arm_summary = $armSummary
+    observed_effect = $observedEffect
 }
 
 $summaryName = if ($SafetyOnly) {
