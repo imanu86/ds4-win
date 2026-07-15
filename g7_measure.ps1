@@ -69,6 +69,8 @@ param(
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [int]$Port = 8000,
     [ValidateRange(64, 131072)][int]$Context = 256,
+    [ValidateRange(-1, 65536)][int]$PrefillChunk = -1,
+    [switch]$PrefillUnionStats,
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [switch]$SkipMemoryPreflight,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0
@@ -234,6 +236,10 @@ if ($Diagnostics) {
 }
 if ($NoSelectedLoad) { $env:DS4_CUDA_MOE_NO_SELECTED_LOAD = "1" }
 else { Remove-Item Env:\DS4_CUDA_MOE_NO_SELECTED_LOAD -ErrorAction SilentlyContinue }
+if ($PrefillChunk -ge 0) { $env:DS4_METAL_PREFILL_CHUNK = "$PrefillChunk" }
+else { Remove-Item Env:\DS4_METAL_PREFILL_CHUNK -ErrorAction SilentlyContinue }
+if ($PrefillUnionStats) { $env:DS4_CUDA_PREFILL_UNION_STATS = "1" }
+else { Remove-Item Env:\DS4_CUDA_PREFILL_UNION_STATS -ErrorAction SilentlyContinue }
 if ($IoQD -gt 1) { $env:DS4_CUDA_MOE_IO_QD = "$IoQD" }
 else { Remove-Item Env:\DS4_CUDA_MOE_IO_QD -ErrorAction SilentlyContinue }
 if ($ExpertCacheN -gt 0) {
@@ -794,6 +800,13 @@ $arenaGrowthPublications = 0; $arenaGrowthSkips = 0
 $arenaGrowthEvents = @()
 $contextObserved = 0; $prefillChunkObserved = 0
 $rawKvRowsObserved = 0; $compressedKvRowsObserved = 0
+$prefillUnionObserved = $false; $prefillUnionCalls = 0; $prefillUnionTokens = 0
+$prefillUnionSelectedSlots = 0; $prefillUnionUniqueExperts = 0; $prefillUnionDedupRatio = 0.0
+$prefillUnionMaxTokens = 0; $prefillUnionMaxUnion = 0; $prefillUnionArenaExperts = 0
+$prefillUnionCacheHits = 0; $prefillUnionCacheAdmissions = 0; $prefillUnionDirectExperts = 0
+$prefillUnionSpexExperts = 0; $prefillUnionNonresidentExperts = 0
+$prefillUnionSourceSpanBytes = 0; $prefillUnionArenaH2DBytes = 0
+$prefillUnionCacheD2DBytes = 0; $prefillUnionUploadSyncs = 0
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
 $arenaAllocatedBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
@@ -854,6 +867,31 @@ if (Test-Path $stderrLog) {
         $overlappedIoObserved = $true
     }
     $overlappedIoFallbacks = ($lines | Where-Object { $_ -match "MoE overlapped read failed; selected-load fallback requested" } | Measure-Object).Count
+    $prefillUnionLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[prefill-union\] final " })
+    if ($prefillUnionLines.Count -gt 0) {
+        $prefillUnionPattern = "^ds4: \[prefill-union\] final calls=(\d+) tokens=(\d+) selected_slots=(\d+) unique_experts=(\d+) dedup_ratio=([0-9.eE+-]+) max_tokens=(\d+) max_union=(\d+) arena_experts=(\d+) cache_hits=(\d+) cache_admissions=(\d+) direct_experts=(\d+) spex_experts=(\d+) nonresident_experts=(\d+) source_span_bytes=(\d+) arena_h2d_bytes=(\d+) cache_d2d_bytes=(\d+) upload_syncs=(\d+)$"
+        foreach ($prefillUnionLine in $prefillUnionLines) {
+            if ($prefillUnionLine -notmatch $prefillUnionPattern) {
+                throw "Prefill union measurement failed: final line format mismatch"
+            }
+            $prefillUnionCalls += [uint64]$Matches[1]; $prefillUnionTokens += [uint64]$Matches[2]
+            $prefillUnionSelectedSlots += [uint64]$Matches[3]; $prefillUnionUniqueExperts += [uint64]$Matches[4]
+            $prefillUnionMaxTokens = [math]::Max($prefillUnionMaxTokens, [uint32]$Matches[6])
+            $prefillUnionMaxUnion = [math]::Max($prefillUnionMaxUnion, [uint32]$Matches[7])
+            $prefillUnionArenaExperts += [uint64]$Matches[8]; $prefillUnionCacheHits += [uint64]$Matches[9]
+            $prefillUnionCacheAdmissions += [uint64]$Matches[10]; $prefillUnionDirectExperts += [uint64]$Matches[11]
+            $prefillUnionSpexExperts += [uint64]$Matches[12]; $prefillUnionNonresidentExperts += [uint64]$Matches[13]
+            $prefillUnionSourceSpanBytes += [uint64]$Matches[14]; $prefillUnionArenaH2DBytes += [uint64]$Matches[15]
+            $prefillUnionCacheD2DBytes += [uint64]$Matches[16]; $prefillUnionUploadSyncs += [uint64]$Matches[17]
+        }
+        $prefillUnionObserved = $true
+        if ($prefillUnionUniqueExperts -gt 0) {
+            $prefillUnionDedupRatio = $prefillUnionSelectedSlots / [double]$prefillUnionUniqueExperts
+        }
+    }
+    if ($PrefillUnionStats -and -not $prefillUnionObserved) {
+        throw "Prefill union stats were requested but no successful batched prefill call was reported"
+    }
     $overlapSharedObserved = [bool]($lines | Where-Object { $_ -match "CUDA MoE shared-overlap consumed" } | Select-Object -First 1)
     $overlapSharedFullObserved = [bool]($lines | Where-Object { $_ -match "CUDA MoE full shared-overlap consumed" } | Select-Object -First 1)
     $spexLine = $lines | Where-Object { $_ -match "\[spex-dry\]" } | Select-Object -Last 1
@@ -1588,7 +1626,27 @@ $summary = [pscustomobject]@{
     requested_warmup_max_tokens = $(if ($Warmup) { $effectiveWarmupMaxTokens } else { 0 })
     context_requested = $Context
     context_observed = $contextObserved
+    prefill_chunk_requested = $PrefillChunk
     prefill_chunk_observed = $prefillChunkObserved
+    prefill_union_stats_requested = [bool]$PrefillUnionStats
+    prefill_union_stats_observed = $prefillUnionObserved
+    prefill_union_calls = $prefillUnionCalls
+    prefill_union_tokens = $prefillUnionTokens
+    prefill_union_selected_slots = $prefillUnionSelectedSlots
+    prefill_union_unique_experts = $prefillUnionUniqueExperts
+    prefill_union_dedup_ratio = $prefillUnionDedupRatio
+    prefill_union_max_tokens = $prefillUnionMaxTokens
+    prefill_union_max_union = $prefillUnionMaxUnion
+    prefill_union_arena_experts = $prefillUnionArenaExperts
+    prefill_union_cache_hits = $prefillUnionCacheHits
+    prefill_union_cache_admissions = $prefillUnionCacheAdmissions
+    prefill_union_direct_experts = $prefillUnionDirectExperts
+    prefill_union_spex_experts = $prefillUnionSpexExperts
+    prefill_union_nonresident_experts = $prefillUnionNonresidentExperts
+    prefill_union_source_span_bytes = $prefillUnionSourceSpanBytes
+    prefill_union_arena_h2d_bytes = $prefillUnionArenaH2DBytes
+    prefill_union_cache_d2d_bytes = $prefillUnionCacheD2DBytes
+    prefill_union_upload_syncs = $prefillUnionUploadSyncs
     raw_kv_rows_observed = $rawKvRowsObserved
     compressed_kv_rows_observed = $compressedKvRowsObserved
     server_arguments = $argList
@@ -1906,6 +1964,8 @@ Write-Host ("server decode t/s mean/min/max: " + $serverDecodeMeanTps + " / " + 
 Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
+Write-Host ("prefill union requested/observed calls/tokens/slots/unique/dedup/max-union: " + [bool]$PrefillUnionStats + " / " + $prefillUnionObserved + " / " + $prefillUnionCalls + " / " + $prefillUnionTokens + " / " + $prefillUnionSelectedSlots + " / " + $prefillUnionUniqueExperts + " / " + $prefillUnionDedupRatio + " / " + $prefillUnionMaxUnion)
+Write-Host ("prefill union source/arena-H2D/cache-D2D GiB, syncs: " + [math]::Round($prefillUnionSourceSpanBytes / 1GB, 3) + " / " + [math]::Round($prefillUnionArenaH2DBytes / 1GB, 3) + " / " + [math]::Round($prefillUnionCacheD2DBytes / 1GB, 3) + " / " + $prefillUnionUploadSyncs)
 Write-Host ("Q8-F16 cap/reserve MiB requested: " + $Q8F16CacheMB + " / " + $Q8F16CacheReserveMB)
 Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
 Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [bool]$PrefillMassObserve + " / " + [bool]$PrefillMassWrap + " / " + $prefillMassPolicy + " / " + $prefillMassArmed + " / " + $prefillMassFinalized)

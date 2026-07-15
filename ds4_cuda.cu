@@ -13594,6 +13594,35 @@ struct cuda_moe_gather {
 };
 static cuda_moe_gather g_moe_gather;
 
+/* Observe the existing per-layer/chunk union without changing execution. */
+struct cuda_prefill_union_stats {
+    uint64_t calls;
+    uint64_t tokens;
+    uint64_t selected_slots;
+    uint64_t unique_experts;
+    uint64_t arena_experts;
+    uint64_t cache_hit_experts;
+    uint64_t cache_admitted_experts;
+    uint64_t direct_experts;
+    uint64_t spex_experts;
+    uint64_t nonresident_experts;
+    uint64_t source_span_bytes;
+    uint64_t arena_h2d_bytes;
+    uint64_t cache_d2d_bytes;
+    uint64_t upload_syncs;
+    uint32_t max_tokens;
+    uint32_t max_union;
+};
+static cuda_prefill_union_stats g_prefill_union_stats;
+
+static uint64_t cuda_u64_saturating_add(uint64_t a, uint64_t b) {
+    return b > UINT64_MAX - a ? UINT64_MAX : a + b;
+}
+
+static uint64_t cuda_u64_saturating_mul(uint64_t a, uint64_t b) {
+    return a != 0 && b > UINT64_MAX / a ? UINT64_MAX : a * b;
+}
+
 struct cuda_moe_selected_prepared {
     const void *model_map;
     const void *selected_ptr;
@@ -14389,6 +14418,31 @@ static void cuda_moe_expert_cache_release(void) {
 }
 
 static void cuda_moe_gather_release(void) {
+    if (g_prefill_union_stats.calls != 0) {
+        const double dedup_ratio =
+            (double)g_prefill_union_stats.selected_slots /
+            (double)g_prefill_union_stats.unique_experts;
+        fprintf(stderr,
+                "ds4: [prefill-union] final calls=%llu tokens=%llu selected_slots=%llu unique_experts=%llu dedup_ratio=%.9g max_tokens=%u max_union=%u arena_experts=%llu cache_hits=%llu cache_admissions=%llu direct_experts=%llu spex_experts=%llu nonresident_experts=%llu source_span_bytes=%llu arena_h2d_bytes=%llu cache_d2d_bytes=%llu upload_syncs=%llu\n",
+                (unsigned long long)g_prefill_union_stats.calls,
+                (unsigned long long)g_prefill_union_stats.tokens,
+                (unsigned long long)g_prefill_union_stats.selected_slots,
+                (unsigned long long)g_prefill_union_stats.unique_experts,
+                dedup_ratio,
+                g_prefill_union_stats.max_tokens,
+                g_prefill_union_stats.max_union,
+                (unsigned long long)g_prefill_union_stats.arena_experts,
+                (unsigned long long)g_prefill_union_stats.cache_hit_experts,
+                (unsigned long long)g_prefill_union_stats.cache_admitted_experts,
+                (unsigned long long)g_prefill_union_stats.direct_experts,
+                (unsigned long long)g_prefill_union_stats.spex_experts,
+                (unsigned long long)g_prefill_union_stats.nonresident_experts,
+                (unsigned long long)g_prefill_union_stats.source_span_bytes,
+                (unsigned long long)g_prefill_union_stats.arena_h2d_bytes,
+                (unsigned long long)g_prefill_union_stats.cache_d2d_bytes,
+                (unsigned long long)g_prefill_union_stats.upload_syncs);
+    }
+    g_prefill_union_stats = {};
     g_moe_selected_prepared.valid = 0;
     g_moe_last_selected.valid = 0;
     if (g_moe_gather.gate) (void)cudaFree(g_moe_gather.gate);
@@ -15671,6 +15725,8 @@ static int cuda_moe_selected_load(
     g_moe_gather.mixed_cache_routes = 0;
     g_moe_gather.mixed_compact_routes = 0;
     const int route_prof = getenv("DS4_CUDA_MOE_ROUTE_PROFILE") != NULL;
+    const int prefill_union_stats = n_tokens > 1u &&
+        getenv("DS4_CUDA_PREFILL_UNION_STATS") != NULL;
     const double route_t0 = route_prof ? cuda_wall_sec() : 0.0;
     double route_t_d2h = route_t0;
     double route_t_observe = route_t0;
@@ -16201,6 +16257,57 @@ static int cuda_moe_selected_load(
         cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 0, 0);
         if (cache) cuda_moe_expert_cache_invalidate();
         return 0;
+    }
+    if (prefill_union_stats) {
+        uint64_t arena_experts = 0;
+        uint64_t cache_copies = 0;
+        uint64_t source_span_bytes = 0;
+        uint64_t expert_bytes = UINT64_MAX;
+        for (uint8_t resident : arena_resident) arena_experts += resident != 0;
+        for (int32_t cache_slot : cache_slots) cache_copies += cache_slot >= 0;
+        for (const cuda_moe_gather::span &span : spans) {
+            source_span_bytes = cuda_u64_saturating_add(source_span_bytes, span.bytes);
+        }
+        if (gate_expert_bytes <= (UINT64_MAX - down_expert_bytes) / 2ull) {
+            expert_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+        }
+        g_prefill_union_stats.calls =
+            cuda_u64_saturating_add(g_prefill_union_stats.calls, 1);
+        g_prefill_union_stats.tokens =
+            cuda_u64_saturating_add(g_prefill_union_stats.tokens, n_tokens);
+        g_prefill_union_stats.selected_slots =
+            cuda_u64_saturating_add(g_prefill_union_stats.selected_slots, slot_count);
+        g_prefill_union_stats.unique_experts =
+            cuda_u64_saturating_add(g_prefill_union_stats.unique_experts, compact_count);
+        g_prefill_union_stats.arena_experts =
+            cuda_u64_saturating_add(g_prefill_union_stats.arena_experts, arena_experts);
+        g_prefill_union_stats.cache_hit_experts =
+            cuda_u64_saturating_add(g_prefill_union_stats.cache_hit_experts, local_hits);
+        g_prefill_union_stats.cache_admitted_experts = cuda_u64_saturating_add(
+            g_prefill_union_stats.cache_admitted_experts, admission_slots.size());
+        g_prefill_union_stats.direct_experts =
+            cuda_u64_saturating_add(g_prefill_union_stats.direct_experts, local_direct);
+        g_prefill_union_stats.spex_experts = cuda_u64_saturating_add(
+            g_prefill_union_stats.spex_experts, spex_prefetch_slot >= 0);
+        g_prefill_union_stats.nonresident_experts = cuda_u64_saturating_add(
+            g_prefill_union_stats.nonresident_experts,
+            compact_count - arena_experts - local_hits);
+        g_prefill_union_stats.source_span_bytes = cuda_u64_saturating_add(
+            g_prefill_union_stats.source_span_bytes, source_span_bytes);
+        g_prefill_union_stats.arena_h2d_bytes = cuda_u64_saturating_add(
+            g_prefill_union_stats.arena_h2d_bytes,
+            cuda_u64_saturating_mul(arena_experts, expert_bytes));
+        g_prefill_union_stats.cache_d2d_bytes = cuda_u64_saturating_add(
+            g_prefill_union_stats.cache_d2d_bytes,
+            cuda_u64_saturating_mul(cache_copies, expert_bytes));
+        g_prefill_union_stats.upload_syncs = cuda_u64_saturating_add(
+            g_prefill_union_stats.upload_syncs, upload_sync_required != 0);
+        if (n_tokens > g_prefill_union_stats.max_tokens) {
+            g_prefill_union_stats.max_tokens = n_tokens;
+        }
+        if (compact_count > g_prefill_union_stats.max_union) {
+            g_prefill_union_stats.max_union = compact_count;
+        }
     }
     if (cache) {
         for (size_t i = 0; i < admission_slots.size(); i++) {

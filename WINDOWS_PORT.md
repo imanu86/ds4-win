@@ -69,6 +69,16 @@ less RAM-to-GPU churn. This is still a short deterministic prompt gate; the
 policy remains opt-in pending a longer workload and domain-switch A/B. See
 `G36_MASS_LFRU_TIERING_RESULTS.md`.
 
+G37 confirms that CUDA prefill already deduplicates the complete routed-expert
+union once per layer/chunk. Its opt-in counter has effectively zero measured
+overhead (-0.21% TTFT, within run noise). On the exact 43-token cyberpunk prompt, reducing the
+chunk from full to 16 and 8 increased logical expert-union traffic by 52.59%
+and 92.35%, while TTFT rose by 14.07% and 37.70%. All 27 measured outputs and
+nine warmups matched the expected hash. The remaining P4 work is therefore not
+another batch-union implementation; it is a separately gated wave executor that
+allows wider chunks while bounding compact staging VRAM. See
+`G37_PREFILL_UNION_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -85,8 +95,8 @@ Follow-on measured gates are:
 
 1. Validate G36 mass/LFRU on a longer exact workload and a domain switch before
    changing the default from `second-touch`.
-2. Add batch-union and waved prefill as separate gates so each unique expert is
-   loaded once per layer/chunk.
+2. P4-A batch-union is measured complete in G37. Add P4-B waved prefill only for
+   unions that would exceed the configured compact staging capacity.
 3. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
    speculative traffic.
 4. Parallel transfer streams where the trace proves serialization remains.
