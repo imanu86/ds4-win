@@ -43,7 +43,7 @@ add_library(ds4_bake STATIC ds4_bake.c)
 target_include_directories(ds4_bake PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 add_library(ds4 STATIC ds4.c ds4_spex_predict.c rax.c)
-target_link_libraries(ds4 PUBLIC ds4_platform)
+target_link_libraries(ds4 PUBLIC ds4_platform ds4_bake)
 if(WIN32)
     target_link_libraries(ds4 PUBLIC bcrypt)
 endif()

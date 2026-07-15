@@ -47,6 +47,7 @@
 #endif
 
 #include "ds4.h"
+#include "ds4_bake.h"
 #include "ds4_spex_predict.h"
 #include "src/platform/os_clock.h"
 #include "src/platform/os_mmap.h"
@@ -124,6 +125,11 @@ enum {
     DS4_N_HC               = 4,
     DS4_N_HC_SINKHORN_ITER = 20,
 };
+
+_Static_assert(DS4_N_LAYER == DS4_BAKE_LAYERS,
+               "DS4 bake layer geometry must match the runtime");
+_Static_assert(DS4_N_EXPERT == DS4_BAKE_EXPERTS,
+               "DS4 bake expert geometry must match the runtime");
 
 #ifdef _WIN32
 static HANDLE g_ds4_lock_handle = INVALID_HANDLE_VALUE;
@@ -948,6 +954,8 @@ typedef struct {
     os_mmap_t mmap;
     const uint8_t *map;
     uint64_t size;
+    bool bake_embedded;
+    ds4_bake_meta bake;
 
     uint32_t version;
     uint64_t n_kv;
@@ -958,6 +966,8 @@ typedef struct {
     ds4_kv *kv;
     ds4_tensor *tensors;
 } ds4_model;
+
+static void model_validate_bake_tensors(const ds4_model *m);
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -1240,6 +1250,27 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->map = m->mmap.addr;
     m->size = m->mmap.size;
 
+    char bake_error[256];
+    const ds4_bake_probe_result bake_result = ds4_bake_probe(
+        m->map, m->mmap.size, &m->bake, bake_error, sizeof(bake_error));
+    if (bake_result == DS4_BAKE_PROBE_INVALID) {
+        fprintf(stderr, "ds4: invalid sparse bake trailer: %s\n", bake_error);
+        exit(1);
+    }
+    if (bake_result == DS4_BAKE_PROBE_VALID) {
+        m->bake_embedded = true;
+        m->size = m->bake.source_size;
+        fprintf(stderr,
+                "ds4: sparse bake validated: logical=%" PRIu64
+                " mapped=%" PRIu64 " mask_sha256=%s source_sha256=%s\n",
+                m->size,
+                m->mmap.size,
+                m->bake.mask_sha256,
+                m->bake.source_model_sha256_present
+                    ? m->bake.source_model_sha256
+                    : "not-embedded");
+    }
+
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
     if (!cursor_u32(&c, &magic)) ds4_die(c.error);
@@ -1252,8 +1283,11 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    model_validate_bake_tensors(m);
 
-    if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+    if (!m->bake_embedded && !metal_mapping && prefetch_cpu) {
+        model_prefetch_cpu_mapping(m);
+    }
 }
 
 static void print_size(uint64_t bytes) {
@@ -1355,6 +1389,37 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
         }
     }
     return NULL;
+}
+
+static void model_validate_bake_tensors(const ds4_model *m) {
+    if (!m || !m->bake_embedded) return;
+
+    for (uint32_t layer = 0; layer < DS4_BAKE_LAYERS; layer++) {
+        for (uint32_t kind = 0; kind < DS4_BAKE_TENSOR_KINDS; kind++) {
+            const ds4_bake_tensor_record *record =
+                &m->bake.routed_tensors[layer][kind];
+            const ds4_tensor *tensor = model_find_tensor(m, record->name);
+            const bool slice_valid = tensor && tensor->bytes % DS4_N_EXPERT == 0;
+            const uint64_t slice_bytes = slice_valid
+                ? tensor->bytes / DS4_N_EXPERT
+                : 0;
+
+            if (!tensor || tensor->ndim != 3 ||
+                tensor->dim[2] != DS4_N_EXPERT ||
+                tensor->type != record->tensor_type ||
+                tensor->abs_offset != record->offset ||
+                tensor->bytes != record->bytes ||
+                !slice_valid || slice_bytes != record->slice_bytes ||
+                record->selected_count != m->bake.retained_count[layer])
+            {
+                fprintf(stderr,
+                        "ds4: sparse bake tensor geometry mismatch: "
+                        "layer=%u kind=%u tensor=%s\n",
+                        layer, kind, record->name);
+                exit(1);
+            }
+        }
+    }
 }
 
 #ifndef DS4_NO_GPU
@@ -18398,10 +18463,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, true);
-    if (opt->warm_weights) model_warm_weights(&e->model);
+    if (opt->warm_weights && !e->model.bake_embedded) {
+        model_warm_weights(&e->model);
+    }
     vocab_load(&e->vocab, &e->model);
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
+    if (e->model.bake_embedded) {
+        fprintf(stderr,
+                "ds4: sparse bake runtime guards are not installed yet; "
+                "refusing inference\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -18409,6 +18484,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->mtp_path && opt->mtp_path[0]) {
         model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        if (e->mtp_model.bake_embedded) {
+            fprintf(stderr,
+                    "ds4: sparse bake containers are not valid MTP support models\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         mtp_weights_bind(&e->mtp_weights, &e->mtp_model);
         e->mtp_ready = true;
         fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
