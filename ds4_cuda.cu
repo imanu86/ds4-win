@@ -14389,6 +14389,8 @@ struct cuda_moe_expert_cache {
     uint64_t route_miss_experts;
     uint64_t route_worker_errors;
     uint64_t route_split_calls;
+    uint64_t route_default_sync_calls;
+    uint64_t route_no_default_sync_calls;
     double route_worker_seconds;
     double route_resolve_sync_seconds;
     double route_ready_wait_seconds;
@@ -14404,6 +14406,11 @@ static int cuda_moe_gpu_routes_requested(void) {
 
 static int cuda_moe_split_hit_miss_requested(void) {
     const char *env = getenv("DS4_CUDA_MOE_SPLIT_HIT_MISS");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int cuda_moe_route_no_default_sync_requested(void) {
+    const char *env = getenv("DS4_CUDA_MOE_ROUTE_NO_DEFAULT_SYNC");
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
@@ -15066,7 +15073,7 @@ static void cuda_moe_expert_cache_release(void) {
     if (g_moe_expert_cache.route_calls != 0 ||
         g_moe_expert_cache.route_worker_jobs != 0) {
         fprintf(stderr,
-                "ds4: [gpu-resident-routes] final calls=%llu split_calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu\n",
+                "ds4: [gpu-resident-routes] final calls=%llu split_calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu default_sync=%llu no_default_sync=%llu\n",
                 (unsigned long long)g_moe_expert_cache.route_calls,
                 (unsigned long long)g_moe_expert_cache.route_split_calls,
                 (unsigned long long)g_moe_expert_cache.route_all_hit_observed,
@@ -15082,7 +15089,9 @@ static void cuda_moe_expert_cache_release(void) {
                 g_moe_expert_cache.route_calls ?
                     1000.0 * g_moe_expert_cache.route_ready_wait_seconds /
                         (double)g_moe_expert_cache.route_calls : 0.0,
-                (unsigned long long)g_moe_expert_cache.route_stream_queries);
+                (unsigned long long)g_moe_expert_cache.route_stream_queries,
+                (unsigned long long)g_moe_expert_cache.route_default_sync_calls,
+                (unsigned long long)g_moe_expert_cache.route_no_default_sync_calls);
     }
     cuda_moe_tiering_report_and_reset();
     if (g_moe_expert_cache.gate) (void)cudaFree(g_moe_expert_cache.gate);
@@ -15171,6 +15180,8 @@ static void cuda_moe_expert_cache_release(void) {
     g_moe_expert_cache.route_miss_experts = 0;
     g_moe_expert_cache.route_worker_errors = 0;
     g_moe_expert_cache.route_split_calls = 0;
+    g_moe_expert_cache.route_default_sync_calls = 0;
+    g_moe_expert_cache.route_no_default_sync_calls = 0;
     g_moe_expert_cache.route_worker_seconds = 0.0;
     g_moe_expert_cache.route_resolve_sync_seconds = 0.0;
     g_moe_expert_cache.route_ready_wait_seconds = 0.0;
@@ -18029,14 +18040,19 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
         uint32_t layer_index,
         int split_hit_miss) {
     if (!cache || sequence == 0u) return NULL;
-    const double resolve_started = cuda_wall_sec();
-    const cudaError_t resolve_err = cudaStreamSynchronize(0);
-    cache->route_resolve_sync_seconds += cuda_wall_sec() - resolve_started;
-    if (resolve_err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA GPU-resident route resolver sync failed: %s\n",
-                cudaGetErrorString(resolve_err));
-        abort();
+    if (cuda_moe_route_no_default_sync_requested()) {
+        cache->route_no_default_sync_calls++;
+    } else {
+        cache->route_default_sync_calls++;
+        const double resolve_started = cuda_wall_sec();
+        const cudaError_t resolve_err = cudaStreamSynchronize(0);
+        cache->route_resolve_sync_seconds += cuda_wall_sec() - resolve_started;
+        if (resolve_err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA GPU-resident route resolver sync failed: %s\n",
+                    cudaGetErrorString(resolve_err));
+            abort();
+        }
     }
     const double wait_started = cuda_wall_sec();
     const double wait_deadline = wait_started + 5.0;
