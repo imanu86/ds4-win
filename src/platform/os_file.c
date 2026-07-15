@@ -120,6 +120,33 @@ int os_file_dup(os_file_t *dst, const os_file_t *src) {
 #endif
 }
 
+int os_file_reopen_read_sequential(os_file_t *dst, const os_file_t *src,
+                                   int overlapped) {
+    if (!dst || !os_file_valid(src)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (os_file_valid(dst)) {
+        errno = EBUSY;
+        return -1;
+    }
+    os_file_init(dst);
+#ifdef _WIN32
+    DWORD flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN;
+    if (overlapped) flags |= FILE_FLAG_OVERLAPPED;
+    HANDLE h = ReOpenFile(src->h, GENERIC_READ, FILE_SHARE_READ, flags);
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = os_win_error_to_errno(GetLastError());
+        return -1;
+    }
+    dst->h = h;
+    return 0;
+#else
+    (void)overlapped;
+    return os_file_dup(dst, src);
+#endif
+}
+
 FILE *os_fopen(const char *path_utf8, const char *mode) {
 #ifdef _WIN32
     wchar_t wpath[OS_MAX_PATH_W];
