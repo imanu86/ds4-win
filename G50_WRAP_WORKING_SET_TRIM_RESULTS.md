@@ -33,6 +33,8 @@ working set:
 - `ds4_cuda.cu` SHA256: `ef742a9a208d23e622736ae8e5994f37bd196311eb19acf1431d71c3534e8e97`
 - Measurement harness SHA256: `9ec229f0f0ece34be730c5f86ef015d8d70271e4b376b5becad03f6ae36a4024`
 - Post-study harness with process-isolation gate SHA256: `c2505e10eb36b41a2a90342017dcb29810615fef576a90b9f9e1eb3975c14700`
+- Final post-study harness with process and system-quiescence gates SHA256:
+  `dc6c06aeea8439607984fda29284fb0ccaeb47eea666562d525a6ed68fa0f5f1`
 - Build-manifest SHA256: `3f69d5a7b40a3348f92f96669836c55301e77da9a6397b39e1c18ab179141db5`
 - Runner SHA256: `c3a5213fc383ce84ea23ae31077c74339633419ab4f8044edc488304a9db969a`
 - Model: `C:\ds4-models\ds4-2bit.gguf` (86,720,111,488 bytes)
@@ -72,7 +74,7 @@ Rispondi in italiano con quattro punti numerati: spiega la differenza tra RAM,
 VRAM e memoria virtuale. Sii conciso.
 ```
 
-## Process isolation audit
+## Benchmark isolation audit
 
 The 11 completed measurements used 11 distinct `ds4_server.exe` PIDs. Runtime
 telemetry intervals were checked chronologically and none overlapped the
@@ -86,10 +88,21 @@ compute process. A post-study harness gate now:
 1. acquires `Local\DS4_G7_MEASUREMENT_LOCK` non-blockingly;
 2. fails closed if another `ds4_server.exe`, `g7_measure.ps1`, or
    `g7_runtime_monitor.ps1` process is present;
-3. records the process-isolation preflight in each future result.
+3. samples system CPU, aggregate physical-disk utilization and I/O throughput,
+   and GPU utilization before loading the model;
+4. rejects sustained median load above the default 60% CPU, 30% disk, 64 MiB/s
+   disk I/O, or 85% GPU thresholds;
+5. records both preflights and their raw samples in each future result.
 
 The mutex rejection path was tested with a separate holder process and refused
-the second harness before model launch.
+the second harness before model launch. The quiescence gate was tested without
+model launch: an intentional zero-percent CPU threshold was rejected, while the
+default thresholds passed on a measured 24% CPU, 0% disk, 0.016 MiB/s disk I/O,
+and 0% GPU median window. The successful probe immediately after the refusal
+also proves the mutex was released on the error path. Both probes used the
+dedicated no-launch mode and record the command, harness, Git, executable,
+build-manifest, model, and prompt provenance plus actual sample cadence.
+These gates were added after G50 and do not retroactively alter its measurements.
 
 ## Exactness and transport
 

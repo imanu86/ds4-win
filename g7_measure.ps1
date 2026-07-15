@@ -85,10 +85,25 @@ param(
     [switch]$RequestPhaseTrace,
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [switch]$SkipMemoryPreflight,
-    [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0
+    [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0,
+    [switch]$SkipSystemQuiescencePreflight,
+    [switch]$QuiescenceProbeOnly,
+    [ValidateRange(3, 60)][int]$QuiescenceSamples = 5,
+    [ValidateRange(100, 10000)][int]$QuiescenceIntervalMs = 1000,
+    [ValidateRange(0.0, 100.0)][double]$MaximumCpuMedianPercent = 60.0,
+    [ValidateRange(0.0, 10000.0)][double]$MaximumDiskMedianPercent = 30.0,
+    [ValidateRange(0.0, 1048576.0)][double]$MaximumDiskIoMedianMiBps = 64.0,
+    [ValidateRange(0.0, 100.0)][double]$MaximumGpuMedianPercent = 85.0
 )
 
 $ErrorActionPreference = "Stop"
+function Get-G7PreflightMedian([double[]]$Values) {
+    if ($null -eq $Values -or $Values.Count -eq 0) { return $null }
+    $sorted = @($Values | Sort-Object)
+    $middle = [int][math]::Floor($sorted.Count / 2)
+    if (($sorted.Count % 2) -eq 1) { return [double]$sorted[$middle] }
+    return ([double]$sorted[$middle - 1] + [double]$sorted[$middle]) / 2.0
+}
 if ($PromptFile) {
     $PromptFile = (Resolve-Path -LiteralPath $PromptFile).Path
     $Prompt = [IO.File]::ReadAllText($PromptFile, [Text.Encoding]::UTF8)
@@ -124,6 +139,9 @@ if ($ArenaWrapTrimBetweenPhases -and
     (-not $ArenaWrapSourceParts -or -not $ArenaWrapTrustWorkerChecksum)) {
     throw "ArenaWrapTrimBetweenPhases requires -ArenaWrapSourceParts and -ArenaWrapTrustWorkerChecksum"
 }
+if ($QuiescenceProbeOnly -and $SkipSystemQuiescencePreflight) {
+    throw "QuiescenceProbeOnly cannot be combined with SkipSystemQuiescencePreflight"
+}
 if ($RequestPhaseTrace -and ($Warmup -or $Repeats -ne 1 -or $MaxTokens -le 0)) {
     throw "RequestPhaseTrace requires one non-warmup request with MaxTokens greater than zero"
 }
@@ -157,6 +175,7 @@ $model = $ModelPath
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 $processIsolationLog = Join-Path $outdir ("g7_" + $Tag + "_process_isolation_preflight.json")
+$systemQuiescenceLog = Join-Path $outdir ("g7_" + $Tag + "_system_quiescence_preflight.json")
 $measurementMutexName = "Local\DS4_G7_MEASUREMENT_LOCK"
 $measurementMutex = New-Object System.Threading.Mutex($false, $measurementMutexName)
 $measurementLockAcquired = $false
@@ -192,6 +211,7 @@ if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
 if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
 if (Test-Path $processIsolationLog) { Remove-Item $processIsolationLog -Force }
+if (Test-Path $systemQuiescenceLog) { Remove-Item $systemQuiescenceLog -Force }
 if (Test-Path $runtimeTelemetryLog) { Remove-Item $runtimeTelemetryLog -Force }
 if (Test-Path $rawOutputsPath) { Remove-Item $rawOutputsPath -Force }
 if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
@@ -670,6 +690,143 @@ try {
         }
     }
 } catch { $gpuIdentity = $null }
+
+$quiescenceThresholds = [pscustomobject][ordered]@{
+    maximum_cpu_median_percent = $MaximumCpuMedianPercent
+    maximum_disk_median_percent = $MaximumDiskMedianPercent
+    maximum_disk_io_median_mib_per_second = $MaximumDiskIoMedianMiBps
+    maximum_gpu_median_percent = $MaximumGpuMedianPercent
+}
+$quiescenceRows = @()
+$quiescenceFailures = @()
+$quiescenceStartedUtc = [DateTime]::UtcNow
+$quiescenceStopwatch = [Diagnostics.Stopwatch]::StartNew()
+if (-not $SkipSystemQuiescencePreflight) {
+    for ($sampleIndex = 0; $sampleIndex -lt $QuiescenceSamples; $sampleIndex++) {
+        try {
+            $cpuSample = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor `
+                -Filter "Name='_Total'" -ErrorAction Stop
+            $diskSample = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk `
+                -Filter "Name='_Total'" -ErrorAction Stop
+            $gpuRaw = @(& nvidia-smi --query-gpu=index,utilization.gpu `
+                --format=csv,noheader,nounits 2>$null)
+            if ($LASTEXITCODE -ne 0 -or $gpuRaw.Count -eq 0) {
+                throw "nvidia-smi did not return GPU utilization"
+            }
+            $gpuRows = @()
+            foreach ($gpuLine in $gpuRaw) {
+                $gpuParts = @(([string]$gpuLine).Split(',') | ForEach-Object { $_.Trim() })
+                if ($gpuParts.Count -ne 2) {
+                    throw "nvidia-smi returned an unexpected GPU utilization row"
+                }
+                $gpuRows += [pscustomobject][ordered]@{
+                    index = [Convert]::ToInt32(
+                        $gpuParts[0], [Globalization.CultureInfo]::InvariantCulture)
+                    utilization_percent = [Convert]::ToDouble(
+                        $gpuParts[1], [Globalization.CultureInfo]::InvariantCulture)
+                }
+            }
+            $gpuPercent = [double](($gpuRows | Measure-Object `
+                -Property utilization_percent -Maximum).Maximum)
+            $diskIoMiBps = ([double]$diskSample.DiskReadBytesPerSec +
+                [double]$diskSample.DiskWriteBytesPerSec) / 1MB
+            $quiescenceRows += [pscustomobject][ordered]@{
+                sample = $sampleIndex + 1
+                timestamp_utc = [DateTime]::UtcNow.ToString(
+                    "o", [Globalization.CultureInfo]::InvariantCulture)
+                elapsed_ms = [math]::Round($quiescenceStopwatch.Elapsed.TotalMilliseconds, 3)
+                cpu_percent = [double]$cpuSample.PercentProcessorTime
+                disk_percent = [double]$diskSample.PercentDiskTime
+                disk_read_mib_per_second = [double]$diskSample.DiskReadBytesPerSec / 1MB
+                disk_write_mib_per_second = [double]$diskSample.DiskWriteBytesPerSec / 1MB
+                disk_io_mib_per_second = $diskIoMiBps
+                gpu_percent = $gpuPercent
+                gpu_utilization_percent_by_index = $gpuRows
+            }
+        } catch {
+            $quiescenceFailures += "sample-error: " + $_.Exception.Message
+            break
+        }
+        if ($sampleIndex + 1 -lt $QuiescenceSamples) {
+            Start-Sleep -Milliseconds $QuiescenceIntervalMs
+        }
+    }
+}
+$quiescenceStopwatch.Stop()
+$cpuMedian = Get-G7PreflightMedian @($quiescenceRows | ForEach-Object { [double]$_.cpu_percent })
+$diskMedian = Get-G7PreflightMedian @($quiescenceRows | ForEach-Object { [double]$_.disk_percent })
+$diskIoMedian = Get-G7PreflightMedian @($quiescenceRows | ForEach-Object { [double]$_.disk_io_mib_per_second })
+$gpuMedian = Get-G7PreflightMedian @($quiescenceRows | ForEach-Object { [double]$_.gpu_percent })
+$observedIntervalsMs = @()
+for ($sampleIndex = 1; $sampleIndex -lt $quiescenceRows.Count; $sampleIndex++) {
+    $observedIntervalsMs += [double]$quiescenceRows[$sampleIndex].elapsed_ms -
+        [double]$quiescenceRows[$sampleIndex - 1].elapsed_ms
+}
+$observedIntervalMedianMs = Get-G7PreflightMedian $observedIntervalsMs
+if (-not $SkipSystemQuiescencePreflight -and $quiescenceRows.Count -ne $QuiescenceSamples) {
+    $quiescenceFailures += "incomplete-sample-window"
+}
+if (-not $SkipSystemQuiescencePreflight -and $quiescenceRows.Count -eq $QuiescenceSamples) {
+    if ($cpuMedian -gt $MaximumCpuMedianPercent) {
+        $quiescenceFailures += "cpu-median-above-threshold"
+    }
+    if ($diskMedian -gt $MaximumDiskMedianPercent) {
+        $quiescenceFailures += "disk-median-above-threshold"
+    }
+    if ($diskIoMedian -gt $MaximumDiskIoMedianMiBps) {
+        $quiescenceFailures += "disk-io-median-above-threshold"
+    }
+    if ($gpuMedian -gt $MaximumGpuMedianPercent) {
+        $quiescenceFailures += "gpu-median-above-threshold"
+    }
+}
+$systemQuiescencePreflight = [pscustomobject][ordered]@{
+    schema = "g7_system_quiescence_preflight_v1"
+    checked_utc = [DateTime]::UtcNow.ToString(
+        "o", [Globalization.CultureInfo]::InvariantCulture)
+    sample_window_started_utc = $quiescenceStartedUtc.ToString(
+        "o", [Globalization.CultureInfo]::InvariantCulture)
+    tag = $Tag
+    command_line = [Environment]::CommandLine
+    harness_sha256 = $harnessHashAtStart
+    git_head = ([string]$headAtStart).Trim()
+    worktree_dirty = $worktreeDirtyAtStart
+    executable_sha256 = $exeHashAtStart
+    build_manifest_sha256 = $buildManifestHashAtStart
+    model_path = $modelInfoAtStart.FullName
+    model_size_bytes = [Int64]$modelInfoAtStart.Length
+    prompt_sha256 = $promptHash
+    context = $Context
+    max_tokens = $MaxTokens
+    probe_only = [bool]$QuiescenceProbeOnly
+    skipped = [bool]$SkipSystemQuiescencePreflight
+    requested_samples = $QuiescenceSamples
+    completed_samples = $quiescenceRows.Count
+    requested_sleep_interval_ms = $QuiescenceIntervalMs
+    observed_interval_median_ms = $observedIntervalMedianMs
+    observed_window_ms = [math]::Round($quiescenceStopwatch.Elapsed.TotalMilliseconds, 3)
+    gpu_scope = "maximum-utilization-across-visible-gpus"
+    thresholds = $quiescenceThresholds
+    cpu_median_percent = $cpuMedian
+    disk_median_percent = $diskMedian
+    disk_io_median_mib_per_second = $diskIoMedian
+    gpu_median_percent = $gpuMedian
+    failures = $quiescenceFailures
+    samples = $quiescenceRows
+    ready_to_launch = [bool]($SkipSystemQuiescencePreflight -or $quiescenceFailures.Count -eq 0)
+}
+$systemQuiescenceJson = $systemQuiescencePreflight | ConvertTo-Json -Depth 8
+if (-not $systemQuiescencePreflight.ready_to_launch) {
+    $systemQuiescenceJson |
+        Set-Content -LiteralPath $systemQuiescenceLog -Encoding UTF8
+    throw ("System quiescence preflight refused launch: " + ($quiescenceFailures -join ", "))
+}
+if ($QuiescenceProbeOnly) {
+    $systemQuiescenceJson |
+        Set-Content -LiteralPath $systemQuiescenceLog -Encoding UTF8
+    Write-Host "[g7] system quiescence probe completed; model launch intentionally skipped"
+    return
+}
 
 $serverMaxTokens = [math]::Max($MaxTokens, $effectiveWarmupMaxTokens)
 $argList = @("-m", $model, "--cuda", "-c", "$Context", "-n", "$serverMaxTokens", "--host", "127.0.0.1", "--port", "$Port")
@@ -2429,6 +2586,7 @@ $summary = [pscustomobject]@{
     diagnostics = [bool]$Diagnostics
     memory_preflight = $memoryPreflight
     process_isolation_preflight = $processIsolationPreflight
+    system_quiescence_preflight = $systemQuiescencePreflight
     runtime_telemetry = $runtimeTelemetry
     moe_io_queue_depth = $IoQD
     moe_io_queue_depth_observed = $observedIoQD
@@ -2582,6 +2740,8 @@ $summary = [pscustomobject]@{
     results = $results
 }
 $summary | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $resultPath
+$systemQuiescenceJson |
+    Set-Content -LiteralPath $systemQuiescenceLog -Encoding UTF8
 
 Write-Host ""
 Write-Host "================ G7 RESULT ($Tag) ================"
