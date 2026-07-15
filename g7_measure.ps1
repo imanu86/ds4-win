@@ -1257,7 +1257,7 @@ $prefillMassWrapRouter = "not_observed"; $prefillMassWrapMask = "not_observed"
 $prefillMassComposeObserved = $false; $prefillMassComposeEventCount = 0
 $prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
 $prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
-$prefillMassComposeCapacity = 0
+$prefillMassComposeCapacity = 0; $prefillMassComposeCandidateFNV1A64 = "not_observed"
 $prefillVramSeedObserved = $false; $prefillVramSeedLineCount = 0
 $prefillVramSeedResult = "not_observed"; $prefillVramSeedReason = "not_observed"
 $prefillVramSeedRequestedObserved = 0; $prefillVramSeedLayers = 0
@@ -1789,13 +1789,14 @@ if (Test-Path $stderrLog) {
     $prefillMassComposeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-compose\]" })
     $prefillMassComposeEventCount = $prefillMassComposeLines.Count
     $prefillMassComposeLine = $prefillMassComposeLines | Select-Object -Last 1
-    if ($prefillMassComposeLine -and $prefillMassComposeLine -match "hash_layers=(\d+) hash_seed_entries=(\d+) ranked_entries=(\d+) total_candidate=(\d+) capacity=(\d+)") {
+    if ($prefillMassComposeLine -and $prefillMassComposeLine -match "hash_layers=(\d+) hash_seed_entries=(\d+) ranked_entries=(\d+) total_candidate=(\d+) capacity=(\d+) candidate_fnv1a64=([0-9a-f]{16})") {
         $prefillMassComposeObserved = $true
         $prefillMassComposeHashLayers = [int]$Matches[1]
         $prefillMassComposeHashSeedEntries = [long]$Matches[2]
         $prefillMassComposeRankedEntries = [long]$Matches[3]
         $prefillMassComposeTotalCandidate = [long]$Matches[4]
         $prefillMassComposeCapacity = [long]$Matches[5]
+        $prefillMassComposeCandidateFNV1A64 = $Matches[6]
     }
     $prefillMassDecodeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" } | Select-Object -Last 1
     if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=([a-z-]+)") {
@@ -2283,6 +2284,7 @@ if ($PrefillMassWrap) {
         if ($prefillMassComposeHashLayers -ne 3 -or $prefillMassComposeHashSeedEntries -ne (3 * 256)) { throw "Prefill mass compose failed: hash-routed layer seed differs" }
         if ($prefillMassComposeTotalCandidate -ne $prefillMassCandidate -or $prefillMassComposeCapacity -ne $prefillMassCapacity) { throw "Prefill mass compose failed: candidate/capacity telemetry differs" }
         if ($prefillMassComposeRankedEntries + $prefillMassComposeHashSeedEntries -ne $prefillMassComposeTotalCandidate) { throw "Prefill mass compose failed: ranked/hash candidate accounting differs" }
+        if ($prefillMassComposeCandidateFNV1A64 -notmatch '^[0-9a-f]{16}$') { throw "Prefill mass compose failed: candidate fingerprint missing" }
     } elseif ($prefillMassComposeEventCount -ne 0 -or $prefillMassComposeObserved) {
         throw "Prefill mass compose telemetry appeared while not requested"
     }
@@ -2874,6 +2876,7 @@ $summary = [pscustomobject]@{
     prefill_mass_compose_ranked_entries = $prefillMassComposeRankedEntries
     prefill_mass_compose_total_candidate = $prefillMassComposeTotalCandidate
     prefill_mass_compose_capacity = $prefillMassComposeCapacity
+    prefill_mass_compose_candidate_fnv1a64 = $prefillMassComposeCandidateFNV1A64
     prefill_mass_layers = $prefillMassLayers
     prefill_mass_rows_min = $prefillMassRowsMin
     prefill_mass_rows_max = $prefillMassRowsMax

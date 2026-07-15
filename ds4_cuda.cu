@@ -5556,11 +5556,14 @@ static void cuda_prefill_mass_observer_finalize(void) {
     }
     observer.candidate_entries = capacity + (uint32_t)hash_entries;
     if (compose_requested > 0) {
+        const uint64_t candidate_hash = cuda_dynamic_arena_fnv1a64(
+            observer.candidate.data(), observer.candidate.size());
         fprintf(stderr,
-                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u mass_source=full-probability-normalized-per-token\n",
+                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u candidate_fnv1a64=%016llx mass_source=full-probability-normalized-per-token\n",
                 hash_layers, (uint32_t)hash_entries, capacity,
                 observer.candidate_entries,
-                (uint32_t)residency_capacity);
+                (uint32_t)residency_capacity,
+                (unsigned long long)candidate_hash);
     }
 
     uint32_t rows_min = UINT32_MAX;

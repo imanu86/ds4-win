@@ -289,7 +289,8 @@ function Invoke-G51Run {
         "prefill_vram_seed_entries",
         "prefill_vram_seed_bytes",
         "prefill_vram_seed_seconds",
-        "prefill_vram_seed_failures")) {
+        "prefill_vram_seed_failures",
+        "prefill_mass_compose_candidate_fnv1a64")) {
         Assert-G51Property -Object $r -Name $name -Tag $Tag
     }
 
@@ -496,6 +497,8 @@ function Invoke-G51Run {
             [double]$r.gpu_resident_routes_wait_ms_per_call
         route_resolve_ms_per_call =
             [double]$r.gpu_resident_routes_resolve_ms_per_call
+        candidate_mask_fnv1a64 =
+            [string]$r.prefill_mass_compose_candidate_fnv1a64
         prefill_vram_seed_requested_per_layer =
             [int]$r.prefill_vram_seed_requested_per_layer
         prefill_vram_seed_observed = [bool]$r.prefill_vram_seed_observed
@@ -621,7 +624,7 @@ $provenanceFields = @(
     "source_observed", "sequential_file_requested",
     "random_file_requested", "execution_runner_sha256",
     "transport_file_qd_requested", "transport_file_qd_requested_observed",
-    "transport_file_qd_observed", "timing_valid"
+    "transport_file_qd_observed", "timing_valid", "candidate_mask_fnv1a64"
 )
 foreach ($field in $provenanceFields) {
     $values = @($runs | ForEach-Object { [string]($_.$field) } |
