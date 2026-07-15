@@ -1,7 +1,10 @@
 param(
     [Parameter(Mandatory = $true)][int]$TargetProcessId,
     [Parameter(Mandatory = $true)][string]$OutputPath,
-    [ValidateRange(250, 10000)][int]$IntervalMs = 1000
+    [ValidateRange(250, 10000)][int]$IntervalMs = 1000,
+    [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 2.0,
+    [ValidateRange(0.0, 100000.0)][double]$MaximumDiskQueueLength = 8.0,
+    [ValidateRange(1, 60)][int]$ContaminationSamples = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -124,6 +127,32 @@ function Get-GpuProcessMemory {
     }
 }
 
+function Get-PhysicalDiskSample {
+    try {
+        $row = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk `
+            -ErrorAction Stop | Where-Object { $_.Name -eq "_Total" } |
+            Select-Object -First 1
+        if (-not $row) { throw "PhysicalDisk _Total was not found" }
+        return [pscustomobject]@{
+            seen = $true
+            percent_time = [double]$row.PercentDiskTime
+            bytes_per_second = [double]$row.DiskBytesPersec
+            read_bytes_per_second = [double]$row.DiskReadBytesPersec
+            write_bytes_per_second = [double]$row.DiskWriteBytesPersec
+            queue_length = [double]$row.CurrentDiskQueueLength
+        }
+    } catch {
+        return [pscustomobject]@{
+            seen = $false
+            percent_time = $null
+            bytes_per_second = $null
+            read_bytes_per_second = $null
+            write_bytes_per_second = $null
+            queue_length = $null
+        }
+    }
+}
+
 function Start-NvidiaSample {
     try {
         $info = New-Object Diagnostics.ProcessStartInfo
@@ -172,6 +201,7 @@ function Convert-FileTimeToSeconds {
     return [double]$ticks / 10000000.0
 }
 
+$contaminationCount = 0
 try {
     while ([NativeTelemetry]::WaitForSingleObject($handle, 0) -eq [NativeTelemetry]::WAIT_TIMEOUT) {
         $remainingMs = [int][math]::Ceiling($nextSampleMs - $clock.Elapsed.TotalMilliseconds)
@@ -180,6 +210,7 @@ try {
 
         $nvidiaProcess = Start-NvidiaSample
         $gpuMemory = Get-GpuProcessMemory -TargetPid $TargetProcessId
+        $disk = Get-PhysicalDiskSample
 
         $io = New-Object NativeTelemetry+IO_COUNTERS
         $processMemory = New-Object NativeTelemetry+PROCESS_MEMORY_COUNTERS_EX
@@ -197,6 +228,16 @@ try {
         $haveTimes = [NativeTelemetry]::GetProcessTimes(
             $handle, [ref]$creation, [ref]$exit, [ref]$kernel, [ref]$user)
         $gpu = Complete-NvidiaSample -Process $nvidiaProcess
+        $lowMemory = $haveMemory -and
+            ([double]$memory.ullAvailPhys -le $MinimumAvailableGiB * 1GB)
+        $highQueue = $disk.seen -and
+            ([double]$disk.queue_length -ge $MaximumDiskQueueLength)
+        if ($lowMemory -and $highQueue) {
+            $contaminationCount++
+        } else {
+            $contaminationCount = 0
+        }
+        $contaminationAbort = $contaminationCount -ge $ContaminationSamples
 
         $sample = [ordered]@{
             timestamp_utc = $startedUtc.AddMilliseconds($clock.Elapsed.TotalMilliseconds).ToString("o")
@@ -208,13 +249,22 @@ try {
             paged_bytes = if ($haveProcessMemory) { [Int64]$processMemory.PagefileUsage.ToUInt64() } else { $null }
             read_transfer_bytes = if ($haveIo) { [Int64]$io.ReadTransferCount } else { $null }
             write_transfer_bytes = if ($haveIo) { [Int64]$io.WriteTransferCount } else { $null }
+            read_operation_count = if ($haveIo) { [Int64]$io.ReadOperationCount } else { $null }
+            other_operation_count = if ($haveIo) { [Int64]$io.OtherOperationCount } else { $null }
             page_faults = if ($haveProcessMemory) { [Int64]$processMemory.PageFaultCount } else { $null }
             windows_available_bytes = if ($haveMemory) { [Int64]$memory.ullAvailPhys } else { $null }
             gpu_process_shared_bytes = $gpuMemory.shared_bytes
             gpu_process_dedicated_bytes = $gpuMemory.dedicated_bytes
+            disk = $disk
+            contamination_consecutive_samples = $contaminationCount
+            contamination_abort = $contaminationAbort
             nvidia = $gpu
         }
         $writer.WriteLine(($sample | ConvertTo-Json -Compress -Depth 4))
+        if ($contaminationAbort) {
+            Stop-Process -Id $TargetProcessId -Force -ErrorAction SilentlyContinue
+            break
+        }
         $nextSampleMs += $IntervalMs
     }
 } finally {

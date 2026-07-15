@@ -86,6 +86,9 @@ param(
     [switch]$GenericSortedMoe,
     [switch]$RequestPhaseTrace,
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
+    [ValidateRange(0.0, 1024.0)][double]$RuntimeMinimumAvailableGiB = 2.0,
+    [ValidateRange(0.0, 100000.0)][double]$RuntimeMaximumDiskQueueLength = 8.0,
+    [ValidateRange(1, 60)][int]$RuntimeContaminationSamples = 3,
     [switch]$SkipMemoryPreflight,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0,
     [switch]$SkipSystemQuiescencePreflight,
@@ -210,6 +213,7 @@ $stderrLog = Join-Path $outdir ("g7_" + $Tag + "_stderr.log")
 $stdoutLog = Join-Path $outdir ("g7_" + $Tag + "_stdout.log")
 $memoryPreflightLog = Join-Path $outdir ("g7_" + $Tag + "_memory_preflight.json")
 $runtimeTelemetryLog = Join-Path $outdir ("g7_" + $Tag + "_runtime_telemetry.jsonl")
+$failurePath = Join-Path $outdir ("g7_" + $Tag + "_failure.json")
 $rawOutputsPath = Join-Path $outdir ("g7_" + $Tag + "_raw_outputs.json")
 $resultPath = Join-Path $outdir ("g7_" + $Tag + "_result.json")
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
@@ -218,6 +222,7 @@ if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
 if (Test-Path $processIsolationLog) { Remove-Item $processIsolationLog -Force }
 if (Test-Path $systemQuiescenceLog) { Remove-Item $systemQuiescenceLog -Force }
 if (Test-Path $runtimeTelemetryLog) { Remove-Item $runtimeTelemetryLog -Force }
+if (Test-Path $failurePath) { Remove-Item $failurePath -Force }
 if (Test-Path $rawOutputsPath) { Remove-Item $rawOutputsPath -Force }
 if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
 
@@ -863,7 +868,10 @@ $proc = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -PassTh
 $telemetryProc = Start-Process -FilePath powershell.exe -ArgumentList @(
     "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runtimeMonitorHelper,
     "-TargetProcessId", "$($proc.Id)", "-OutputPath", $runtimeTelemetryLog,
-    "-IntervalMs", "$TelemetryIntervalMs"
+    "-IntervalMs", "$TelemetryIntervalMs",
+    "-MinimumAvailableGiB", $RuntimeMinimumAvailableGiB.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-MaximumDiskQueueLength", $RuntimeMaximumDiskQueueLength.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-ContaminationSamples", "$RuntimeContaminationSamples"
 ) -WindowStyle Hidden -PassThru
 $launchTime = Get-Date
 
@@ -883,8 +891,43 @@ $loadSec = ($readyTime - $launchTime).TotalSeconds
 if (-not $ready) {
     Write-Host ("[g7] NOT READY within timeout (load " + [int]$loadSec + "s). Aborting.")
     if (-not $proc.HasExited) { $proc.Kill() }
+    $proc.WaitForExit(30000) | Out-Null
+    if ($telemetryProc -and -not $telemetryProc.HasExited) {
+        $telemetryProc.WaitForExit(10000) | Out-Null
+    }
+    if ($telemetryProc -and -not $telemetryProc.HasExited) {
+        $telemetryProc.Kill()
+        $telemetryProc.WaitForExit(10000) | Out-Null
+    }
+    $abortSample = $null
+    if (Test-Path -LiteralPath $runtimeTelemetryLog) {
+        foreach ($line in Get-Content -LiteralPath $runtimeTelemetryLog) {
+            if (-not $line.Trim()) { continue }
+            try {
+                $candidate = $line | ConvertFrom-Json
+                if ($candidate.contamination_abort) { $abortSample = $candidate }
+            } catch {}
+        }
+    }
+    $failureReason = if ($abortSample) {
+        "runtime-contamination-abort"
+    } else {
+        "server-not-ready"
+    }
+    [pscustomobject]@{
+        schema = "g7_measurement_failure_v1"
+        tag = $Tag
+        reason = $failureReason
+        head = $headAtStart
+        executable_sha256 = $exeHashAtStart
+        harness_sha256 = $harnessHashAtStart
+        runtime_monitor_harness_sha256 = $runtimeMonitorHashAtStart
+        runtime_telemetry_path = $runtimeTelemetryLog
+        contamination_abort_sample = $abortSample
+    } | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath $failurePath -Encoding UTF8
     Write-Host "=== stderr tail ==="; if (Test-Path $stderrLog) { Get-Content $stderrLog -Tail 30 }
-    exit 2
+    throw "Measurement failed before server readiness: $failureReason"
 }
 Write-Host ("[g7] server READY in " + [int]$loadSec + "s")
 
@@ -1018,9 +1061,17 @@ $availableSamples = @($runtimeSamples | ForEach-Object { $_.windows_available_by
 $gpuUtilSamples = @($runtimeSamples | ForEach-Object { if ($_.nvidia) { $_.nvidia.utilization_percent } } | Where-Object { $null -ne $_ })
 $vramSamples = @($runtimeSamples | ForEach-Object { if ($_.nvidia) { $_.nvidia.vram_used_mib } } | Where-Object { $null -ne $_ })
 $powerSamples = @($runtimeSamples | ForEach-Object { if ($_.nvidia) { $_.nvidia.power_watts } } | Where-Object { $null -ne $_ })
+$diskPercentSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.percent_time } } | Where-Object { $null -ne $_ })
+$diskBytesSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.bytes_per_second } } | Where-Object { $null -ne $_ })
+$diskReadSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.read_bytes_per_second } } | Where-Object { $null -ne $_ })
+$diskWriteSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.write_bytes_per_second } } | Where-Object { $null -ne $_ })
+$diskQueueSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.queue_length } } | Where-Object { $null -ne $_ })
+$contaminationSamplesObserved = @($runtimeSamples | ForEach-Object { $_.contamination_consecutive_samples } | Where-Object { $null -ne $_ })
+$contaminationAbortObserved = @($runtimeSamples | Where-Object { $_.contamination_abort }).Count -gt 0
 if ($sharedSamples.Count -eq 0 -or $dedicatedSamples.Count -eq 0 -or
-    $gpuUtilSamples.Count -eq 0 -or $vramSamples.Count -eq 0) {
-    throw "Runtime telemetry failed closed: required WDDM/NVIDIA counters are missing"
+    $gpuUtilSamples.Count -eq 0 -or $vramSamples.Count -eq 0 -or
+    $diskQueueSamples.Count -eq 0 -or $diskReadSamples.Count -eq 0) {
+    throw "Runtime telemetry failed closed: required WDDM/NVIDIA/disk counters are missing"
 }
 $firstRuntimeSample = $runtimeSamples[0]
 $lastRuntimeSample = $runtimeSamples[-1]
@@ -1033,6 +1084,16 @@ for ($sampleIndex = 1; $sampleIndex -lt $runtimeSamples.Count; $sampleIndex++) {
 $runtimeEffectiveIntervalSeconds = if ($runtimeSamples.Count -gt 1) {
     $runtimeElapsedSeconds / ($runtimeSamples.Count - 1)
 } else { $null }
+$diskReadBytesEstimated = 0.0
+for ($sampleIndex = 1; $sampleIndex -lt $runtimeSamples.Count; $sampleIndex++) {
+    $previous = $runtimeSamples[$sampleIndex - 1]
+    $current = $runtimeSamples[$sampleIndex]
+    if ($previous.disk -and $previous.disk.seen -and
+        $null -ne $previous.disk.read_bytes_per_second) {
+        $dt = [double]$current.elapsed_seconds - [double]$previous.elapsed_seconds
+        $diskReadBytesEstimated += [double]$previous.disk.read_bytes_per_second * $dt
+    }
+}
 $runtimeTelemetry = [pscustomobject]@{
     path = $runtimeTelemetryLog
     requested_interval_ms = $TelemetryIntervalMs
@@ -1053,7 +1114,25 @@ $runtimeTelemetry = [pscustomobject]@{
     gpu_utilization_peak_percent = if ($gpuUtilSamples.Count) { [double]($gpuUtilSamples | Measure-Object -Maximum).Maximum } else { $null }
     vram_used_peak_mib = if ($vramSamples.Count) { [double]($vramSamples | Measure-Object -Maximum).Maximum } else { $null }
     power_median_watts = Get-G7Median $powerSamples
+    aggregate_disk_percent_time_median = Get-G7Median $diskPercentSamples
+    aggregate_disk_percent_time_peak = if ($diskPercentSamples.Count) { [double]($diskPercentSamples | Measure-Object -Maximum).Maximum } else { $null }
+    aggregate_disk_bytes_per_second_median = Get-G7Median $diskBytesSamples
+    aggregate_disk_bytes_per_second_peak = if ($diskBytesSamples.Count) { [double]($diskBytesSamples | Measure-Object -Maximum).Maximum } else { $null }
+    aggregate_disk_read_bytes_estimated = [Int64][math]::Round($diskReadBytesEstimated)
+    aggregate_disk_read_mib_per_second = if ($diskReadSamples.Count) { [double](($diskReadSamples | Measure-Object -Average).Average / 1MB) } else { $null }
+    aggregate_disk_read_throughput_mib_per_second = if ($runtimeElapsedSeconds -gt 0) { [double]($diskReadBytesEstimated / 1MB / $runtimeElapsedSeconds) } else { $null }
+    aggregate_disk_write_mib_per_second = if ($diskWriteSamples.Count) { [double](($diskWriteSamples | Measure-Object -Average).Average / 1MB) } else { $null }
+    aggregate_disk_queue_length_median = Get-G7Median $diskQueueSamples
+    aggregate_disk_queue_length_peak = if ($diskQueueSamples.Count) { [double]($diskQueueSamples | Measure-Object -Maximum).Maximum } else { $null }
+    contamination_consecutive_peak = if ($contaminationSamplesObserved.Count) { [int]($contaminationSamplesObserved | Measure-Object -Maximum).Maximum } else { 0 }
+    contamination_abort_observed = [bool]$contaminationAbortObserved
+    contamination_runtime_minimum_available_gib = $RuntimeMinimumAvailableGiB
+    contamination_runtime_maximum_disk_queue_length = $RuntimeMaximumDiskQueueLength
+    contamination_runtime_consecutive_samples = $RuntimeContaminationSamples
+    contamination_contract = "abort after $RuntimeContaminationSamples consecutive samples with available RAM <=$RuntimeMinimumAvailableGiB GiB and aggregate disk queue >=$RuntimeMaximumDiskQueueLength"
     win32_process_read_transfer_delta_bytes = if ($null -ne $firstRuntimeSample.read_transfer_bytes -and $null -ne $lastRuntimeSample.read_transfer_bytes) { [Int64]$lastRuntimeSample.read_transfer_bytes - [Int64]$firstRuntimeSample.read_transfer_bytes } else { $null }
+    win32_process_read_operation_delta = if ($null -ne $firstRuntimeSample.read_operation_count -and $null -ne $lastRuntimeSample.read_operation_count) { [Int64]$lastRuntimeSample.read_operation_count - [Int64]$firstRuntimeSample.read_operation_count } else { $null }
+    win32_process_other_operation_delta = if ($null -ne $firstRuntimeSample.other_operation_count -and $null -ne $lastRuntimeSample.other_operation_count) { [Int64]$lastRuntimeSample.other_operation_count - [Int64]$firstRuntimeSample.other_operation_count } else { $null }
     win32_process_write_transfer_delta_bytes = if ($null -ne $firstRuntimeSample.write_transfer_bytes -and $null -ne $lastRuntimeSample.write_transfer_bytes) { [Int64]$lastRuntimeSample.write_transfer_bytes - [Int64]$firstRuntimeSample.write_transfer_bytes } else { $null }
     win32_process_transfer_counters_include_mmap_pageins = $false
     mmap_backed_file_io_measured = $false
@@ -1894,6 +1973,9 @@ if (Test-Path $stderrLog) {
         $arenaFinalFatal = [long]$Matches[3]
         $arenaFinalUploadedGiB = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
+}
+if ($runtimeTelemetry.contamination_abort_observed) {
+    throw "Runtime telemetry aborted a contaminated measurement (low RAM plus deep disk queue)"
 }
 
 $spexCpuProbeLines = @()
@@ -2898,6 +2980,7 @@ Write-Host ("process working/private peak GiB: " + [math]::Round($runtimeTelemet
 Write-Host ("GPU util median/peak percent: " + $runtimeTelemetry.gpu_utilization_median_percent + " / " + $runtimeTelemetry.gpu_utilization_peak_percent)
 Write-Host ("Win32 process read/write delta GiB (excludes mmap page-ins): " + [math]::Round($runtimeTelemetry.win32_process_read_transfer_delta_bytes / 1GB, 3) + " / " + [math]::Round($runtimeTelemetry.win32_process_write_transfer_delta_bytes / 1GB, 3))
 Write-Host ("process page-fault delta / mmap I/O measured: " + $runtimeTelemetry.page_fault_delta + " / " + $runtimeTelemetry.mmap_backed_file_io_measured)
+Write-Host ("aggregate disk read GiB / read MiBps / queue median/peak / contamination peak: " + [math]::Round($runtimeTelemetry.aggregate_disk_read_bytes_estimated / 1GB, 3) + " / " + [math]::Round($runtimeTelemetry.aggregate_disk_read_mib_per_second, 3) + " / " + $runtimeTelemetry.aggregate_disk_queue_length_median + " / " + $runtimeTelemetry.aggregate_disk_queue_length_peak + " / " + $runtimeTelemetry.contamination_consecutive_peak)
 Write-Host ("evictions     : " + $evicts)
 Write-Host ("streams_expert: " + $streamsExpert)
 Write-Host ("streams_hot   : " + $streamsHot)

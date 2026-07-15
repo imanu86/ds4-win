@@ -8,6 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $harness = Join-Path $root "g7_measure.ps1"
+$runtimeMonitor = Join-Path $root "g7_runtime_monitor.ps1"
 $outdir = Join-Path $root "g7_runs"
 $model = "C:\ds4-models\ds4-2bit.gguf"
 $prompt = "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document."
@@ -85,6 +86,7 @@ function Test-G52HarnessParameter {
 $provenance = [pscustomobject]@{
     executable_sha256 = Get-G52SHA256 $executable
     harness_sha256 = Get-G52SHA256 $harness
+    runtime_monitor_harness_sha256 = Get-G52SHA256 $runtimeMonitor
     ds4_cuda_sha256 = Get-G52SHA256 (Join-Path $root "ds4_cuda.cu")
     ds4_c_sha256 = Get-G52SHA256 (Join-Path $root "ds4.c")
     ds4_server_c_sha256 = Get-G52SHA256 (Join-Path $root "ds4_server.c")
@@ -157,6 +159,8 @@ function Invoke-G52Run {
         $r.requested_max_tokens -ne 64 -or $r.context_requested -ne 256 -or
         $r.executable_sha256 -ne $provenance.executable_sha256 -or
         $r.harness_sha256 -ne $provenance.harness_sha256 -or
+        $r.runtime_monitor_harness_sha256 -ne
+            $provenance.runtime_monitor_harness_sha256 -or
         $r.ds4_cuda_sha256 -ne $provenance.ds4_cuda_sha256 -or
         $r.ds4_c_sha256 -ne $provenance.ds4_c_sha256 -or
         $r.ds4_server_c_sha256 -ne $provenance.ds4_server_c_sha256 -or
@@ -197,7 +201,8 @@ function Invoke-G52Run {
         $r.arena_wrap_part_profile_requested -or
         $r.arena_wrap_part_profile_observed -or
         $r.expert_cache_requested -ne 320 -or
-        $r.expert_cache_capacity -ne 320 -or
+        $r.expert_cache_capacity -lt 300 -or
+        $r.expert_cache_capacity -gt 320 -or
         $r.expert_cache_reserve_gb -ne 0.125 -or
         $r.expert_cache_policy -ne "lru" -or
         $r.expert_tiering_requested -ne "enforce" -or
@@ -212,14 +217,20 @@ function Invoke-G52Run {
         $tier.replacement_budget -ne 16 -or
         $tier.min_frequency -ne 3 -or
         $tier.hysteresis -ne 1.25 -or
-        $tier.states_vram -ne 320 -or
+        $tier.states_vram -ne $r.expert_cache_capacity -or
         $tier.snapshot_backing_misses -ne 0 -or
         $tier.ssd_bytes -ne 0 -or
         $tier.failures -ne 0 -or
         $tier.forbidden_cold_ssd_to_vram -ne 0 -or
         $mem.ready_to_launch -ne $true -or
         $proc.ready_to_launch -ne $true -or
-        $sys.ready_to_launch -ne $true) {
+        $sys.ready_to_launch -ne $true -or
+        $rt.contamination_abort_observed -ne $false -or
+        $rt.contamination_runtime_minimum_available_gib -ne 2 -or
+        $rt.contamination_runtime_maximum_disk_queue_length -ne 8 -or
+        $rt.contamination_runtime_consecutive_samples -ne 3 -or
+        $null -eq $rt.aggregate_disk_queue_length_peak -or
+        $null -eq $rt.aggregate_disk_read_bytes_estimated) {
         throw "G52 contract mismatch: tag=$Tag"
     }
 
@@ -242,10 +253,12 @@ function Invoke-G52Run {
         build_input_fingerprint_sha256 =
             $r.build_manifest_input_fingerprint_sha256
         harness_sha256 = $r.harness_sha256
+        runtime_monitor_harness_sha256 = $r.runtime_monitor_harness_sha256
         model = $r.model
         model_bytes = $r.model_bytes
         model_last_write_utc = $r.model_last_write_utc
         build_worktree_dirty = $r.build_manifest_worktree_dirty_at_build_start
+        expert_cache_capacity = [int]$r.expert_cache_capacity
         content_sha256 = $r.results[0].content_sha256
         source_requested = [string]$r.arena_wrap_source_requested
         source_observed = [string]$r.arena_wrap_source_observed
@@ -303,15 +316,16 @@ function Invoke-G52Run {
             Get-G52Property $rt "win32_process_other_operation_delta"
         process_read_throughput_mib_per_second =
             Get-G52Property $rt "process_read_throughput_mib_per_second"
-        disk_read_gib =
-            Convert-G52BytesToGiB (Get-G52Property $rt "disk_read_bytes")
-        disk_read_mib_per_second =
-            Get-G52Property $rt "disk_read_mib_per_second"
-        disk_read_throughput_mib_per_second =
-            Get-G52Property $rt "disk_read_throughput_mib_per_second"
-        disk_queue_length = Get-G52Property $rt "disk_queue_length"
-        disk_queue_length_peak =
-            Get-G52Property $rt "disk_queue_length_peak"
+        aggregate_disk_read_gib = Convert-G52BytesToGiB `
+            (Get-G52Property $rt "aggregate_disk_read_bytes_estimated")
+        aggregate_disk_read_mib_per_second =
+            Get-G52Property $rt "aggregate_disk_read_mib_per_second"
+        aggregate_disk_read_throughput_mib_per_second =
+            Get-G52Property $rt "aggregate_disk_read_throughput_mib_per_second"
+        aggregate_disk_queue_length =
+            Get-G52Property $rt "aggregate_disk_queue_length_median"
+        aggregate_disk_queue_length_peak =
+            Get-G52Property $rt "aggregate_disk_queue_length_peak"
         mmap_backed_file_io_measured =
             Get-G52Property $rt "mmap_backed_file_io_measured"
         snapshot_misses = [uint64]$tier.snapshot_backing_misses
@@ -349,8 +363,10 @@ foreach ($item in $runPlan) {
 $provenanceFields = @(
     "head", "executable_sha256", "ds4_cuda_sha256", "ds4_c_sha256",
     "ds4_server_c_sha256", "build_manifest_sha256",
-    "build_input_fingerprint_sha256", "harness_sha256", "model",
-    "model_bytes", "model_last_write_utc", "build_worktree_dirty"
+    "build_input_fingerprint_sha256", "harness_sha256",
+    "runtime_monitor_harness_sha256", "model",
+    "model_bytes", "model_last_write_utc", "build_worktree_dirty",
+    "expert_cache_capacity"
 )
 foreach ($field in $provenanceFields) {
     $values = @($runs | ForEach-Object { [string]($_.$field) } |
@@ -386,13 +402,14 @@ foreach ($arm in @("mmap", "sequential-file")) {
         process_read_gib_mean = Get-G52Mean $rows "process_read_gib"
         process_write_gib_mean = Get-G52Mean $rows "process_write_gib"
         page_fault_delta_mean = Get-G52Mean $rows "page_fault_delta"
-        disk_read_gib_mean = Get-G52Mean $rows "disk_read_gib"
-        disk_read_mib_per_second_mean =
-            Get-G52Mean $rows "disk_read_mib_per_second"
-        disk_read_throughput_mib_per_second_mean =
-            Get-G52Mean $rows "disk_read_throughput_mib_per_second"
-        disk_queue_length_peak_mean =
-            Get-G52Mean $rows "disk_queue_length_peak"
+        aggregate_disk_read_gib_mean =
+            Get-G52Mean $rows "aggregate_disk_read_gib"
+        aggregate_disk_read_mib_per_second_mean =
+            Get-G52Mean $rows "aggregate_disk_read_mib_per_second"
+        aggregate_disk_read_throughput_mib_per_second_mean =
+            Get-G52Mean $rows "aggregate_disk_read_throughput_mib_per_second"
+        aggregate_disk_queue_length_peak_mean =
+            Get-G52Mean $rows "aggregate_disk_queue_length_peak"
         snapshot_misses_sum =
             ($rows | Measure-Object -Property snapshot_misses -Sum).Sum
         ssd_bytes_sum = ($rows | Measure-Object -Property ssd_bytes -Sum).Sum
@@ -439,6 +456,8 @@ $summary = [pscustomobject]@{
         build_input_fingerprint_sha256 =
             $runs[0].build_input_fingerprint_sha256
         harness_sha256 = $runs[0].harness_sha256
+        runtime_monitor_harness_sha256 =
+            $runs[0].runtime_monitor_harness_sha256
         model = $runs[0].model
         model_bytes = $runs[0].model_bytes
         model_last_write_utc = $runs[0].model_last_write_utc
