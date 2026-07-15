@@ -1,0 +1,66 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.712s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 04:23:27 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 04:23:28 ds4-server: listening on http://127.0.0.1:8000
+0715 04:23:28 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 336 slots
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 04:23:30 ds4-server: chat ctx=0..5:5 prompt done 1.606s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [gpu-route-debug] request seq=1 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=1
+ds4: [gpu-route-debug] request seq=2 layer=2 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=2
+ds4: [gpu-route-debug] request seq=3 layer=3 misses=6
+ds4: [gpu-route-debug] request seq=4 layer=4 misses=6
+ds4: [gpu-route-debug] request seq=5 layer=5 misses=6
+ds4: [gpu-route-debug] request seq=6 layer=6 misses=6
+ds4: [gpu-route-debug] request seq=7 layer=7 misses=6
+ds4: [gpu-route-debug] request seq=8 layer=8 misses=6
+ds4: [gpu-route-debug] request seq=9 layer=9 misses=6
+ds4: [gpu-route-debug] request seq=10 layer=10 misses=6
+ds4: [gpu-route-debug] request seq=11 layer=11 misses=6
+ds4: [gpu-route-debug] request seq=12 layer=12 misses=6
+ds4: [gpu-route-debug] request seq=13 layer=13 misses=6
+ds4: [gpu-route-debug] request seq=14 layer=14 misses=6
+ds4: [gpu-route-debug] request seq=15 layer=15 misses=6
+ds4: [gpu-route-debug] request seq=16 layer=16 misses=6
+ds4: [gpu-route-debug] request seq=17 layer=17 misses=6
+ds4: [gpu-route-debug] request seq=18 layer=18 misses=6
+ds4: [gpu-route-debug] request seq=19 layer=19 misses=6
+ds4: [gpu-route-debug] request seq=20 layer=20 misses=6
+ds4: [gpu-route-debug] request seq=21 layer=21 misses=6
+ds4: [gpu-route-debug] request seq=22 layer=22 misses=6
+ds4: [gpu-route-debug] request seq=23 layer=23 misses=6
+ds4: [gpu-route-debug] request seq=24 layer=24 misses=6
+ds4: [gpu-route-debug] request seq=25 layer=25 misses=6
+ds4: [gpu-route-debug] request seq=26 layer=26 misses=6
+ds4: [gpu-route-debug] request seq=27 layer=27 misses=6
+ds4: [gpu-route-debug] request seq=28 layer=28 misses=6
+ds4: [gpu-route-debug] request seq=29 layer=29 misses=6
+ds4: [gpu-route-debug] request seq=30 layer=30 misses=6
+ds4: [gpu-route-debug] request seq=31 layer=31 misses=6
+ds4: [gpu-route-debug] request seq=32 layer=32 misses=6
+ds4: [gpu-route-debug] request seq=33 layer=33 misses=6
+ds4: [gpu-route-debug] request seq=34 layer=34 misses=6
+ds4: [gpu-route-debug] request seq=35 layer=35 misses=6
+ds4: [gpu-route-debug] request seq=36 layer=36 misses=6
+ds4: [gpu-route-debug] request seq=37 layer=37 misses=4
+ds4: [gpu-route-debug] request seq=38 layer=38 misses=3
+ds4: [gpu-route-debug] request seq=39 layer=39 misses=5
+ds4: [gpu-route-debug] request seq=40 layer=40 misses=5
+ds4: [gpu-route-debug] request seq=41 layer=41 misses=2
+ds4: [gpu-route-debug] request seq=42 layer=42 misses=1
+0715 04:23:30 ds4-server: chat ctx=0..5:5 gen=1 decoding chunk=1.79 t/s avg=1.79 t/s 0.560s
+0715 04:23:30 ds4-server: chat ctx=0..5:5 gen=1 finish=length 2.181s
+0715 04:23:30 ds4-server: benchmark request target reached; shutting down cleanly
+0715 04:23:30 ds4-server: shutdown requested, draining requests
+ds4: [gpu-resident-routes] final calls=42 all_hit=0 worker_jobs=42 miss_experts=236 errors=0 worker=5.898ms/job queries=0

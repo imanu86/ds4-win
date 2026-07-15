@@ -1,0 +1,28 @@
+﻿{
+    "schema":  "g7_raw_outputs_v1",
+    "tag":  "g32_streamwait_debug_n1",
+    "head":  "dbc7e1e3876065aa755068675594ae42537b748b",
+    "executable_sha256":  "3b236c5df0c0f35f71f5a8e798ab5b6f956db1ae6bfa7c795134d34f2120bff3",
+    "ds4_cuda_sha256":  "70d470f5d7c8cc8cac56331a44bb22301473489424bac77702d156591adefae2",
+    "prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "system_prompt":  "",
+    "system_prompt_sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "warmup_prompt_sha256":  "",
+    "expected_content_sha256":  "",
+    "expected_warmup_content_sha256":  "",
+    "warmup_result":  null,
+    "output_hashes":  [
+                          "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969"
+                      ],
+    "outputs_identical":  true,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  2.30679,
+                        "completion_tokens":  1,
+                        "tokens_per_second":  0.433503,
+                        "content_sha256":  "185f8db32271fe25f561a6fc938b2e264306ec304eda518007d1764826381969",
+                        "content":  "Hello"
+                    }
+                ]
+}

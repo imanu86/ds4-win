@@ -1,0 +1,20 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.840s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 04:23:52 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 04:23:53 ds4-server: listening on http://127.0.0.1:8000
+0715 04:23:53 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 04:23:55 ds4-server: chat ctx=0..5:5 prompt done 1.489s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+0715 04:23:57 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=4.25 t/s avg=4.25 t/s 2.116s
+0715 04:23:57 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.619s
+0715 04:23:57 ds4-server: benchmark request target reached; shutting down cleanly
+0715 04:23:57 ds4-server: shutdown requested, draining requests

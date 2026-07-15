@@ -1,0 +1,28 @@
+﻿{
+    "schema":  "g7_raw_outputs_v1",
+    "tag":  "g32_syncworker_off_hi12_safety_n1",
+    "head":  "dbc7e1e3876065aa755068675594ae42537b748b",
+    "executable_sha256":  "8b6bebab128d1d36b26c8c53b240c1f30b418723ed7a306b26ad115095b943d3",
+    "ds4_cuda_sha256":  "33673aba3cd094daee7b7737b35e6cc91b04be819538f2da263fb4d800e70059",
+    "prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "system_prompt":  "",
+    "system_prompt_sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "warmup_prompt_sha256":  "",
+    "expected_content_sha256":  "",
+    "expected_warmup_content_sha256":  "",
+    "warmup_result":  null,
+    "output_hashes":  [
+                          "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5"
+                      ],
+    "outputs_identical":  true,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  3.981172,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.260641,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    }
+                ]
+}

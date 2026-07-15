@@ -60,6 +60,21 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+struct cuda_moe_route_request {
+    volatile uint32_t sequence;
+    uint32_t layer_index;
+    uint32_t miss_count;
+    uint32_t route_count;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    int32_t selected[6];
+    int32_t hit_slots[6];
+    uint32_t miss_routes[6];
+};
+
 struct ds4_gpu_async_read {
     void *host;
     uint64_t bytes;
@@ -11942,6 +11957,99 @@ __global__ static void moe_gate_up_mid_decode_ptrs_lut_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_resolve_resident_routes_kernel(
+        uint64_t *route_ptrs,
+        volatile uint32_t *ready_sequence,
+        cuda_moe_route_request *request,
+        const int32_t *selected,
+        const int32_t *slot_by_layer_expert,
+        uint32_t layer_index,
+        uint32_t sequence,
+        const char *cache_gate,
+        const char *cache_up,
+        const char *cache_down,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    uint32_t miss_count = 0;
+    int32_t selected_local[6];
+    int32_t hit_slots_local[6];
+    uint32_t miss_routes_local[6];
+    for (uint32_t route = 0; route < 6u; route++) {
+        const int32_t expert = selected[route];
+        int32_t slot = -1;
+        if (expert >= 0 && expert < 256) {
+            slot = slot_by_layer_expert[(uint64_t)layer_index * 256u + (uint32_t)expert];
+        }
+        selected_local[route] = expert;
+        hit_slots_local[route] = slot;
+        if (slot >= 0) {
+            const uint64_t gate_byte = (uint64_t)(uint32_t)slot * gate_expert_bytes;
+            const uint64_t down_byte = (uint64_t)(uint32_t)slot * down_expert_bytes;
+            route_ptrs[route] = (uint64_t)(uintptr_t)(cache_gate + gate_byte);
+            route_ptrs[6u + route] = (uint64_t)(uintptr_t)(cache_up + gate_byte);
+            route_ptrs[12u + route] = (uint64_t)(uintptr_t)(cache_down + down_byte);
+        } else {
+            miss_routes_local[miss_count++] = route;
+        }
+    }
+    if (miss_count == 0u) {
+        request->miss_count = 0u;
+        request->route_count = 6u;
+        request->layer_index = layer_index;
+        __threadfence_system();
+        request->sequence = sequence;
+        __threadfence_system();
+        *ready_sequence = sequence;
+        return;
+    }
+    request->layer_index = layer_index;
+    request->miss_count = miss_count;
+    request->route_count = 6u;
+    request->gate_offset = gate_offset;
+    request->up_offset = up_offset;
+    request->down_offset = down_offset;
+    request->gate_expert_bytes = gate_expert_bytes;
+    request->down_expert_bytes = down_expert_bytes;
+    for (uint32_t route = 0; route < 6u; route++) {
+        request->selected[route] = selected_local[route];
+        request->hit_slots[route] = hit_slots_local[route];
+    }
+    for (uint32_t miss = 0; miss < miss_count; miss++) {
+        request->miss_routes[miss] = miss_routes_local[miss];
+    }
+    __threadfence_system();
+    request->sequence = sequence;
+}
+
+__global__ static void moe_publish_resident_route_kernel(
+        int32_t *slot_by_layer_expert,
+        uint64_t *route_ptrs,
+        int32_t old_map_index,
+        uint32_t new_map_index,
+        uint32_t cache_slot,
+        uint32_t route,
+        const char *cache_gate,
+        const char *cache_up,
+        const char *cache_down,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    if (old_map_index >= 0 &&
+        slot_by_layer_expert[(uint32_t)old_map_index] == (int32_t)cache_slot) {
+        slot_by_layer_expert[(uint32_t)old_map_index] = -1;
+    }
+    slot_by_layer_expert[new_map_index] = (int32_t)cache_slot;
+    const uint64_t gate_byte = (uint64_t)cache_slot * gate_expert_bytes;
+    const uint64_t down_byte = (uint64_t)cache_slot * down_expert_bytes;
+    route_ptrs[route] = (uint64_t)(uintptr_t)(cache_gate + gate_byte);
+    route_ptrs[6u + route] = (uint64_t)(uintptr_t)(cache_up + gate_byte);
+    route_ptrs[12u + route] = (uint64_t)(uintptr_t)(cache_down + down_byte);
+}
+
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -13440,6 +13548,11 @@ enum cuda_moe_cache_slot_state : uint8_t {
     CUDA_MOE_CACHE_LOADING = 2,
 };
 
+enum {
+    CUDA_MOE_LAYER_COUNT = 43,
+    CUDA_MOE_ROUTE_COUNT = 6,
+};
+
 struct cuda_moe_cache_key {
     uint64_t gate_src;
     uint64_t up_src;
@@ -13450,6 +13563,8 @@ struct cuda_moe_cache_slot {
     cuda_moe_cache_key key;
     uint64_t layer_key;
     uint64_t age;
+    uint32_t layer_index;
+    uint32_t expert_id;
     uint8_t layer_owned;
     cuda_moe_cache_slot_state state;
 };
@@ -13471,8 +13586,45 @@ struct cuda_moe_expert_cache {
     uint32_t capacity;
     uint32_t count;
     std::vector<cuda_moe_cache_slot> slots;
+    std::vector<int32_t> host_slot_by_layer_expert;
+    int32_t *device_slot_by_layer_expert;
+    uint64_t *device_route_ptrs;
+    uint32_t *route_ready_host;
+    uint32_t *route_failed_host;
+    uint32_t *device_route_ready_sequence;
+    uint32_t *device_route_failed_sequence;
+    cuda_moe_route_request *route_request_host;
+    cuda_moe_route_request *route_request_device;
+    char *route_host_gate;
+    char *route_host_up;
+    char *route_host_down;
+    cudaStream_t route_upload_stream;
+    os_thread_t route_thread;
+    volatile int route_stop;
+    volatile int route_worker_ready;
+    volatile int route_worker_failed;
+    volatile uint32_t route_submitted_sequence;
+    int route_thread_started;
+    int route_device;
+    uint32_t route_sequence;
+    uint64_t route_calls;
+    uint64_t route_worker_jobs;
+    uint64_t route_all_hit_observed;
+    uint64_t route_stream_queries;
+    uint64_t route_miss_experts;
+    uint64_t route_worker_errors;
+    double route_worker_seconds;
+    double route_resolve_sync_seconds;
+    double route_ready_wait_seconds;
 };
 static cuda_moe_expert_cache g_moe_expert_cache;
+
+static void *cuda_moe_route_worker(void *arg);
+
+static int cuda_moe_gpu_routes_requested(void) {
+    const char *env = getenv("DS4_CUDA_MOE_GPU_RESIDENT_ROUTES");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
 
 static uint32_t cuda_moe_expert_cache_requested(void) {
     const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_N");
@@ -13521,7 +13673,25 @@ static void cuda_moe_expert_cache_invalidate(void) {
         slot.state = CUDA_MOE_CACHE_EMPTY;
         slot.age = 0;
         slot.layer_key = 0;
+        slot.layer_index = UINT32_MAX;
+        slot.expert_id = UINT32_MAX;
         slot.layer_owned = 0;
+    }
+    std::fill(g_moe_expert_cache.host_slot_by_layer_expert.begin(),
+              g_moe_expert_cache.host_slot_by_layer_expert.end(), -1);
+    if (g_moe_expert_cache.device_slot_by_layer_expert) {
+        (void)cudaMemset(g_moe_expert_cache.device_slot_by_layer_expert, 0xff,
+                         (size_t)CUDA_MOE_LAYER_COUNT * 256u * sizeof(int32_t));
+    }
+    if (g_moe_expert_cache.route_ready_host) {
+        *g_moe_expert_cache.route_ready_host = 0;
+    }
+    if (g_moe_expert_cache.route_failed_host) {
+        *g_moe_expert_cache.route_failed_host = 0;
+    }
+    if (g_moe_expert_cache.route_request_host) {
+        memset(g_moe_expert_cache.route_request_host, 0,
+               sizeof(*g_moe_expert_cache.route_request_host));
     }
     g_moe_expert_cache.tick = 0;
     g_moe_expert_cache.count = 0;
@@ -13529,12 +13699,73 @@ static void cuda_moe_expert_cache_invalidate(void) {
 
 static void cuda_moe_expert_cache_release(void) {
     g_model_expert_cache_ready = 0;
+    g_moe_expert_cache.route_stop = 1;
+    if (g_moe_expert_cache.route_thread_started) {
+        os_thread_join(g_moe_expert_cache.route_thread);
+        g_moe_expert_cache.route_thread_started = 0;
+    }
+    if (g_moe_expert_cache.route_upload_stream) {
+        (void)cudaStreamSynchronize(g_moe_expert_cache.route_upload_stream);
+    }
+    if (g_moe_expert_cache.route_calls != 0 ||
+        g_moe_expert_cache.route_worker_jobs != 0) {
+        fprintf(stderr,
+                "ds4: [gpu-resident-routes] final calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu\n",
+                (unsigned long long)g_moe_expert_cache.route_calls,
+                (unsigned long long)g_moe_expert_cache.route_all_hit_observed,
+                (unsigned long long)g_moe_expert_cache.route_worker_jobs,
+                (unsigned long long)g_moe_expert_cache.route_miss_experts,
+                (unsigned long long)g_moe_expert_cache.route_worker_errors,
+                g_moe_expert_cache.route_worker_jobs ?
+                    1000.0 * g_moe_expert_cache.route_worker_seconds /
+                        (double)g_moe_expert_cache.route_worker_jobs : 0.0,
+                g_moe_expert_cache.route_calls ?
+                    1000.0 * g_moe_expert_cache.route_resolve_sync_seconds /
+                        (double)g_moe_expert_cache.route_calls : 0.0,
+                g_moe_expert_cache.route_calls ?
+                    1000.0 * g_moe_expert_cache.route_ready_wait_seconds /
+                        (double)g_moe_expert_cache.route_calls : 0.0,
+                (unsigned long long)g_moe_expert_cache.route_stream_queries);
+    }
     if (g_moe_expert_cache.gate) (void)cudaFree(g_moe_expert_cache.gate);
     if (g_moe_expert_cache.up) (void)cudaFree(g_moe_expert_cache.up);
     if (g_moe_expert_cache.down) (void)cudaFree(g_moe_expert_cache.down);
+    if (g_moe_expert_cache.device_slot_by_layer_expert) {
+        (void)cudaFree(g_moe_expert_cache.device_slot_by_layer_expert);
+    }
+    if (g_moe_expert_cache.device_route_ptrs) {
+        (void)cudaFree(g_moe_expert_cache.device_route_ptrs);
+    }
+    if (g_moe_expert_cache.route_ready_host) {
+        (void)cudaFreeHost(g_moe_expert_cache.route_ready_host);
+    }
+    if (g_moe_expert_cache.route_failed_host) {
+        (void)cudaFreeHost(g_moe_expert_cache.route_failed_host);
+    }
+    if (g_moe_expert_cache.route_request_host) {
+        (void)cudaFreeHost(g_moe_expert_cache.route_request_host);
+    }
+    if (g_moe_expert_cache.route_host_gate) (void)cudaFreeHost(g_moe_expert_cache.route_host_gate);
+    if (g_moe_expert_cache.route_host_up) (void)cudaFreeHost(g_moe_expert_cache.route_host_up);
+    if (g_moe_expert_cache.route_host_down) (void)cudaFreeHost(g_moe_expert_cache.route_host_down);
+    if (g_moe_expert_cache.route_upload_stream) {
+        (void)cudaStreamDestroy(g_moe_expert_cache.route_upload_stream);
+    }
     g_moe_expert_cache.gate = NULL;
     g_moe_expert_cache.up = NULL;
     g_moe_expert_cache.down = NULL;
+    g_moe_expert_cache.device_slot_by_layer_expert = NULL;
+    g_moe_expert_cache.device_route_ptrs = NULL;
+    g_moe_expert_cache.route_ready_host = NULL;
+    g_moe_expert_cache.route_failed_host = NULL;
+    g_moe_expert_cache.device_route_ready_sequence = NULL;
+    g_moe_expert_cache.device_route_failed_sequence = NULL;
+    g_moe_expert_cache.route_request_host = NULL;
+    g_moe_expert_cache.route_request_device = NULL;
+    g_moe_expert_cache.route_host_gate = NULL;
+    g_moe_expert_cache.route_host_up = NULL;
+    g_moe_expert_cache.route_host_down = NULL;
+    g_moe_expert_cache.route_upload_stream = NULL;
     g_moe_expert_cache.gate_expert_bytes = 0;
     g_moe_expert_cache.down_expert_bytes = 0;
     g_moe_expert_cache.tick = 0;
@@ -13548,6 +13779,21 @@ static void cuda_moe_expert_cache_release(void) {
     g_moe_expert_cache.capacity = 0;
     g_moe_expert_cache.count = 0;
     g_moe_expert_cache.slots.clear();
+    g_moe_expert_cache.host_slot_by_layer_expert.clear();
+    g_moe_expert_cache.route_stop = 0;
+    g_moe_expert_cache.route_worker_ready = 0;
+    g_moe_expert_cache.route_worker_failed = 0;
+    g_moe_expert_cache.route_submitted_sequence = 0;
+    g_moe_expert_cache.route_sequence = 0;
+    g_moe_expert_cache.route_calls = 0;
+    g_moe_expert_cache.route_worker_jobs = 0;
+    g_moe_expert_cache.route_all_hit_observed = 0;
+    g_moe_expert_cache.route_stream_queries = 0;
+    g_moe_expert_cache.route_miss_experts = 0;
+    g_moe_expert_cache.route_worker_errors = 0;
+    g_moe_expert_cache.route_worker_seconds = 0.0;
+    g_moe_expert_cache.route_resolve_sync_seconds = 0.0;
+    g_moe_expert_cache.route_ready_wait_seconds = 0.0;
 }
 
 static void cuda_moe_gather_release(void) {
@@ -13635,16 +13881,78 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         return NULL;
     }
 
+    const int gpu_routes = cuda_moe_gpu_routes_requested();
+
     while (cap != 0) {
         void *gate = NULL;
         void *up = NULL;
         void *down = NULL;
+        int32_t *device_map = NULL;
+        uint64_t *device_routes = NULL;
+        uint32_t *ready_host = NULL;
+        uint32_t *failed_host = NULL;
+        uint32_t *device_ready = NULL;
+        uint32_t *device_failed = NULL;
+        cuda_moe_route_request *request_host = NULL;
+        cuda_moe_route_request *request_device = NULL;
+        char *host_gate = NULL;
+        char *host_up = NULL;
+        char *host_down = NULL;
+        cudaStream_t route_stream = NULL;
         err = cudaMalloc(&gate, (size_t)((uint64_t)cap * gate_expert_bytes));
         if (err == cudaSuccess) err = cudaMalloc(&up, (size_t)((uint64_t)cap * gate_expert_bytes));
         if (err == cudaSuccess) err = cudaMalloc(&down, (size_t)((uint64_t)cap * down_expert_bytes));
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaMalloc((void **)&device_map,
+                (size_t)CUDA_MOE_LAYER_COUNT * 256u * sizeof(int32_t));
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaMalloc((void **)&device_routes,
+                (size_t)CUDA_MOE_ROUTE_COUNT * 3u * sizeof(uint64_t));
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostAlloc((void **)&ready_host, sizeof(uint32_t),
+                                cudaHostAllocMapped);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostGetDevicePointer((void **)&device_ready, ready_host, 0);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostAlloc((void **)&failed_host, sizeof(uint32_t),
+                                cudaHostAllocMapped);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostGetDevicePointer((void **)&device_failed, failed_host, 0);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostAlloc((void **)&request_host, sizeof(*request_host),
+                                cudaHostAllocMapped);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostGetDevicePointer((void **)&request_device, request_host, 0);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostAlloc((void **)&host_gate,
+                (size_t)CUDA_MOE_ROUTE_COUNT * gate_expert_bytes, cudaHostAllocDefault);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostAlloc((void **)&host_up,
+                (size_t)CUDA_MOE_ROUTE_COUNT * gate_expert_bytes, cudaHostAllocDefault);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaHostAlloc((void **)&host_down,
+                (size_t)CUDA_MOE_ROUTE_COUNT * down_expert_bytes, cudaHostAllocDefault);
+        }
+        if (err == cudaSuccess && gpu_routes) {
+            err = cudaStreamCreateWithFlags(&route_stream, cudaStreamNonBlocking);
+        }
         if (err == cudaSuccess) {
             try {
                 g_moe_expert_cache.slots.resize(cap);
+                if (gpu_routes) {
+                    g_moe_expert_cache.host_slot_by_layer_expert.assign(
+                        (size_t)CUDA_MOE_LAYER_COUNT * 256u, -1);
+                }
             } catch (...) {
                 err = cudaErrorMemoryAllocation;
             }
@@ -13657,7 +13965,49 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
             g_moe_expert_cache.down_expert_bytes = down_expert_bytes;
             g_moe_expert_cache.requested = requested;
             g_moe_expert_cache.capacity = cap;
+            g_moe_expert_cache.device_slot_by_layer_expert = device_map;
+            g_moe_expert_cache.device_route_ptrs = device_routes;
+            g_moe_expert_cache.route_ready_host = ready_host;
+            g_moe_expert_cache.route_failed_host = failed_host;
+            g_moe_expert_cache.device_route_ready_sequence = device_ready;
+            g_moe_expert_cache.device_route_failed_sequence = device_failed;
+            g_moe_expert_cache.route_request_host = request_host;
+            g_moe_expert_cache.route_request_device = request_device;
+            g_moe_expert_cache.route_host_gate = host_gate;
+            g_moe_expert_cache.route_host_up = host_up;
+            g_moe_expert_cache.route_host_down = host_down;
+            g_moe_expert_cache.route_upload_stream = route_stream;
+            g_moe_expert_cache.route_stop = 0;
+            g_moe_expert_cache.route_worker_ready = 0;
+            g_moe_expert_cache.route_worker_failed = 0;
+            (void)cudaGetDevice(&g_moe_expert_cache.route_device);
             cuda_moe_expert_cache_invalidate();
+            if (gpu_routes &&
+                os_thread_create(&g_moe_expert_cache.route_thread,
+                                 cuda_moe_route_worker,
+                                 &g_moe_expert_cache) != 0) {
+                fprintf(stderr, "ds4: CUDA GPU-resident route worker creation failed\n");
+                cuda_moe_expert_cache_release();
+                return NULL;
+            }
+            g_moe_expert_cache.route_thread_started = gpu_routes ? 1 : 0;
+            if (gpu_routes) {
+                const double ready_deadline = cuda_wall_sec() + 2.0;
+                while (!g_moe_expert_cache.route_worker_ready &&
+                       !g_moe_expert_cache.route_worker_failed &&
+                       cuda_wall_sec() < ready_deadline) {
+#ifdef _WIN32
+                    (void)SwitchToThread();
+#else
+                    usleep(0);
+#endif
+                }
+                if (!g_moe_expert_cache.route_worker_ready) {
+                    fprintf(stderr, "ds4: CUDA GPU-resident route worker failed to initialize\n");
+                    cuda_moe_expert_cache_release();
+                    return NULL;
+                }
+            }
             const uint64_t startup_reserve = cuda_model_stream_reserve_bytes();
             g_model_expert_cache_ready = 1;
             const uint64_t runtime_reserve = cuda_model_stream_reserve_bytes();
@@ -13665,6 +14015,11 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
                     "ds4: CUDA resident expert cache ready: %u/%u experts, %.2f MiB/expert, %.2f GiB total\n",
                     cap, requested, (double)per_expert / 1048576.0,
                     (double)((uint64_t)cap * per_expert) / 1073741824.0);
+            if (gpu_routes) {
+                fprintf(stderr,
+                        "ds4: CUDA GPU-resident route resolver active: exact miss worker, %u slots\n",
+                        cap);
+            }
             if (startup_reserve != runtime_reserve) {
                 fprintf(stderr,
                         "ds4: CUDA stream runtime reserve activated: %.2f GiB -> %.2f GiB\n",
@@ -13679,6 +14034,15 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         if (gate) (void)cudaFree(gate);
         if (up) (void)cudaFree(up);
         if (down) (void)cudaFree(down);
+        if (device_map) (void)cudaFree(device_map);
+        if (device_routes) (void)cudaFree(device_routes);
+        if (ready_host) (void)cudaFreeHost(ready_host);
+        if (failed_host) (void)cudaFreeHost(failed_host);
+        if (request_host) (void)cudaFreeHost(request_host);
+        if (host_gate) (void)cudaFreeHost(host_gate);
+        if (host_up) (void)cudaFreeHost(host_up);
+        if (host_down) (void)cudaFreeHost(host_down);
+        if (route_stream) (void)cudaStreamDestroy(route_stream);
         const uint32_t release = (cap + 9u) / 10u;
         const uint32_t next = cap > release ? cap - release : 0;
         fprintf(stderr,
@@ -13724,6 +14088,232 @@ static int cuda_moe_expert_cache_lru_slot(
         }
     }
     return best;
+}
+
+static int cuda_moe_route_worker_pick_slot(
+        cuda_moe_expert_cache *cache,
+        const uint8_t *claimed) {
+    if (!cache || !claimed) return -1;
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        if (!claimed[i] && cache->slots[i].state == CUDA_MOE_CACHE_EMPTY) {
+            return (int)i;
+        }
+    }
+    int best = -1;
+    uint64_t best_age = UINT64_MAX;
+    for (uint32_t i = 0; i < cache->capacity; i++) {
+        const cuda_moe_cache_slot &slot = cache->slots[i];
+        if (claimed[i] || slot.state != CUDA_MOE_CACHE_VALID) continue;
+        if (slot.age < best_age) {
+            best = (int)i;
+            best_age = slot.age;
+        }
+    }
+    return best;
+}
+
+static void *cuda_moe_route_worker(void *arg) {
+    cuda_moe_expert_cache *cache = (cuda_moe_expert_cache *)arg;
+    if (!cache || cudaSetDevice(cache->route_device) != cudaSuccess) {
+        if (cache) {
+            cache->route_worker_errors++;
+            cache->route_worker_failed = 1;
+        }
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    cache->route_worker_ready = 1;
+    uint32_t consumed_sequence = 0;
+    std::vector<uint8_t> claimed(cache->capacity, 0u);
+
+    while (!cache->route_stop) {
+        const uint32_t sequence = cache->route_request_host->sequence;
+        if (sequence == 0u || sequence == consumed_sequence) {
+#ifdef _WIN32
+            (void)SwitchToThread();
+#else
+            usleep(0);
+#endif
+            continue;
+        }
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+        cuda_moe_route_request request;
+        memcpy(&request, cache->route_request_host, sizeof(request));
+        if (request.sequence != sequence) continue;
+        consumed_sequence = sequence;
+        if (sequence <= 2u) {
+            fprintf(stderr,
+                    "ds4: [gpu-route-debug] request seq=%u layer=%u misses=%u\n",
+                    sequence, request.layer_index, request.miss_count);
+        }
+        if (request.route_count == CUDA_MOE_ROUTE_COUNT && request.miss_count == 0u) {
+            cache->route_all_hit_observed++;
+            continue;
+        }
+        const double started = cuda_wall_sec();
+        int ok = request.route_count == CUDA_MOE_ROUTE_COUNT &&
+                 request.miss_count > 0u &&
+                 request.miss_count <= CUDA_MOE_ROUTE_COUNT &&
+                 request.layer_index < CUDA_MOE_LAYER_COUNT &&
+                 request.gate_expert_bytes == cache->gate_expert_bytes &&
+                 request.down_expert_bytes == cache->down_expert_bytes;
+        std::fill(claimed.begin(), claimed.end(), 0u);
+        for (uint32_t route = 0; ok && route < CUDA_MOE_ROUTE_COUNT; route++) {
+            const int32_t slot = request.hit_slots[route];
+            if (slot >= 0) {
+                if ((uint32_t)slot >= cache->capacity) {
+                    ok = 0;
+                    break;
+                }
+                claimed[(uint32_t)slot] = 1u;
+                cache->slots[(uint32_t)slot].age = ++cache->tick;
+            }
+        }
+
+        uint32_t admitted[CUDA_MOE_ROUTE_COUNT] = {0};
+        uint32_t admitted_count = 0;
+        for (uint32_t miss = 0; ok && miss < request.miss_count; miss++) {
+            const uint32_t route = request.miss_routes[miss];
+            if (route >= CUDA_MOE_ROUTE_COUNT) {
+                ok = 0;
+                break;
+            }
+            const int32_t expert_i = request.selected[route];
+            if (expert_i < 0 || expert_i >= 256) {
+                ok = 0;
+                break;
+            }
+            const uint32_t expert = (uint32_t)expert_i;
+            const int cache_slot_i = cuda_moe_route_worker_pick_slot(cache, claimed.data());
+            if (cache_slot_i < 0) {
+                ok = 0;
+                break;
+            }
+            const uint32_t cache_slot = (uint32_t)cache_slot_i;
+            claimed[cache_slot] = 1u;
+            cuda_moe_cache_slot &entry = cache->slots[cache_slot];
+            int32_t old_map_index = -1;
+            const int was_valid = entry.state == CUDA_MOE_CACHE_VALID;
+            if (was_valid && entry.layer_index < CUDA_MOE_LAYER_COUNT &&
+                entry.expert_id < 256u) {
+                old_map_index = (int32_t)(entry.layer_index * 256u + entry.expert_id);
+                if ((size_t)old_map_index < cache->host_slot_by_layer_expert.size() &&
+                    cache->host_slot_by_layer_expert[(size_t)old_map_index] ==
+                        (int32_t)cache_slot) {
+                    cache->host_slot_by_layer_expert[(size_t)old_map_index] = -1;
+                }
+            }
+            entry.state = CUDA_MOE_CACHE_LOADING;
+
+            char *host_gate = cache->route_host_gate +
+                (uint64_t)miss * cache->gate_expert_bytes;
+            char *host_up = cache->route_host_up +
+                (uint64_t)miss * cache->gate_expert_bytes;
+            char *host_down = cache->route_host_down +
+                (uint64_t)miss * cache->down_expert_bytes;
+            const uint64_t gate_src = request.gate_offset +
+                (uint64_t)expert * cache->gate_expert_bytes;
+            const uint64_t up_src = request.up_offset +
+                (uint64_t)expert * cache->gate_expert_bytes;
+            const uint64_t down_src = request.down_offset +
+                (uint64_t)expert * cache->down_expert_bytes;
+            if (!g_model_file_valid ||
+                !cuda_pread_full(&g_model_file, host_gate,
+                                 cache->gate_expert_bytes, gate_src) ||
+                !cuda_pread_full(&g_model_file, host_up,
+                                 cache->gate_expert_bytes, up_src) ||
+                !cuda_pread_full(&g_model_file, host_down,
+                                 cache->down_expert_bytes, down_src)) {
+                ok = 0;
+                break;
+            }
+            const uint64_t gate_dst = (uint64_t)cache_slot * cache->gate_expert_bytes;
+            const uint64_t down_dst = (uint64_t)cache_slot * cache->down_expert_bytes;
+            if (cudaMemcpyAsync(cache->gate + gate_dst, host_gate,
+                                (size_t)cache->gate_expert_bytes,
+                                cudaMemcpyHostToDevice,
+                                cache->route_upload_stream) != cudaSuccess ||
+                cudaMemcpyAsync(cache->up + gate_dst, host_up,
+                                (size_t)cache->gate_expert_bytes,
+                                cudaMemcpyHostToDevice,
+                                cache->route_upload_stream) != cudaSuccess ||
+                cudaMemcpyAsync(cache->down + down_dst, host_down,
+                                (size_t)cache->down_expert_bytes,
+                                cudaMemcpyHostToDevice,
+                                cache->route_upload_stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                ok = 0;
+                break;
+            }
+            const uint32_t new_map_index = request.layer_index * 256u + expert;
+            moe_publish_resident_route_kernel<<<1, 1, 0, cache->route_upload_stream>>>(
+                cache->device_slot_by_layer_expert,
+                cache->device_route_ptrs,
+                old_map_index,
+                new_map_index,
+                cache_slot,
+                route,
+                cache->gate,
+                cache->up,
+                cache->down,
+                cache->gate_expert_bytes,
+                cache->down_expert_bytes);
+            if (cudaGetLastError() != cudaSuccess) {
+                (void)cudaGetLastError();
+                ok = 0;
+                break;
+            }
+            entry.key = {gate_src, up_src, down_src};
+            entry.layer_index = request.layer_index;
+            entry.expert_id = expert;
+            entry.age = ++cache->tick;
+            entry.layer_owned = 0;
+            entry.layer_key = request.gate_offset;
+            cache->host_slot_by_layer_expert[new_map_index] = (int32_t)cache_slot;
+            admitted[admitted_count++] = cache_slot;
+            if (!was_valid && cache->count < cache->capacity) cache->count++;
+            else if (was_valid) cache->evictions++;
+            cache->admissions++;
+        }
+
+        if (cudaGetLastError() != cudaSuccess ||
+            cudaStreamSynchronize(cache->route_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            ok = 0;
+        }
+        for (uint32_t i = 0; i < admitted_count; i++) {
+            cache->slots[admitted[i]].state = ok ? CUDA_MOE_CACHE_VALID : CUDA_MOE_CACHE_EMPTY;
+        }
+        cache->route_worker_jobs++;
+        cache->route_miss_experts += request.miss_count;
+        cache->route_worker_seconds += cuda_wall_sec() - started;
+        cache->misses += request.miss_count;
+        cache->hits += CUDA_MOE_ROUTE_COUNT - request.miss_count;
+        cache->calls++;
+        if (!ok) {
+            *cache->route_failed_host = sequence;
+            cache->route_worker_errors++;
+            fprintf(stderr,
+                    "ds4: CUDA GPU-resident route worker failed seq=%u layer=%u misses=%u\n",
+                    sequence, request.layer_index, request.miss_count);
+        }
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+        *cache->route_ready_host = sequence;
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+    }
+    return NULL;
 }
 
 static int cuda_moe_expert_cache_copy_to_compact_async(
@@ -14329,6 +14919,7 @@ static int cuda_moe_selected_load(
     uint64_t local_misses = 0;
     uint64_t local_evictions = 0;
     uint64_t local_direct = 0;
+    int cache_map_dirty = 0;
 
     auto expert_key = [&](uint32_t compact_slot) {
         const uint64_t e = (uint64_t)(uint32_t)compact[compact_slot];
@@ -14371,15 +14962,30 @@ static int cuda_moe_selected_load(
                                  const cuda_moe_cache_key &key) {
         cuda_moe_cache_slot &entry = cache->slots[cache_slot];
         const uint8_t evicted = entry.state == CUDA_MOE_CACHE_VALID ? 1u : 0u;
+        if (evicted && entry.layer_index < CUDA_MOE_LAYER_COUNT &&
+            entry.expert_id < 256u &&
+            !cache->host_slot_by_layer_expert.empty()) {
+            const uint32_t old_index = entry.layer_index * 256u + entry.expert_id;
+            if (cache->host_slot_by_layer_expert[old_index] == (int32_t)cache_slot) {
+                cache->host_slot_by_layer_expert[old_index] = -1;
+            }
+        }
         entry.state = CUDA_MOE_CACHE_LOADING;
         entry.key = key;
         entry.age = 0;
+        entry.layer_index = layer_index;
+        entry.expert_id = (uint32_t)compact[compact_slot];
         claimed[cache_slot] = 1;
         cache_slots[compact_slot] = (int32_t)cache_slot;
         admission_compact.push_back(compact_slot);
         admission_slots.push_back(cache_slot);
         admission_evicted.push_back(evicted);
         local_evictions += evicted;
+        if (!cache->host_slot_by_layer_expert.empty()) {
+            cache->host_slot_by_layer_expert[
+                layer_index * 256u + entry.expert_id] = (int32_t)cache_slot;
+            cache_map_dirty = 1;
+        }
         const uint64_t gate_dst = (uint64_t)cache_slot * gate_expert_bytes;
         const uint64_t down_dst = (uint64_t)cache_slot * down_expert_bytes;
         const uint32_t expert = (uint32_t)compact[compact_slot];
@@ -14393,15 +14999,6 @@ static int cuda_moe_selected_load(
                     down_expert_bytes, expert,
                     CUDA_DYNAMIC_ARENA_MIRROR_DOWN);
     };
-    auto discard_admissions = [&]() {
-        if (!cache) return;
-        for (size_t i = 0; i < admission_slots.size(); i++) {
-            cuda_moe_cache_slot &entry = cache->slots[admission_slots[i]];
-            if (admission_evicted[i] && cache->count > 0) cache->count--;
-            entry.state = CUDA_MOE_CACHE_EMPTY;
-        }
-    };
-
     if (cache && layer_top1) {
         int layer_slot = -1;
         for (uint32_t i = 0; i < cache->capacity; i++) {
@@ -14508,6 +15105,7 @@ static int cuda_moe_selected_load(
             (void)cudaGetLastError();
             const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
             cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
+            if (cache) cuda_moe_expert_cache_invalidate();
             return 0;
         }
     }
@@ -14538,7 +15136,7 @@ static int cuda_moe_selected_load(
     if (!fill_ok) {
         const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
         cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
-        discard_admissions();
+        if (cache) cuda_moe_expert_cache_invalidate();
         return 0;
     }
 
@@ -14571,7 +15169,7 @@ static int cuda_moe_selected_load(
                 (void)cudaGetLastError();
                 const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
                 cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
-                discard_admissions();
+                if (cache) cuda_moe_expert_cache_invalidate();
                 return 0;
             }
         }
@@ -14602,6 +15200,15 @@ static int cuda_moe_selected_load(
         }
         for (int32_t slot : cache_slots) {
             if (slot >= 0) cache->slots[(uint32_t)slot].age = ++cache->tick;
+        }
+        if (cache_map_dirty && cache->device_slot_by_layer_expert &&
+            cudaMemcpyAsync(cache->device_slot_by_layer_expert,
+                            cache->host_slot_by_layer_expert.data(),
+                            cache->host_slot_by_layer_expert.size() * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, 0) != cudaSuccess) {
+            (void)cudaGetLastError();
+            cuda_moe_expert_cache_invalidate();
+            return 0;
         }
         cache->calls++;
         cache->hits += local_hits;
@@ -14761,6 +15368,117 @@ extern "C" uint32_t ds4_gpu_routed_moe_last_selected(
     return count;
 }
 
+static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
+        uint32_t layer_index,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        uint32_t expert_in_dim,
+        const ds4_gpu_tensor *selected,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        ds4_gpu_spex_queue *spex_queue) {
+    if (!cuda_moe_gpu_routes_requested() || !selected || !selected->ptr ||
+        n_tokens != 1u || n_expert != CUDA_MOE_ROUTE_COUNT ||
+        layer_index >= CUDA_MOE_LAYER_COUNT || spex_queue ||
+        cuda_moe_expert_cache_layer_top1() ||
+        g_dynamic_arena_observer.enabled ||
+        g_prefill_mass_observer.enabled ||
+        g_reap_mass_observer.enabled ||
+        expert_in_dim / CUDA_QK_K > 16u ||
+        getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") != NULL ||
+        getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") != NULL) {
+        return NULL;
+    }
+    cuda_moe_expert_cache *cache =
+        cuda_moe_expert_cache_prepare(gate_expert_bytes, down_expert_bytes);
+    if (!cache || !cache->route_thread_started || !cache->route_worker_ready ||
+        cache->route_worker_failed || cache->route_stop ||
+        cache->capacity < CUDA_MOE_ROUTE_COUNT ||
+        !cache->device_slot_by_layer_expert || !cache->device_route_ptrs ||
+        !cache->route_ready_host || !cache->route_failed_host ||
+        !cache->device_route_ready_sequence ||
+        !cache->device_route_failed_sequence ||
+        !cache->route_request_device) {
+        return NULL;
+    }
+    uint32_t sequence = ++cache->route_sequence;
+    if (sequence == 0u) sequence = ++cache->route_sequence;
+    moe_resolve_resident_routes_kernel<<<1, 1>>>(
+        cache->device_route_ptrs,
+        cache->device_route_ready_sequence,
+        cache->route_request_device,
+        (const int32_t *)selected->ptr,
+        cache->device_slot_by_layer_expert,
+        layer_index,
+        sequence,
+        cache->gate,
+        cache->up,
+        cache->down,
+        gate_offset,
+        up_offset,
+        down_offset,
+        gate_expert_bytes,
+        down_expert_bytes);
+    if (cudaGetLastError() != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    const double resolve_started = cuda_wall_sec();
+    const cudaError_t resolve_err = cudaStreamSynchronize(0);
+    cache->route_resolve_sync_seconds += cuda_wall_sec() - resolve_started;
+    if (resolve_err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA GPU-resident route resolver sync failed: %s\n",
+                cudaGetErrorString(resolve_err));
+        abort();
+    }
+    cache->route_submitted_sequence = sequence;
+    const double wait_started = cuda_wall_sec();
+    const double wait_deadline = wait_started + 5.0;
+    while (*(volatile uint32_t *)cache->route_ready_host != sequence) {
+        if (cache->route_stop || cache->route_worker_failed) {
+            fprintf(stderr,
+                    "ds4: CUDA GPU-resident route resolver lost worker seq=%u\n",
+                    sequence);
+            abort();
+        }
+        if (cuda_wall_sec() >= wait_deadline) {
+            fprintf(stderr,
+                    "ds4: CUDA GPU-resident route worker timed out seq=%u\n",
+                    sequence);
+            abort();
+        }
+#ifdef _WIN32
+        (void)SwitchToThread();
+#else
+        usleep(0);
+#endif
+    }
+#ifdef _WIN32
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    cache->route_ready_wait_seconds += cuda_wall_sec() - wait_started;
+    if (*(volatile uint32_t *)cache->route_failed_host == sequence) {
+        fprintf(stderr,
+                "ds4: CUDA GPU-resident route resolver observed failure seq=%u; falling back\n",
+                sequence);
+        cuda_moe_expert_cache_invalidate();
+        return NULL;
+    }
+    if (sequence <= 2u) {
+        fprintf(stderr,
+                "ds4: [gpu-route-debug] submit seq=%u layer=%u\n",
+                sequence, layer_index);
+    }
+    cache->route_calls++;
+    return cache;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -14818,6 +15536,7 @@ static int routed_moe_launch(
     const char *up_w = NULL;
     const char *down_w = NULL;
     uint32_t use_mixed_route_ptrs = 0;
+    const uint64_t *mixed_route_ptrs = NULL;
     /* Selected-expert load: when the whole 256-expert block is beyond the pinned
      * host window (streaming regime), fetch/gather ONLY the routed experts into a
      * compact VRAM buffer and rebind `selected` to compact slots -- the unchanged
@@ -14827,7 +15546,23 @@ static int routed_moe_launch(
         cuda_model_range_in_window(model_map, gate_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, down_offset, down_bytes);
-    if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL &&
+    cuda_moe_expert_cache *gpu_route_cache = NULL;
+    if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL) {
+        gpu_route_cache = cuda_moe_gpu_resident_routes_submit(
+            layer_index,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            expert_in_dim,
+            selected, n_expert, n_tokens,
+            spex_queue);
+    }
+    if (gpu_route_cache) {
+        gate_w = gpu_route_cache->gate;
+        up_w = gpu_route_cache->up;
+        down_w = gpu_route_cache->down;
+        use_mixed_route_ptrs = 1;
+        mixed_route_ptrs = gpu_route_cache->device_route_ptrs;
+    } else if (!whole_in_window && getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL &&
         cuda_moe_selected_load(model_map, model_size, layer_index,
                                gate_offset, up_offset, down_offset,
                                gate_expert_bytes, down_expert_bytes,
@@ -14844,6 +15579,7 @@ static int routed_moe_launch(
             down_w = g_moe_gather.down;
         }
         use_mixed_route_ptrs = g_moe_gather.mixed_direct_active;
+        mixed_route_ptrs = use_mixed_route_ptrs ? g_moe_gather.route_ptrs : NULL;
         selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
     } else {
         ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
@@ -15104,7 +15840,7 @@ static int routed_moe_launch(
                         (float *)gate->ptr,
                         (float *)up->ptr,
                         (float *)mid->ptr,
-                        g_moe_gather.route_ptrs,
+                        mixed_route_ptrs,
                         xq,
                         (const float *)weights->ptr,
                         gate_row_bytes,
@@ -15173,7 +15909,7 @@ static int routed_moe_launch(
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 moe_down_sum6_ptrs_qwarp32_kernel<<<sgrid, 256>>>(
                     (float *)out->ptr,
-                    g_moe_gather.route_ptrs + 2u * n_expert,
+                    mixed_route_ptrs + 2u * n_expert,
                     midq,
                     down_row_bytes,
                     midq_blocks,
