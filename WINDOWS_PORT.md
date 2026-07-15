@@ -79,6 +79,16 @@ another batch-union implementation; it is a separately gated wave executor that
 allows wider chunks while bounding compact staging VRAM. See
 `G37_PREFILL_UNION_RESULTS.md`.
 
+G38 implements that capacity mechanism behind `DS4_CUDA_PREFILL_WAVES=1`.
+It builds the exact full-chunk union once, partitions experts into bounded waves,
+computes only the original pairs belonging to each wave and performs one final
+ordered six-route sum. All 18 measured outputs and six warmups matched the
+expected hash; forced widths 7 and 1 also passed boundary safety checks with
+zero runtime failures. The serial v1 reduced process reads by 20.27% and peak
+dedicated VRAM by 4.25%, but TTFT regressed 38.56% versus production. Keep it
+opt-in: G39 must double-buffer uploads and recover tile-capable wave kernels
+before any production promotion. See `G38_PREFILL_WAVES_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -95,13 +105,20 @@ Follow-on measured gates are:
 
 1. Validate G36 mass/LFRU on a longer exact workload and a domain switch before
    changing the default from `second-touch`.
-2. P4-A batch-union is measured complete in G37. Add P4-B waved prefill only for
-   unions that would exceed the configured compact staging capacity.
+2. P4-A batch-union is measured complete in G37. P4-B serial waved prefill is
+   exact but negative in G38; overlap upload N+1 with compute N and restore
+   tile-capable wave kernels before retesting production promotion.
 3. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
    speculative traffic.
 4. Parallel transfer streams where the trace proves serialization remains.
 5. A separately gated hybrid CPU/GPU cold-expert fallback. External systems make
    this promising, but it is not yet a result on this engine or machine.
+6. Prompt-intent router probes for transport-bound hosts: decompose a request
+   into a few semantic shards, observe unbiased per-layer router mass without
+   generating or merging shard KV, aggregate a preload prior, then execute the
+   original prompt once. Compare total probe-plus-prefill TTFT, cold misses and
+   transport bytes against one ordinary prefill; never claim a win from prefill
+   time that excludes the probes.
 
 ## Build
 

@@ -71,6 +71,9 @@ param(
     [ValidateRange(64, 131072)][int]$Context = 256,
     [ValidateRange(-1, 65536)][int]$PrefillChunk = -1,
     [switch]$PrefillUnionStats,
+    [switch]$PrefillWaves,
+    [ValidateRange(0, 256)][int]$PrefillWaveForceExperts = 0,
+    [switch]$GenericSortedMoe,
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [switch]$SkipMemoryPreflight,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0
@@ -113,6 +116,9 @@ if ($GpuResidentRoutes -and $ExpertCacheN -le 0) {
 }
 if ($SplitHitMiss -and -not $GpuResidentRoutes) {
     throw "SplitHitMiss requires -GpuResidentRoutes"
+}
+if ($PrefillWaveForceExperts -gt 0 -and -not $PrefillWaves) {
+    throw "PrefillWaveForceExperts requires -PrefillWaves"
 }
 $effectiveWarmupPrompt = if ($WarmupPrompt) { $WarmupPrompt } else { $Prompt }
 $effectiveWarmupMaxTokens = if ($WarmupMaxTokens -gt 0) { $WarmupMaxTokens } else { $MaxTokens }
@@ -240,6 +246,20 @@ if ($PrefillChunk -ge 0) { $env:DS4_METAL_PREFILL_CHUNK = "$PrefillChunk" }
 else { Remove-Item Env:\DS4_METAL_PREFILL_CHUNK -ErrorAction SilentlyContinue }
 if ($PrefillUnionStats) { $env:DS4_CUDA_PREFILL_UNION_STATS = "1" }
 else { Remove-Item Env:\DS4_CUDA_PREFILL_UNION_STATS -ErrorAction SilentlyContinue }
+if ($PrefillWaves) { $env:DS4_CUDA_PREFILL_WAVES = "1" }
+else { Remove-Item Env:\DS4_CUDA_PREFILL_WAVES -ErrorAction SilentlyContinue }
+if ($PrefillWaveForceExperts -gt 0) {
+    $env:DS4_CUDA_PREFILL_WAVE_FORCE_EXPERTS = "$PrefillWaveForceExperts"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_WAVE_FORCE_EXPERTS -ErrorAction SilentlyContinue
+}
+if ($GenericSortedMoe) {
+    $env:DS4_CUDA_MOE_NO_EXPERT_TILES = "1"
+    $env:DS4_CUDA_MOE_NO_P2 = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_MOE_NO_EXPERT_TILES -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_MOE_NO_P2 -ErrorAction SilentlyContinue
+}
 if ($IoQD -gt 1) { $env:DS4_CUDA_MOE_IO_QD = "$IoQD" }
 else { Remove-Item Env:\DS4_CUDA_MOE_IO_QD -ErrorAction SilentlyContinue }
 if ($ExpertCacheN -gt 0) {
@@ -807,6 +827,9 @@ $prefillUnionCacheHits = 0; $prefillUnionCacheAdmissions = 0; $prefillUnionDirec
 $prefillUnionSpexExperts = 0; $prefillUnionNonresidentExperts = 0
 $prefillUnionSourceSpanBytes = 0; $prefillUnionArenaH2DBytes = 0
 $prefillUnionCacheD2DBytes = 0; $prefillUnionUploadSyncs = 0
+$prefillWavesObserved = $false; $prefillWaveActivations = 0; $prefillWaveLayers = 0
+$prefillWaveCount = 0; $prefillWaveMaxExperts = 0; $prefillWaveActivePairs = 0
+$prefillWaveUniqueExperts = 0; $prefillWaveUploadWaits = 0; $prefillWaveFailures = 0
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
 $arenaAllocatedBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
@@ -891,6 +914,28 @@ if (Test-Path $stderrLog) {
     }
     if ($PrefillUnionStats -and -not $prefillUnionObserved) {
         throw "Prefill union stats were requested but no successful batched prefill call was reported"
+    }
+    $prefillWaveLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[prefill-waves\] final " })
+    if ($prefillWaveLines.Count -gt 0) {
+        $prefillWavePattern = "^ds4: \[prefill-waves\] final activations=(\d+) layers=(\d+) waves=(\d+) max_wave=(\d+) active_pairs=(\d+) unique_experts=(\d+) upload_waits=(\d+) failures=(\d+)$"
+        foreach ($prefillWaveLine in $prefillWaveLines) {
+            if ($prefillWaveLine -notmatch $prefillWavePattern) {
+                throw "Prefill wave measurement failed: final line format mismatch"
+            }
+            $prefillWaveActivations += [uint64]$Matches[1]
+            $prefillWaveLayers += [uint64]$Matches[2]
+            $prefillWaveCount += [uint64]$Matches[3]
+            $prefillWaveMaxExperts = [math]::Max($prefillWaveMaxExperts, [uint32]$Matches[4])
+            $prefillWaveActivePairs += [uint64]$Matches[5]
+            $prefillWaveUniqueExperts += [uint64]$Matches[6]
+            $prefillWaveUploadWaits += [uint64]$Matches[7]
+            $prefillWaveFailures += [uint64]$Matches[8]
+        }
+        $prefillWavesObserved = $true
+    }
+    if ($PrefillWaves -and $PrefillWaveForceExperts -gt 0 -and
+        -not $prefillWavesObserved) {
+        throw "Prefill waves were forced but no successful wave activation was reported"
     }
     $overlapSharedObserved = [bool]($lines | Where-Object { $_ -match "CUDA MoE shared-overlap consumed" } | Select-Object -First 1)
     $overlapSharedFullObserved = [bool]($lines | Where-Object { $_ -match "CUDA MoE full shared-overlap consumed" } | Select-Object -First 1)
@@ -1629,6 +1674,18 @@ $summary = [pscustomobject]@{
     prefill_chunk_requested = $PrefillChunk
     prefill_chunk_observed = $prefillChunkObserved
     prefill_union_stats_requested = [bool]$PrefillUnionStats
+    prefill_waves_requested = [bool]$PrefillWaves
+    prefill_wave_force_experts_requested = $PrefillWaveForceExperts
+    generic_sorted_moe_requested = [bool]$GenericSortedMoe
+    prefill_waves_observed = $prefillWavesObserved
+    prefill_wave_activations = $prefillWaveActivations
+    prefill_wave_layers = $prefillWaveLayers
+    prefill_wave_count = $prefillWaveCount
+    prefill_wave_max_experts = $prefillWaveMaxExperts
+    prefill_wave_active_pairs = $prefillWaveActivePairs
+    prefill_wave_unique_experts = $prefillWaveUniqueExperts
+    prefill_wave_upload_waits = $prefillWaveUploadWaits
+    prefill_wave_failures = $prefillWaveFailures
     prefill_union_stats_observed = $prefillUnionObserved
     prefill_union_calls = $prefillUnionCalls
     prefill_union_tokens = $prefillUnionTokens
@@ -1966,6 +2023,7 @@ Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
 Write-Host ("prefill union requested/observed calls/tokens/slots/unique/dedup/max-union: " + [bool]$PrefillUnionStats + " / " + $prefillUnionObserved + " / " + $prefillUnionCalls + " / " + $prefillUnionTokens + " / " + $prefillUnionSelectedSlots + " / " + $prefillUnionUniqueExperts + " / " + $prefillUnionDedupRatio + " / " + $prefillUnionMaxUnion)
 Write-Host ("prefill union source/arena-H2D/cache-D2D GiB, syncs: " + [math]::Round($prefillUnionSourceSpanBytes / 1GB, 3) + " / " + [math]::Round($prefillUnionArenaH2DBytes / 1GB, 3) + " / " + [math]::Round($prefillUnionCacheD2DBytes / 1GB, 3) + " / " + $prefillUnionUploadSyncs)
+Write-Host ("prefill waves requested/observed/force/activations/layers/waves/max/active-pairs/unique/waits/failures: " + [bool]$PrefillWaves + " / " + $prefillWavesObserved + " / " + $PrefillWaveForceExperts + " / " + $prefillWaveActivations + " / " + $prefillWaveLayers + " / " + $prefillWaveCount + " / " + $prefillWaveMaxExperts + " / " + $prefillWaveActivePairs + " / " + $prefillWaveUniqueExperts + " / " + $prefillWaveUploadWaits + " / " + $prefillWaveFailures)
 Write-Host ("Q8-F16 cap/reserve MiB requested: " + $Q8F16CacheMB + " / " + $Q8F16CacheReserveMB)
 Write-Host ("effective DS4 env: " + (($effectiveDs4Environment.GetEnumerator() | ForEach-Object { $_.Key + "=" + $_.Value }) -join "; "))
 Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [bool]$PrefillMassObserve + " / " + [bool]$PrefillMassWrap + " / " + $prefillMassPolicy + " / " + $prefillMassArmed + " / " + $prefillMassFinalized)
