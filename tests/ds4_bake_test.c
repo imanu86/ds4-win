@@ -30,8 +30,10 @@ typedef enum fixture_mode {
     FIX_DUP_TENSOR,
     FIX_DUP_TENSOR_FIELD,
     FIX_DUP_TOP_KEY,
+    FIX_ESCAPED_DUP_TOP_KEY,
     FIX_OVERLONG_SHA,
     FIX_OVERLAP_EXTENTS,
+    FIX_MISSING_RETAINED_EXTENT,
     FIX_K60_SHAPE
 } fixture_mode;
 
@@ -88,6 +90,10 @@ static uint32_t layer_count(uint32_t layer, fixture_mode mode) {
     return 6;
 }
 
+static uint32_t k60_expert(uint32_t ordinal) {
+    return ordinal + ordinal / 2u;
+}
+
 static int append_selected(strbuf *j, fixture_mode mode) {
     if (!sb_add(j, "\"selected_experts_by_layer\":{")) return 0;
     if (mode == FIX_K60_SHAPE) {
@@ -96,7 +102,7 @@ static int append_selected(strbuf *j, fixture_mode mode) {
             if (!sb_add(j, "%s\"%u\":[", first ? "" : ",", layer)) return 0;
             first = false;
             for (uint32_t e = 0; e < 154; e++) {
-                if (!sb_add(j, "%s%u", e ? "," : "", e)) return 0;
+                if (!sb_add(j, "%s%u", e ? "," : "", k60_expert(e))) return 0;
             }
             if (!sb_add(j, "]")) return 0;
         }
@@ -172,7 +178,9 @@ static unsigned char *build_fixture(fixture_mode mode, size_t *out_len) {
     if (mode == FIX_K60_SHAPE) {
         for (uint32_t layer = 3; layer < DS4_BAKE_LAYERS; layer++) {
             memset(mask + layer * 32u, 0, 32u);
-            for (uint32_t e = 0; e < 154; e++) set_mask_bit(mask, layer, e);
+            for (uint32_t e = 0; e < 154; e++) {
+                set_mask_bit(mask, layer, k60_expert(e));
+            }
         }
     } else {
         memset(mask, 0, 32);
@@ -183,14 +191,19 @@ static unsigned char *build_fixture(fixture_mode mode, size_t *out_len) {
     if (!sb_add(&j,
         "{\"format\":\"ds4-windows-sparse-bake\",\"version\":%u,"
         "\"source_model_size\":%llu,\"source_model_sha256\":null,"
-        "\"mask_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef%s\"," 
-        "\"payload_bytes\":%llu,\"extents\":%s,",
+        "\"mask_sha256\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef%s\","
+        "\"payload_bytes\":%llu,\"payload_gib\":0.0009765625,"
+        "\"logical_savings_gib\":0.0,\"extents\":%s,",
         mode == FIX_MANIFEST_BAD_VERSION ? 2u : 1u,
         (unsigned long long)source_size,
         mode == FIX_OVERLONG_SHA ? "f" : "",
-        (unsigned long long)source_size,
-        mode == FIX_OVERLAP_EXTENTS ? "[[0,600000],[500000,448576]]" : "[[0,1048576]]")) goto fail;
+        (unsigned long long)(mode == FIX_MISSING_RETAINED_EXTENT ?
+            1044480ull : source_size),
+        mode == FIX_OVERLAP_EXTENTS ? "[[0,600000],[500000,448576]]" :
+        (mode == FIX_MISSING_RETAINED_EXTENT ? "[[0,4096],[8192,1040384]]" :
+            "[[0,1048576]]"))) goto fail;
     if (mode == FIX_DUP_TOP_KEY && !sb_add(&j, "\"version\":1,")) goto fail;
+    if (mode == FIX_ESCAPED_DUP_TOP_KEY && !sb_add(&j, "\"\\u0076ersion\":1,")) goto fail;
     if (!append_selected(&j, mode)) goto fail;
     if (!sb_add(&j, ",")) goto fail;
     if (!append_routed(&j, mode)) goto fail;
@@ -274,8 +287,8 @@ static int test_k60_shape(void) {
     CHECK(meta.retained_count[3] == 154);
     CHECK(meta.retained_count[42] == 154);
     CHECK(meta.routed_tensors[3][DS4_BAKE_TENSOR_GATE].selected_count == 154);
-    CHECK(ds4_bake_expert_retained(&meta, 42, 153) == 1);
-    CHECK(ds4_bake_expert_retained(&meta, 42, 154) == 0);
+    CHECK(ds4_bake_expert_retained(&meta, 42, k60_expert(153)) == 1);
+    CHECK(ds4_bake_expert_retained(&meta, 42, 2) == 0);
     free(buf);
     return 0;
 }
@@ -365,8 +378,10 @@ int main(void) {
     CHECK(expect_invalid(FIX_DUP_TENSOR) == 0);
     CHECK(expect_invalid(FIX_DUP_TENSOR_FIELD) == 0);
     CHECK(expect_invalid(FIX_DUP_TOP_KEY) == 0);
+    CHECK(expect_invalid(FIX_ESCAPED_DUP_TOP_KEY) == 0);
     CHECK(expect_invalid(FIX_OVERLONG_SHA) == 0);
     CHECK(expect_invalid(FIX_OVERLAP_EXTENTS) == 0);
+    CHECK(expect_invalid(FIX_MISSING_RETAINED_EXTENT) == 0);
     CHECK(expect_invalid(FIX_MANIFEST_BAD_VERSION) == 0);
     return 0;
 }

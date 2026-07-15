@@ -3,6 +3,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define DS4_BAKE_FOOTER_LEN 56u
@@ -16,6 +17,11 @@ typedef struct json_parser {
     size_t err_cap;
 } json_parser;
 
+typedef struct bake_extent {
+    uint64_t offset;
+    uint64_t end;
+} bake_extent;
+
 typedef struct parse_state {
     ds4_bake_meta *meta;
     uint8_t selected[DS4_BAKE_MASK_LEN];
@@ -24,6 +30,9 @@ typedef struct parse_state {
     uint32_t tensor_count;
     uint64_t payload_bytes;
     uint64_t extent_bytes;
+    bake_extent *extents;
+    size_t extent_count;
+    size_t extent_cap;
     bool saw_format;
     bool saw_version;
     bool saw_source_size;
@@ -154,10 +163,7 @@ static bool js_string(json_parser *j, char *out, size_t cap) {
             else if (c == 'r') c = '\r';
             else if (c == 't') c = '\t';
             else if (c == 'u') {
-                if (j->end - j->p < 4) return fail(j, "short unicode escape");
-                for (int i = 0; i < 4; i++) if (hexval(j->p[i]) < 0) return fail(j, "bad unicode escape");
-                j->p += 4;
-                c = '?';
+                return fail(j, "unicode escapes are not accepted in DS4BAKE manifests");
             } else {
                 return fail(j, "bad string escape");
             }
@@ -187,6 +193,35 @@ static bool js_u64(json_parser *j, uint64_t *out) {
     }
     if (j->p < j->end && (*j->p == '.' || *j->p == 'e' || *j->p == 'E')) return fail(j, "non-integer number");
     *out = v;
+    return true;
+}
+
+static bool js_skip_number(json_parser *j) {
+    js_ws(j);
+    if (j->p < j->end && *j->p == '-') j->p++;
+    if (j->p >= j->end) return fail(j, "expected number");
+    if (*j->p == '0') {
+        j->p++;
+    } else if (*j->p >= '1' && *j->p <= '9') {
+        do { j->p++; } while (j->p < j->end && *j->p >= '0' && *j->p <= '9');
+    } else {
+        return fail(j, "expected number");
+    }
+    if (j->p < j->end && *j->p == '.') {
+        j->p++;
+        if (j->p >= j->end || *j->p < '0' || *j->p > '9') {
+            return fail(j, "bad number fraction");
+        }
+        do { j->p++; } while (j->p < j->end && *j->p >= '0' && *j->p <= '9');
+    }
+    if (j->p < j->end && (*j->p == 'e' || *j->p == 'E')) {
+        j->p++;
+        if (j->p < j->end && (*j->p == '+' || *j->p == '-')) j->p++;
+        if (j->p >= j->end || *j->p < '0' || *j->p > '9') {
+            return fail(j, "bad number exponent");
+        }
+        do { j->p++; } while (j->p < j->end && *j->p >= '0' && *j->p <= '9');
+    }
     return true;
 }
 
@@ -245,10 +280,7 @@ static bool js_skip_value(json_parser *j) {
     if (*j->p == 't') return js_lit(j, "true");
     if (*j->p == 'f') return js_lit(j, "false");
     if (*j->p == 'n') return js_lit(j, "null");
-    if ((*j->p >= '0' && *j->p <= '9')) {
-        uint64_t v;
-        return js_u64(j, &v);
-    }
+    if (*j->p == '-' || (*j->p >= '0' && *j->p <= '9')) return js_skip_number(j);
     return fail(j, "unexpected value");
 }
 
@@ -458,7 +490,6 @@ static bool parse_routed(json_parser *j, parse_state *st) {
 
 static bool parse_extents(json_parser *j, parse_state *st) {
     uint64_t previous_end = 0;
-    uint32_t count = 0;
 
     js_ws(j);
     if (j->p >= j->end || *j->p++ != '[') return fail(j, "expected extents array");
@@ -478,11 +509,25 @@ static bool parse_extents(json_parser *j, parse_state *st) {
             end > st->meta->source_size) {
             return fail(j, "extent outside source");
         }
-        if (count != 0 && offset < previous_end) return fail(j, "extents overlap or are unsorted");
+        if (st->extent_count != 0 && offset < previous_end) {
+            return fail(j, "extents overlap or are unsorted");
+        }
         if (!add_u64(st->extent_bytes, length, &total)) return fail(j, "extent byte sum overflow");
+        if (st->extent_count == st->extent_cap) {
+            size_t next_cap = st->extent_cap ? st->extent_cap * 2u : 256u;
+            if (next_cap < st->extent_cap ||
+                next_cap > SIZE_MAX / sizeof(st->extents[0])) {
+                return fail(j, "too many extents");
+            }
+            bake_extent *next = (bake_extent *)realloc(
+                st->extents, next_cap * sizeof(st->extents[0]));
+            if (!next) return fail(j, "out of memory for extents");
+            st->extents = next;
+            st->extent_cap = next_cap;
+        }
+        st->extents[st->extent_count++] = (bake_extent){offset, end};
         st->extent_bytes = total;
         previous_end = end;
-        count++;
         js_ws(j);
         if (j->p >= j->end) return fail(j, "unterminated extents array");
         if (*j->p == ']') {
@@ -491,6 +536,45 @@ static bool parse_extents(json_parser *j, parse_state *st) {
         }
         if (*j->p++ != ',') return fail(j, "expected extents comma");
     }
+}
+
+static bool extent_covers(const parse_state *st, uint64_t offset, uint64_t length) {
+    uint64_t end;
+    if (!add_u64(offset, length, &end)) return false;
+    size_t lo = 0;
+    size_t hi = st->extent_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2u;
+        if (st->extents[mid].offset <= offset) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo == 0) return false;
+    const bake_extent *extent = &st->extents[lo - 1u];
+    return offset >= extent->offset && end <= extent->end;
+}
+
+static bool validate_retained_extent_coverage(json_parser *j, parse_state *st) {
+    if (st->extent_count == 0 || st->extents[0].offset != 0) {
+        return fail(j, "extents do not cover the GGUF header");
+    }
+    for (uint32_t layer = 0; layer < DS4_BAKE_LAYERS; layer++) {
+        for (uint32_t kind = 0; kind < DS4_BAKE_TENSOR_KINDS; kind++) {
+            const ds4_bake_tensor_record *record =
+                &st->meta->routed_tensors[layer][kind];
+            for (uint32_t expert = 0; expert < DS4_BAKE_EXPERTS; expert++) {
+                uint64_t expert_offset;
+                if (!ds4_bake_expert_retained(st->meta, layer, expert)) continue;
+                if ((expert != 0 && record->slice_bytes > UINT64_MAX / expert) ||
+                    !add_u64(record->offset,
+                             record->slice_bytes * expert,
+                             &expert_offset) ||
+                    !extent_covers(st, expert_offset, record->slice_bytes)) {
+                    return fail(j, "retained expert slice is absent from extents");
+                }
+            }
+        }
+    }
+    return true;
 }
 
 static bool parse_manifest(json_parser *j, parse_state *st) {
@@ -583,7 +667,8 @@ static bool parse_manifest(json_parser *j, parse_state *st) {
             }
         }
     }
-    return true;
+    memcpy(st->meta->retained_mask, st->selected, DS4_BAKE_MASK_LEN);
+    return validate_retained_extent_coverage(j, st);
 }
 
 ds4_bake_probe_result ds4_bake_probe(const void *map, uint64_t mapped_size,
@@ -655,11 +740,16 @@ ds4_bake_probe_result ds4_bake_probe(const void *map, uint64_t mapped_size,
     j.end = manifest + manifest_len;
     j.err = err;
     j.err_cap = err_cap;
-    if (!parse_manifest(&j, &st)) return DS4_BAKE_PROBE_INVALID;
+    if (!parse_manifest(&j, &st)) {
+        free(st.extents);
+        return DS4_BAKE_PROBE_INVALID;
+    }
     if (memcmp(st.selected, mask, DS4_BAKE_MASK_LEN) != 0) {
         set_err(err, err_cap, "retained mask mismatch");
+        free(st.extents);
         return DS4_BAKE_PROBE_INVALID;
     }
     memcpy(out->retained_mask, mask, DS4_BAKE_MASK_LEN);
+    free(st.extents);
     return DS4_BAKE_PROBE_VALID;
 }
