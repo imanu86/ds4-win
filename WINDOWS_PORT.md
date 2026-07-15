@@ -100,6 +100,16 @@ TTFT from 10.388 to 8.583 seconds versus serial wave31 (-17.38%), but remained
 20.15% below production. Keep G39 opt-in and next restore tile-capable wave
 kernels. See `G39_PREFILL_WAVE_OVERLAP_RESULTS.md`.
 
+G40 composes production full-chunk prefill with the G36 mass/LFRU actuator on
+the cyberpunk coding prompt. All 18 measured outputs and six warmups were exact,
+but the composed path is a strong transport negative: versus the matched arena
+control, missing experts fell 17.32% and all-hit calls rose from 28 to 137 while
+process reads rose from 174.99 to 433.99 GiB and decode fell from 1.99 to 0.463
+t/s. The arena was allocated but not bulk-populated from prefill mass, so the
+actuator still paid incremental admissions during decode. Do not tune policy
+thresholds yet; first measure prompt-mass bulk publication into pinned RAM. See
+`G40_MASS_LFRU_CYBERPUNK_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -114,8 +124,11 @@ a prompt-trained mask. See `G19_0051_POLICY_INTEGRATION_PLAN.md`.
 
 Follow-on measured gates are:
 
-1. Validate G36 mass/LFRU on a longer exact workload and a domain switch before
-   changing the default from `second-touch`.
+1. G40 completed the broader exact-prefix composition gate and found that the
+   current incremental G36 mass/LFRU actuator does not transfer: it reduces
+   misses but multiplies physical transport. Before changing `second-touch` or
+   tuning thresholds, enable unbiased prefill-mass observation plus WRAP to
+   bulk-seed the pinned arena, then rerun the matched cyberpunk A/B.
 2. P4-A batch-union is measured complete in G37. P4-B serial waved prefill is
    exact but negative in G38. G39 overlap recovered 17.38% versus serial but is
    still 9.18% behind production; restore tile-capable wave kernels before
@@ -137,6 +150,10 @@ Follow-on measured gates are:
    and make outside experts ineligible for SSD transport. Compare against full
    routing with all probe/build time included; this is not a reusable static
    domain mask and must be rebuilt on an intent/domain change.
+8. Use the G40/G41 split to keep policy and transport distinct: G40 established
+   that incremental mass/LFRU has a useful residency signal but an unacceptable
+   miss cost; G41 must test one bounded prefill-derived load before any semantic
+   shard probes or closed-set masking are added.
 
 ## Build
 
