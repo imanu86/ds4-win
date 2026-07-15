@@ -1,0 +1,32 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA loading model tensors 0.63 GiB cached
+ds4: CUDA loading model tensors 1.26 GiB cached
+ds4: CUDA loading model tensors 1.88 GiB cached
+ds4: CUDA loading model tensors 2.12 GiB cached
+ds4: CUDA loading model tensors 2.56 GiB cached
+ds4: CUDA loading model tensors 3.05 GiB cached
+ds4: CUDA loading model tensors 3.55 GiB cached
+ds4: CUDA loading model tensors 4.15 GiB cached
+ds4: CUDA loading model tensors 4.77 GiB cached
+ds4: CUDA loading model tensors 5.39 GiB cached
+ds4: CUDA loading model tensors 5.99 GiB cached
+ds4: CUDA loading model tensors 6.62 GiB cached
+ds4: CUDA loading model tensors 7.21 GiB cached
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 139.586s
+ds4: cuda backend initialized for graph diagnostics
+0715 17:34:26 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=21.72 GiB bytes=32211468288 slot_bytes=7077888
+0715 17:34:30 ds4-server: listening on http://127.0.0.1:8000
+0715 17:34:31 ds4-server: chat ctx=0..36:36 prompt start
+ds4: [request-phase] event=prompt-start mono=64893.342067 since_prompt=0.009054 since_decode=-1.000000
+ds4: [request-phase] event=session-sync-enter mono=64893.353877 since_prompt=0.020864 since_decode=-1.000000
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [request-phase] event=prefill-finalize-enter mono=65065.041456
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=36 rows_max=36 routed_slots=8640 unique=10240 candidate=4551 capacity=4551 mass_total=1440.000000 mass_candidate=840.702572 mass_coverage=0.5838 cutoff=0.140806 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [request-phase] event=wrap-enter mono=65065.089891
+ds4: [request-phase] event=wrap-copy-enter mono=65065.094496
+ds4: [arena] begin base=0 target=1 resident=4551 loads=4551 slots=4551

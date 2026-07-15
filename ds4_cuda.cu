@@ -3240,6 +3240,34 @@ static int cuda_dynamic_arena_wrap_part_profile(void) {
     return 0;
 }
 
+static int cuda_dynamic_arena_wrap_trim_between_phases(void) {
+    const char *value =
+        getenv("DS4_CUDA_ARENA_WRAP_TRIM_BETWEEN_PHASES");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-trim] invalid enable value '%s'; disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0;
+}
+
+static int cuda_dynamic_arena_trim_process_working_set(uint32_t *last_error) {
+#ifdef _WIN32
+    SetLastError(ERROR_SUCCESS);
+    const BOOL ok = SetProcessWorkingSetSize(
+        GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+    if (last_error) *last_error = ok ? 0u : (uint32_t)GetLastError();
+    return ok ? 1 : 0;
+#else
+    if (last_error) *last_error = (uint32_t)ENOTSUP;
+    return 0;
+#endif
+}
+
 static double cuda_dynamic_arena_wrap_slow_part_seconds(void) {
     const char *value = getenv("DS4_CUDA_ARENA_WRAP_SLOW_PART_MS");
     if (!value || !value[0]) return 0.025;
@@ -3278,6 +3306,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const int trust_worker_checksum =
         cuda_dynamic_arena_wrap_trust_worker_checksum();
     const int part_profile = cuda_dynamic_arena_wrap_part_profile();
+    const int trim_between_phases_requested =
+        cuda_dynamic_arena_wrap_trim_between_phases();
     const double slow_part_threshold_seconds =
         part_profile ? cuda_dynamic_arena_wrap_slow_part_seconds() : 0.025;
     const cuda_dynamic_arena_wrap_schedule schedule =
@@ -3322,6 +3352,11 @@ static int cuda_dynamic_arena_wrap_publish_target(
     uint32_t source_parts_slow_parts = 0;
     uint32_t source_parts_profile_workers = 0;
     uint8_t source_parts_max_part_kind = 0;
+    uint32_t source_parts_trim_calls = 0;
+    uint32_t source_parts_trim_succeeded = 0;
+    uint32_t source_parts_trim_failed = 0;
+    uint32_t source_parts_trim_last_error = 0;
+    double source_parts_trim_seconds = 0;
 
     local.loads = load_count;
     int all_succeeded = loads != NULL || load_count == 0;
@@ -3483,6 +3518,22 @@ static int cuda_dynamic_arena_wrap_publish_target(
                         }
                     }
                 }
+                if (trim_between_phases_requested &&
+                    phase + 1u < phase_count) {
+                    const double trim_started_at = cuda_wall_sec();
+                    uint32_t trim_error = 0;
+                    const int trim_ok =
+                        cuda_dynamic_arena_trim_process_working_set(&trim_error);
+                    source_parts_trim_seconds +=
+                        cuda_wall_sec() - trim_started_at;
+                    source_parts_trim_calls++;
+                    if (trim_ok) {
+                        source_parts_trim_succeeded++;
+                    } else {
+                        source_parts_trim_failed++;
+                        source_parts_trim_last_error = trim_error;
+                    }
+                }
             }
             const double source_copy_done_at = cuda_wall_sec();
             source_parts_copy_seconds =
@@ -3513,6 +3564,23 @@ static int cuda_dynamic_arena_wrap_publish_target(
                             source_parts_max_part_kind),
                         (unsigned long long)
                             source_parts_max_part_source_offset);
+            }
+            if (trim_between_phases_requested) {
+                const int trim_contract_valid =
+                    schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS &&
+                    trust_worker_checksum && phase_count == 3u;
+                const char *trim_result = !trim_contract_valid ? "skipped" :
+                    (source_parts_trim_calls == 2u &&
+                     source_parts_trim_succeeded == 2u &&
+                     source_parts_trim_failed == 0u ? "complete" : "failed");
+                fprintf(stderr,
+                        "ds4: [arena-wrap-trim] result=%s calls=%u succeeded=%u failed=%u seconds=%.6f last_error=%u\n",
+                        trim_result,
+                        source_parts_trim_calls,
+                        source_parts_trim_succeeded,
+                        source_parts_trim_failed,
+                        source_parts_trim_seconds,
+                        source_parts_trim_last_error);
             }
             for (size_t i = 0; i < part_success.size(); i++) {
                 if (!part_success[i]) {

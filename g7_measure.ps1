@@ -25,6 +25,7 @@ param(
     [switch]$ArenaWrapSourceParts,
     [switch]$ArenaWrapPartProfile,
     [ValidateRange(0.001, 600000.0)][double]$ArenaWrapSlowPartMs = 25.0,
+    [switch]$ArenaWrapTrimBetweenPhases,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
@@ -119,6 +120,10 @@ if ($WarmupMaxTokens -gt 0 -and -not $Warmup) {
 if ($RequestPhaseTrace -and -not $PrefillMassWrap) {
     throw "RequestPhaseTrace currently requires -PrefillMassWrap"
 }
+if ($ArenaWrapTrimBetweenPhases -and
+    (-not $ArenaWrapSourceParts -or -not $ArenaWrapTrustWorkerChecksum)) {
+    throw "ArenaWrapTrimBetweenPhases requires -ArenaWrapSourceParts and -ArenaWrapTrustWorkerChecksum"
+}
 if ($RequestPhaseTrace -and ($Warmup -or $Repeats -ne 1 -or $MaxTokens -le 0)) {
     throw "RequestPhaseTrace requires one non-warmup request with MaxTokens greater than zero"
 }
@@ -151,6 +156,32 @@ $buildManifestPath = Join-Path $PSScriptRoot "build\Release\g7_build_manifest.js
 $model = $ModelPath
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
+$processIsolationLog = Join-Path $outdir ("g7_" + $Tag + "_process_isolation_preflight.json")
+$measurementMutexName = "Local\DS4_G7_MEASUREMENT_LOCK"
+$measurementMutex = New-Object System.Threading.Mutex($false, $measurementMutexName)
+$measurementLockAcquired = $false
+try {
+    $measurementLockAcquired = $measurementMutex.WaitOne(0)
+} catch [System.Threading.AbandonedMutexException] {
+    $measurementLockAcquired = $true
+}
+if (-not $measurementLockAcquired) {
+    [pscustomobject]@{
+        schema = "g7_process_isolation_preflight_v1"
+        checked_utc = (Get-Date).ToUniversalTime().ToString("o")
+        mutex_name = $measurementMutexName
+        mutex_acquired = $false
+        current_harness_pid = $PID
+        conflict_count = $null
+        conflicts = @()
+        ready_to_launch = $false
+        refusal_reason = "measurement-lock-owned"
+    } | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath $processIsolationLog -Encoding UTF8
+    $measurementMutex.Dispose()
+    throw "Process isolation preflight refused launch: another G7 harness owns the measurement lock"
+}
+try {
 $stderrLog = Join-Path $outdir ("g7_" + $Tag + "_stderr.log")
 $stdoutLog = Join-Path $outdir ("g7_" + $Tag + "_stdout.log")
 $memoryPreflightLog = Join-Path $outdir ("g7_" + $Tag + "_memory_preflight.json")
@@ -160,9 +191,64 @@ $resultPath = Join-Path $outdir ("g7_" + $Tag + "_result.json")
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
 if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
+if (Test-Path $processIsolationLog) { Remove-Item $processIsolationLog -Force }
 if (Test-Path $runtimeTelemetryLog) { Remove-Item $runtimeTelemetryLog -Force }
 if (Test-Path $rawOutputsPath) { Remove-Item $rawOutputsPath -Force }
 if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
+
+try {
+    $processesAtPreflight = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+} catch {
+    throw ("Process isolation preflight could not enumerate processes: " + $_.Exception.Message)
+}
+$processById = @{}
+foreach ($candidateProcess in $processesAtPreflight) {
+    $processById[[int]$candidateProcess.ProcessId] = $candidateProcess
+}
+$ancestorProcessIds = @()
+$seenAncestorIds = @{}
+$cursorPid = $PID
+while ($processById.ContainsKey([int]$cursorPid)) {
+    $parentPid = [int]$processById[[int]$cursorPid].ParentProcessId
+    if ($parentPid -le 0 -or $seenAncestorIds.ContainsKey($parentPid)) { break }
+    $ancestorProcessIds += $parentPid
+    $seenAncestorIds[$parentPid] = $true
+    $cursorPid = $parentPid
+}
+$processConflicts = @($processesAtPreflight | Where-Object {
+    $_.ProcessId -ne $PID -and
+    $ancestorProcessIds -notcontains [int]$_.ProcessId -and
+    ($_.Name -ieq "ds4_server.exe" -or
+     ($_.Name -match "^(powershell|pwsh)(\.exe)?$" -and
+      $_.CommandLine -match "g7_(measure|runtime_monitor)\.ps1"))
+} | ForEach-Object {
+    [pscustomobject]@{
+        pid = [int]$_.ProcessId
+        parent_pid = [int]$_.ParentProcessId
+        name = [string]$_.Name
+        executable_path = [string]$_.ExecutablePath
+        command_line = [string]$_.CommandLine
+    }
+})
+$processIsolationPreflight = [pscustomobject]@{
+    schema = "g7_process_isolation_preflight_v1"
+    checked_utc = (Get-Date).ToUniversalTime().ToString("o")
+    mutex_name = $measurementMutexName
+    mutex_acquired = $measurementLockAcquired
+    current_harness_pid = $PID
+    ancestor_process_ids = $ancestorProcessIds
+    conflict_count = $processConflicts.Count
+    conflicts = $processConflicts
+    ready_to_launch = ($processConflicts.Count -eq 0)
+}
+$processIsolationPreflight | ConvertTo-Json -Depth 5 |
+    Set-Content -LiteralPath $processIsolationLog -Encoding UTF8
+if ($processConflicts.Count -ne 0) {
+    $conflictText = @($processConflicts | ForEach-Object {
+        $_.name + " pid=" + $_.pid
+    }) -join ", "
+    throw ("Process isolation preflight refused launch: " + $conflictText)
+}
 
 $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
 $env:PATH = "$env:CUDA_PATH\bin;" + $env:PATH
@@ -227,6 +313,11 @@ if ($ArenaWrapPartProfile) {
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_PART_PROFILE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SLOW_PART_MS -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapTrimBetweenPhases) {
+    $env:DS4_CUDA_ARENA_WRAP_TRIM_BETWEEN_PHASES = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_TRIM_BETWEEN_PHASES -ErrorAction SilentlyContinue
 }
 if ($ComposePrefillMassTiering) {
     $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
@@ -911,6 +1002,9 @@ $arenaWrapPartProfileSlowThresholdMs = 0.0; $arenaWrapPartProfileSlowParts = 0
 $arenaWrapPartProfileMaxPartMs = 0.0; $arenaWrapPartProfileMaxPartBytes = 0
 $arenaWrapPartProfileMaxPartLoad = 0; $arenaWrapPartProfileMaxPartCursor = 0
 $arenaWrapPartProfileMaxPartKind = "not_observed"; $arenaWrapPartProfileMaxPartSource = 0
+$arenaWrapTrimObserved = $false; $arenaWrapTrimResult = "not_observed"
+$arenaWrapTrimCalls = 0; $arenaWrapTrimSucceeded = 0; $arenaWrapTrimFailed = 0
+$arenaWrapTrimSeconds = 0.0; $arenaWrapTrimLastError = 0
 $arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
 $arenaObserverPublicationCount = 0; $arenaWrapPublicationCount = 0
@@ -1505,6 +1599,16 @@ if (Test-Path $stderrLog) {
         $arenaWrapPartProfileMaxPartKind = $Matches[19]
         $arenaWrapPartProfileMaxPartSource = [long]$Matches[20]
     }
+    $arenaWrapTrimLine = $lines | Where-Object { $_ -match "\[arena-wrap-trim\] result=" } | Select-Object -Last 1
+    if ($arenaWrapTrimLine -and $arenaWrapTrimLine -match "result=([^ ]+) calls=(\d+) succeeded=(\d+) failed=(\d+) seconds=([0-9.]+) last_error=(\d+)") {
+        $arenaWrapTrimObserved = $true
+        $arenaWrapTrimResult = $Matches[1]
+        $arenaWrapTrimCalls = [int]$Matches[2]
+        $arenaWrapTrimSucceeded = [int]$Matches[3]
+        $arenaWrapTrimFailed = [int]$Matches[4]
+        $arenaWrapTrimSeconds = [double]::Parse($Matches[5], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapTrimLastError = [long]$Matches[6]
+    }
     $arenaResultLines = @($lines | Where-Object { $_ -match "\[arena-observe\] window complete" })
     $arenaObserverPublicationCount = $arenaResultLines.Count
     $arenaResultLine = $arenaResultLines | Select-Object -Last 1
@@ -1907,6 +2011,18 @@ if ($ArenaWrapPartProfile) {
         throw "Arena WRAP part profile measurement failed: slow-part threshold differs"
     }
 }
+if ($ArenaWrapTrimBetweenPhases) {
+    if (-not $arenaWrapTrimObserved -or
+        $arenaWrapTrimResult -ne "complete" -or
+        $arenaWrapTrimCalls -ne 2 -or
+        $arenaWrapTrimSucceeded -ne 2 -or
+        $arenaWrapTrimFailed -ne 0 -or
+        $arenaWrapTrimLastError -ne 0) {
+        throw "Arena WRAP trim measurement failed: telemetry/contract differs"
+    }
+} elseif ($arenaWrapTrimObserved) {
+    throw "Arena WRAP trim measurement failed: unexpected trim telemetry while disabled"
+}
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
 $serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
@@ -2105,6 +2221,7 @@ $summary = [pscustomobject]@{
     arena_wrap_schedule_requested = if ($ArenaWrapSourceParts) { "source-parts" } else { "expert-major" }
     arena_wrap_part_profile_requested = [bool]$ArenaWrapPartProfile
     arena_wrap_slow_part_ms_requested = $ArenaWrapSlowPartMs
+    arena_wrap_trim_between_phases_requested = [bool]$ArenaWrapTrimBetweenPhases
     arena_wrap_profile_observed = $arenaWrapProfileObserved
     arena_wrap_profile_result = $arenaWrapProfileResult
     arena_wrap_schedule_observed = $arenaWrapScheduleObserved
@@ -2142,6 +2259,13 @@ $summary = [pscustomobject]@{
     arena_wrap_part_profile_max_part_cursor = $arenaWrapPartProfileMaxPartCursor
     arena_wrap_part_profile_max_part_kind = $arenaWrapPartProfileMaxPartKind
     arena_wrap_part_profile_max_part_source = $arenaWrapPartProfileMaxPartSource
+    arena_wrap_trim_observed = $arenaWrapTrimObserved
+    arena_wrap_trim_result = $arenaWrapTrimResult
+    arena_wrap_trim_calls = $arenaWrapTrimCalls
+    arena_wrap_trim_succeeded = $arenaWrapTrimSucceeded
+    arena_wrap_trim_failed = $arenaWrapTrimFailed
+    arena_wrap_trim_seconds = $arenaWrapTrimSeconds
+    arena_wrap_trim_last_error = $arenaWrapTrimLastError
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
@@ -2304,6 +2428,7 @@ $summary = [pscustomobject]@{
     no_selected_load = [bool]$NoSelectedLoad
     diagnostics = [bool]$Diagnostics
     memory_preflight = $memoryPreflight
+    process_isolation_preflight = $processIsolationPreflight
     runtime_telemetry = $runtimeTelemetry
     moe_io_queue_depth = $IoQD
     moe_io_queue_depth_observed = $observedIoQD
@@ -2492,6 +2617,7 @@ Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " /
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena WRAP profile result/schedule/checksum/total/copy/parts/workers: " + $arenaWrapProfileResult + " / " + $arenaWrapScheduleObserved + " / " + $arenaWrapChecksumObserved + " / " + $arenaWrapProfileTotalSeconds + " / " + $arenaWrapSourcePartsCopySeconds + " / " + $arenaWrapPartCount + " / " + $arenaWrapCopyWorkers)
 Write-Host ("arena WRAP part profile req/obs/workers/parts/memcpy/main/join/max-part-ms/slow: " + [bool]$ArenaWrapPartProfile + " / " + $arenaWrapPartProfileObserved + " / " + $arenaWrapPartProfileWorkers + " / " + $arenaWrapPartProfileParts + " / " + $arenaWrapPartProfileMemcpySumSeconds + " / " + $arenaWrapPartProfileMainWorkerSeconds + " / " + $arenaWrapPartProfileJoinSeconds + " / " + $arenaWrapPartProfileMaxPartMs + " / " + $arenaWrapPartProfileSlowParts)
+Write-Host ("arena WRAP trim req/obs/result/calls/ok/fail/sec/error: " + [bool]$ArenaWrapTrimBetweenPhases + " / " + $arenaWrapTrimObserved + " / " + $arenaWrapTrimResult + " / " + $arenaWrapTrimCalls + " / " + $arenaWrapTrimSucceeded + " / " + $arenaWrapTrimFailed + " / " + $arenaWrapTrimSeconds + " / " + $arenaWrapTrimLastError)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
 Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaReportedResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
@@ -2528,3 +2654,9 @@ Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitM
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="
+} finally {
+    if ($measurementLockAcquired) {
+        try { $measurementMutex.ReleaseMutex() } catch {}
+    }
+    $measurementMutex.Dispose()
+}
