@@ -11884,6 +11884,64 @@ __global__ static void moe_gate_up_mid_decode_lut_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_gate_up_mid_decode_ptrs_lut_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const uint64_t *route_ptrs,
+        const cuda_block_q8_K *xq,
+        const float *weights,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t write_aux,
+        float clamp) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row_lane = threadIdx.x >> 3u;
+    uint32_t slot = blockIdx.y;
+    const cuda_block_q8_K *xqb = xq;
+    __shared__ cuda_block_q8_K sxq[16];
+    __shared__ uint64_t s_iq2_grid[256];
+    __shared__ uint8_t s_iq2_signs[128];
+    if (xq_blocks <= 16u) {
+        for (uint32_t i = threadIdx.x; i < xq_blocks; i += blockDim.x) sxq[i] = xqb[i];
+        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
+        __syncthreads();
+        xqb = sxq;
+    }
+    const char *gate_ptr = (const char *)(uintptr_t)route_ptrs[slot];
+    const char *up_ptr = (const char *)(uintptr_t)route_ptrs[n_expert + slot];
+    for (uint32_t rr = 0; rr < 4u; rr++) {
+        uint32_t row = blockIdx.x * 128u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        const cuda_block_iq2_xxs *gr = (const cuda_block_iq2_xxs *)(gate_ptr + (uint64_t)row * gate_row_bytes);
+        const cuda_block_iq2_xxs *ur = (const cuda_block_iq2_xxs *)(up_ptr + (uint64_t)row * gate_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+            gate += dev_dot_iq2_xxs_q8_K_block_lut(gr + b, xqb + b, s_iq2_grid, s_iq2_signs);
+            up += dev_dot_iq2_xxs_q8_K_block_lut(ur + b, xqb + b, s_iq2_grid, s_iq2_signs);
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)slot * expert_mid_dim + row;
+            if (write_aux) {
+                gate_out[off] = gate;
+                up_out[off] = up;
+            }
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[slot];
+        }
+    }
+}
+
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -12612,6 +12670,30 @@ __global__ static void moe_down_sum6_qwarp32_kernel(
     if (lane == 0) out[row] = total;
 }
 
+__global__ static void moe_down_sum6_ptrs_qwarp32_kernel(
+        float *out,
+        const uint64_t *down_ptrs,
+        const cuda_block_q8_K *midq,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        const char *down_ptr = (const char *)(uintptr_t)down_ptrs[slot];
+        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(down_ptr + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq = midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -13298,6 +13380,7 @@ struct cuda_moe_gather {
     char *up;   uint64_t up_cap;
     char *down; uint64_t down_cap;
     int32_t *slot; uint64_t slot_cap;
+    uint64_t *route_ptrs; uint64_t route_ptrs_cap;
     ds4_gpu_tensor slot_tensor;
     std::vector<int32_t> h_sel;
     std::vector<float> h_weights;
@@ -13320,7 +13403,11 @@ struct cuda_moe_gather {
     std::vector<uint8_t> h_cache_admission_evicted;
     std::vector<float> h_compact_mass;
     std::vector<uint8_t> h_arena_resident;
+    std::vector<uint64_t> h_route_ptrs;
     uint8_t direct_cache_active;
+    uint8_t mixed_direct_active;
+    uint32_t mixed_cache_routes;
+    uint32_t mixed_compact_routes;
 };
 static cuda_moe_gather g_moe_gather;
 
@@ -13470,14 +13557,17 @@ static void cuda_moe_gather_release(void) {
     if (g_moe_gather.up) (void)cudaFree(g_moe_gather.up);
     if (g_moe_gather.down) (void)cudaFree(g_moe_gather.down);
     if (g_moe_gather.slot) (void)cudaFree(g_moe_gather.slot);
+    if (g_moe_gather.route_ptrs) (void)cudaFree(g_moe_gather.route_ptrs);
     g_moe_gather.gate = NULL;
     g_moe_gather.up = NULL;
     g_moe_gather.down = NULL;
     g_moe_gather.slot = NULL;
+    g_moe_gather.route_ptrs = NULL;
     g_moe_gather.gate_cap = 0;
     g_moe_gather.up_cap = 0;
     g_moe_gather.down_cap = 0;
     g_moe_gather.slot_cap = 0;
+    g_moe_gather.route_ptrs_cap = 0;
     g_moe_gather.slot_tensor.ptr = NULL;
     g_moe_gather.slot_tensor.bytes = 0;
     g_moe_gather.slot_tensor.owner = 0;
@@ -13494,7 +13584,11 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.h_cache_admission_evicted.clear();
     g_moe_gather.h_compact_mass.clear();
     g_moe_gather.h_arena_resident.clear();
+    g_moe_gather.h_route_ptrs.clear();
     g_moe_gather.direct_cache_active = 0;
+    g_moe_gather.mixed_direct_active = 0;
+    g_moe_gather.mixed_cache_routes = 0;
+    g_moe_gather.mixed_compact_routes = 0;
 }
 
 static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
@@ -13966,6 +14060,7 @@ static int cuda_moe_selected_load(
         uint32_t layer_index,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        uint32_t expert_in_dim,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg,
         const ds4_gpu_tensor *weights_arg,
@@ -13973,6 +14068,9 @@ static int cuda_moe_selected_load(
         const ds4_gpu_spex_key *spex_key) {
     g_moe_last_selected.valid = 0;
     g_moe_gather.direct_cache_active = 0;
+    g_moe_gather.mixed_direct_active = 0;
+    g_moe_gather.mixed_cache_routes = 0;
+    g_moe_gather.mixed_compact_routes = 0;
     (void)model_size;
     if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
     if (!selected_arg || !selected_arg->ptr) return 0;
@@ -14429,8 +14527,16 @@ static int cuda_moe_selected_load(
         return 0;
     }
 
+    const int mixed_direct_active =
+        getenv("DS4_CUDA_MOE_MIXED_DIRECT") != NULL &&
+        n_tokens == 1u && n_expert == 6u && cache &&
+        expert_in_dim / CUDA_QK_K <= 16u &&
+        spex_prefetch_slot < 0 &&
+        getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL &&
+        getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6") == NULL;
     int direct_cache_active = 0;
-    if (getenv("DS4_CUDA_MOE_DIRECT_CACHE_HITS") != NULL &&
+    if (!mixed_direct_active &&
+        getenv("DS4_CUDA_MOE_DIRECT_CACHE_HITS") != NULL &&
         n_tokens == 1u && cache && spex_prefetch_slot < 0 &&
         admission_slots.empty() && spans.empty()) {
         direct_cache_active = 1;
@@ -14442,7 +14548,7 @@ static int cuda_moe_selected_load(
         }
     }
 
-    if (cache && !direct_cache_active) {
+    if (cache && !direct_cache_active && !mixed_direct_active) {
         for (uint32_t i = 0; i < compact_count; i++) {
             if (cache_slots[i] < 0) continue;
             if (!cuda_moe_expert_cache_copy_to_compact_async(
@@ -14456,7 +14562,18 @@ static int cuda_moe_selected_load(
         }
     }
 
-    if (!direct_cache_active &&
+    int arena_upload_pending = 0;
+    for (uint8_t resident : arena_resident) {
+        if (resident) {
+            arena_upload_pending = 1;
+            break;
+        }
+    }
+    const int upload_sync_required =
+        !direct_cache_active &&
+        (!mixed_direct_active || !spans.empty() ||
+         spex_prefetch_slot >= 0 || arena_upload_pending);
+    if (upload_sync_required &&
         !cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) {
         cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 0, 0);
         if (cache) cuda_moe_expert_cache_invalidate();
@@ -14516,6 +14633,56 @@ static int cuda_moe_selected_load(
             fprintf(stderr,
                     "ds4: CUDA MoE direct resident-cache hit layer=%u slots=%u compact=%u\n",
                     layer_index, slot_count, compact_count);
+        }
+    }
+    if (mixed_direct_active) {
+        const uint64_t route_ptr_count = (uint64_t)slot_count * 3ull;
+        const uint64_t route_ptr_bytes = route_ptr_count * sizeof(uint64_t);
+        if (!cuda_moe_gather_ensure(
+                (char **)&g_moe_gather.route_ptrs,
+                &g_moe_gather.route_ptrs_cap,
+                route_ptr_bytes,
+                "moe mixed route pointers")) {
+            cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 1, 0);
+            return 0;
+        }
+        std::vector<uint64_t> &route_ptrs = g_moe_gather.h_route_ptrs;
+        route_ptrs.resize((size_t)route_ptr_count);
+        uint32_t cache_routes = 0;
+        uint32_t compact_routes = 0;
+        for (uint32_t i = 0; i < slot_count; i++) {
+            const uint32_t compact_slot = (uint32_t)slots[i];
+            const int32_t cache_slot = cache_slots[compact_slot];
+            if (cache_slot >= 0) {
+                const uint64_t gate_off = (uint64_t)(uint32_t)cache_slot * gate_expert_bytes;
+                const uint64_t down_off = (uint64_t)(uint32_t)cache_slot * down_expert_bytes;
+                route_ptrs[i] = (uint64_t)(uintptr_t)(cache->gate + gate_off);
+                route_ptrs[slot_count + i] = (uint64_t)(uintptr_t)(cache->up + gate_off);
+                route_ptrs[2u * slot_count + i] = (uint64_t)(uintptr_t)(cache->down + down_off);
+                cache_routes++;
+            } else {
+                const uint64_t gate_off = (uint64_t)compact_slot * gate_expert_bytes;
+                const uint64_t down_off = (uint64_t)compact_slot * down_expert_bytes;
+                route_ptrs[i] = (uint64_t)(uintptr_t)(g_moe_gather.gate + gate_off);
+                route_ptrs[slot_count + i] = (uint64_t)(uintptr_t)(g_moe_gather.up + gate_off);
+                route_ptrs[2u * slot_count + i] = (uint64_t)(uintptr_t)(g_moe_gather.down + down_off);
+                compact_routes++;
+            }
+        }
+        if (!cuda_ok(cudaMemcpy(
+                g_moe_gather.route_ptrs, route_ptrs.data(),
+                (size_t)route_ptr_bytes, cudaMemcpyHostToDevice),
+                "moe mixed route pointers")) {
+            cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 1, 0);
+            return 0;
+        }
+        g_moe_gather.mixed_direct_active = 1;
+        g_moe_gather.mixed_cache_routes = cache_routes;
+        g_moe_gather.mixed_compact_routes = compact_routes;
+        if (getenv("DS4_CUDA_MOE_MIXED_DIRECT_STATS") != NULL) {
+            fprintf(stderr,
+                    "ds4: CUDA MoE mixed direct layer=%u cache_routes=%u compact_routes=%u\n",
+                    layer_index, cache_routes, compact_routes);
         }
     }
     if (!cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
@@ -14613,6 +14780,7 @@ static int routed_moe_launch(
     const char *gate_w = NULL;
     const char *up_w = NULL;
     const char *down_w = NULL;
+    uint32_t use_mixed_route_ptrs = 0;
     /* Selected-expert load: when the whole 256-expert block is beyond the pinned
      * host window (streaming regime), fetch/gather ONLY the routed experts into a
      * compact VRAM buffer and rebind `selected` to compact slots -- the unchanged
@@ -14626,6 +14794,7 @@ static int routed_moe_launch(
         cuda_moe_selected_load(model_map, model_size, layer_index,
                                gate_offset, up_offset, down_offset,
                                gate_expert_bytes, down_expert_bytes,
+                               expert_in_dim,
                                n_total_expert, n_expert, n_tokens, selected, weights,
                                spex_queue, spex_key)) {
         if (g_moe_gather.direct_cache_active) {
@@ -14637,6 +14806,7 @@ static int routed_moe_launch(
             up_w = g_moe_gather.up;
             down_w = g_moe_gather.down;
         }
+        use_mixed_route_ptrs = g_moe_gather.mixed_direct_active;
         selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
     } else {
         ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
@@ -14892,7 +15062,21 @@ static int routed_moe_launch(
                     clamp);
             } else if (ok) {
                 dim3 qgrid((expert_mid_dim + 127u) / 128u, n_tokens * n_expert, 1);
-                if (use_decode_lut_gate) {
+                if (use_mixed_route_ptrs) {
+                    moe_gate_up_mid_decode_ptrs_lut_qwarp32_kernel<<<qgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        g_moe_gather.route_ptrs,
+                        xq,
+                        (const float *)weights->ptr,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        write_gate_up,
+                        clamp);
+                } else if (use_decode_lut_gate) {
                     moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
                         (float *)gate->ptr,
                         (float *)up->ptr,
@@ -14948,7 +15132,16 @@ static int routed_moe_launch(
                 down_tile_starts = tile16_starts;
                 down_tile_capacity = tile16_capacity;
             }
-            if (use_direct_down_sum6) {
+            if (use_mixed_route_ptrs) {
+                dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
+                moe_down_sum6_ptrs_qwarp32_kernel<<<sgrid, 256>>>(
+                    (float *)out->ptr,
+                    g_moe_gather.route_ptrs + 2u * n_expert,
+                    midq,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim);
+            } else if (use_direct_down_sum6) {
                 dim3 sgrid((out_dim + 31u) / 32u, 1, 1);
                 moe_down_sum6_qwarp32_kernel<<<sgrid, 256>>>(
                     (float *)out->ptr,
@@ -14964,7 +15157,7 @@ static int routed_moe_launch(
                 zero_kernel<<<(n + 255u) / 256u, 256>>>((float *)out->ptr, n);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe atomic zero launch");
             }
-            if (use_direct_down_sum6) {
+            if (use_mixed_route_ptrs || use_direct_down_sum6) {
                 /* The direct decode kernel writes the final token row. */
             } else if (sorted_pairs && use_expert_tiles && sorted_offsets && sorted_counts &&
                 down_tile_total && down_tile_experts && down_tile_starts) {

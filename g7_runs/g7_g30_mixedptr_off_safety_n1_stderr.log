@@ -1,0 +1,729 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA fd-cached tensor-span:1 1020.40 MiB (total 1.00 GiB)
+ds4: CUDA fd-cached tensor-span:2 1015.67 MiB (total 1.99 GiB)
+ds4: CUDA fd-cached tensor-span:3 1012.67 MiB (total 2.98 GiB)
+ds4: CUDA fd-cached tensor-span:4 996.65 MiB (total 3.95 GiB)
+ds4: CUDA fd-cached tensor-span:5 1021.44 MiB (total 4.95 GiB)
+ds4: CUDA fd-cached tensor-span:6 997.03 MiB (total 5.92 GiB)
+ds4: CUDA fd-cached tensor-span:7 774.34 MiB (total 6.68 GiB)
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.920s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 03:21:19 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 03:21:20 ds4-server: listening on http://127.0.0.1:8000
+0715 03:21:20 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA evicted streamed range (evicts=1)
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+ds4: CUDA MoE selected-load slots=30 compact=27 gate/up 55.69 MiB down 70.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=28 gate/up 57.75 MiB down 73.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA fd-cached f16 0.75 MiB (total 5.69 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 5.69 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 5.69 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 5.69 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 5.69 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 5.72 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 5.72 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 5.72 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 5.72 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 5.72 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 5.73 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 5.73 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 5.74 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 5.74 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 5.75 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 5.75 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 5.75 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 5.75 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 5.75 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 5.76 GiB)
+ds4: CUDA fd-cached q8_0 2.12 MiB (total 5.76 GiB)
+ds4: CUDA fd-cached q_rms_weight 0.00 MiB (total 5.76 GiB)
+ds4: CUDA fd-cached kv_rms_weight 0.00 MiB (total 5.76 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 5.79 GiB)
+ds4: CUDA fd-cached f16 4.00 MiB (total 5.80 GiB)
+ds4: CUDA fd-cached f16 4.00 MiB (total 5.80 GiB)
+ds4: CUDA fd-cached compressor_ape 0.12 MiB (total 5.80 GiB)
+ds4: CUDA fd-cached attn_sinks 0.00 MiB (total 5.80 GiB)
+ds4: CUDA fd-cached attn_out_a 34.00 MiB (total 5.83 GiB)
+ds4: CUDA fd-cached attn_out_b 34.00 MiB (total 5.87 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 5.87 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 5.87 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 5.87 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 5.87 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 5.87 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 5.87 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 5.88 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 5.89 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 5.89 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 5.89 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 5.89 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 5.89 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 5.89 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 5.90 GiB)
+ds4: CUDA fd-cached q8_0 2.12 MiB (total 5.90 GiB)
+ds4: CUDA fd-cached q_rms_weight 0.00 MiB (total 5.90 GiB)
+ds4: CUDA fd-cached kv_rms_weight 0.00 MiB (total 5.90 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 5.93 GiB)
+ds4: CUDA fd-cached f16 8.00 MiB (total 5.94 GiB)
+ds4: CUDA fd-cached f16 8.00 MiB (total 5.95 GiB)
+ds4: CUDA fd-cached compressor_ape 0.01 MiB (total 5.95 GiB)
+ds4: CUDA fd-cached rms_weight 0.00 MiB (total 5.95 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 5.95 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 5.95 GiB)
+ds4: CUDA fd-cached f16 16.00 MiB (total 5.97 GiB)
+ds4: CUDA fd-cached f16 0.50 MiB (total 5.97 GiB)
+ds4: CUDA fd-cached compressor_ape 0.00 MiB (total 5.97 GiB)
+ds4: CUDA fd-cached rms_weight 0.00 MiB (total 5.97 GiB)
+ds4: CUDA fd-cached attn_sinks 0.00 MiB (total 5.97 GiB)
+ds4: CUDA fd-cached attn_out_a 34.00 MiB (total 6.00 GiB)
+ds4: CUDA fd-cached attn_out_b 34.00 MiB (total 6.04 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.04 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.04 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.04 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.04 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.04 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 6.04 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.05 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.06 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.06 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.06 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.06 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.06 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.06 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 6.07 GiB)
+ds4: CUDA fd-cached q8_0 2.12 MiB (total 6.07 GiB)
+ds4: CUDA fd-cached q_rms_weight 0.00 MiB (total 6.07 GiB)
+ds4: CUDA fd-cached kv_rms_weight 0.00 MiB (total 6.07 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 6.10 GiB)
+ds4: CUDA fd-cached f16 4.00 MiB (total 6.11 GiB)
+ds4: CUDA fd-cached f16 4.00 MiB (total 6.11 GiB)
+ds4: CUDA fd-cached compressor_ape 0.12 MiB (total 6.11 GiB)
+ds4: CUDA fd-cached attn_sinks 0.00 MiB (total 6.11 GiB)
+ds4: CUDA fd-cached attn_out_a 34.00 MiB (total 6.15 GiB)
+ds4: CUDA fd-cached attn_out_b 34.00 MiB (total 6.18 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.18 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.18 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.18 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.18 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.18 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 6.18 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.19 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.20 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached q8_0 2.12 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached q_rms_weight 0.00 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached kv_rms_weight 0.00 MiB (total 6.21 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 6.25 GiB)
+ds4: CUDA fd-cached f16 8.00 MiB (total 6.25 GiB)
+ds4: CUDA fd-cached f16 8.00 MiB (total 6.26 GiB)
+ds4: CUDA fd-cached compressor_ape 0.01 MiB (total 6.26 GiB)
+ds4: CUDA fd-cached rms_weight 0.00 MiB (total 6.26 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.26 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.27 GiB)
+ds4: CUDA fd-cached f16 16.00 MiB (total 6.28 GiB)
+ds4: CUDA fd-cached f16 0.50 MiB (total 6.28 GiB)
+ds4: CUDA fd-cached compressor_ape 0.00 MiB (total 6.28 GiB)
+ds4: CUDA fd-cached rms_weight 0.00 MiB (total 6.28 GiB)
+ds4: CUDA fd-cached attn_sinks 0.00 MiB (total 6.28 GiB)
+ds4: CUDA fd-cached attn_out_a 34.00 MiB (total 6.31 GiB)
+ds4: CUDA fd-cached attn_out_b 34.00 MiB (total 6.35 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.35 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.35 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.35 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.35 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.35 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 6.35 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=21 gate/up 43.31 MiB down 55.12 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.36 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.37 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached q8_0 2.12 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached q_rms_weight 0.00 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached kv_rms_weight 0.00 MiB (total 6.38 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 6.42 GiB)
+ds4: CUDA fd-cached f16 4.00 MiB (total 6.42 GiB)
+ds4: CUDA fd-cached f16 4.00 MiB (total 6.42 GiB)
+ds4: CUDA fd-cached compressor_ape 0.12 MiB (total 6.42 GiB)
+ds4: CUDA fd-cached attn_sinks 0.00 MiB (total 6.42 GiB)
+ds4: CUDA fd-cached attn_out_a 34.00 MiB (total 6.46 GiB)
+ds4: CUDA fd-cached attn_out_b 34.00 MiB (total 6.49 GiB)
+ds4: CUDA fd-cached f16 0.75 MiB (total 6.49 GiB)
+ds4: CUDA fd-cached hc_scale 0.00 MiB (total 6.49 GiB)
+ds4: CUDA fd-cached hc_base 0.00 MiB (total 6.49 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.49 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.49 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 6.49 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.50 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.51 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.52 GiB)
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.52 GiB)
+ds4: CUDA fd-cached q8_0 4.25 MiB (total 6.52 GiB)
+ds4: CUDA fd-cached q8_0 2.12 MiB (total 6.52 GiB)
+ds4: CUDA fd-cached q_rms_weight 0.00 MiB (total 6.52 GiB)
+ds4: CUDA fd-cached kv_rms_weight 0.00 MiB (total 6.52 GiB)
+ds4: CUDA fd-cached q8_0 34.00 MiB (total 6.56 GiB)
+ds4: CUDA fd-cached f16 8.00 MiB (total 6.57 GiB)
+ds4: CUDA fd-cached f16 8.00 MiB (total 6.57 GiB)
+ds4: CUDA fd-cached compressor_ape 0.01 MiB (total 6.57 GiB)
+ds4: CUDA fd-cached rms_weight 0.00 MiB (total 6.57 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.57 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.58 GiB)
+ds4: CUDA fd-cached f16 16.00 MiB (total 6.59 GiB)
+ds4: CUDA fd-cached f16 0.50 MiB (total 6.59 GiB)
+ds4: CUDA fd-cached compressor_ape 0.00 MiB (total 6.59 GiB)
+ds4: CUDA fd-cached rms_weight 0.00 MiB (total 6.59 GiB)
+ds4: CUDA fd-cached attn_sinks 0.00 MiB (total 6.59 GiB)
+ds4: CUDA fd-cached attn_out_a 34.00 MiB (total 6.63 GiB)
+ds4: CUDA fd-cached attn_out_b 34.00 MiB (total 6.66 GiB)
+ds4: CUDA fd-cached f16 2.00 MiB (total 6.66 GiB)
+ds4: CUDA fd-cached router_bias 0.00 MiB (total 6.66 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=21 gate/up 43.31 MiB down 55.12 MiB
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.67 GiB)
+ds4: CUDA fd-cached q8_0 8.50 MiB (total 6.68 GiB)
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=24 gate/up 49.50 MiB down 63.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=25 gate/up 51.56 MiB down 65.62 MiB
+ds4: [moecache] calls=42 layer=42 compact=23 cap=336 count=336 hits=0 misses=839 hit_rate=0.000 admissions=839 evictions=503 direct=0
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA fd-cached rms_weight 0.02 MiB (total 6.68 GiB)
+ds4: CUDA fd-cached q8_0 536.56 MiB (total 7.20 GiB)
+0715 03:21:23 ds4-server: chat ctx=0..5:5 prompt done 3.175s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [selprof] calls=60 experts=947 fill=1.491s (1.57 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=84 layer=42 compact=6 cap=336 count=336 hits=16 misses=1075 hit_rate=0.015 admissions=1075 evictions=739 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+0715 03:21:24 ds4-server: chat ctx=0..5:5 gen=1 decoding chunk=1.21 t/s avg=1.21 t/s 0.824s
+0715 03:21:24 ds4-server: chat ctx=0..5:5 gen=1 finish=length 4.013s
+0715 03:21:24 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA MoE selected-load slots=30 compact=27 gate/up 55.69 MiB down 70.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=28 gate/up 57.75 MiB down 73.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=21 gate/up 43.31 MiB down 55.12 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=21 gate/up 43.31 MiB down 55.12 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=24 gate/up 49.50 MiB down 63.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=16 gate/up 33.00 MiB down 42.00 MiB
+ds4: CUDA MoE selected-load slots=30 compact=18 gate/up 37.12 MiB down 47.25 MiB
+ds4: CUDA MoE selected-load slots=30 compact=22 gate/up 45.38 MiB down 57.75 MiB
+ds4: CUDA MoE selected-load slots=30 compact=19 gate/up 39.19 MiB down 49.88 MiB
+ds4: [selprof] calls=120 experts=1796 fill=2.324s (1.29 ms/expert)
+ds4: CUDA MoE selected-load slots=30 compact=17 gate/up 35.06 MiB down 44.62 MiB
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+ds4: CUDA MoE selected-load slots=30 compact=20 gate/up 41.25 MiB down 52.50 MiB
+ds4: CUDA MoE selected-load slots=30 compact=25 gate/up 51.56 MiB down 65.62 MiB
+ds4: [moecache] calls=126 layer=42 compact=23 cap=336 count=336 hits=28 misses=1902 hit_rate=0.015 admissions=1902 evictions=1566 direct=0
+ds4: CUDA MoE selected-load slots=30 compact=23 gate/up 47.44 MiB down 60.38 MiB
+0715 03:21:26 ds4-server: chat ctx=0..5:5 prompt done 1.643s
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=168 layer=42 compact=6 cap=336 count=336 hits=44 misses=2138 hit_rate=0.020 admissions=2138 evictions=1802 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [selprof] calls=180 experts=2254 fill=2.765s (1.23 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=210 layer=42 compact=6 cap=336 count=336 hits=194 misses=2240 hit_rate=0.080 admissions=2240 evictions=1904 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [selprof] calls=240 experts=2614 fill=3.071s (1.17 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=252 layer=42 compact=6 cap=336 count=336 hits=313 misses=2373 hit_rate=0.117 admissions=2373 evictions=2037 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=294 layer=42 compact=6 cap=336 count=336 hits=444 misses=2494 hit_rate=0.151 admissions=2494 evictions=2158 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [selprof] calls=300 experts=2974 fill=3.584s (1.21 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=336 layer=42 compact=6 cap=336 count=336 hits=546 misses=2644 hit_rate=0.171 admissions=2644 evictions=2308 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [selprof] calls=360 experts=3334 fill=4.062s (1.22 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=378 layer=42 compact=6 cap=336 count=336 hits=628 misses=2814 hit_rate=0.182 admissions=2814 evictions=2478 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=420 layer=42 compact=6 cap=336 count=336 hits=762 misses=2932 hit_rate=0.206 admissions=2932 evictions=2596 direct=0
+ds4: [selprof] calls=420 experts=3694 fill=4.449s (1.20 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=462 layer=42 compact=6 cap=336 count=336 hits=883 misses=3063 hit_rate=0.224 admissions=3063 evictions=2727 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [selprof] calls=480 experts=4054 fill=4.797s (1.18 ms/expert)
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+ds4: [moecache] calls=504 layer=42 compact=6 cap=336 count=336 hits=994 misses=3204 hit_rate=0.237 admissions=3204 evictions=2868 direct=0
+ds4: CUDA MoE selected-load slots=6 compact=6 gate/up 12.38 MiB down 15.75 MiB
+0715 03:21:33 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=1.31 t/s avg=1.31 t/s 6.879s
+0715 03:21:33 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 8.537s
+0715 03:21:33 ds4-server: benchmark request target reached; shutting down cleanly
+0715 03:21:33 ds4-server: shutdown requested, draining requests

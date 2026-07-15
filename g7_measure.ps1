@@ -39,6 +39,7 @@ param(
     [ValidateRange(0.0, 6.0)][double]$ExpertCacheReserveGB = 0.5,
     [ValidateSet("lru", "layer-top1")][string]$ExpertCachePolicy = "lru",
     [switch]$DirectCacheHits,
+    [switch]$MixedDirectCache,
     [switch]$ExpertCacheStats,
     [ValidateRange(1, 1000000)][int]$ExpertCacheStatsInterval = 128,
     [switch]$OverlapShared,
@@ -234,6 +235,17 @@ if ($DirectCacheHits) {
 } else {
     Remove-Item Env:\DS4_CUDA_MOE_DIRECT_CACHE_HITS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_MOE_DIRECT_CACHE_STATS -ErrorAction SilentlyContinue
+}
+if ($MixedDirectCache) {
+    $env:DS4_CUDA_MOE_MIXED_DIRECT = "1"
+    if ($Diagnostics) {
+        $env:DS4_CUDA_MOE_MIXED_DIRECT_STATS = "1"
+    } else {
+        Remove-Item Env:\DS4_CUDA_MOE_MIXED_DIRECT_STATS -ErrorAction SilentlyContinue
+    }
+} else {
+    Remove-Item Env:\DS4_CUDA_MOE_MIXED_DIRECT -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_MOE_MIXED_DIRECT_STATS -ErrorAction SilentlyContinue
 }
 if ($ExpertCacheStats) {
     $env:DS4_CUDA_MOE_CACHE_STATS = "1"
@@ -614,6 +626,8 @@ $observedIoQD = 1; $overlappedIoObserved = $false; $overlappedIoFallbacks = 0
 $cacheCalls = 0; $cacheLastLayer = -1; $cacheLastCompact = 0
 $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
 $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
+$mixedDirectObserved = $false; $mixedDirectCalls = 0
+$mixedDirectCacheRoutes = 0; $mixedDirectCompactRoutes = 0
 $overlapSharedObserved = $false
 $overlapSharedFullObserved = $false
 $spexObserved = $false; $spexObservedStage = ""; $spexObservedCap = 0; $spexScheduled = 0; $spexReady = 0; $spexNotReady = 0
@@ -792,6 +806,15 @@ if (Test-Path $stderrLog) {
         $cacheCapacity = [int]$Matches[4]; $cacheCount = [int]$Matches[5]
         $cacheHits = [long]$Matches[6]; $cacheMisses = [long]$Matches[7]; $cacheAdmissions = [long]$Matches[8]
         $cacheEvictions = [long]$Matches[9]; $cacheDirect = [long]$Matches[10]
+    }
+    $mixedDirectLines = $lines | Where-Object { $_ -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)" }
+    foreach ($mixedDirectLine in $mixedDirectLines) {
+        if ($mixedDirectLine -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)") {
+            $mixedDirectObserved = $true
+            $mixedDirectCalls++
+            $mixedDirectCacheRoutes += [long]$Matches[2]
+            $mixedDirectCompactRoutes += [long]$Matches[3]
+        }
     }
     $contextLine = $lines | Where-Object { $_ -match "context buffers .*ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)" } | Select-Object -Last 1
     if ($contextLine -and $contextLine -match "ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)") {
@@ -1434,6 +1457,11 @@ $summary = [pscustomobject]@{
     expert_cache_reserve_gb = $ExpertCacheReserveGB
     expert_cache_policy = $ExpertCachePolicy
     direct_cache_hits_requested = [bool]$DirectCacheHits
+    mixed_direct_cache_requested = [bool]$MixedDirectCache
+    mixed_direct_cache_observed = $mixedDirectObserved
+    mixed_direct_calls = $mixedDirectCalls
+    mixed_direct_cache_routes = $mixedDirectCacheRoutes
+    mixed_direct_compact_routes = $mixedDirectCompactRoutes
     expert_cache_stats_enabled = [bool]$ExpertCacheStats
     expert_cache_stats_interval = $ExpertCacheStatsInterval
     overlap_shared_requested = [bool]$OverlapShared
@@ -1559,6 +1587,7 @@ Write-Host ("moe_io_qd req/observed: " + $IoQD + " / " + $observedIoQD)
 Write-Host ("moe_io_fallbacks: " + $overlappedIoFallbacks)
 Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapacity + " / " + $cacheCount)
 Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
+Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("overlap_shared requested/observed: " + [bool]$OverlapShared + " / " + $overlapSharedObserved)
 Write-Host ("overlap_shared_full requested/observed: " + [bool]$OverlapSharedFull + " / " + $overlapSharedFullObserved)
 Write-Host ("shared_down_fusion_disabled: " + [bool]$DisableSharedDownFusion)

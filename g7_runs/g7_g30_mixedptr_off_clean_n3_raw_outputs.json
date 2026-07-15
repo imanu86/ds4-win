@@ -1,0 +1,49 @@
+﻿{
+    "schema":  "g7_raw_outputs_v1",
+    "tag":  "g30_mixedptr_off_clean_n3",
+    "head":  "3cf34c7624f018c1736eea51cb7c9bd4b8ddfd7d",
+    "executable_sha256":  "1189080d14db8a186e39d2b471ec13d8403f65f3d0ea8ea9ced333e85d7c62e7",
+    "ds4_cuda_sha256":  "f6c3a9eced34f95280a4f087343d4fccf7130214dab9e9c0c83347c084001268",
+    "prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "system_prompt":  "",
+    "system_prompt_sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "warmup_prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "expected_content_sha256":  "",
+    "expected_warmup_content_sha256":  "",
+    "warmup_result":  {
+                          "seconds":  4.045388,
+                          "completion_tokens":  9,
+                          "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                          "content":  "Hello! How can I help you today?"
+                      },
+    "output_hashes":  [
+                          "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5"
+                      ],
+    "outputs_identical":  true,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  4.139817,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.174009,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    },
+                    {
+                        "repeat":  2,
+                        "seconds":  4.016019,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.241025,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    },
+                    {
+                        "repeat":  3,
+                        "seconds":  4.199667,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.143027,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    }
+                ]
+}
