@@ -3085,6 +3085,158 @@ static int cuda_dynamic_arena_wrap_build_source_parts(
     return parts.size() == (size_t)load_count * 3u;
 }
 
+static int cuda_dynamic_arena_wrap_layout_profile_enabled(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_LAYOUT_PROFILE");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-layout-profile] invalid enable value '%s'; disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0;
+}
+
+struct cuda_dynamic_arena_layout_projection {
+    uint64_t reads;
+    uint64_t bytes;
+};
+
+static const char *cuda_dynamic_arena_wrap_part_name(uint8_t part);
+
+static int cuda_dynamic_arena_wrap_emit_layout_profile(
+        const ds4_gpu_dynamic_arena_load *loads,
+        uint32_t load_count,
+        const std::vector<cuda_dynamic_arena_wrap_part> &parts) {
+    if ((!loads && load_count != 0) ||
+        parts.size() != (size_t)load_count * 3u) {
+        return 0;
+    }
+    uint64_t page_size = 4096;
+#ifdef _WIN32
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    if (system_info.dwPageSize) page_size = system_info.dwPageSize;
+#else
+    const long observed_page_size = sysconf(_SC_PAGESIZE);
+    if (observed_page_size > 0) page_size = (uint64_t)observed_page_size;
+#endif
+
+    const uint8_t phases[3] = {
+        CUDA_DYNAMIC_ARENA_MIRROR_GATE,
+        CUDA_DYNAMIC_ARENA_MIRROR_UP,
+        CUDA_DYNAMIC_ARENA_MIRROR_DOWN,
+    };
+    const uint64_t thresholds[4] = {0, 4096, 65536, 1048576};
+    for (uint32_t phase_index = 0; phase_index < 3u; phase_index++) {
+        const uint8_t phase = phases[phase_index];
+        uint64_t part_count = 0;
+        uint64_t payload_bytes = 0;
+        uint64_t gap_count = 0;
+        uint64_t overlap_count = 0;
+        uint64_t gap_eq0 = 0;
+        uint64_t gap_1_4k = 0;
+        uint64_t gap_4k_64k = 0;
+        uint64_t gap_64k_1m = 0;
+        uint64_t gap_gt1m = 0;
+        uint64_t source_aligned = 0;
+        uint64_t bytes_aligned = 0;
+        uint64_t destination_aligned = 0;
+        uint64_t previous_end = 0;
+        int have_previous = 0;
+        cuda_dynamic_arena_layout_projection projections[4] = {};
+
+        for (size_t cursor = 0; cursor < parts.size(); cursor++) {
+            const cuda_dynamic_arena_wrap_part &part = parts[cursor];
+            if (part.part != phase) continue;
+            if (part.load_index >= load_count || part.bytes == 0 ||
+                part.source_offset > UINT64_MAX - part.bytes) {
+                return 0;
+            }
+            const ds4_gpu_dynamic_arena_load &load = loads[part.load_index];
+            if (!load.host_ptr || part.destination_offset > load.host_bytes ||
+                part.bytes > load.host_bytes - part.destination_offset) {
+                return 0;
+            }
+
+            const uint64_t part_end = part.source_offset + part.bytes;
+            payload_bytes += part.bytes;
+            if (part.source_offset % page_size == 0) source_aligned++;
+            if (part.bytes % page_size == 0) bytes_aligned++;
+            const uintptr_t destination =
+                (uintptr_t)load.host_ptr + (uintptr_t)part.destination_offset;
+            if ((uint64_t)(destination % page_size) == 0) {
+                destination_aligned++;
+            }
+
+            if (!have_previous) {
+                for (uint32_t i = 0; i < 4u; i++) {
+                    projections[i].reads = 1;
+                    projections[i].bytes = part.bytes;
+                }
+                have_previous = 1;
+            } else if (part.source_offset < previous_end) {
+                overlap_count++;
+                const uint64_t extension = part_end > previous_end ?
+                    part_end - previous_end : 0;
+                for (uint32_t i = 0; i < 4u; i++) {
+                    projections[i].bytes += extension;
+                }
+            } else {
+                const uint64_t gap = part.source_offset - previous_end;
+                gap_count++;
+                if (gap == 0) gap_eq0++;
+                else if (gap <= 4096) gap_1_4k++;
+                else if (gap <= 65536) gap_4k_64k++;
+                else if (gap <= 1048576) gap_64k_1m++;
+                else gap_gt1m++;
+                for (uint32_t i = 0; i < 4u; i++) {
+                    if (gap <= thresholds[i]) {
+                        projections[i].bytes += gap + part.bytes;
+                    } else {
+                        projections[i].reads++;
+                        projections[i].bytes += part.bytes;
+                    }
+                }
+            }
+            if (part_end > previous_end) previous_end = part_end;
+            part_count++;
+        }
+
+        if (part_count != load_count ||
+            (part_count != 0 && gap_count + overlap_count != part_count - 1u)) {
+            return 0;
+        }
+        fprintf(stderr,
+                "ds4: [arena-wrap-layout-profile] result=ok phase=%s parts=%llu payload=%llu gaps=%llu overlaps=%llu gap_eq0=%llu gap_1_4k=%llu gap_4k_64k=%llu gap_64k_1m=%llu gap_gt1m=%llu t0_reads=%llu t0_bytes=%llu t4096_reads=%llu t4096_bytes=%llu t65536_reads=%llu t65536_bytes=%llu t1048576_reads=%llu t1048576_bytes=%llu page_size=%llu source_aligned=%llu bytes_aligned=%llu destination_aligned=%llu\n",
+                cuda_dynamic_arena_wrap_part_name(phase),
+                (unsigned long long)part_count,
+                (unsigned long long)payload_bytes,
+                (unsigned long long)gap_count,
+                (unsigned long long)overlap_count,
+                (unsigned long long)gap_eq0,
+                (unsigned long long)gap_1_4k,
+                (unsigned long long)gap_4k_64k,
+                (unsigned long long)gap_64k_1m,
+                (unsigned long long)gap_gt1m,
+                (unsigned long long)projections[0].reads,
+                (unsigned long long)projections[0].bytes,
+                (unsigned long long)projections[1].reads,
+                (unsigned long long)projections[1].bytes,
+                (unsigned long long)projections[2].reads,
+                (unsigned long long)projections[2].bytes,
+                (unsigned long long)projections[3].reads,
+                (unsigned long long)projections[3].bytes,
+                (unsigned long long)page_size,
+                (unsigned long long)source_aligned,
+                (unsigned long long)bytes_aligned,
+                (unsigned long long)destination_aligned);
+    }
+    return 1;
+}
+
 static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
     cuda_dynamic_arena_part_copy_context *context =
         (cuda_dynamic_arena_part_copy_context *)arg;
@@ -3559,6 +3711,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const int trust_worker_checksum =
         cuda_dynamic_arena_wrap_trust_worker_checksum();
     const int part_profile = cuda_dynamic_arena_wrap_part_profile();
+    const int layout_profile =
+        cuda_dynamic_arena_wrap_layout_profile_enabled();
     const int trim_between_phases_requested =
         cuda_dynamic_arena_wrap_trim_between_phases();
     const double slow_part_threshold_seconds =
@@ -3580,6 +3734,13 @@ static int cuda_dynamic_arena_wrap_publish_target(
             "fnv1a64-worker-plus-finish";
     if (sequential_file_requested && random_file_requested) {
         local.reason = "multiple-file-sources";
+        local.seconds = cuda_wall_sec() - started_at;
+        if (result) *result = local;
+        return 0;
+    }
+    if (layout_profile &&
+        schedule != CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS) {
+        local.reason = "layout-profile-requires-source-parts";
         local.seconds = cuda_wall_sec() - started_at;
         if (result) *result = local;
         return 0;
@@ -3664,6 +3825,12 @@ static int cuda_dynamic_arena_wrap_publish_target(
                     all_succeeded = 0;
                 } else {
                     part_success.assign(parts.size(), 0);
+                    if (layout_profile &&
+                        !cuda_dynamic_arena_wrap_emit_layout_profile(
+                            loads, load_count, parts)) {
+                        local.reason = "layout-profile";
+                        all_succeeded = 0;
+                    }
                     if (trust_worker_checksum) {
                         std::fill(checksums.begin(), checksums.end(),
                                   UINT64_C(14695981039346656037));

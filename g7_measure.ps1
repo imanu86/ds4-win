@@ -28,6 +28,7 @@ param(
     [ValidateRange(1, 32)][int]$ArenaWrapSequentialWorkers = 1,
     [ValidateRange(1, 64)][int]$ArenaWrapFileQD = 1,
     [switch]$ArenaWrapPartProfile,
+    [switch]$ArenaWrapLayoutProfile,
     [ValidateRange(0.001, 600000.0)][double]$ArenaWrapSlowPartMs = 25.0,
     [switch]$ArenaWrapTrimBetweenPhases,
     [switch]$PrefillMassObserve,
@@ -155,6 +156,9 @@ if ($ArenaWrapRandomFile -and -not $ArenaWrapSourceParts) {
 }
 if ($ArenaWrapRandomFile -and $ArenaWrapSequentialFile) {
     throw "Select only one ArenaWrap file source"
+}
+if ($ArenaWrapLayoutProfile -and -not $ArenaWrapSourceParts) {
+    throw "ArenaWrapLayoutProfile requires -ArenaWrapSourceParts"
 }
 if ($ArenaWrapSequentialWorkers -ne 1 -and -not $ArenaWrapSequentialFile) {
     throw "ArenaWrapSequentialWorkers other than 1 requires -ArenaWrapSequentialFile"
@@ -382,6 +386,11 @@ if ($ArenaWrapPartProfile) {
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_PART_PROFILE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SLOW_PART_MS -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapLayoutProfile) {
+    $env:DS4_CUDA_ARENA_WRAP_LAYOUT_PROFILE = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_LAYOUT_PROFILE -ErrorAction SilentlyContinue
 }
 if ($ArenaWrapTrimBetweenPhases) {
     $env:DS4_CUDA_ARENA_WRAP_TRIM_BETWEEN_PHASES = "1"
@@ -1307,6 +1316,7 @@ $arenaWrapPartProfileSlowThresholdMs = 0.0; $arenaWrapPartProfileSlowParts = 0
 $arenaWrapPartProfileMaxPartMs = 0.0; $arenaWrapPartProfileMaxPartBytes = 0
 $arenaWrapPartProfileMaxPartLoad = 0; $arenaWrapPartProfileMaxPartCursor = 0
 $arenaWrapPartProfileMaxPartKind = "not_observed"; $arenaWrapPartProfileMaxPartSource = 0
+$arenaWrapLayoutProfileObserved = $false; $arenaWrapLayoutProfileRows = @()
 $arenaWrapTrimObserved = $false; $arenaWrapTrimResult = "not_observed"
 $arenaWrapTrimCalls = 0; $arenaWrapTrimSucceeded = 0; $arenaWrapTrimFailed = 0
 $arenaWrapTrimSeconds = 0.0; $arenaWrapTrimLastError = 0
@@ -1950,6 +1960,41 @@ if (Test-Path $stderrLog) {
         $arenaWrapPartProfileMaxPartKind = $Matches[19]
         $arenaWrapPartProfileMaxPartSource = [long]$Matches[20]
     }
+    $arenaWrapLayoutProfileLines = @($lines | Where-Object {
+        $_ -match "^\s*ds4: \[arena-wrap-layout-profile\] "
+    })
+    $arenaWrapLayoutProfilePattern = "^ds4: \[arena-wrap-layout-profile\] result=ok phase=(gate|up|down) parts=(\d+) payload=(\d+) gaps=(\d+) overlaps=(\d+) gap_eq0=(\d+) gap_1_4k=(\d+) gap_4k_64k=(\d+) gap_64k_1m=(\d+) gap_gt1m=(\d+) t0_reads=(\d+) t0_bytes=(\d+) t4096_reads=(\d+) t4096_bytes=(\d+) t65536_reads=(\d+) t65536_bytes=(\d+) t1048576_reads=(\d+) t1048576_bytes=(\d+) page_size=(\d+) source_aligned=(\d+) bytes_aligned=(\d+) destination_aligned=(\d+)$"
+    foreach ($arenaWrapLayoutProfileLine in $arenaWrapLayoutProfileLines) {
+        if ($arenaWrapLayoutProfileLine -notmatch $arenaWrapLayoutProfilePattern) {
+            throw "Arena WRAP layout profile line format mismatch: $arenaWrapLayoutProfileLine"
+        }
+        $arenaWrapLayoutProfileRows += [pscustomobject]@{
+            result = "ok"
+            phase = $Matches[1]
+            parts = [uint64]$Matches[2]
+            payload = [uint64]$Matches[3]
+            gaps = [uint64]$Matches[4]
+            overlaps = [uint64]$Matches[5]
+            gap_eq0 = [uint64]$Matches[6]
+            gap_1_4k = [uint64]$Matches[7]
+            gap_4k_64k = [uint64]$Matches[8]
+            gap_64k_1m = [uint64]$Matches[9]
+            gap_gt1m = [uint64]$Matches[10]
+            t0_reads = [uint64]$Matches[11]
+            t0_bytes = [uint64]$Matches[12]
+            t4096_reads = [uint64]$Matches[13]
+            t4096_bytes = [uint64]$Matches[14]
+            t65536_reads = [uint64]$Matches[15]
+            t65536_bytes = [uint64]$Matches[16]
+            t1048576_reads = [uint64]$Matches[17]
+            t1048576_bytes = [uint64]$Matches[18]
+            page_size = [uint32]$Matches[19]
+            source_aligned = [uint64]$Matches[20]
+            bytes_aligned = [uint64]$Matches[21]
+            destination_aligned = [uint64]$Matches[22]
+        }
+    }
+    $arenaWrapLayoutProfileObserved = ($arenaWrapLayoutProfileRows.Count -gt 0)
     $arenaWrapTrimLine = $lines | Where-Object { $_ -match "\[arena-wrap-trim\] result=" } | Select-Object -Last 1
     if ($arenaWrapTrimLine -and $arenaWrapTrimLine -match "result=([^ ]+) calls=(\d+) succeeded=(\d+) failed=(\d+) seconds=([0-9.]+) last_error=(\d+)") {
         $arenaWrapTrimObserved = $true
@@ -2393,6 +2438,59 @@ if ($ArenaWrapPartProfile) {
         throw "Arena WRAP part profile measurement failed: slow-part threshold differs"
     }
 }
+if ($ArenaWrapLayoutProfile) {
+    if (-not $arenaWrapLayoutProfileObserved -or
+        $arenaWrapLayoutProfileRows.Count -ne 3) {
+        throw "Arena WRAP layout profile measurement failed: expected exactly three phase lines"
+    }
+    $requiredLayoutPhases = @("gate", "up", "down")
+    foreach ($phase in $requiredLayoutPhases) {
+        $phaseRows = @($arenaWrapLayoutProfileRows |
+            Where-Object { $_.phase -eq $phase })
+        if ($phaseRows.Count -ne 1) {
+            throw "Arena WRAP layout profile measurement failed: phase count differs for $phase"
+        }
+    }
+    $arenaWrapLayoutProfilePartsSum = [uint64]0
+    foreach ($layoutRow in $arenaWrapLayoutProfileRows) {
+        $arenaWrapLayoutProfilePartsSum += [uint64]$layoutRow.parts
+        if ($layoutRow.result -ne "ok" -or
+            [uint64]$layoutRow.parts -eq 0 -or
+            [uint64]$layoutRow.overlaps -ne 0 -or
+            [uint64]$layoutRow.gaps -ne ([uint64]$layoutRow.parts - 1) -or
+            ([uint64]$layoutRow.gap_eq0 +
+             [uint64]$layoutRow.gap_1_4k +
+             [uint64]$layoutRow.gap_4k_64k +
+             [uint64]$layoutRow.gap_64k_1m +
+             [uint64]$layoutRow.gap_gt1m) -ne [uint64]$layoutRow.gaps -or
+            [uint64]$layoutRow.t0_reads -gt [uint64]$layoutRow.parts -or
+            [uint64]$layoutRow.t0_reads -lt [uint64]$layoutRow.t4096_reads -or
+            [uint64]$layoutRow.t4096_reads -lt [uint64]$layoutRow.t65536_reads -or
+            [uint64]$layoutRow.t65536_reads -lt [uint64]$layoutRow.t1048576_reads -or
+            [uint64]$layoutRow.t1048576_reads -eq 0 -or
+            [uint64]$layoutRow.t4096_reads -gt [uint64]$layoutRow.parts -or
+            [uint64]$layoutRow.t65536_reads -gt [uint64]$layoutRow.parts -or
+            [uint64]$layoutRow.t1048576_reads -gt [uint64]$layoutRow.parts -or
+            [uint64]$layoutRow.t0_bytes -ne [uint64]$layoutRow.payload -or
+            [uint64]$layoutRow.t0_bytes -gt [uint64]$layoutRow.t4096_bytes -or
+            [uint64]$layoutRow.t4096_bytes -gt [uint64]$layoutRow.t65536_bytes -or
+            [uint64]$layoutRow.t65536_bytes -gt [uint64]$layoutRow.t1048576_bytes -or
+            [uint64]$layoutRow.t4096_bytes -lt [uint64]$layoutRow.payload -or
+            [uint64]$layoutRow.t65536_bytes -lt [uint64]$layoutRow.payload -or
+            [uint64]$layoutRow.t1048576_bytes -lt [uint64]$layoutRow.payload -or
+            [uint64]$layoutRow.source_aligned -gt [uint64]$layoutRow.parts -or
+            [uint64]$layoutRow.bytes_aligned -gt [uint64]$layoutRow.parts -or
+            [uint64]$layoutRow.destination_aligned -gt [uint64]$layoutRow.parts -or
+            [uint32]$layoutRow.page_size -eq 0) {
+            throw "Arena WRAP layout profile measurement failed: numeric accounting differs"
+        }
+    }
+    if ($arenaWrapLayoutProfilePartsSum -ne [uint64]$arenaWrapPartCount) {
+        throw "Arena WRAP layout profile measurement failed: phase parts do not sum to arena_wrap_part_count"
+    }
+} elseif ($arenaWrapLayoutProfileObserved) {
+    throw "Arena WRAP layout profile measurement failed: unexpected layout telemetry while disabled"
+}
 if ($ArenaWrapTrimBetweenPhases) {
     if (-not $arenaWrapTrimObserved -or
         $arenaWrapTrimResult -ne "complete" -or
@@ -2647,6 +2745,9 @@ $summary = [pscustomobject]@{
     arena_wrap_file_failures = $arenaWrapFileFailures
     arena_wrap_part_profile_observed = $arenaWrapPartProfileObserved
     arena_wrap_part_profile_result = $arenaWrapPartProfileResult
+    arena_wrap_layout_profile_requested = [bool]$ArenaWrapLayoutProfile
+    arena_wrap_layout_profile_observed = $arenaWrapLayoutProfileObserved
+    arena_wrap_layout_profile = $arenaWrapLayoutProfileRows
     arena_wrap_part_profile_phases = $arenaWrapPartProfilePhases
     arena_wrap_part_profile_workers = $arenaWrapPartProfileWorkers
     arena_wrap_part_profile_parts = $arenaWrapPartProfileParts
@@ -3042,6 +3143,7 @@ Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $
 Write-Host ("arena WRAP profile result/schedule/source/checksum/total/copy/parts/workers: " + $arenaWrapProfileResult + " / " + $arenaWrapScheduleObserved + " / " + $arenaWrapSourceObserved + " / " + $arenaWrapChecksumObserved + " / " + $arenaWrapProfileTotalSeconds + " / " + $arenaWrapSourcePartsCopySeconds + " / " + $arenaWrapPartCount + " / " + $arenaWrapCopyWorkers)
 Write-Host ("arena WRAP file QD req/line/obs/submits/completions/failures: " + $ArenaWrapFileQD + " / " + $arenaWrapFileQDRequestedObserved + " / " + $arenaWrapFileQDObserved + " / " + $arenaWrapFileSubmits + " / " + $arenaWrapFileCompletions + " / " + $arenaWrapFileFailures)
 Write-Host ("arena WRAP part profile req/obs/workers/parts/memcpy/main/join/max-part-ms/slow: " + [bool]$ArenaWrapPartProfile + " / " + $arenaWrapPartProfileObserved + " / " + $arenaWrapPartProfileWorkers + " / " + $arenaWrapPartProfileParts + " / " + $arenaWrapPartProfileMemcpySumSeconds + " / " + $arenaWrapPartProfileMainWorkerSeconds + " / " + $arenaWrapPartProfileJoinSeconds + " / " + $arenaWrapPartProfileMaxPartMs + " / " + $arenaWrapPartProfileSlowParts)
+Write-Host ("arena WRAP layout profile req/obs/lines: " + [bool]$ArenaWrapLayoutProfile + " / " + $arenaWrapLayoutProfileObserved + " / " + $arenaWrapLayoutProfileRows.Count)
 Write-Host ("arena WRAP trim req/obs/result/calls/ok/fail/sec/error: " + [bool]$ArenaWrapTrimBetweenPhases + " / " + $arenaWrapTrimObserved + " / " + $arenaWrapTrimResult + " / " + $arenaWrapTrimCalls + " / " + $arenaWrapTrimSucceeded + " / " + $arenaWrapTrimFailed + " / " + $arenaWrapTrimSeconds + " / " + $arenaWrapTrimLastError)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
