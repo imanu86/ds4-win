@@ -39,6 +39,11 @@ param(
     [ValidateRange(0.0, 6.0)][double]$ExpertCacheReserveGB = 0.5,
     [ValidateSet("lru", "layer-top1")][string]$ExpertCachePolicy = "lru",
     [ValidateSet("off", "observe", "enforce")][string]$ExpertTiering = "off",
+    [ValidateSet("second-touch", "mass-lfru")][string]$ExpertTierPolicy = "second-touch",
+    [ValidateRange(1, 1000000)][int]$ExpertTierClockCalls = 430,
+    [ValidateRange(1, 512)][int]$ExpertTierReplacementBudget = 16,
+    [ValidateRange(2, 1000000)][int]$ExpertTierMinFrequency = 3,
+    [ValidateRange(1.0, 100.0)][double]$ExpertTierHysteresis = 1.25,
     [switch]$DirectCacheHits,
     [switch]$MixedDirectCache,
     [switch]$GpuResidentRoutes,
@@ -242,8 +247,18 @@ if ($ExpertCacheN -gt 0) {
 }
 if ($ExpertTiering -eq "off") {
     Remove-Item Env:\DS4_EXPERT_TIERING -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_POLICY -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_CLOCK_CALLS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_REPLACEMENT_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_MIN_FREQUENCY -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_HYSTERESIS -ErrorAction SilentlyContinue
 } else {
     $env:DS4_EXPERT_TIERING = $ExpertTiering
+    $env:DS4_EXPERT_TIER_POLICY = $ExpertTierPolicy
+    $env:DS4_EXPERT_TIER_CLOCK_CALLS = "$ExpertTierClockCalls"
+    $env:DS4_EXPERT_TIER_REPLACEMENT_BUDGET = "$ExpertTierReplacementBudget"
+    $env:DS4_EXPERT_TIER_MIN_FREQUENCY = "$ExpertTierMinFrequency"
+    $env:DS4_EXPERT_TIER_HYSTERESIS = $ExpertTierHysteresis.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
 }
 if ($DirectCacheHits) {
     $env:DS4_CUDA_MOE_DIRECT_CACHE_HITS = "1"
@@ -679,6 +694,8 @@ $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
 $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
 $expertTieringFinalObserved = $false; $expertTieringFinalLineCount = 0; $expertTieringControlLineCount = 0
 $expertTieringModeObserved = ""; $expertTieringCalls = 0; $expertTieringSelected = 0
+$expertTieringPolicyObserved = ""; $expertTieringClockCalls = 0; $expertTieringReplacementBudget = 0
+$expertTieringMinFrequency = 0; $expertTieringHysteresis = 0.0
 $expertTieringCold = 0; $expertTieringRamHits = 0; $expertTieringVramHits = 0
 $expertTieringColdToRam = 0; $expertTieringColdToVram = 0; $expertTieringRamToWarm = 0
 $expertTieringVramPromotions = 0; $expertTieringVramDemotions = 0; $expertTieringRamEvictions = 0
@@ -687,6 +704,9 @@ $expertTieringSsdBytes = 0; $expertTieringRamH2DBytes = 0
 $expertTieringStatesSsd = 0; $expertTieringStatesProbation = 0
 $expertTieringStatesWarm = 0; $expertTieringStatesVram = 0
 $expertTieringMassSum = 0.0; $expertTieringLfruTop = 0.0
+$expertTieringPolicyEpochs = 0; $expertTieringPolicyFreePromotions = 0
+$expertTieringPolicyReplacements = 0; $expertTieringPolicyMinFrequencySkips = 0
+$expertTieringPolicyBudgetSkips = 0; $expertTieringPolicyScoreSkips = 0
 $mixedDirectObserved = $false; $mixedDirectCalls = 0
 $mixedDirectCacheRoutes = 0; $mixedDirectCompactRoutes = 0
 $routeProfileObserved = $false; $routeProfileCalls = 0
@@ -886,24 +906,35 @@ if (Test-Path $stderrLog) {
     $expertTieringFinalLineCount = $expertTieringFinalLines.Count
     if ($expertTieringFinalLineCount -gt 0) {
         $expertTieringFinalLine = $expertTieringFinalLines | Select-Object -Last 1
-        $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) lfru_top=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$"
+        $numberPattern = "([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+        $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
         if ($expertTieringFinalLine -notmatch $expertTieringFinalPattern) {
             throw "Expert tiering measurement failed: final line format mismatch"
         }
         $expertTieringFinalObserved = $true
         $expertTieringModeObserved = $Matches[1]
-        $expertTieringCalls = [uint64]$Matches[2]; $expertTieringSelected = [uint64]$Matches[3]
-        $expertTieringCold = [uint64]$Matches[4]; $expertTieringRamHits = [uint64]$Matches[5]
-        $expertTieringVramHits = [uint64]$Matches[6]; $expertTieringColdToRam = [uint64]$Matches[7]
-        $expertTieringColdToVram = [uint64]$Matches[8]; $expertTieringRamToWarm = [uint64]$Matches[9]
-        $expertTieringVramPromotions = [uint64]$Matches[10]; $expertTieringVramDemotions = [uint64]$Matches[11]
-        $expertTieringRamEvictions = [uint64]$Matches[12]; $expertTieringRamAdmitSkips = [uint64]$Matches[13]
-        $expertTieringTransient = [uint64]$Matches[14]; $expertTieringFailures = [uint64]$Matches[15]
-        $expertTieringSsdBytes = [uint64]$Matches[16]; $expertTieringRamH2DBytes = [uint64]$Matches[17]
-        $expertTieringStatesSsd = [uint32]$Matches[18]; $expertTieringStatesProbation = [uint32]$Matches[19]
-        $expertTieringStatesWarm = [uint32]$Matches[20]; $expertTieringStatesVram = [uint32]$Matches[21]
-        $expertTieringMassSum = [double]::Parse($Matches[22], [Globalization.CultureInfo]::InvariantCulture)
-        $expertTieringLfruTop = [double]::Parse($Matches[23], [Globalization.CultureInfo]::InvariantCulture)
+        $expertTieringPolicyObserved = $Matches[2]
+        $expertTieringClockCalls = [uint32]$Matches[3]; $expertTieringReplacementBudget = [uint32]$Matches[4]
+        $expertTieringMinFrequency = [uint32]$Matches[5]
+        $expertTieringHysteresis = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
+        $expertTieringCalls = [uint64]$Matches[7]; $expertTieringSelected = [uint64]$Matches[8]
+        $expertTieringCold = [uint64]$Matches[9]; $expertTieringRamHits = [uint64]$Matches[10]
+        $expertTieringVramHits = [uint64]$Matches[11]; $expertTieringColdToRam = [uint64]$Matches[12]
+        $expertTieringColdToVram = [uint64]$Matches[13]; $expertTieringRamToWarm = [uint64]$Matches[14]
+        $expertTieringVramPromotions = [uint64]$Matches[15]; $expertTieringVramDemotions = [uint64]$Matches[16]
+        $expertTieringRamEvictions = [uint64]$Matches[17]; $expertTieringRamAdmitSkips = [uint64]$Matches[18]
+        $expertTieringTransient = [uint64]$Matches[19]; $expertTieringFailures = [uint64]$Matches[20]
+        $expertTieringSsdBytes = [uint64]$Matches[21]; $expertTieringRamH2DBytes = [uint64]$Matches[22]
+        $expertTieringPolicyEpochs = [uint64]$Matches[23]
+        $expertTieringPolicyFreePromotions = [uint64]$Matches[24]
+        $expertTieringPolicyReplacements = [uint64]$Matches[25]
+        $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[26]
+        $expertTieringPolicyBudgetSkips = [uint64]$Matches[27]
+        $expertTieringPolicyScoreSkips = [uint64]$Matches[28]
+        $expertTieringStatesSsd = [uint32]$Matches[29]; $expertTieringStatesProbation = [uint32]$Matches[30]
+        $expertTieringStatesWarm = [uint32]$Matches[31]; $expertTieringStatesVram = [uint32]$Matches[32]
+        $expertTieringMassSum = [double]::Parse($Matches[33], [Globalization.CultureInfo]::InvariantCulture)
+        $expertTieringLfruTop = [double]::Parse($Matches[34], [Globalization.CultureInfo]::InvariantCulture)
     }
     $mixedDirectLines = $lines | Where-Object { $_ -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)" }
     foreach ($mixedDirectLine in $mixedDirectLines) {
@@ -1198,6 +1229,20 @@ if ($ExpertTiering -eq "off") {
     if ($expertTieringControlLineCount -ne 0) { throw "Expert tiering measurement failed: control telemetry was observed" }
     if ($expertTieringFinalLineCount -ne 1 -or -not $expertTieringFinalObserved) { throw "Expert tiering measurement failed: final counters were not observed exactly once" }
     if ($expertTieringModeObserved -ne $ExpertTiering) { throw "Expert tiering measurement failed: observed mode mismatch" }
+    if ($expertTieringPolicyObserved -ne $ExpertTierPolicy) { throw "Expert tiering measurement failed: observed policy mismatch" }
+    if ($ExpertTierPolicy -eq "mass-lfru") {
+        if ($expertTieringClockCalls -ne $ExpertTierClockCalls -or
+            $expertTieringReplacementBudget -ne $ExpertTierReplacementBudget -or
+            $expertTieringMinFrequency -ne $ExpertTierMinFrequency -or
+            [math]::Abs($expertTieringHysteresis - $ExpertTierHysteresis) -gt 1.0e-9) {
+            throw "Expert tiering measurement failed: mass-lfru policy parameters mismatch"
+        }
+    } elseif ($expertTieringClockCalls -ne 0 -or
+              $expertTieringReplacementBudget -ne 0 -or
+              $expertTieringMinFrequency -ne 2 -or
+              [math]::Abs($expertTieringHysteresis - 1.0) -gt 1.0e-9) {
+        throw "Expert tiering measurement failed: second-touch effective parameters mismatch"
+    }
     if ($expertTieringCalls -le 0 -or $expertTieringSelected -le 0) { throw "Expert tiering measurement failed: no routed calls were observed" }
     if ($expertTieringFailures -ne 0) { throw "Expert tiering measurement failed: runtime failures observed" }
     if ($expertTieringSelected -ne ($expertTieringCalls * 6)) { throw "Expert tiering measurement failed: selected count does not equal calls*6" }
@@ -1215,6 +1260,20 @@ if ($ExpertTiering -eq "off") {
     }
     if ($expertTieringVramDemotions -gt ($expertTieringVramPromotions + $expertTieringColdToVram)) {
         throw "Expert tiering measurement failed: VRAM demotions exceed admissions"
+    }
+    if ($ExpertTiering -eq "enforce") {
+        if (($expertTieringPolicyFreePromotions + $expertTieringPolicyReplacements) -ne
+            $expertTieringVramPromotions) {
+            throw "Expert tiering measurement failed: policy promotion accounting mismatch"
+        }
+        if ($expertTieringPolicyReplacements -ne $expertTieringVramDemotions) {
+            throw "Expert tiering measurement failed: policy replacement accounting mismatch"
+        }
+        if ($ExpertTierPolicy -eq "mass-lfru" -and
+            $expertTieringPolicyReplacements -gt
+                ($expertTieringPolicyEpochs * $ExpertTierReplacementBudget)) {
+            throw "Expert tiering measurement failed: mass-lfru replacement budget exceeded"
+        }
     }
     if ($expertTieringStatesVram -gt $ExpertCacheN) {
         throw "Expert tiering measurement failed: VRAM state count exceeds ExpertCacheN"
@@ -1417,10 +1476,16 @@ $maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maxim
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
 $expertTieringResult = [pscustomobject]@{
     requested_mode = $ExpertTiering
+    requested_policy = $ExpertTierPolicy
     final_observed = $expertTieringFinalObserved
     final_line_count = $expertTieringFinalLineCount
     control_line_count = $expertTieringControlLineCount
     mode = $expertTieringModeObserved
+    policy = $expertTieringPolicyObserved
+    clock_calls = $expertTieringClockCalls
+    replacement_budget = $expertTieringReplacementBudget
+    min_frequency = $expertTieringMinFrequency
+    hysteresis = $expertTieringHysteresis
     calls = $expertTieringCalls
     selected = $expertTieringSelected
     cold = $expertTieringCold
@@ -1437,6 +1502,12 @@ $expertTieringResult = [pscustomobject]@{
     failures = $expertTieringFailures
     ssd_bytes = $expertTieringSsdBytes
     ram_h2d_bytes = $expertTieringRamH2DBytes
+    policy_epochs = $expertTieringPolicyEpochs
+    policy_free_promotions = $expertTieringPolicyFreePromotions
+    policy_replacements = $expertTieringPolicyReplacements
+    policy_min_frequency_skips = $expertTieringPolicyMinFrequencySkips
+    policy_budget_skips = $expertTieringPolicyBudgetSkips
+    policy_score_skips = $expertTieringPolicyScoreSkips
     states_ssd = $expertTieringStatesSsd
     states_probation = $expertTieringStatesProbation
     states_warm = $expertTieringStatesWarm
@@ -1696,6 +1767,11 @@ $summary = [pscustomobject]@{
     expert_cache_reserve_gb = $ExpertCacheReserveGB
     expert_cache_policy = $ExpertCachePolicy
     expert_tiering_requested = $ExpertTiering
+    expert_tier_policy_requested = $ExpertTierPolicy
+    expert_tier_clock_calls_requested = $ExpertTierClockCalls
+    expert_tier_replacement_budget_requested = $ExpertTierReplacementBudget
+    expert_tier_min_frequency_requested = $ExpertTierMinFrequency
+    expert_tier_hysteresis_requested = $ExpertTierHysteresis
     expert_tiering = $expertTieringResult
     direct_cache_hits_requested = [bool]$DirectCacheHits
     mixed_direct_cache_requested = [bool]$MixedDirectCache

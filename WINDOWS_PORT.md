@@ -59,6 +59,16 @@ next gate is slower mass/LFRU promotion with hysteresis to reduce the observed
 4,299 promotions and 3,963 demotions. See
 `G35_REAL_EXPERT_TIERING_RESULTS.md`.
 
+G36 replaces only G35's second-touch replacement policy with a slow-clock
+mass/LFRU policy. In the counter-ordered exact `n=3` matrix, server decode rose
+from 4.948 to 5.557 t/s (+12.29%) and client throughput rose from 2.820 to
+3.044 t/s (+7.96%). VRAM replacements fell from 3,963 to 48, VRAM hits rose
+from 3,984 to 5,089 and RAM H2D fell from 34.963 to 27.679 GiB. Process reads
+were unchanged at 31.001 GiB, isolating the gain to a more stable hotset and
+less RAM-to-GPU churn. This is still a short deterministic prompt gate; the
+policy remains opt-in pending a longer workload and domain-switch A/B. See
+`G36_MASS_LFRU_TIERING_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -73,12 +83,14 @@ a prompt-trained mask. See `G19_0051_POLICY_INTEGRATION_PLAN.md`.
 
 Follow-on measured gates are:
 
-1. Replace G35 second-touch promotion with mass/LFRU admission at a slow clock
-   and hysteresis, without weakening the cold-to-RAM invariant.
-2. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
+1. Validate G36 mass/LFRU on a longer exact workload and a domain switch before
+   changing the default from `second-touch`.
+2. Add batch-union and waved prefill as separate gates so each unique expert is
+   loaded once per layer/chunk.
+3. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
    speculative traffic.
-3. Parallel transfer streams where the trace proves serialization remains.
-4. A separately gated hybrid CPU/GPU cold-expert fallback. External systems make
+4. Parallel transfer streams where the trace proves serialization remains.
+5. A separately gated hybrid CPU/GPU cold-expert fallback. External systems make
    this promising, but it is not yet a result on this engine or machine.
 
 ## Build

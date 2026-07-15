@@ -13650,6 +13650,11 @@ enum cuda_moe_tier_mode : uint8_t {
     CUDA_MOE_TIER_ENFORCE = 2,
 };
 
+enum cuda_moe_tier_policy : uint8_t {
+    CUDA_MOE_TIER_POLICY_SECOND_TOUCH = 0,
+    CUDA_MOE_TIER_POLICY_MASS_LFRU = 1,
+};
+
 enum cuda_moe_tier_state : uint8_t {
     CUDA_MOE_TIER_SSD_COLD = 0,
     CUDA_MOE_TIER_RAM_PROBATION = 1,
@@ -13669,6 +13674,13 @@ struct cuda_moe_tier_entry {
 
 struct cuda_moe_tiering {
     cuda_moe_tier_mode mode;
+    cuda_moe_tier_policy policy;
+    uint32_t policy_clock_calls;
+    uint32_t policy_replacement_budget;
+    uint32_t policy_budget_remaining;
+    uint32_t policy_min_frequency;
+    uint64_t policy_epoch;
+    double policy_hysteresis;
     uint64_t call_tick;
     uint64_t calls;
     uint64_t selected;
@@ -13686,6 +13698,12 @@ struct cuda_moe_tiering {
     uint64_t failures;
     uint64_t ssd_bytes;
     uint64_t ram_h2d_bytes;
+    uint64_t policy_epochs;
+    uint64_t policy_free_promotions;
+    uint64_t policy_replacements;
+    uint64_t policy_min_frequency_skips;
+    uint64_t policy_budget_skips;
+    uint64_t policy_score_skips;
     std::vector<cuda_moe_tier_entry> entries;
 };
 static cuda_moe_tiering g_moe_tiering;
@@ -13820,6 +13838,69 @@ static const char *cuda_moe_tiering_mode_name(cuda_moe_tier_mode mode) {
     }
 }
 
+static int cuda_moe_tiering_policy_requested(void) {
+    const char *env = getenv("DS4_EXPERT_TIER_POLICY");
+    if (!env || !env[0] || strcmp(env, "second-touch") == 0) {
+        return CUDA_MOE_TIER_POLICY_SECOND_TOUCH;
+    }
+    if (strcmp(env, "mass-lfru") == 0) {
+        return CUDA_MOE_TIER_POLICY_MASS_LFRU;
+    }
+    fprintf(stderr, "ds4: invalid DS4_EXPERT_TIER_POLICY=%s\n", env);
+    return -1;
+}
+
+static const char *cuda_moe_tiering_policy_name(cuda_moe_tier_policy policy) {
+    switch (policy) {
+    case CUDA_MOE_TIER_POLICY_MASS_LFRU: return "mass-lfru";
+    default: return "second-touch";
+    }
+}
+
+static int cuda_moe_tiering_u32_env(
+        const char *name, uint32_t fallback,
+        uint32_t min_value, uint32_t max_value, uint32_t *value) {
+    const char *env = getenv(name);
+    if (!value) return 0;
+    if (!env || !env[0]) {
+        *value = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long parsed = strtoul(env, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == env || errno != 0 || !end || *end != '\0' ||
+        parsed < min_value || parsed > max_value) {
+        fprintf(stderr, "ds4: invalid %s=%s\n", name, env);
+        return 0;
+    }
+    *value = (uint32_t)parsed;
+    return 1;
+}
+
+static int cuda_moe_tiering_double_env(
+        const char *name, double fallback,
+        double min_value, double max_value, double *value) {
+    const char *env = getenv(name);
+    if (!value) return 0;
+    if (!env || !env[0]) {
+        *value = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    const double parsed = strtod(env, &end);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == env || errno != 0 || !end || *end != '\0' ||
+        !isfinite(parsed) || parsed < min_value || parsed > max_value) {
+        fprintf(stderr, "ds4: invalid %s=%s\n", name, env);
+        return 0;
+    }
+    *value = parsed;
+    return 1;
+}
+
 static size_t cuda_moe_tiering_entry_index(uint32_t layer, uint32_t expert) {
     return (size_t)layer * 256u + expert;
 }
@@ -13865,8 +13946,13 @@ static void cuda_moe_tiering_report_and_reset(void) {
             if (score > lfru_top) lfru_top = score;
         }
         fprintf(stderr,
-                "ds4: [expert-tiering] final mode=%s calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
+                "ds4: [expert-tiering] final mode=%s policy=%s clock_calls=%u replacement_budget=%u min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
                 cuda_moe_tiering_mode_name(g_moe_tiering.mode),
+                cuda_moe_tiering_policy_name(g_moe_tiering.policy),
+                g_moe_tiering.policy_clock_calls,
+                g_moe_tiering.policy_replacement_budget,
+                g_moe_tiering.policy_min_frequency,
+                g_moe_tiering.policy_hysteresis,
                 (unsigned long long)g_moe_tiering.calls,
                 (unsigned long long)g_moe_tiering.selected,
                 (unsigned long long)g_moe_tiering.cold,
@@ -13883,6 +13969,12 @@ static void cuda_moe_tiering_report_and_reset(void) {
                 (unsigned long long)g_moe_tiering.failures,
                 (unsigned long long)g_moe_tiering.ssd_bytes,
                 (unsigned long long)g_moe_tiering.ram_h2d_bytes,
+                (unsigned long long)g_moe_tiering.policy_epochs,
+                (unsigned long long)g_moe_tiering.policy_free_promotions,
+                (unsigned long long)g_moe_tiering.policy_replacements,
+                (unsigned long long)g_moe_tiering.policy_min_frequency_skips,
+                (unsigned long long)g_moe_tiering.policy_budget_skips,
+                (unsigned long long)g_moe_tiering.policy_score_skips,
                 states[CUDA_MOE_TIER_SSD_COLD],
                 states[CUDA_MOE_TIER_RAM_PROBATION],
                 states[CUDA_MOE_TIER_RAM_WARM],
@@ -13903,7 +13995,38 @@ static int cuda_moe_tiering_prepare(void) {
         }
         return 1;
     }
+    const int policy_requested = cuda_moe_tiering_policy_requested();
+    uint32_t clock_calls = 430u;
+    uint32_t replacement_budget = 16u;
+    uint32_t min_frequency = 3u;
+    double hysteresis = 1.25;
+    if (policy_requested < 0 ||
+        !cuda_moe_tiering_u32_env(
+            "DS4_EXPERT_TIER_CLOCK_CALLS", 430u, 1u, 1000000u,
+            &clock_calls) ||
+        !cuda_moe_tiering_u32_env(
+            "DS4_EXPERT_TIER_REPLACEMENT_BUDGET", 16u, 1u, 512u,
+            &replacement_budget) ||
+        !cuda_moe_tiering_u32_env(
+            "DS4_EXPERT_TIER_MIN_FREQUENCY", 3u, 2u, 1000000u,
+            &min_frequency) ||
+        !cuda_moe_tiering_double_env(
+            "DS4_EXPERT_TIER_HYSTERESIS", 1.25, 1.0, 100.0,
+            &hysteresis)) {
+        return 0;
+    }
+    if (policy_requested == CUDA_MOE_TIER_POLICY_SECOND_TOUCH) {
+        clock_calls = 0u;
+        replacement_budget = 0u;
+        min_frequency = 2u;
+        hysteresis = 1.0;
+    }
     if (g_moe_tiering.mode == (cuda_moe_tier_mode)requested &&
+        g_moe_tiering.policy == (cuda_moe_tier_policy)policy_requested &&
+        g_moe_tiering.policy_clock_calls == clock_calls &&
+        g_moe_tiering.policy_replacement_budget == replacement_budget &&
+        g_moe_tiering.policy_min_frequency == min_frequency &&
+        g_moe_tiering.policy_hysteresis == hysteresis &&
         g_moe_tiering.entries.size() ==
             (size_t)CUDA_MOE_LAYER_COUNT * 256u) {
         return 1;
@@ -13936,11 +14059,22 @@ static int cuda_moe_tiering_prepare(void) {
         return 0;
     }
     g_moe_tiering.mode = (cuda_moe_tier_mode)requested;
+    g_moe_tiering.policy = (cuda_moe_tier_policy)policy_requested;
+    g_moe_tiering.policy_clock_calls = clock_calls;
+    g_moe_tiering.policy_replacement_budget = replacement_budget;
+    g_moe_tiering.policy_min_frequency = min_frequency;
+    g_moe_tiering.policy_hysteresis = hysteresis;
+    g_moe_tiering.policy_epoch = UINT64_MAX;
     if (g_moe_tiering.mode == CUDA_MOE_TIER_ENFORCE) {
         g_dynamic_arena.tiering_exclusive = 1;
     }
-    fprintf(stderr, "ds4: expert tiering active mode=%s entries=%u ram_slots=%u\n",
+    fprintf(stderr, "ds4: expert tiering active mode=%s policy=%s clock_calls=%u replacement_budget=%u min_frequency=%u hysteresis=%.9g entries=%u ram_slots=%u\n",
             cuda_moe_tiering_mode_name(g_moe_tiering.mode),
+            cuda_moe_tiering_policy_name(g_moe_tiering.policy),
+            g_moe_tiering.policy_clock_calls,
+            g_moe_tiering.policy_replacement_budget,
+            g_moe_tiering.policy_min_frequency,
+            g_moe_tiering.policy_hysteresis,
             (uint32_t)g_moe_tiering.entries.size(),
             (uint32_t)g_dynamic_arena.slots.size());
     return 1;
@@ -14615,6 +14749,88 @@ static int cuda_moe_route_worker_pick_slot(
     return best;
 }
 
+static double cuda_moe_tiering_mass_lfru_score(
+        const cuda_moe_tier_entry &entry) {
+    const uint64_t age = g_moe_tiering.call_tick > entry.last_call ?
+        g_moe_tiering.call_tick - entry.last_call : 0;
+    const double clock = g_moe_tiering.policy_clock_calls ?
+        (double)g_moe_tiering.policy_clock_calls : 1.0;
+    const double recency = 1.0 / (1.0 + (double)age / clock);
+    const double frequency = 1.0 + log1p((double)entry.frequency);
+    return entry.mass * frequency * recency;
+}
+
+static int cuda_moe_tiering_pick_vram_slot(
+        cuda_moe_expert_cache *cache, const uint8_t *claimed,
+        const cuda_moe_tier_entry &candidate) {
+    const uint32_t min_frequency =
+        g_moe_tiering.policy == CUDA_MOE_TIER_POLICY_MASS_LFRU ?
+        g_moe_tiering.policy_min_frequency : 2u;
+    if (candidate.frequency < min_frequency) {
+        g_moe_tiering.policy_min_frequency_skips++;
+        return -1;
+    }
+    for (uint32_t slot = 0; slot < cache->capacity; slot++) {
+        if (!claimed[slot] &&
+            cache->slots[slot].state == CUDA_MOE_CACHE_EMPTY) {
+            g_moe_tiering.policy_free_promotions++;
+            return (int)slot;
+        }
+    }
+    if (g_moe_tiering.policy == CUDA_MOE_TIER_POLICY_SECOND_TOUCH) {
+        const int slot = cuda_moe_route_worker_pick_slot(cache, claimed);
+        if (slot >= 0) g_moe_tiering.policy_replacements++;
+        return slot;
+    }
+
+    const uint64_t epoch = g_moe_tiering.call_tick /
+        (uint64_t)g_moe_tiering.policy_clock_calls;
+    if (epoch != g_moe_tiering.policy_epoch) {
+        g_moe_tiering.policy_epoch = epoch;
+        g_moe_tiering.policy_budget_remaining =
+            g_moe_tiering.policy_replacement_budget;
+        g_moe_tiering.policy_epochs++;
+    }
+    if (g_moe_tiering.policy_budget_remaining == 0u) {
+        g_moe_tiering.policy_budget_skips++;
+        return -1;
+    }
+
+    int victim_slot = -1;
+    double victim_score = 1.0e300;
+    for (uint32_t slot = 0; slot < cache->capacity; slot++) {
+        const cuda_moe_cache_slot &cache_entry = cache->slots[slot];
+        if (claimed[slot] || cache_entry.state != CUDA_MOE_CACHE_VALID ||
+            cache_entry.layer_index >= CUDA_MOE_LAYER_COUNT ||
+            cache_entry.expert_id >= 256u) {
+            continue;
+        }
+        const cuda_moe_tier_entry &tier_entry = g_moe_tiering.entries[
+            cuda_moe_tiering_entry_index(
+                cache_entry.layer_index, cache_entry.expert_id)];
+        if (tier_entry.state != CUDA_MOE_TIER_VRAM_PROTECTED) continue;
+        const double score = cuda_moe_tiering_mass_lfru_score(tier_entry);
+        if (score < victim_score) {
+            victim_score = score;
+            victim_slot = (int)slot;
+        }
+    }
+    if (victim_slot < 0) {
+        g_moe_tiering.policy_score_skips++;
+        return -1;
+    }
+    const double candidate_score =
+        cuda_moe_tiering_mass_lfru_score(candidate);
+    if (candidate_score <
+            victim_score * g_moe_tiering.policy_hysteresis) {
+        g_moe_tiering.policy_score_skips++;
+        return -1;
+    }
+    g_moe_tiering.policy_budget_remaining--;
+    g_moe_tiering.policy_replacements++;
+    return victim_slot;
+}
+
 static int cuda_moe_tiering_enforce_request(
         cuda_moe_expert_cache *cache,
         const cuda_moe_route_request &request,
@@ -14691,14 +14907,10 @@ static int cuda_moe_tiering_enforce_request(
                 cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
         }
 
-        const int promote = have_ram && tier.frequency >= 2u;
+        const int cache_slot_i = have_ram ?
+            cuda_moe_tiering_pick_vram_slot(cache, claimed, tier) : -1;
+        const int promote = cache_slot_i >= 0;
         if (promote) {
-            const int cache_slot_i =
-                cuda_moe_route_worker_pick_slot(cache, claimed);
-            if (cache_slot_i < 0) {
-                ok = 0;
-                break;
-            }
             const uint32_t cache_slot = (uint32_t)cache_slot_i;
             claimed[cache_slot] = 1u;
             cuda_moe_cache_slot &entry = cache->slots[cache_slot];
