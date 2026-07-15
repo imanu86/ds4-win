@@ -26,6 +26,7 @@ param(
     [switch]$ArenaWrapSequentialFile,
     [switch]$ArenaWrapRandomFile,
     [ValidateRange(1, 32)][int]$ArenaWrapSequentialWorkers = 1,
+    [ValidateRange(1, 64)][int]$ArenaWrapFileQD = 1,
     [switch]$ArenaWrapPartProfile,
     [ValidateRange(0.001, 600000.0)][double]$ArenaWrapSlowPartMs = 25.0,
     [switch]$ArenaWrapTrimBetweenPhases,
@@ -157,6 +158,16 @@ if ($ArenaWrapRandomFile -and $ArenaWrapSequentialFile) {
 }
 if ($ArenaWrapSequentialWorkers -ne 1 -and -not $ArenaWrapSequentialFile) {
     throw "ArenaWrapSequentialWorkers other than 1 requires -ArenaWrapSequentialFile"
+}
+if ($ArenaWrapFileQD -gt 1) {
+    if (-not $ArenaWrapSourceParts -or -not $ArenaWrapSequentialFile -or
+        -not $ArenaWrapTrustWorkerChecksum -or
+        $ArenaWrapSequentialWorkers -ne 1) {
+        throw "ArenaWrapFileQD greater than 1 requires -ArenaWrapSourceParts, -ArenaWrapSequentialFile, -ArenaWrapTrustWorkerChecksum, and -ArenaWrapSequentialWorkers 1"
+    }
+    if ($ArenaWrapPartProfile) {
+        throw "ArenaWrapFileQD greater than 1 cannot be combined with -ArenaWrapPartProfile"
+    }
 }
 if ($QuiescenceProbeOnly -and $SkipSystemQuiescencePreflight) {
     throw "QuiescenceProbeOnly cannot be combined with SkipSystemQuiescencePreflight"
@@ -353,6 +364,11 @@ if ($ArenaWrapSequentialFile) {
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SEQUENTIAL_FILE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SEQUENTIAL_WORKERS -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapFileQD -gt 1) {
+    $env:DS4_CUDA_ARENA_WRAP_FILE_QD = "$ArenaWrapFileQD"
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_FILE_QD -ErrorAction SilentlyContinue
 }
 if ($ArenaWrapRandomFile) {
     $env:DS4_CUDA_ARENA_WRAP_RANDOM_FILE = "1"
@@ -1277,6 +1293,8 @@ $arenaWrapProfileFinishSeconds = 0.0; $arenaWrapProfilePublishSeconds = 0.0
 $arenaWrapProfileTotalSeconds = 0.0; $arenaWrapSourcePartsCopySeconds = 0.0
 $arenaWrapSourcePartsChecksumSeconds = 0.0; $arenaWrapPartCount = 0
 $arenaWrapCopyWorkers = 0; $arenaWrapChecksumWorkers = 0
+$arenaWrapFileQDRequestedObserved = 1; $arenaWrapFileQDObserved = 1; $arenaWrapFileSubmits = 0
+$arenaWrapFileCompletions = 0; $arenaWrapFileFailures = 0
 $arenaWrapPartProfileObserved = $false; $arenaWrapPartProfileResult = "not_observed"
 $arenaWrapPartProfilePhases = 0; $arenaWrapPartProfileWorkers = 0
 $arenaWrapPartProfileParts = 0; $arenaWrapPartProfileBytes = 0
@@ -1899,6 +1917,13 @@ if (Test-Path $stderrLog) {
             $arenaWrapCopyWorkers = [int]$Matches[4]
             $arenaWrapChecksumWorkers = [int]$Matches[5]
         }
+        if ($arenaWrapProfileLine -match "file_qd=(\d+) file_qd_observed=(\d+) file_submits=(\d+) file_completions=(\d+) file_failures=(\d+)") {
+            $arenaWrapFileQDRequestedObserved = [int]$Matches[1]
+            $arenaWrapFileQDObserved = [int]$Matches[2]
+            $arenaWrapFileSubmits = [uint64]$Matches[3]
+            $arenaWrapFileCompletions = [uint64]$Matches[4]
+            $arenaWrapFileFailures = [uint32]$Matches[5]
+        }
     }
     $arenaWrapPartProfileLine = $lines | Where-Object { $_ -match "\[arena-wrap-part-profile\] result=" } | Select-Object -Last 1
     if ($arenaWrapPartProfileLine -and $arenaWrapPartProfileLine -match "result=([^ ]+) phases=(\d+) workers=(\d+) parts=(\d+) bytes=(\d+) memcpy_sum=([0-9.]+) main_worker=([0-9.]+) join=([0-9.]+) phase_worker_active_min=([0-9.]+) phase_worker_active_max=([0-9.]+) phase_worker_parts_min=(\d+) phase_worker_parts_max=(\d+) slow_threshold_ms=([0-9.]+) slow_parts=(\d+) max_part_ms=([0-9.]+) max_part_bytes=(\d+) max_part_load=(\d+) max_part_cursor=(\d+) max_part_kind=([^ ]+) max_part_source=(\d+)") {
@@ -2337,6 +2362,14 @@ if ($ArenaWrapSourceParts) {
     if ($ArenaWrapTrustWorkerChecksum -and $arenaWrapChecksumWorkers -ne 0) {
         throw "Arena WRAP source-parts measurement failed: unexpected cold checksum pass observed"
     }
+    if ($ArenaWrapFileQD -gt 1 -and
+        ($arenaWrapFileQDRequestedObserved -ne $ArenaWrapFileQD -or
+         $arenaWrapFileQDObserved -ne $ArenaWrapFileQD -or
+         $arenaWrapFileSubmits -ne $arenaWrapPartCount -or
+         $arenaWrapFileCompletions -ne $arenaWrapPartCount -or
+         $arenaWrapFileFailures -ne 0)) {
+        throw "Arena WRAP file QD measurement failed: observed queue depth or file counters differ"
+    }
 }
 if ($ArenaWrapPartProfile) {
     if (-not $arenaWrapPartProfileObserved -or
@@ -2581,6 +2614,7 @@ $summary = [pscustomobject]@{
     arena_wrap_sequential_file_requested = [bool]$ArenaWrapSequentialFile
     arena_wrap_random_file_requested = [bool]$ArenaWrapRandomFile
     arena_wrap_sequential_workers_requested = $ArenaWrapSequentialWorkers
+    arena_wrap_file_qd_requested = $ArenaWrapFileQD
     arena_wrap_part_profile_requested = [bool]$ArenaWrapPartProfile
     arena_wrap_slow_part_ms_requested = $ArenaWrapSlowPartMs
     arena_wrap_trim_between_phases_requested = [bool]$ArenaWrapTrimBetweenPhases
@@ -2601,6 +2635,11 @@ $summary = [pscustomobject]@{
     arena_wrap_part_count = $arenaWrapPartCount
     arena_wrap_copy_workers = $arenaWrapCopyWorkers
     arena_wrap_checksum_workers = $arenaWrapChecksumWorkers
+    arena_wrap_file_qd_requested_observed = $arenaWrapFileQDRequestedObserved
+    arena_wrap_file_qd_observed = $arenaWrapFileQDObserved
+    arena_wrap_file_submits = $arenaWrapFileSubmits
+    arena_wrap_file_completions = $arenaWrapFileCompletions
+    arena_wrap_file_failures = $arenaWrapFileFailures
     arena_wrap_part_profile_observed = $arenaWrapPartProfileObserved
     arena_wrap_part_profile_result = $arenaWrapPartProfileResult
     arena_wrap_part_profile_phases = $arenaWrapPartProfilePhases
@@ -2996,6 +3035,7 @@ Write-Host ("arena publication/window+WRAP counts: " + $arenaObserverPublication
 Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " / " + $arenaGrowthSkips)
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena WRAP profile result/schedule/source/checksum/total/copy/parts/workers: " + $arenaWrapProfileResult + " / " + $arenaWrapScheduleObserved + " / " + $arenaWrapSourceObserved + " / " + $arenaWrapChecksumObserved + " / " + $arenaWrapProfileTotalSeconds + " / " + $arenaWrapSourcePartsCopySeconds + " / " + $arenaWrapPartCount + " / " + $arenaWrapCopyWorkers)
+Write-Host ("arena WRAP file QD req/line/obs/submits/completions/failures: " + $ArenaWrapFileQD + " / " + $arenaWrapFileQDRequestedObserved + " / " + $arenaWrapFileQDObserved + " / " + $arenaWrapFileSubmits + " / " + $arenaWrapFileCompletions + " / " + $arenaWrapFileFailures)
 Write-Host ("arena WRAP part profile req/obs/workers/parts/memcpy/main/join/max-part-ms/slow: " + [bool]$ArenaWrapPartProfile + " / " + $arenaWrapPartProfileObserved + " / " + $arenaWrapPartProfileWorkers + " / " + $arenaWrapPartProfileParts + " / " + $arenaWrapPartProfileMemcpySumSeconds + " / " + $arenaWrapPartProfileMainWorkerSeconds + " / " + $arenaWrapPartProfileJoinSeconds + " / " + $arenaWrapPartProfileMaxPartMs + " / " + $arenaWrapPartProfileSlowParts)
 Write-Host ("arena WRAP trim req/obs/result/calls/ok/fail/sec/error: " + [bool]$ArenaWrapTrimBetweenPhases + " / " + $arenaWrapTrimObserved + " / " + $arenaWrapTrimResult + " / " + $arenaWrapTrimCalls + " / " + $arenaWrapTrimSucceeded + " / " + $arenaWrapTrimFailed + " / " + $arenaWrapTrimSeconds + " / " + $arenaWrapTrimLastError)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)

@@ -2923,6 +2923,14 @@ struct cuda_dynamic_arena_part_copy_context {
     uint32_t profile_worker_capacity;
 };
 
+struct cuda_dynamic_arena_file_qd_profile {
+    uint32_t requested;
+    uint32_t observed;
+    uint32_t failures;
+    uint64_t submits;
+    uint64_t completions;
+};
+
 struct alignas(64) cuda_dynamic_arena_part_worker_profile {
     uint64_t parts;
     uint64_t bytes;
@@ -3191,6 +3199,178 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
     return NULL;
 }
 
+#ifdef _WIN32
+struct cuda_dynamic_arena_file_qd_slot {
+    OVERLAPPED overlapped;
+    HANDLE event;
+    uint32_t cursor;
+    DWORD expected;
+    int pending;
+};
+
+static void cuda_dynamic_arena_file_qd_drain(
+        const os_file_t *source_file,
+        cuda_dynamic_arena_file_qd_slot *slots,
+        uint32_t count) {
+    if (!source_file || !slots) return;
+    for (uint32_t i = 0; i < count; i++) {
+        if (slots[i].pending) {
+            (void)CancelIoEx(source_file->h, &slots[i].overlapped);
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        if (!slots[i].pending) continue;
+        DWORD ignored = 0;
+        (void)GetOverlappedResult(source_file->h, &slots[i].overlapped,
+                                  &ignored, TRUE);
+        slots[i].pending = 0;
+    }
+}
+
+/* Submit several source-sorted reads into their final pinned arena slots.
+ * Each checksum phase is drained before the next begins, preserving the
+ * canonical gate || up || down FNV order without staging or extra copies. */
+static int cuda_dynamic_arena_copy_phase_file_qd(
+        cuda_dynamic_arena_part_copy_context *context,
+        uint32_t qd,
+        cuda_dynamic_arena_file_qd_profile *profile) {
+    if (!context || !context->source_file ||
+        !os_file_valid(context->source_file) || qd < 2u || qd > 64u ||
+        !profile) {
+        return 0;
+    }
+
+    std::vector<cuda_dynamic_arena_file_qd_slot> slots;
+    try {
+        slots.resize(qd);
+    } catch (...) {
+        profile->failures++;
+        return 0;
+    }
+    for (uint32_t i = 0; i < qd; i++) {
+        memset(&slots[i].overlapped, 0, sizeof(slots[i].overlapped));
+        slots[i].event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        slots[i].cursor = 0;
+        slots[i].expected = 0;
+        slots[i].pending = 0;
+        if (!slots[i].event) {
+            profile->failures++;
+            for (uint32_t j = 0; j < i; j++) CloseHandle(slots[j].event);
+            return 0;
+        }
+    }
+
+    int ok = 1;
+    uint32_t cursor = 0;
+    while (cursor < context->part_count && ok) {
+        uint32_t submitted = 0;
+        while (cursor < context->part_count && submitted < qd) {
+            const uint32_t part_cursor = cursor++;
+            const cuda_dynamic_arena_wrap_part &part =
+                context->parts[part_cursor];
+            if (context->phase_part && part.part != context->phase_part) {
+                continue;
+            }
+            if (part.load_index >= context->load_count ||
+                (part.part != CUDA_DYNAMIC_ARENA_MIRROR_GATE &&
+                 part.part != CUDA_DYNAMIC_ARENA_MIRROR_UP &&
+                 part.part != CUDA_DYNAMIC_ARENA_MIRROR_DOWN) ||
+                part.bytes == 0 || part.bytes > 0xffffffffull) {
+                profile->failures++;
+                ok = 0;
+                break;
+            }
+            const ds4_gpu_dynamic_arena_load &load =
+                context->loads[part.load_index];
+            if (!load.host_ptr ||
+                part.source_offset > g_dynamic_arena.model_size ||
+                part.bytes > g_dynamic_arena.model_size - part.source_offset ||
+                part.destination_offset > load.host_bytes ||
+                part.bytes > load.host_bytes - part.destination_offset) {
+                profile->failures++;
+                ok = 0;
+                break;
+            }
+
+            cuda_dynamic_arena_file_qd_slot &slot = slots[submitted];
+            OVERLAPPED &overlapped = slot.overlapped;
+            memset(&overlapped, 0, sizeof(overlapped));
+            overlapped.Offset = (DWORD)(part.source_offset & 0xffffffffu);
+            overlapped.OffsetHigh = (DWORD)(part.source_offset >> 32);
+            overlapped.hEvent = slot.event;
+            (void)ResetEvent(slot.event);
+            slot.cursor = part_cursor;
+            slot.expected = (DWORD)part.bytes;
+            slot.pending = 0;
+            uint8_t *destination =
+                (uint8_t *)load.host_ptr + part.destination_offset;
+            const BOOL started = ReadFile(context->source_file->h,
+                                          destination, slot.expected,
+                                          NULL, &overlapped);
+            if (!started && GetLastError() != ERROR_IO_PENDING) {
+                fprintf(stderr,
+                        "ds4: [arena-wrap-file-qd] submit failed offset=%llu error=%lu\n",
+                        (unsigned long long)part.source_offset,
+                        (unsigned long)GetLastError());
+                profile->failures++;
+                ok = 0;
+                break;
+            }
+            slot.pending = 1;
+            submitted++;
+            profile->submits++;
+            if (submitted > profile->observed) profile->observed = submitted;
+        }
+
+        for (uint32_t i = 0; i < submitted; i++) {
+            cuda_dynamic_arena_file_qd_slot &slot = slots[i];
+            if (!slot.pending) continue;
+            DWORD got = 0;
+            const BOOL completed = GetOverlappedResult(
+                context->source_file->h, &slot.overlapped, &got, TRUE);
+            slot.pending = 0;
+            if (!completed || got != slot.expected) {
+                const DWORD error = completed ? ERROR_READ_FAULT : GetLastError();
+                fprintf(stderr,
+                        "ds4: [arena-wrap-file-qd] completion failed cursor=%u error=%lu bytes=%lu/%lu\n",
+                        slot.cursor, (unsigned long)error,
+                        (unsigned long)got, (unsigned long)slot.expected);
+                profile->failures++;
+                ok = 0;
+                continue;
+            }
+            const cuda_dynamic_arena_wrap_part &part =
+                context->parts[slot.cursor];
+            const ds4_gpu_dynamic_arena_load &load =
+                context->loads[part.load_index];
+            uint8_t *destination =
+                (uint8_t *)load.host_ptr + part.destination_offset;
+            if (context->checksum_parts) {
+                context->checksums[part.load_index] =
+                    cuda_dynamic_arena_fnv1a64_continue(
+                        destination, part.bytes,
+                        context->checksums[part.load_index]);
+            }
+            context->success[slot.cursor] = 1u;
+            profile->completions++;
+        }
+        if (!ok) {
+            cuda_dynamic_arena_file_qd_drain(
+                context->source_file, slots.data(), submitted);
+        }
+    }
+
+    for (uint32_t i = 0; i < qd; i++) CloseHandle(slots[i].event);
+    return ok;
+}
+#else
+static int cuda_dynamic_arena_copy_phase_file_qd(
+        cuda_dynamic_arena_part_copy_context *, uint32_t,
+        cuda_dynamic_arena_file_qd_profile *) {
+    return 0;
+}
+#endif
+
 static void *cuda_dynamic_arena_checksum_worker(void *arg) {
     cuda_dynamic_arena_checksum_context *context =
         (cuda_dynamic_arena_checksum_context *)arg;
@@ -3262,6 +3442,26 @@ static uint32_t cuda_dynamic_arena_wrap_sequential_workers(
     }
     if (work_count != 0 && workers > work_count) workers = work_count;
     return workers;
+}
+
+static uint32_t cuda_dynamic_arena_wrap_file_qd(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_FILE_QD");
+    if (!value || !value[0]) return 1;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    if (errno == 0 && end && *end == '\0' &&
+        parsed >= 1 && parsed <= 64) {
+        return (uint32_t)parsed;
+    }
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-file-qd] invalid queue depth '%s'; using 1\n",
+                value);
+        warned = 1;
+    }
+    return 1;
 }
 
 static int cuda_dynamic_arena_wrap_trust_worker_checksum(void) {
@@ -3368,6 +3568,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const int sequential_file_requested =
         cuda_dynamic_arena_wrap_sequential_file();
     const int random_file_requested = cuda_dynamic_arena_wrap_random_file();
+    const uint32_t file_qd_requested =
+        cuda_dynamic_arena_wrap_file_qd();
     const char *schedule_name =
         schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS ?
         "source-parts" : "expert-major";
@@ -3436,6 +3638,9 @@ static int cuda_dynamic_arena_wrap_publish_target(
     uint32_t source_parts_trim_failed = 0;
     uint32_t source_parts_trim_last_error = 0;
     double source_parts_trim_seconds = 0;
+    cuda_dynamic_arena_file_qd_profile file_qd_profile = {};
+    file_qd_profile.requested = file_qd_requested;
+    file_qd_profile.observed = file_qd_requested == 1u ? 1u : 0u;
 
     local.loads = load_count;
     int all_succeeded = loads != NULL || load_count == 0;
@@ -3488,6 +3693,15 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 (random_file_requested ? 1u :
                  cuda_dynamic_arena_observer_workers(work_count));
             requested_copy_workers = requested_workers;
+            if (file_qd_requested > 1u &&
+                (schedule != CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS ||
+                 !sequential_file_requested || random_file_requested ||
+                 !trust_worker_checksum || requested_workers != 1u ||
+                 part_profile)) {
+                local.reason = "file-qd-contract";
+                source_parts_copy_failed = 1;
+                all_succeeded = 0;
+            }
             threads.resize(requested_workers > 1 ? requested_workers - 1 : 0);
             started_threads.reserve(threads.size());
             if (part_profile &&
@@ -3539,14 +3753,17 @@ static int cuda_dynamic_arena_wrap_publish_target(
                         std::memory_order_relaxed);
                 }
                 started_threads.clear();
-                for (uint32_t i = 0; i < threads.size(); i++) {
-                    if (os_thread_create(&threads[i],
-                                         cuda_dynamic_arena_part_copy_worker,
-                                         &context) == 0) {
-                        started_threads.push_back(threads[i]);
+                if (file_qd_requested == 1u) {
+                    for (uint32_t i = 0; i < threads.size(); i++) {
+                        if (os_thread_create(
+                                &threads[i],
+                                cuda_dynamic_arena_part_copy_worker,
+                                &context) == 0) {
+                            started_threads.push_back(threads[i]);
+                        }
                     }
                 }
-                const uint32_t phase_workers =
+                const uint32_t phase_workers = file_qd_requested > 1u ? 1u :
                     1u + (uint32_t)started_threads.size();
                 if (phase_workers > local.workers) {
                     local.workers = phase_workers;
@@ -3558,7 +3775,16 @@ static int cuda_dynamic_arena_wrap_publish_target(
                     all_succeeded = 0;
                 }
                 const double main_worker_started_at = cuda_wall_sec();
-                (void)cuda_dynamic_arena_part_copy_worker(&context);
+                if (file_qd_requested > 1u) {
+                    if (!cuda_dynamic_arena_copy_phase_file_qd(
+                            &context, file_qd_requested, &file_qd_profile)) {
+                        local.reason = "file-qd-copy";
+                        source_parts_copy_failed = 1;
+                        all_succeeded = 0;
+                    }
+                } else {
+                    (void)cuda_dynamic_arena_part_copy_worker(&context);
+                }
                 source_parts_main_worker_seconds +=
                     cuda_wall_sec() - main_worker_started_at;
                 const double join_started_at = cuda_wall_sec();
@@ -3675,7 +3901,9 @@ static int cuda_dynamic_arena_wrap_publish_target(
             }
             for (size_t i = 0; i < part_success.size(); i++) {
                 if (!part_success[i]) {
-                    local.reason = "copy-part";
+                    if (!source_parts_copy_failed) {
+                        local.reason = "copy-part";
+                    }
                     all_succeeded = 0;
                     source_parts_copy_failed = 1;
                 }
@@ -3765,7 +3993,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
         local.published = 1;
         local.seconds = publish_done_at - started_at;
         fprintf(stderr,
-                "ds4: [arena-wrap-profile] result=published schedule=%s source=%s checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f source_parts_copy=%.3f source_parts_checksum=%.3f parts=%u copy_workers=%u checksum_workers=%u\n",
+                "ds4: [arena-wrap-profile] result=published schedule=%s source=%s checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f source_parts_copy=%.3f source_parts_checksum=%.3f parts=%u copy_workers=%u checksum_workers=%u file_qd=%u file_qd_observed=%u file_submits=%llu file_completions=%llu file_failures=%u\n",
                 schedule_name,
                 source_name,
                 checksum_name,
@@ -3777,7 +4005,11 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 local.seconds,
                 source_parts_copy_seconds,
                 source_parts_checksum_seconds,
-                (uint32_t)parts.size(), local.workers, checksum_workers);
+                (uint32_t)parts.size(), local.workers, checksum_workers,
+                file_qd_profile.requested, file_qd_profile.observed,
+                (unsigned long long)file_qd_profile.submits,
+                (unsigned long long)file_qd_profile.completions,
+                file_qd_profile.failures);
         if (result) *result = local;
         return 1;
     }
@@ -3788,7 +4020,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
     }
     local.seconds = cuda_wall_sec() - started_at;
     fprintf(stderr,
-            "ds4: [arena-wrap-profile] result=failed schedule=%s source=%s checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f source_parts_copy=%.3f source_parts_checksum=%.3f parts=%u copy_workers=%u checksum_workers=%u reason=%s\n",
+            "ds4: [arena-wrap-profile] result=failed schedule=%s source=%s checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f source_parts_copy=%.3f source_parts_checksum=%.3f parts=%u copy_workers=%u checksum_workers=%u file_qd=%u file_qd_observed=%u file_submits=%llu file_completions=%llu file_failures=%u reason=%s\n",
             schedule_name,
             source_name,
             checksum_name,
@@ -3801,6 +4033,10 @@ static int cuda_dynamic_arena_wrap_publish_target(
             source_parts_copy_seconds,
             source_parts_checksum_seconds,
             (uint32_t)parts.size(), local.workers, checksum_workers,
+            file_qd_profile.requested, file_qd_profile.observed,
+            (unsigned long long)file_qd_profile.submits,
+            (unsigned long long)file_qd_profile.completions,
+            file_qd_profile.failures,
             local.reason ? local.reason : "unknown");
     if (result) *result = local;
     return 0;
