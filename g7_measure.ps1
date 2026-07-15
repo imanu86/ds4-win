@@ -79,6 +79,7 @@ param(
     [ValidateRange(0, 256)][int]$PrefillWaveForceExperts = 0,
     [switch]$PrefillWaveDoubleBuffer,
     [switch]$GenericSortedMoe,
+    [switch]$RequestPhaseTrace,
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [switch]$SkipMemoryPreflight,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0
@@ -112,6 +113,12 @@ if ($WarmupPrompt -and -not $Warmup) {
 }
 if ($WarmupMaxTokens -gt 0 -and -not $Warmup) {
     throw "WarmupMaxTokens requires -Warmup"
+}
+if ($RequestPhaseTrace -and -not $PrefillMassWrap) {
+    throw "RequestPhaseTrace currently requires -PrefillMassWrap"
+}
+if ($RequestPhaseTrace -and ($Warmup -or $Repeats -ne 1 -or $MaxTokens -le 0)) {
+    throw "RequestPhaseTrace requires one non-warmup request with MaxTokens greater than zero"
 }
 if ($ExpectedWarmupContentSHA256 -and -not $Warmup) {
     throw "ExpectedWarmupContentSHA256 requires -Warmup"
@@ -351,6 +358,11 @@ if ($RouteNoDefaultSync) {
     $env:DS4_CUDA_MOE_ROUTE_NO_DEFAULT_SYNC = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_MOE_ROUTE_NO_DEFAULT_SYNC -ErrorAction SilentlyContinue
+}
+if ($RequestPhaseTrace) {
+    $env:DS4_REQUEST_PHASE_TRACE = "1"
+} else {
+    Remove-Item Env:\DS4_REQUEST_PHASE_TRACE -ErrorAction SilentlyContinue
 }
 if ($SplitHitMiss) {
     $env:DS4_CUDA_MOE_SPLIT_HIT_MISS = "1"
@@ -906,9 +918,68 @@ $prefillWaveOverlapFailures = 0
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
 $arenaAllocatedBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
+$requestPhaseObserved = $false; $requestPhaseLineCount = 0
+$requestPhaseEvents = @{}
+$requestPhasePrefillComputeSeconds = 0.0; $requestPhaseWrapSeconds = 0.0
+$requestPhaseWrapCopySeconds = 0.0; $requestPhasePostWrapSeconds = 0.0
+$requestPhaseSyncTailSeconds = 0.0; $requestPhaseDecodeGapSeconds = 0.0
+$requestPhaseFirstSampleSeconds = 0.0; $requestPhaseFirstEvalSeconds = 0.0
+$requestPhaseDecodeToFirstSeconds = 0.0; $requestPhasePromptToFirstSeconds = 0.0
 $serverRunsAll = @()
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
+
+    $requestPhaseLines = @($lines | Where-Object { $_ -match '^ds4: \[request-phase\] ' })
+    $requestPhaseLineCount = $requestPhaseLines.Count
+    foreach ($phaseLine in $requestPhaseLines) {
+        if ($phaseLine -notmatch '^ds4: \[request-phase\] event=([a-z-]+) mono=([0-9.]+)') {
+            throw "Request phase trace line format mismatch: $phaseLine"
+        }
+        $phaseEvent = $Matches[1]
+        $phaseMono = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+        if ($requestPhaseEvents.ContainsKey($phaseEvent)) {
+            throw "Request phase trace event repeated: $phaseEvent"
+        }
+        $requestPhaseEvents[$phaseEvent] = $phaseMono
+    }
+    if ($RequestPhaseTrace) {
+        $requiredPhaseEvents = @(
+            'prompt-start', 'session-sync-enter', 'prefill-finalize-enter',
+            'wrap-enter', 'wrap-copy-enter', 'wrap-copy-return',
+            'wrap-terminal', 'prefill-finalize-return', 'session-sync-return',
+            'decode-enter', 'first-sample-enter', 'first-sample-return',
+            'first-eval-enter', 'first-eval-return', 'first-token-ready',
+            'request-end'
+        )
+        foreach ($phaseEvent in $requiredPhaseEvents) {
+            if (-not $requestPhaseEvents.ContainsKey($phaseEvent)) {
+                throw "Request phase trace event missing: $phaseEvent"
+            }
+        }
+        for ($phaseIndex = 1; $phaseIndex -lt $requiredPhaseEvents.Count; $phaseIndex++) {
+            $phasePrev = $requiredPhaseEvents[$phaseIndex - 1]
+            $phaseCurrent = $requiredPhaseEvents[$phaseIndex]
+            if ($requestPhaseEvents[$phaseCurrent] -lt $requestPhaseEvents[$phasePrev]) {
+                throw "Request phase trace order mismatch: $phasePrev -> $phaseCurrent"
+            }
+        }
+        if ($requestPhaseLineCount -ne $requiredPhaseEvents.Count) {
+            throw "Request phase trace emitted unexpected extra events"
+        }
+        $requestPhaseObserved = $true
+        $requestPhasePrefillComputeSeconds = $requestPhaseEvents['prefill-finalize-enter'] - $requestPhaseEvents['session-sync-enter']
+        $requestPhaseWrapSeconds = $requestPhaseEvents['wrap-terminal'] - $requestPhaseEvents['wrap-enter']
+        $requestPhaseWrapCopySeconds = $requestPhaseEvents['wrap-copy-return'] - $requestPhaseEvents['wrap-copy-enter']
+        $requestPhasePostWrapSeconds = $requestPhaseEvents['prefill-finalize-return'] - $requestPhaseEvents['wrap-terminal']
+        $requestPhaseSyncTailSeconds = $requestPhaseEvents['session-sync-return'] - $requestPhaseEvents['prefill-finalize-return']
+        $requestPhaseDecodeGapSeconds = $requestPhaseEvents['decode-enter'] - $requestPhaseEvents['session-sync-return']
+        $requestPhaseFirstSampleSeconds = $requestPhaseEvents['first-sample-return'] - $requestPhaseEvents['first-sample-enter']
+        $requestPhaseFirstEvalSeconds = $requestPhaseEvents['first-eval-return'] - $requestPhaseEvents['first-eval-enter']
+        $requestPhaseDecodeToFirstSeconds = $requestPhaseEvents['first-token-ready'] - $requestPhaseEvents['decode-enter']
+        $requestPhasePromptToFirstSeconds = $requestPhaseEvents['first-token-ready'] - $requestPhaseEvents['prompt-start']
+    } elseif ($requestPhaseLineCount -ne 0) {
+        throw "Request phase trace activated while not requested"
+    }
 
     # Keep server-reported decode throughput separate from HTTP wall time, which
     # also includes prefill/TTFT. A request block starts at "prompt start" and
@@ -2191,6 +2262,20 @@ $summary = [pscustomobject]@{
     gpu_resident_routes_queries = $gpuRoutesQueries
     gpu_resident_routes_default_sync_calls = $gpuRoutesDefaultSyncCalls
     gpu_resident_routes_no_default_sync_calls = $gpuRoutesNoDefaultSyncCalls
+    request_phase_trace_requested = [bool]$RequestPhaseTrace
+    request_phase_trace_observed = $requestPhaseObserved
+    request_phase_trace_line_count = $requestPhaseLineCount
+    request_phase_trace_prefill_compute_seconds = $requestPhasePrefillComputeSeconds
+    request_phase_trace_wrap_seconds = $requestPhaseWrapSeconds
+    request_phase_trace_wrap_copy_seconds = $requestPhaseWrapCopySeconds
+    request_phase_trace_post_wrap_seconds = $requestPhasePostWrapSeconds
+    request_phase_trace_sync_tail_seconds = $requestPhaseSyncTailSeconds
+    request_phase_trace_decode_gap_seconds = $requestPhaseDecodeGapSeconds
+    request_phase_trace_first_sample_seconds = $requestPhaseFirstSampleSeconds
+    request_phase_trace_first_eval_seconds = $requestPhaseFirstEvalSeconds
+    request_phase_trace_decode_to_first_seconds = $requestPhaseDecodeToFirstSeconds
+    request_phase_trace_prompt_to_first_seconds = $requestPhasePromptToFirstSeconds
+    request_phase_trace_events = $requestPhaseEvents
     expert_cache_stats_enabled = [bool]$ExpertCacheStats
     expert_cache_stats_interval = $ExpertCacheStatsInterval
     overlap_shared_requested = [bool]$OverlapShared
@@ -2342,6 +2427,7 @@ Write-Host ("expert_tiering requested/observed/calls/selected/failures/states vr
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
 Write-Host ("gpu resident routes requested/no-sync/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms/queries/default-sync/no-sync-calls: " + [bool]$GpuResidentRoutes + " / " + [bool]$RouteNoDefaultSync + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs + " / " + $gpuRoutesQueries + " / " + $gpuRoutesDefaultSyncCalls + " / " + $gpuRoutesNoDefaultSyncCalls)
+Write-Host ("request phase trace requested/observed/lines prefill/wrap/copy/post-wrap/sync-tail/decode-gap/sample/eval/decode-first/prompt-first sec: " + [bool]$RequestPhaseTrace + " / " + $requestPhaseObserved + " / " + $requestPhaseLineCount + " / " + $requestPhasePrefillComputeSeconds + " / " + $requestPhaseWrapSeconds + " / " + $requestPhaseWrapCopySeconds + " / " + $requestPhasePostWrapSeconds + " / " + $requestPhaseSyncTailSeconds + " / " + $requestPhaseDecodeGapSeconds + " / " + $requestPhaseFirstSampleSeconds + " / " + $requestPhaseFirstEvalSeconds + " / " + $requestPhaseDecodeToFirstSeconds + " / " + $requestPhasePromptToFirstSeconds)
 Write-Host ("overlap_shared requested/observed: " + [bool]$OverlapShared + " / " + $overlapSharedObserved)
 Write-Host ("overlap_shared_full requested/observed: " + [bool]$OverlapSharedFull + " / " + $overlapSharedFullObserved)
 Write-Host ("shared_down_fusion_disabled: " + [bool]$DisableSharedDownFusion)

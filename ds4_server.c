@@ -4814,6 +4814,26 @@ static double now_sec(void) {
     return os_monotonic_sec();
 }
 
+static bool request_phase_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_REQUEST_PHASE_TRACE");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    }
+    return enabled != 0;
+}
+
+static void request_phase_trace(const char *event, double prompt_t0,
+                                double decode_t0) {
+    if (!request_phase_trace_enabled()) return;
+    const double mono = now_sec();
+    fprintf(stderr,
+            "ds4: [request-phase] event=%s mono=%.6f since_prompt=%.6f since_decode=%.6f\n",
+            event, mono,
+            prompt_t0 > 0.0 ? mono - prompt_t0 : -1.0,
+            decode_t0 > 0.0 ? mono - decode_t0 : -1.0);
+}
+
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -7227,6 +7247,7 @@ static void generate_job(server *s, job *j) {
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags);
+    request_phase_trace("prompt-start", t0, 0.0);
     ds4_session_set_progress(s->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
@@ -7259,6 +7280,7 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&prefix);
     }
 
+    request_phase_trace("session-sync-enter", t0, 0.0);
     if (ds4_session_sync(s->session, prompt_for_sync, err, sizeof(err)) != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
@@ -7266,6 +7288,7 @@ static void generate_job(server *s, job *j) {
         http_error(j->fd, 500, err);
         return;
     }
+    request_phase_trace("session-sync-return", t0, 0.0);
     ds4_session_set_progress(s->session, NULL, NULL);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
@@ -7329,6 +7352,7 @@ static void generate_job(server *s, job *j) {
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
     const double decode_t0 = now_sec();
+    request_phase_trace("decode-enter", t0, decode_t0);
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -7356,7 +7380,13 @@ static void generate_job(server *s, job *j) {
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
+        if (completion == 0) {
+            request_phase_trace("first-sample-enter", t0, decode_t0);
+        }
         int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        if (completion == 0) {
+            request_phase_trace("first-sample-return", t0, decode_t0);
+        }
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -7364,6 +7394,9 @@ static void generate_job(server *s, job *j) {
 
         int toks[17];
         int ntok = 0;
+        if (completion == 0) {
+            request_phase_trace("first-eval-enter", t0, decode_t0);
+        }
         if (temperature <= 0.0f &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
@@ -7388,6 +7421,9 @@ static void generate_job(server *s, job *j) {
             toks[0] = token;
             ntok = 1;
         }
+        if (completion == 0) {
+            request_phase_trace("first-eval-return", t0, decode_t0);
+        }
 
         bool stop_decode = false;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
@@ -7404,6 +7440,9 @@ static void generate_job(server *s, job *j) {
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
+            if (completion == 1) {
+                request_phase_trace("first-token-ready", t0, decode_t0);
+            }
             thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 dsml_decode_tracker_update(&dsml_tracker, text.ptr, text.len);
@@ -7700,6 +7739,7 @@ static void generate_job(server *s, job *j) {
                        now_sec() - t0);
         }
     }
+    request_phase_trace("request-end", t0, decode_t0);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);

@@ -1151,6 +1151,21 @@ static double cuda_wall_sec(void) {
     return os_monotonic_sec();
 }
 
+static int cuda_request_phase_trace_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_REQUEST_PHASE_TRACE");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    }
+    return enabled;
+}
+
+static void cuda_request_phase_trace(const char *event) {
+    if (!cuda_request_phase_trace_enabled()) return;
+    fprintf(stderr, "ds4: [request-phase] event=%s mono=%.6f\n",
+            event, cuda_wall_sec());
+}
+
 static int cuda_model_load_progress_enabled(void) {
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE") != NULL) return 0;
     return 1;
@@ -4491,6 +4506,7 @@ static void cuda_prefill_mass_observer_reset(void) {
 
 static int cuda_prefill_mass_publish_candidate(void) {
     cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
+    cuda_request_phase_trace("wrap-enter");
     observer.wrap_attempted = 1;
     const uint64_t snapshot_before = g_dynamic_arena.snapshot_generation;
     const uint32_t resident_before = cuda_dynamic_arena_active_count();
@@ -4550,8 +4566,11 @@ static int cuda_prefill_mass_publish_candidate(void) {
             break;
         }
 
-        if (cuda_dynamic_arena_wrap_publish_target(
-                observer.candidate.data(), entry_count, &wrap)) {
+        cuda_request_phase_trace("wrap-copy-enter");
+        const int published = cuda_dynamic_arena_wrap_publish_target(
+                observer.candidate.data(), entry_count, &wrap);
+        cuda_request_phase_trace("wrap-copy-return");
+        if (published) {
             if (cuda_prefill_mass_compose_apply_router_mask()) {
                 terminal = "published";
                 reason = "ok";
@@ -4596,12 +4615,14 @@ static int cuda_prefill_mass_publish_candidate(void) {
             resident_before, resident_after,
             (unsigned long long)wrap.generation,
             observer.compose_mask_applied ? "request-scoped-closed" : "off");
+    cuda_request_phase_trace("wrap-terminal");
     return observer.wrap_published;
 }
 
 static void cuda_prefill_mass_observer_finalize(void) {
     cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
     if (!observer.enabled || observer.finalized) return;
+    cuda_request_phase_trace("prefill-finalize-enter");
     observer.finalized = 1;
     if (observer.routed_slots == 0 || observer.unique_entries == 0) {
         fprintf(stderr,
@@ -4610,6 +4631,7 @@ static void cuda_prefill_mass_observer_finalize(void) {
         if (observer.wrap_requested) {
             (void)cuda_prefill_mass_publish_candidate();
         }
+        cuda_request_phase_trace("prefill-finalize-return");
         return;
     }
 
@@ -4636,6 +4658,7 @@ static void cuda_prefill_mass_observer_finalize(void) {
                     cuda_dynamic_arena_active_count());
         }
         cuda_prefill_mass_observer_release(0);
+        cuda_request_phase_trace("prefill-finalize-return");
         return;
     }
     std::sort(ranked.begin(), ranked.end(),
@@ -4661,6 +4684,7 @@ static void cuda_prefill_mass_observer_finalize(void) {
                 (unsigned long long)g_dynamic_arena.snapshot_generation,
                 cuda_dynamic_arena_active_count(),
                 cuda_dynamic_arena_active_count());
+        cuda_request_phase_trace("prefill-finalize-return");
         return;
     }
     const size_t ranked_capacity = residency_capacity - hash_entries;
@@ -4708,6 +4732,7 @@ static void cuda_prefill_mass_observer_finalize(void) {
             wrap ? "prefill-ranked" : "unchanged",
             wrap ? "bulk-wrap" : "observe-only");
     if (wrap) (void)cuda_prefill_mass_publish_candidate();
+    cuda_request_phase_trace("prefill-finalize-return");
 }
 
 static void cuda_prefill_mass_observe_selected(
