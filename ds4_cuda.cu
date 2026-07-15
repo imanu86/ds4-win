@@ -2110,15 +2110,22 @@ static int cuda_dynamic_arena_binding_valid(
         slot.content_generation == binding.slot_generation;
 }
 
-static uint64_t cuda_dynamic_arena_fnv1a64(
+static uint64_t cuda_dynamic_arena_fnv1a64_continue(
         const uint8_t *data,
-        uint64_t bytes) {
-    uint64_t checksum = UINT64_C(14695981039346656037);
+        uint64_t bytes,
+        uint64_t checksum) {
     for (uint64_t i = 0; i < bytes; i++) {
         checksum ^= data[i];
         checksum *= UINT64_C(1099511628211);
     }
     return checksum;
+}
+
+static uint64_t cuda_dynamic_arena_fnv1a64(
+        const uint8_t *data,
+        uint64_t bytes) {
+    return cuda_dynamic_arena_fnv1a64_continue(
+        data, bytes, UINT64_C(14695981039346656037));
 }
 
 enum cuda_dynamic_arena_copy_status {
@@ -2862,6 +2869,39 @@ struct cuda_dynamic_arena_wrap_context {
     uint8_t *success;
 };
 
+enum cuda_dynamic_arena_wrap_schedule {
+    CUDA_DYNAMIC_ARENA_WRAP_EXPERT_MAJOR = 0,
+    CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS = 1,
+};
+
+struct cuda_dynamic_arena_wrap_part {
+    uint32_t load_index;
+    uint8_t part;
+    uint64_t source_offset;
+    uint64_t bytes;
+    uint64_t destination_offset;
+};
+
+struct cuda_dynamic_arena_part_copy_context {
+    const ds4_gpu_dynamic_arena_load *loads;
+    uint32_t load_count;
+    const cuda_dynamic_arena_wrap_part *parts;
+    uint32_t part_count;
+    std::atomic<uint32_t> next;
+    uint64_t *checksums;
+    uint8_t *success;
+    uint8_t phase_part;
+    int checksum_parts;
+};
+
+struct cuda_dynamic_arena_checksum_context {
+    const ds4_gpu_dynamic_arena_load *loads;
+    uint32_t load_count;
+    std::atomic<uint32_t> next;
+    uint64_t *checksums;
+    uint8_t *success;
+};
+
 struct cuda_dynamic_arena_wrap_result {
     const char *reason;
     uint32_t loads;
@@ -2904,6 +2944,176 @@ static void *cuda_dynamic_arena_wrap_worker(void *arg) {
     return NULL;
 }
 
+static int cuda_dynamic_arena_wrap_add_part(
+        std::vector<cuda_dynamic_arena_wrap_part> &parts,
+        uint32_t load_index,
+        uint8_t part,
+        uint64_t base_offset,
+        uint64_t expert,
+        uint64_t expert_bytes,
+        uint64_t destination_offset,
+        uint64_t host_bytes) {
+    if (expert_bytes == 0 ||
+        (expert != 0 && expert_bytes > UINT64_MAX / expert)) {
+        return 0;
+    }
+    const uint64_t expert_delta = expert * expert_bytes;
+    if (base_offset > UINT64_MAX - expert_delta) return 0;
+    const uint64_t source_offset = base_offset + expert_delta;
+    if (source_offset > g_dynamic_arena.model_size ||
+        expert_bytes > g_dynamic_arena.model_size - source_offset ||
+        destination_offset > host_bytes ||
+        expert_bytes > host_bytes - destination_offset) {
+        return 0;
+    }
+    parts.push_back({
+        load_index, part, source_offset, expert_bytes, destination_offset
+    });
+    return 1;
+}
+
+static int cuda_dynamic_arena_wrap_build_source_parts(
+        const ds4_gpu_dynamic_arena_load *loads,
+        uint32_t load_count,
+        std::vector<cuda_dynamic_arena_wrap_part> &parts) {
+    if (!loads || load_count > UINT32_MAX / 3u) return 0;
+    try {
+        parts.clear();
+        parts.reserve((size_t)load_count * 3u);
+        for (uint32_t i = 0; i < load_count; i++) {
+            const ds4_gpu_dynamic_arena_load &load = loads[i];
+            if (!load.host_ptr ||
+                load.layer >= g_dynamic_arena.n_layer ||
+                load.expert >= g_dynamic_arena.n_expert) {
+                return 0;
+            }
+            const ds4_gpu_dynamic_arena_layer &layer =
+                g_dynamic_arena.layers[load.layer];
+            if (layer.gate_expert_bytes >
+                    UINT64_MAX - layer.up_expert_bytes) {
+                return 0;
+            }
+            const uint64_t gate_up_bytes =
+                layer.gate_expert_bytes + layer.up_expert_bytes;
+            if (gate_up_bytes > UINT64_MAX - layer.down_expert_bytes ||
+                gate_up_bytes + layer.down_expert_bytes != load.host_bytes ||
+                load.host_bytes != g_dynamic_arena.slot_bytes) {
+                return 0;
+            }
+            const uint64_t expert = load.expert;
+            if (!cuda_dynamic_arena_wrap_add_part(
+                    parts, i, CUDA_DYNAMIC_ARENA_MIRROR_GATE,
+                    layer.gate_offset, expert, layer.gate_expert_bytes,
+                    0, load.host_bytes) ||
+                !cuda_dynamic_arena_wrap_add_part(
+                    parts, i, CUDA_DYNAMIC_ARENA_MIRROR_UP,
+                    layer.up_offset, expert, layer.up_expert_bytes,
+                    layer.gate_expert_bytes, load.host_bytes) ||
+                !cuda_dynamic_arena_wrap_add_part(
+                    parts, i, CUDA_DYNAMIC_ARENA_MIRROR_DOWN,
+                    layer.down_offset, expert, layer.down_expert_bytes,
+                    gate_up_bytes, load.host_bytes)) {
+                return 0;
+            }
+        }
+        std::sort(parts.begin(), parts.end(),
+            [](const cuda_dynamic_arena_wrap_part &a,
+               const cuda_dynamic_arena_wrap_part &b) {
+                if (a.source_offset != b.source_offset) {
+                    return a.source_offset < b.source_offset;
+                }
+                if (a.load_index != b.load_index) {
+                    return a.load_index < b.load_index;
+                }
+                return a.part < b.part;
+            });
+    } catch (...) {
+        parts.clear();
+        return 0;
+    }
+    return parts.size() == (size_t)load_count * 3u;
+}
+
+static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
+    cuda_dynamic_arena_part_copy_context *context =
+        (cuda_dynamic_arena_part_copy_context *)arg;
+    const uint8_t *model = (const uint8_t *)g_dynamic_arena.model_map;
+    for (;;) {
+        const uint32_t cursor =
+            context->next.fetch_add(1, std::memory_order_relaxed);
+        if (cursor >= context->part_count) break;
+        const cuda_dynamic_arena_wrap_part &part = context->parts[cursor];
+        if (context->phase_part && part.part != context->phase_part) {
+            continue;
+        }
+        if (part.load_index >= context->load_count ||
+            (part.part != CUDA_DYNAMIC_ARENA_MIRROR_GATE &&
+             part.part != CUDA_DYNAMIC_ARENA_MIRROR_UP &&
+             part.part != CUDA_DYNAMIC_ARENA_MIRROR_DOWN)) {
+            continue;
+        }
+        const ds4_gpu_dynamic_arena_load &load =
+            context->loads[part.load_index];
+        if (!load.host_ptr ||
+            part.source_offset > g_dynamic_arena.model_size ||
+            part.bytes > g_dynamic_arena.model_size - part.source_offset ||
+            part.destination_offset > load.host_bytes ||
+            part.bytes > load.host_bytes - part.destination_offset) {
+            continue;
+        }
+        uint8_t *destination =
+            (uint8_t *)load.host_ptr + part.destination_offset;
+        memcpy(destination, model + part.source_offset, (size_t)part.bytes);
+        if (context->checksum_parts) {
+            context->checksums[part.load_index] =
+                cuda_dynamic_arena_fnv1a64_continue(
+                    destination, part.bytes,
+                    context->checksums[part.load_index]);
+        }
+        context->success[cursor] = 1u;
+    }
+    return NULL;
+}
+
+static void *cuda_dynamic_arena_checksum_worker(void *arg) {
+    cuda_dynamic_arena_checksum_context *context =
+        (cuda_dynamic_arena_checksum_context *)arg;
+    for (;;) {
+        const uint32_t cursor =
+            context->next.fetch_add(1, std::memory_order_relaxed);
+        if (cursor >= context->load_count) break;
+        const ds4_gpu_dynamic_arena_load &load = context->loads[cursor];
+        if (!load.host_ptr || load.host_bytes != g_dynamic_arena.slot_bytes) {
+            continue;
+        }
+        context->checksums[cursor] = cuda_dynamic_arena_fnv1a64(
+            (const uint8_t *)load.host_ptr, load.host_bytes);
+        context->success[cursor] = 1u;
+    }
+    return NULL;
+}
+
+static cuda_dynamic_arena_wrap_schedule
+cuda_dynamic_arena_wrap_schedule_env(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_SCHEDULE");
+    if (!value || !value[0] || strcmp(value, "0") == 0 ||
+        strcmp(value, "expert-major") == 0) {
+        return CUDA_DYNAMIC_ARENA_WRAP_EXPERT_MAJOR;
+    }
+    if (strcmp(value, "source-parts") == 0 ||
+        strcmp(value, "g44-source-parts") == 0) {
+        return CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS;
+    }
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-profile] invalid schedule '%s'; using expert-major\n",
+                value);
+        warned = 1;
+    }
+    return CUDA_DYNAMIC_ARENA_WRAP_EXPERT_MAJOR;
+}
+
 static int cuda_dynamic_arena_wrap_trust_worker_checksum(void) {
     const char *value =
         getenv("DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM");
@@ -2928,6 +3138,14 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const double started_at = cuda_wall_sec();
     const int trust_worker_checksum =
         cuda_dynamic_arena_wrap_trust_worker_checksum();
+    const cuda_dynamic_arena_wrap_schedule schedule =
+        cuda_dynamic_arena_wrap_schedule_env();
+    const char *schedule_name =
+        schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS ?
+        "source-parts" : "expert-major";
+    const char *checksum_name = trust_worker_checksum ?
+            "fnv1a64-worker-only" :
+            "fnv1a64-worker-plus-finish";
     ds4_gpu_dynamic_arena_txn *txn = NULL;
     const ds4_gpu_dynamic_arena_load *loads = NULL;
     uint32_t load_count = 0;
@@ -2941,36 +3159,58 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const double begin_done_at = cuda_wall_sec();
     double copy_done_at = begin_done_at;
     double finish_done_at = begin_done_at;
+    double source_parts_copy_seconds = 0;
+    double source_parts_checksum_seconds = 0;
+    uint32_t checksum_workers = 0;
+    int source_parts_copy_failed = 0;
 
     local.loads = load_count;
     int all_succeeded = loads != NULL || load_count == 0;
     std::vector<uint32_t> order;
+    std::vector<cuda_dynamic_arena_wrap_part> parts;
     std::vector<uint64_t> checksums;
     std::vector<uint8_t> success;
+    std::vector<uint8_t> part_success;
     std::vector<os_thread_t> threads;
     std::vector<os_thread_t> started_threads;
     if (load_count != 0) {
         try {
-            order.resize(load_count);
             checksums.assign(load_count, 0);
             success.assign(load_count, 0);
-            for (uint32_t i = 0; i < load_count; i++) order[i] = i;
-            std::sort(order.begin(), order.end(),
-                [&](uint32_t lhs, uint32_t rhs) {
-                    const ds4_gpu_dynamic_arena_load &a = loads[lhs];
-                    const ds4_gpu_dynamic_arena_load &b = loads[rhs];
-                    const ds4_gpu_dynamic_arena_layer &la =
-                        g_dynamic_arena.layers[a.layer];
-                    const ds4_gpu_dynamic_arena_layer &lb =
-                        g_dynamic_arena.layers[b.layer];
-                    const uint64_t ao = la.gate_offset +
-                        (uint64_t)a.expert * la.gate_expert_bytes;
-                    const uint64_t bo = lb.gate_offset +
-                        (uint64_t)b.expert * lb.gate_expert_bytes;
-                    return ao < bo;
-                });
+            uint32_t work_count = load_count;
+            if (schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS) {
+                if (!cuda_dynamic_arena_wrap_build_source_parts(
+                        loads, load_count, parts)) {
+                    local.reason = "part-order";
+                    all_succeeded = 0;
+                } else {
+                    part_success.assign(parts.size(), 0);
+                    if (trust_worker_checksum) {
+                        std::fill(checksums.begin(), checksums.end(),
+                                  UINT64_C(14695981039346656037));
+                    }
+                    work_count = (uint32_t)parts.size();
+                }
+            } else {
+                order.resize(load_count);
+                for (uint32_t i = 0; i < load_count; i++) order[i] = i;
+                std::sort(order.begin(), order.end(),
+                    [&](uint32_t lhs, uint32_t rhs) {
+                        const ds4_gpu_dynamic_arena_load &a = loads[lhs];
+                        const ds4_gpu_dynamic_arena_load &b = loads[rhs];
+                        const ds4_gpu_dynamic_arena_layer &la =
+                            g_dynamic_arena.layers[a.layer];
+                        const ds4_gpu_dynamic_arena_layer &lb =
+                            g_dynamic_arena.layers[b.layer];
+                        const uint64_t ao = la.gate_offset +
+                            (uint64_t)a.expert * la.gate_expert_bytes;
+                        const uint64_t bo = lb.gate_offset +
+                            (uint64_t)b.expert * lb.gate_expert_bytes;
+                        return ao < bo;
+                    });
+            }
             const uint32_t requested_workers =
-                cuda_dynamic_arena_observer_workers(load_count);
+                cuda_dynamic_arena_observer_workers(work_count);
             threads.resize(requested_workers > 1 ? requested_workers - 1 : 0);
             started_threads.reserve(threads.size());
         } catch (...) {
@@ -2980,29 +3220,115 @@ static int cuda_dynamic_arena_wrap_publish_target(
     }
 
     if (all_succeeded && load_count != 0) {
-        cuda_dynamic_arena_wrap_context context;
-        context.loads = loads;
-        context.order = order.data();
-        context.load_count = load_count;
-        context.next.store(0, std::memory_order_relaxed);
-        context.checksums = checksums.data();
-        context.success = success.data();
-        for (uint32_t i = 0; i < threads.size(); i++) {
-            if (os_thread_create(&threads[i],
-                                 cuda_dynamic_arena_wrap_worker,
-                                 &context) == 0) {
-                started_threads.push_back(threads[i]);
+        if (schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS) {
+            cuda_dynamic_arena_part_copy_context context;
+            context.loads = loads;
+            context.load_count = load_count;
+            context.parts = parts.data();
+            context.part_count = (uint32_t)parts.size();
+            context.checksums = checksums.data();
+            context.success = part_success.data();
+            context.checksum_parts = trust_worker_checksum;
+            const uint8_t phases[3] = {
+                CUDA_DYNAMIC_ARENA_MIRROR_GATE,
+                CUDA_DYNAMIC_ARENA_MIRROR_UP,
+                CUDA_DYNAMIC_ARENA_MIRROR_DOWN,
+            };
+            const uint32_t phase_count = trust_worker_checksum ? 3u : 1u;
+            for (uint32_t phase = 0; phase < phase_count; phase++) {
+                context.phase_part = trust_worker_checksum ?
+                    phases[phase] : 0;
+                context.next.store(0, std::memory_order_relaxed);
+                started_threads.clear();
+                for (uint32_t i = 0; i < threads.size(); i++) {
+                    if (os_thread_create(&threads[i],
+                                         cuda_dynamic_arena_part_copy_worker,
+                                         &context) == 0) {
+                        started_threads.push_back(threads[i]);
+                    }
+                }
+                const uint32_t phase_workers =
+                    1u + (uint32_t)started_threads.size();
+                if (phase_workers > local.workers) {
+                    local.workers = phase_workers;
+                }
+                (void)cuda_dynamic_arena_part_copy_worker(&context);
+                for (uint32_t i = 0; i < started_threads.size(); i++) {
+                    os_thread_join(started_threads[i]);
+                }
             }
+            const double source_copy_done_at = cuda_wall_sec();
+            source_parts_copy_seconds =
+                source_copy_done_at - begin_done_at;
+            for (size_t i = 0; i < part_success.size(); i++) {
+                if (!part_success[i]) {
+                    local.reason = "copy-part";
+                    all_succeeded = 0;
+                    source_parts_copy_failed = 1;
+                }
+            }
+
+            if (all_succeeded && trust_worker_checksum) {
+                for (uint32_t i = 0; i < load_count; i++) {
+                    success[i] = 1u;
+                }
+                copy_done_at = source_copy_done_at;
+            } else if (all_succeeded) {
+                started_threads.clear();
+                const uint32_t requested_checksum_workers =
+                    cuda_dynamic_arena_observer_workers(load_count);
+                threads.resize(requested_checksum_workers > 1 ?
+                               requested_checksum_workers - 1 : 0);
+                cuda_dynamic_arena_checksum_context checksum_context;
+                checksum_context.loads = loads;
+                checksum_context.load_count = load_count;
+                checksum_context.next.store(0, std::memory_order_relaxed);
+                checksum_context.checksums = checksums.data();
+                checksum_context.success = success.data();
+                for (uint32_t i = 0; i < threads.size(); i++) {
+                    if (os_thread_create(&threads[i],
+                                         cuda_dynamic_arena_checksum_worker,
+                                         &checksum_context) == 0) {
+                        started_threads.push_back(threads[i]);
+                    }
+                }
+                checksum_workers =
+                    1u + (uint32_t)started_threads.size();
+                (void)cuda_dynamic_arena_checksum_worker(&checksum_context);
+                for (uint32_t i = 0; i < started_threads.size(); i++) {
+                    os_thread_join(started_threads[i]);
+                }
+                copy_done_at = cuda_wall_sec();
+                source_parts_checksum_seconds =
+                    copy_done_at - source_copy_done_at;
+            } else {
+                copy_done_at = source_copy_done_at;
+            }
+        } else {
+            cuda_dynamic_arena_wrap_context context;
+            context.loads = loads;
+            context.order = order.data();
+            context.load_count = load_count;
+            context.next.store(0, std::memory_order_relaxed);
+            context.checksums = checksums.data();
+            context.success = success.data();
+            for (uint32_t i = 0; i < threads.size(); i++) {
+                if (os_thread_create(&threads[i],
+                                     cuda_dynamic_arena_wrap_worker,
+                                     &context) == 0) {
+                    started_threads.push_back(threads[i]);
+                }
+            }
+            local.workers = 1u + (uint32_t)started_threads.size();
+            (void)cuda_dynamic_arena_wrap_worker(&context);
+            for (uint32_t i = 0; i < started_threads.size(); i++) {
+                os_thread_join(started_threads[i]);
+            }
+            copy_done_at = cuda_wall_sec();
         }
-        local.workers = 1u + (uint32_t)started_threads.size();
-        (void)cuda_dynamic_arena_wrap_worker(&context);
-        for (uint32_t i = 0; i < started_threads.size(); i++) {
-            os_thread_join(started_threads[i]);
-        }
-        copy_done_at = cuda_wall_sec();
         for (uint32_t i = 0; i < load_count; i++) {
             if (!success[i]) {
-                local.reason = "copy";
+                if (!source_parts_copy_failed) local.reason = "copy";
                 all_succeeded = 0;
             }
             const int finished = cuda_dynamic_arena_finish_load_impl(
@@ -3026,15 +3352,18 @@ static int cuda_dynamic_arena_wrap_publish_target(
         local.published = 1;
         local.seconds = publish_done_at - started_at;
         fprintf(stderr,
-                "ds4: [arena-wrap-profile] result=published schedule=expert-major source=mmap checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f\n",
-                trust_worker_checksum ? "fnv1a64-worker-only" :
-                    "fnv1a64-worker-plus-finish",
+                "ds4: [arena-wrap-profile] result=published schedule=%s source=mmap checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f source_parts_copy=%.3f source_parts_checksum=%.3f parts=%u copy_workers=%u checksum_workers=%u\n",
+                schedule_name,
+                checksum_name,
                 local.loads, local.workers,
                 begin_done_at - started_at,
                 copy_done_at - begin_done_at,
                 finish_done_at - copy_done_at,
                 publish_done_at - publish_started_at,
-                local.seconds);
+                local.seconds,
+                source_parts_copy_seconds,
+                source_parts_checksum_seconds,
+                (uint32_t)parts.size(), local.workers, checksum_workers);
         if (result) *result = local;
         return 1;
     }
@@ -3045,15 +3374,19 @@ static int cuda_dynamic_arena_wrap_publish_target(
     }
     local.seconds = cuda_wall_sec() - started_at;
     fprintf(stderr,
-            "ds4: [arena-wrap-profile] result=failed schedule=expert-major source=mmap checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f reason=%s\n",
-            trust_worker_checksum ? "fnv1a64-worker-only" :
-                "fnv1a64-worker-plus-finish",
+            "ds4: [arena-wrap-profile] result=failed schedule=%s source=mmap checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f source_parts_copy=%.3f source_parts_checksum=%.3f parts=%u copy_workers=%u checksum_workers=%u reason=%s\n",
+            schedule_name,
+            checksum_name,
             local.loads, local.workers,
             begin_done_at - started_at,
             copy_done_at - begin_done_at,
             finish_done_at - copy_done_at,
             publish_done_at - publish_started_at,
-            local.seconds, local.reason ? local.reason : "unknown");
+            local.seconds,
+            source_parts_copy_seconds,
+            source_parts_checksum_seconds,
+            (uint32_t)parts.size(), local.workers, checksum_workers,
+            local.reason ? local.reason : "unknown");
     if (result) *result = local;
     return 0;
 }

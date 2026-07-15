@@ -22,6 +22,7 @@ param(
     [switch]$EmbedRowStaging,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [switch]$ArenaWrapTrustWorkerChecksum,
+    [switch]$ArenaWrapSourceParts,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
@@ -197,6 +198,11 @@ if ($ArenaWrapTrustWorkerChecksum) {
     $env:DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapSourceParts) {
+    $env:DS4_CUDA_ARENA_WRAP_SCHEDULE = "source-parts"
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SCHEDULE -ErrorAction SilentlyContinue
 }
 if ($ComposePrefillMassTiering) {
     $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
@@ -850,6 +856,14 @@ $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
 $arenaWrapSeconds = 0.0; $arenaWrapGeneration = 0
 $arenaWrapPreloaded = 0; $arenaWrapMirrorGiB = 0.0
+$arenaWrapProfileObserved = $false; $arenaWrapProfileResult = "not_observed"
+$arenaWrapScheduleObserved = "not_observed"; $arenaWrapChecksumObserved = "not_observed"
+$arenaWrapProfileLoads = 0; $arenaWrapProfileWorkers = 0
+$arenaWrapProfileBeginSeconds = 0.0; $arenaWrapProfileCopyChecksumSeconds = 0.0
+$arenaWrapProfileFinishSeconds = 0.0; $arenaWrapProfilePublishSeconds = 0.0
+$arenaWrapProfileTotalSeconds = 0.0; $arenaWrapSourcePartsCopySeconds = 0.0
+$arenaWrapSourcePartsChecksumSeconds = 0.0; $arenaWrapPartCount = 0
+$arenaWrapCopyWorkers = 0; $arenaWrapChecksumWorkers = 0
 $arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
 $arenaObserverPublicationCount = 0; $arenaWrapPublicationCount = 0
@@ -1324,6 +1338,27 @@ if (Test-Path $stderrLog) {
         $arenaWrapLoads = [long]$Matches[3]
         $arenaWrapSeconds = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
+    $arenaWrapProfileLine = $lines | Where-Object { $_ -match "\[arena-wrap-profile\] result=" } | Select-Object -Last 1
+    if ($arenaWrapProfileLine -and $arenaWrapProfileLine -match "result=(published|failed) schedule=([^ ]+) source=([^ ]+) checksum=([^ ]+) loads=(\d+) workers=(\d+) begin=([0-9.]+) copy_checksum=([0-9.]+) finish=([0-9.]+) publish=([0-9.]+) total=([0-9.]+)") {
+        $arenaWrapProfileObserved = $true
+        $arenaWrapProfileResult = $Matches[1]
+        $arenaWrapScheduleObserved = $Matches[2]
+        $arenaWrapChecksumObserved = $Matches[4]
+        $arenaWrapProfileLoads = [long]$Matches[5]
+        $arenaWrapProfileWorkers = [int]$Matches[6]
+        $arenaWrapProfileBeginSeconds = [double]::Parse($Matches[7], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfileCopyChecksumSeconds = [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfileFinishSeconds = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfilePublishSeconds = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfileTotalSeconds = [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
+        if ($arenaWrapProfileLine -match "source_parts_copy=([0-9.]+) source_parts_checksum=([0-9.]+) parts=(\d+) copy_workers=(\d+) checksum_workers=(\d+)") {
+            $arenaWrapSourcePartsCopySeconds = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaWrapSourcePartsChecksumSeconds = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaWrapPartCount = [long]$Matches[3]
+            $arenaWrapCopyWorkers = [int]$Matches[4]
+            $arenaWrapChecksumWorkers = [int]$Matches[5]
+        }
+    }
     $arenaResultLines = @($lines | Where-Object { $_ -match "\[arena-observe\] window complete" })
     $arenaObserverPublicationCount = $arenaResultLines.Count
     $arenaResultLine = $arenaResultLines | Select-Object -Last 1
@@ -1683,6 +1718,31 @@ if ($DynamicArenaCarry -ne "default") {
     }
     if ($arenaObserverPublicationCount -ne 1 -or $arenaWrapPublicationCount -ne 1) { throw "Dynamic arena carry measurement failed: learned arena was republished during measured requests" }
 }
+if ($ArenaWrapSourceParts) {
+    if (-not $arenaWrapProfileObserved) {
+        throw "Arena WRAP source-parts measurement failed: profile telemetry was not observed"
+    }
+    if ($arenaWrapProfileResult -ne "published" -or
+        $arenaWrapScheduleObserved -ne "source-parts") {
+        throw "Arena WRAP source-parts measurement failed: observed result/schedule differs"
+    }
+    if ($ArenaWrapTrustWorkerChecksum -and
+        $arenaWrapChecksumObserved -ne "fnv1a64-worker-only") {
+        throw "Arena WRAP source-parts measurement failed: observed checksum mode differs"
+    }
+    if (-not $ArenaWrapTrustWorkerChecksum -and
+        $arenaWrapChecksumObserved -ne "fnv1a64-worker-plus-finish") {
+        throw "Arena WRAP source-parts measurement failed: observed verified checksum mode differs"
+    }
+    if ($arenaWrapProfileLoads -le 0 -or
+        $arenaWrapPartCount -ne (3 * $arenaWrapProfileLoads) -or
+        $arenaWrapCopyWorkers -le 0) {
+        throw "Arena WRAP source-parts measurement failed: part/worker accounting differs"
+    }
+    if ($ArenaWrapTrustWorkerChecksum -and $arenaWrapChecksumWorkers -ne 0) {
+        throw "Arena WRAP source-parts measurement failed: unexpected cold checksum pass observed"
+    }
+}
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
 $serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
@@ -1878,6 +1938,23 @@ $summary = [pscustomobject]@{
     embed_row_staging_requested = [bool]$EmbedRowStaging
     dynamic_arena_gib_requested = $DynamicArenaGiB
     arena_wrap_trust_worker_checksum_requested = [bool]$ArenaWrapTrustWorkerChecksum
+    arena_wrap_schedule_requested = if ($ArenaWrapSourceParts) { "source-parts" } else { "expert-major" }
+    arena_wrap_profile_observed = $arenaWrapProfileObserved
+    arena_wrap_profile_result = $arenaWrapProfileResult
+    arena_wrap_schedule_observed = $arenaWrapScheduleObserved
+    arena_wrap_checksum_observed = $arenaWrapChecksumObserved
+    arena_wrap_profile_loads = $arenaWrapProfileLoads
+    arena_wrap_profile_workers = $arenaWrapProfileWorkers
+    arena_wrap_profile_begin_seconds = $arenaWrapProfileBeginSeconds
+    arena_wrap_profile_copy_checksum_seconds = $arenaWrapProfileCopyChecksumSeconds
+    arena_wrap_profile_finish_seconds = $arenaWrapProfileFinishSeconds
+    arena_wrap_profile_publish_seconds = $arenaWrapProfilePublishSeconds
+    arena_wrap_profile_total_seconds = $arenaWrapProfileTotalSeconds
+    arena_wrap_source_parts_copy_seconds = $arenaWrapSourcePartsCopySeconds
+    arena_wrap_source_parts_checksum_seconds = $arenaWrapSourcePartsChecksumSeconds
+    arena_wrap_part_count = $arenaWrapPartCount
+    arena_wrap_copy_workers = $arenaWrapCopyWorkers
+    arena_wrap_checksum_workers = $arenaWrapChecksumWorkers
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
@@ -2208,6 +2285,7 @@ Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer
 Write-Host ("arena publication/window+WRAP counts: " + $arenaObserverPublicationCount + " / " + $arenaWrapPublicationCount)
 Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " / " + $arenaGrowthSkips)
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
+Write-Host ("arena WRAP profile result/schedule/checksum/total/copy/parts/workers: " + $arenaWrapProfileResult + " / " + $arenaWrapScheduleObserved + " / " + $arenaWrapChecksumObserved + " / " + $arenaWrapProfileTotalSeconds + " / " + $arenaWrapSourcePartsCopySeconds + " / " + $arenaWrapPartCount + " / " + $arenaWrapCopyWorkers)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
 Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaReportedResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
