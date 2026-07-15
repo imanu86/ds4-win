@@ -110,6 +110,16 @@ actuator still paid incremental admissions during decode. Do not tune policy
 thresholds yet; first measure prompt-mass bulk publication into pinned RAM. See
 `G40_MASS_LFRU_CYBERPUNK_RESULTS.md`.
 
+G41 isolates that bulk publication on the same prompt. Three independent
+processes per arm all matched the exact hash. A 30 GiB arena held all 2,657
+prefill-selected entries and covered 84.83% of candidate decode IDs. WRAP raised
+decode from 1.48 to 2.31 t/s (+56.08%) and reduced process reads from 51.43 to
+36.94 GiB (-28.17%), but cost 24.66 seconds to publish and raised TTFT from
+20.49 to 44.71 seconds. This passes the pay-once transport mechanism gate, not
+the 12-token end-to-end gate. Next retain the snapshot as immutable RAM backing
+while mass/LFRU manages only the VRAM subset; do not merely remove the existing
+co-ownership guardrails. See `G41_PREFILL_BULK_SEED_CYBERPUNK_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -124,11 +134,11 @@ a prompt-trained mask. See `G19_0051_POLICY_INTEGRATION_PLAN.md`.
 
 Follow-on measured gates are:
 
-1. G40 completed the broader exact-prefix composition gate and found that the
-   current incremental G36 mass/LFRU actuator does not transfer: it reduces
-   misses but multiplies physical transport. Before changing `second-touch` or
-   tuning thresholds, enable unbiased prefill-mass observation plus WRAP to
-   bulk-seed the pinned arena, then rerun the matched cyberpunk A/B.
+1. G40 found incremental mass/LFRU transport negative. G41 then proved that one
+   prefill-derived bulk seed improves decode and process reads, but its 24.66 s
+   publication cost does not amortize over 12 tokens. Measure a long decode and
+   implement explicit co-ownership: immutable pinned-RAM snapshot plus a
+   mass/LFRU-protected VRAM subset, with no cold SSD-to-VRAM promotion.
 2. P4-A batch-union is measured complete in G37. P4-B serial waved prefill is
    exact but negative in G38. G39 overlap recovered 17.38% versus serial but is
    still 9.18% behind production; restore tile-capable wave kernels before
@@ -150,10 +160,11 @@ Follow-on measured gates are:
    and make outside experts ineligible for SSD transport. Compare against full
    routing with all probe/build time included; this is not a reusable static
    domain mask and must be rebuilt on an intent/domain change.
-8. Use the G40/G41 split to keep policy and transport distinct: G40 established
-   that incremental mass/LFRU has a useful residency signal but an unacceptable
-   miss cost; G41 must test one bounded prefill-derived load before any semantic
-   shard probes or closed-set masking are added.
+8. Keep the G40/G41 split when adding semantic probes: G40 established that
+   incremental mass/LFRU has a useful residency signal but unacceptable miss
+   cost; G41 established that bounded prefill-derived loading improves transport
+   but needs faster publication and long-run amortization. Closed-set masking
+   must not be added until those mechanisms compose exactly.
 
 ## Build
 
