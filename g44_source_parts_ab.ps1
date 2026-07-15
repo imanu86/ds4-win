@@ -136,7 +136,7 @@ function Invoke-G44Run {
         ram_hits = [uint64]$tier.ram_hits
         dedicated_peak_gib = [uint64]$result.runtime_telemetry.gpu_process_dedicated_peak_bytes / 1GB
         available_min_gib = [uint64]$result.runtime_telemetry.windows_available_min_bytes / 1GB
-        standby_before_gib = [uint64]$result.memory_preflight.before.standby_cache_bytes / 1GB
+        standby_before_gib = [uint64]$result.memory_preflight.before.standby_bytes / 1GB
     }
 }
 
