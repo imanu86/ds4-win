@@ -114,15 +114,22 @@ Run these gates immediately after mmap and before normal GGUF bounds validation:
    fail-closed parser. Do not use substring extraction.
 5. Reconstruct the retained bitset from manifest layer selections and require
    exact equality with the embedded bitset.
-6. Validate source size, source SHA-256 identity, tensor geometry, retained
-   counts, extent ordering, non-overlap, and that every retained expert has all
-   gate/up/down slices present.
+6. Validate source size, tensor geometry, retained counts, extent ordering,
+   non-overlap, and that every retained expert has all gate/up/down slices
+   present. If `source_model_sha256` is present, require a valid 64-hex value
+   and match it to an explicitly supplied expected identity.
 7. Require at least `DS4_N_EXPERT_USED` retained experts in every routed layer.
 8. Set the logical model size to `source_model_size` before ordinary tensor
    range checks so the appended trailer is never exposed as GGUF tensor data.
 
 Any recognized but invalid bake footer is fatal. There is no permissive fallback
 to an ordinary GGUF once the bake magic is present.
+
+The current K60/K75 manifests record `source_model_sha256: null`; runtime code
+must not claim that hash was verified. Their identity chain is the externally
+verified full pack SHA-256, the embedded manifest/mask CRCs, and an exact match
+of source size plus routed GGUF tensor geometry. Future packs should include the
+source hash so the additional runtime gate can become mandatory.
 
 ## Routing and read guards
 
