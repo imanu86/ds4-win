@@ -98,6 +98,7 @@ build input fingerprint: 752b0f3035f44c205e1cdf104b07c078b79a29594100481c7d60f90
 harness sha256: 235d4220e3903425ae55c32cec950a01a58bf601f6b55d80c2784995aa069533
 execution runner sha256: 23699ea6251ad4bffb5e03d077de0fdfa9be9095c55ac15171e680463132a31d
 corrected summary runner sha256: c9ceca6fc95467bd76ec65ecf9c4644a7470fb6108cf93da25214b7980629ad7
+TTFT recheck runner sha256: 75fdf15e0747a6f4724e42af9014b778c392b5932a7296a34eebd7d7354dcf6e
 ```
 
 The build manifest reports a dirty worktree because untracked build and run
@@ -144,7 +145,7 @@ The transport counters are deterministic for a given capacity across all
 three replicas. The 64 extra slots replace exactly 524 pinned-RAM routes with
 VRAM hits over 64 generated tokens and remove 3.454 GiB of H2D traffic.
 
-### TTFT outlier
+### TTFT outlier and required recheck
 
 `g45_stable_cache256_c` reported 377.736 seconds TTFT while decode remained
 4.43 t/s. The source-parts WRAP inside that request was only 23.084 seconds:
@@ -156,9 +157,26 @@ prompt done 13:50:37 (377.719 s)
 decode 64 tokens 14.438 s
 ```
 
-The stall is therefore outside the measured WRAP interval and before the first
-token. Current telemetry does not localize it further; it is recorded as an
-unlocalized prefill/WDDM stall. The TTFT mean is not used for the cache verdict.
+Per the permanent outlier rule, three additional independent cache256 processes
+were run with the identical executable, prompt, hash and runtime contract:
+
+| Recheck | TTFT s | WRAP s | TTFT - WRAP s | Decode t/s |
+|---|---:|---:|---:|---:|
+| A | 42.959 | 22.481 | 20.478 | 4.42 |
+| B | 42.569 | 22.065 | 20.504 | 4.44 |
+| C | 226.664 | 21.979 | 204.685 | 4.41 |
+
+All three rechecks were exact, used capacity 256, had the same deterministic
+5,129 VRAM hits and 11,383 pinned-RAM hits, and reported zero snapshot misses,
+SSD bytes and failures. Recheck C reproduced the stall while WRAP and decode
+remained normal.
+
+Across the six measured cache256 processes, two had a large pre-first-token
+stall: 377.736 and 226.664 seconds. The stall is therefore intermittent but
+real, outside the measured WRAP interval and before the first token. Current
+telemetry does not localize it further. It must not be attributed to cache256:
+only three cache320 processes exist and none stalled, which is insufficient for
+an arm-correlation verdict. TTFT mean is not used for the cache verdict.
 
 ## Verdict
 
@@ -178,6 +196,10 @@ stream synchronization in the GPU-resident route handoff, relying on the
 already existing mapped request sequence plus worker-ready publication. It
 must remain opt-in and pass exact safety before an n=3 A/B.
 
+In parallel, the prefill path needs phase telemetry after WRAP publication to
+localize the recurrent 204-355 second unexplained interval. That is a separate
+diagnostic gate and must not be presented as a cache320 regression.
+
 ## Command
 
 ```powershell
@@ -195,7 +217,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\g45_direct_resident_cache_
 ## Primary artifacts
 
 - `g45_direct_resident_cache_ab.ps1`
+- `g45_ttft_outlier_recheck.ps1`
 - `g7_runs/g45_direct_resident_cache_ab_result.json`
+- `g7_runs/g45_ttft_outlier_recheck_result.json`
 - `g7_runs/g7_g45_stable_cache{256,320}_{a,b,c}_result.json`
+- `g7_runs/g7_g45_cache256_ttft_recheck_{a,b,c}_result.json`
 - matching raw outputs, stderr logs, runtime telemetry and memory preflight JSON
 - rejected-capacity tags listed in the capacity gate table
