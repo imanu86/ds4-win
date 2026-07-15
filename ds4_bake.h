@@ -36,10 +36,16 @@ typedef struct ds4_bake_tensor_record {
     uint32_t selected_count;
 } ds4_bake_tensor_record;
 
+typedef struct ds4_bake_extent {
+    uint64_t offset;
+    uint64_t end;
+} ds4_bake_extent;
+
 typedef struct ds4_bake_meta {
     uint64_t mapped_size;
     uint64_t source_size;
     uint64_t manifest_len;
+    uint64_t payload_bytes;
     uint32_t manifest_crc32;
     uint32_t mask_crc32;
     int source_model_sha256_present;
@@ -49,6 +55,8 @@ typedef struct ds4_bake_meta {
     uint8_t retained_mask[DS4_BAKE_MASK_LEN];
     uint16_t retained_count[DS4_BAKE_LAYERS];
     ds4_bake_tensor_record routed_tensors[DS4_BAKE_LAYERS][DS4_BAKE_TENSOR_KINDS];
+    ds4_bake_extent *extents;
+    size_t extent_count;
 } ds4_bake_meta;
 
 ds4_bake_probe_result ds4_bake_probe(const void *map,
@@ -60,6 +68,12 @@ ds4_bake_probe_result ds4_bake_probe(const void *map,
 int ds4_bake_expert_retained(const ds4_bake_meta *meta,
                              uint32_t layer,
                              uint32_t expert);
+
+int ds4_bake_range_retained(const ds4_bake_meta *meta,
+                            uint64_t offset,
+                            uint64_t length);
+
+void ds4_bake_meta_release(ds4_bake_meta *meta);
 
 #ifdef __cplusplus
 }

@@ -1120,6 +1120,7 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    ds4_bake_meta_release(&m->bake);
     os_mmap_close(&m->mmap);
     memset(m, 0, sizeof(*m));
 }
@@ -1394,6 +1395,10 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 static void model_validate_bake_tensors(const ds4_model *m) {
     if (!m || !m->bake_embedded) return;
 
+    if (!ds4_bake_range_retained(&m->bake, 0, m->tensor_data_pos)) {
+        ds4_die("sparse bake does not retain the complete GGUF header");
+    }
+
     for (uint32_t layer = 0; layer < DS4_BAKE_LAYERS; layer++) {
         for (uint32_t kind = 0; kind < DS4_BAKE_TENSOR_KINDS; kind++) {
             const ds4_bake_tensor_record *record =
@@ -1418,6 +1423,31 @@ static void model_validate_bake_tensors(const ds4_model *m) {
                         layer, kind, record->name);
                 exit(1);
             }
+        }
+    }
+
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *tensor = &m->tensors[i];
+        bool routed = false;
+        for (uint32_t layer = 0; layer < DS4_BAKE_LAYERS && !routed; layer++) {
+            for (uint32_t kind = 0; kind < DS4_BAKE_TENSOR_KINDS; kind++) {
+                const char *name = m->bake.routed_tensors[layer][kind].name;
+                const size_t name_len = strlen(name);
+                if (tensor->name.len == name_len &&
+                    memcmp(tensor->name.ptr, name, name_len) == 0) {
+                    routed = true;
+                    break;
+                }
+            }
+        }
+        if (!routed && tensor->bytes != 0 &&
+            !ds4_bake_range_retained(
+                &m->bake, tensor->abs_offset, tensor->bytes))
+        {
+            fprintf(stderr,
+                    "ds4: sparse bake omits non-routed tensor: %.*s\n",
+                    (int)tensor->name.len, tensor->name.ptr);
+            exit(1);
         }
     }
 }

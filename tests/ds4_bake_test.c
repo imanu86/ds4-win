@@ -271,6 +271,11 @@ static int test_valid(void) {
     CHECK(ds4_bake_expert_retained(&meta, 0, 5) == 1);
     CHECK(ds4_bake_expert_retained(&meta, 0, 6) == 0);
     CHECK(strcmp(meta.routed_tensors[42][DS4_BAKE_TENSOR_DOWN].name, "blk.42.ffn_down_exps.weight") == 0);
+    CHECK(meta.payload_bytes == 1024ull * 1024ull);
+    CHECK(meta.extent_count == 1);
+    CHECK(ds4_bake_range_retained(&meta, 0, meta.source_size) == 1);
+    CHECK(ds4_bake_range_retained(&meta, meta.source_size - 8u, 16u) == 0);
+    ds4_bake_meta_release(&meta);
     free(buf);
     return 0;
 }
@@ -289,6 +294,7 @@ static int test_k60_shape(void) {
     CHECK(meta.routed_tensors[3][DS4_BAKE_TENSOR_GATE].selected_count == 154);
     CHECK(ds4_bake_expert_retained(&meta, 42, k60_expert(153)) == 1);
     CHECK(ds4_bake_expert_retained(&meta, 42, 2) == 0);
+    ds4_bake_meta_release(&meta);
     free(buf);
     return 0;
 }

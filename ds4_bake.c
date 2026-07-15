@@ -17,11 +17,6 @@ typedef struct json_parser {
     size_t err_cap;
 } json_parser;
 
-typedef struct bake_extent {
-    uint64_t offset;
-    uint64_t end;
-} bake_extent;
-
 typedef struct parse_state {
     ds4_bake_meta *meta;
     uint8_t selected[DS4_BAKE_MASK_LEN];
@@ -30,7 +25,7 @@ typedef struct parse_state {
     uint32_t tensor_count;
     uint64_t payload_bytes;
     uint64_t extent_bytes;
-    bake_extent *extents;
+    ds4_bake_extent *extents;
     size_t extent_count;
     size_t extent_cap;
     bool saw_format;
@@ -300,6 +295,46 @@ int ds4_bake_expert_retained(const ds4_bake_meta *meta, uint32_t layer, uint32_t
     return (meta->retained_mask[bit >> 3] & (uint8_t)(1u << (bit & 7u))) != 0;
 }
 
+int ds4_bake_range_retained(const ds4_bake_meta *meta,
+                            uint64_t offset,
+                            uint64_t length) {
+    uint64_t end;
+    size_t lo = 0;
+    size_t hi;
+    size_t i;
+
+    if (!meta || !meta->extents || meta->extent_count == 0 ||
+        !add_u64(offset, length, &end)) return 0;
+    if (length == 0) return offset <= meta->source_size;
+
+    hi = meta->extent_count;
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2u;
+        if (meta->extents[mid].offset <= offset) lo = mid + 1u;
+        else hi = mid;
+    }
+    i = lo == 0 ? 0 : lo - 1u;
+    if (offset < meta->extents[i].offset || offset >= meta->extents[i].end) {
+        return 0;
+    }
+    uint64_t covered = meta->extents[i].end;
+    while (covered < end) {
+        i++;
+        if (i >= meta->extent_count || meta->extents[i].offset != covered) {
+            return 0;
+        }
+        covered = meta->extents[i].end;
+    }
+    return 1;
+}
+
+void ds4_bake_meta_release(ds4_bake_meta *meta) {
+    if (!meta) return;
+    free(meta->extents);
+    meta->extents = NULL;
+    meta->extent_count = 0;
+}
+
 static void init_all_selected(parse_state *st) {
     memset(st->selected, 0xff, DS4_BAKE_MASK_LEN);
     for (uint32_t l = 0; l < DS4_BAKE_LAYERS; l++) st->meta->retained_count[l] = DS4_BAKE_EXPERTS;
@@ -519,13 +554,13 @@ static bool parse_extents(json_parser *j, parse_state *st) {
                 next_cap > SIZE_MAX / sizeof(st->extents[0])) {
                 return fail(j, "too many extents");
             }
-            bake_extent *next = (bake_extent *)realloc(
+            ds4_bake_extent *next = (ds4_bake_extent *)realloc(
                 st->extents, next_cap * sizeof(st->extents[0]));
             if (!next) return fail(j, "out of memory for extents");
             st->extents = next;
             st->extent_cap = next_cap;
         }
-        st->extents[st->extent_count++] = (bake_extent){offset, end};
+        st->extents[st->extent_count++] = (ds4_bake_extent){offset, end};
         st->extent_bytes = total;
         previous_end = end;
         js_ws(j);
@@ -549,7 +584,7 @@ static bool extent_covers(const parse_state *st, uint64_t offset, uint64_t lengt
         else hi = mid;
     }
     if (lo == 0) return false;
-    const bake_extent *extent = &st->extents[lo - 1u];
+    const ds4_bake_extent *extent = &st->extents[lo - 1u];
     return offset >= extent->offset && end <= extent->end;
 }
 
@@ -750,6 +785,10 @@ ds4_bake_probe_result ds4_bake_probe(const void *map, uint64_t mapped_size,
         return DS4_BAKE_PROBE_INVALID;
     }
     memcpy(out->retained_mask, mask, DS4_BAKE_MASK_LEN);
+    out->payload_bytes = st.payload_bytes;
+    out->extents = st.extents;
+    out->extent_count = st.extent_count;
+    st.extents = NULL;
     free(st.extents);
     return DS4_BAKE_PROBE_VALID;
 }
