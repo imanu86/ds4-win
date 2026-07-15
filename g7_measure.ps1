@@ -23,6 +23,7 @@ param(
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
+    [switch]$ComposePrefillMassTiering,
     [switch]$ReapMassObserve,
     [switch]$ReapMassWrap,
     [string]$ReapMaskFile = "",
@@ -190,6 +191,11 @@ if ($PrefillMassWrap) {
     $env:DS4_CUDA_PREFILL_MASS_WRAP = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_MASS_WRAP -ErrorAction SilentlyContinue
+}
+if ($ComposePrefillMassTiering) {
+    $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_TIER_COMPOSE -ErrorAction SilentlyContinue
 }
 if ($ReapMassObserve -or $ReapMassWrap) {
     $env:DS4_CUDA_REAP_MASS_OBSERVE = "1"
@@ -372,13 +378,26 @@ if ($SpexDryRun) {
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
+if ($ComposePrefillMassTiering) {
+    if (-not $PrefillMassWrap) { throw "ComposePrefillMassTiering requires PrefillMassWrap" }
+    if ($DynamicArenaGiB -le 0.0) { throw "ComposePrefillMassTiering requires DynamicArenaGiB > 0" }
+    if ($ExpertTiering -ne "enforce") { throw "ComposePrefillMassTiering requires ExpertTiering enforce" }
+    if ($ExpertTierPolicy -ne "mass-lfru") { throw "ComposePrefillMassTiering requires ExpertTierPolicy mass-lfru" }
+    if ($ExpertCacheN -le 0) { throw "ComposePrefillMassTiering requires ExpertCacheN > 0" }
+    if (-not $GpuResidentRoutes) { throw "ComposePrefillMassTiering requires GpuResidentRoutes" }
+    if (-not $DisableQ8F16Cache -or $Q8F16CacheMB -ne 0) { throw "ComposePrefillMassTiering requires Q8-F16 cache disabled" }
+    if ($Warmup -or $Repeats -ne 1) { throw "ComposePrefillMassTiering requires one request and no warmup" }
+    if ($PrefillMassObserve -or $ReapMassObserve -or $ReapMassWrap) { throw "ComposePrefillMassTiering must be isolated from observe-only prefill and REAP mass" }
+    if ($DynamicArenaObservedWindow -gt 0 -or $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default") { throw "ComposePrefillMassTiering must be isolated from dynamic arena observer/grow/carry" }
+}
 if ($ExpertTiering -ne "off") {
     if (-not $GpuResidentRoutes) { throw "ExpertTiering requires GpuResidentRoutes" }
     if ($ExpertCacheN -le 0) { throw "ExpertTiering requires ExpertCacheN > 0" }
     if (-not $DisableQ8F16Cache -or $Q8F16CacheMB -ne 0) { throw "ExpertTiering requires Q8-F16 cache disabled" }
     if ($SplitHitMiss) { throw "ExpertTiering must be isolated from SplitHitMiss" }
     if ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0) { throw "ExpertTiering must be isolated from SPEX" }
-    if ($PrefillMassObserve -or $PrefillMassWrap -or $ReapMassObserve -or $ReapMassWrap) { throw "ExpertTiering must be isolated from prefill/REAP mass observe/wrap" }
+    if (-not $ComposePrefillMassTiering -and ($PrefillMassObserve -or $PrefillMassWrap -or $ReapMassObserve -or $ReapMassWrap)) { throw "ExpertTiering must be isolated from prefill/REAP mass observe/wrap" }
+    if ($ComposePrefillMassTiering -and ($PrefillMassObserve -or $ReapMassObserve -or $ReapMassWrap)) { throw "ExpertTiering compose must be isolated from observe-only prefill and REAP mass" }
     if ($DynamicArenaObservedWindow -gt 0 -or $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default") { throw "ExpertTiering must be isolated from dynamic arena observer/grow/carry" }
     if ($ReapMaskFile) { throw "ExpertTiering must be isolated from ReapMaskFile" }
     if ($OverlapShared -or $OverlapSharedFull) { throw "ExpertTiering must be isolated from overlap" }
@@ -399,7 +418,7 @@ if ($ReapMaskFile -and ($PrefillMassObserve -or $PrefillMassWrap -or
 if ($PrefillMassWrap -and $DynamicArenaObservedWindow -gt 0) { throw "PrefillMassWrap must be isolated from the decode observer" }
 if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassWrap must be isolated from arena growth" }
 if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
-if ($PrefillMassWrap -and ($ExpertCacheN -gt 0 -or $ExpertCacheStats)) { throw "PrefillMassWrap must be isolated from the expert cache" }
+if ($PrefillMassWrap -and -not $ComposePrefillMassTiering -and ($ExpertCacheN -gt 0 -or $ExpertCacheStats)) { throw "PrefillMassWrap must be isolated from the expert cache" }
 if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
 if ($PrefillMassWrap -and ($Warmup -or $Repeats -ne 1)) { throw "PrefillMassWrap first-snapshot measurements require one request and no warmup" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
@@ -739,6 +758,10 @@ $expertTieringSsdBytes = 0; $expertTieringRamH2DBytes = 0
 $expertTieringStatesSsd = 0; $expertTieringStatesProbation = 0
 $expertTieringStatesWarm = 0; $expertTieringStatesVram = 0
 $expertTieringMassSum = 0.0; $expertTieringLfruTop = 0.0
+$expertTieringComposeObserved = $false; $expertTieringComposeFlag = 0
+$expertTieringSnapshotGeneration = 0; $expertTieringSnapshotBackingEntries = 0
+$expertTieringSnapshotBackingHits = 0; $expertTieringSnapshotBackingMisses = 0
+$expertTieringSnapshotToVramBytes = 0; $expertTieringForbiddenColdSsdToVram = 0
 $expertTieringPolicyEpochs = 0; $expertTieringPolicyFreePromotions = 0
 $expertTieringPolicyReplacements = 0; $expertTieringPolicyMinFrequencySkips = 0
 $expertTieringPolicyBudgetSkips = 0; $expertTieringPolicyScoreSkips = 0
@@ -1023,33 +1046,68 @@ if (Test-Path $stderrLog) {
         $expertTieringFinalLine = $expertTieringFinalLines | Select-Object -Last 1
         $numberPattern = "([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
         $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
-        if ($expertTieringFinalLine -notmatch $expertTieringFinalPattern) {
+        $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
+        if ($expertTieringFinalLine -match $expertTieringComposeFinalPattern) {
+            $expertTieringFinalObserved = $true
+            $expertTieringComposeObserved = $true
+            $expertTieringModeObserved = $Matches[1]
+            $expertTieringPolicyObserved = $Matches[2]
+            $expertTieringComposeFlag = [uint32]$Matches[3]
+            $expertTieringSnapshotGeneration = [uint64]$Matches[4]
+            $expertTieringSnapshotBackingEntries = [uint32]$Matches[5]
+            $expertTieringSnapshotBackingHits = [uint64]$Matches[6]
+            $expertTieringSnapshotBackingMisses = [uint64]$Matches[7]
+            $expertTieringSnapshotToVramBytes = [uint64]$Matches[8]
+            $expertTieringForbiddenColdSsdToVram = [uint64]$Matches[9]
+            $expertTieringClockCalls = [uint32]$Matches[10]; $expertTieringReplacementBudget = [uint32]$Matches[11]
+            $expertTieringMinFrequency = [uint32]$Matches[12]
+            $expertTieringHysteresis = [double]::Parse($Matches[13], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringCalls = [uint64]$Matches[14]; $expertTieringSelected = [uint64]$Matches[15]
+            $expertTieringCold = [uint64]$Matches[16]; $expertTieringRamHits = [uint64]$Matches[17]
+            $expertTieringVramHits = [uint64]$Matches[18]; $expertTieringColdToRam = [uint64]$Matches[19]
+            $expertTieringColdToVram = [uint64]$Matches[20]; $expertTieringRamToWarm = [uint64]$Matches[21]
+            $expertTieringVramPromotions = [uint64]$Matches[22]; $expertTieringVramDemotions = [uint64]$Matches[23]
+            $expertTieringRamEvictions = [uint64]$Matches[24]; $expertTieringRamAdmitSkips = [uint64]$Matches[25]
+            $expertTieringTransient = [uint64]$Matches[26]; $expertTieringFailures = [uint64]$Matches[27]
+            $expertTieringSsdBytes = [uint64]$Matches[28]; $expertTieringRamH2DBytes = [uint64]$Matches[29]
+            $expertTieringPolicyEpochs = [uint64]$Matches[30]
+            $expertTieringPolicyFreePromotions = [uint64]$Matches[31]
+            $expertTieringPolicyReplacements = [uint64]$Matches[32]
+            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[33]
+            $expertTieringPolicyBudgetSkips = [uint64]$Matches[34]
+            $expertTieringPolicyScoreSkips = [uint64]$Matches[35]
+            $expertTieringStatesSsd = [uint32]$Matches[36]; $expertTieringStatesProbation = [uint32]$Matches[37]
+            $expertTieringStatesWarm = [uint32]$Matches[38]; $expertTieringStatesVram = [uint32]$Matches[39]
+            $expertTieringMassSum = [double]::Parse($Matches[40], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringLfruTop = [double]::Parse($Matches[41], [Globalization.CultureInfo]::InvariantCulture)
+        } elseif ($expertTieringFinalLine -notmatch $expertTieringFinalPattern) {
             throw "Expert tiering measurement failed: final line format mismatch"
+        } else {
+            $expertTieringFinalObserved = $true
+            $expertTieringModeObserved = $Matches[1]
+            $expertTieringPolicyObserved = $Matches[2]
+            $expertTieringClockCalls = [uint32]$Matches[3]; $expertTieringReplacementBudget = [uint32]$Matches[4]
+            $expertTieringMinFrequency = [uint32]$Matches[5]
+            $expertTieringHysteresis = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringCalls = [uint64]$Matches[7]; $expertTieringSelected = [uint64]$Matches[8]
+            $expertTieringCold = [uint64]$Matches[9]; $expertTieringRamHits = [uint64]$Matches[10]
+            $expertTieringVramHits = [uint64]$Matches[11]; $expertTieringColdToRam = [uint64]$Matches[12]
+            $expertTieringColdToVram = [uint64]$Matches[13]; $expertTieringRamToWarm = [uint64]$Matches[14]
+            $expertTieringVramPromotions = [uint64]$Matches[15]; $expertTieringVramDemotions = [uint64]$Matches[16]
+            $expertTieringRamEvictions = [uint64]$Matches[17]; $expertTieringRamAdmitSkips = [uint64]$Matches[18]
+            $expertTieringTransient = [uint64]$Matches[19]; $expertTieringFailures = [uint64]$Matches[20]
+            $expertTieringSsdBytes = [uint64]$Matches[21]; $expertTieringRamH2DBytes = [uint64]$Matches[22]
+            $expertTieringPolicyEpochs = [uint64]$Matches[23]
+            $expertTieringPolicyFreePromotions = [uint64]$Matches[24]
+            $expertTieringPolicyReplacements = [uint64]$Matches[25]
+            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[26]
+            $expertTieringPolicyBudgetSkips = [uint64]$Matches[27]
+            $expertTieringPolicyScoreSkips = [uint64]$Matches[28]
+            $expertTieringStatesSsd = [uint32]$Matches[29]; $expertTieringStatesProbation = [uint32]$Matches[30]
+            $expertTieringStatesWarm = [uint32]$Matches[31]; $expertTieringStatesVram = [uint32]$Matches[32]
+            $expertTieringMassSum = [double]::Parse($Matches[33], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringLfruTop = [double]::Parse($Matches[34], [Globalization.CultureInfo]::InvariantCulture)
         }
-        $expertTieringFinalObserved = $true
-        $expertTieringModeObserved = $Matches[1]
-        $expertTieringPolicyObserved = $Matches[2]
-        $expertTieringClockCalls = [uint32]$Matches[3]; $expertTieringReplacementBudget = [uint32]$Matches[4]
-        $expertTieringMinFrequency = [uint32]$Matches[5]
-        $expertTieringHysteresis = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
-        $expertTieringCalls = [uint64]$Matches[7]; $expertTieringSelected = [uint64]$Matches[8]
-        $expertTieringCold = [uint64]$Matches[9]; $expertTieringRamHits = [uint64]$Matches[10]
-        $expertTieringVramHits = [uint64]$Matches[11]; $expertTieringColdToRam = [uint64]$Matches[12]
-        $expertTieringColdToVram = [uint64]$Matches[13]; $expertTieringRamToWarm = [uint64]$Matches[14]
-        $expertTieringVramPromotions = [uint64]$Matches[15]; $expertTieringVramDemotions = [uint64]$Matches[16]
-        $expertTieringRamEvictions = [uint64]$Matches[17]; $expertTieringRamAdmitSkips = [uint64]$Matches[18]
-        $expertTieringTransient = [uint64]$Matches[19]; $expertTieringFailures = [uint64]$Matches[20]
-        $expertTieringSsdBytes = [uint64]$Matches[21]; $expertTieringRamH2DBytes = [uint64]$Matches[22]
-        $expertTieringPolicyEpochs = [uint64]$Matches[23]
-        $expertTieringPolicyFreePromotions = [uint64]$Matches[24]
-        $expertTieringPolicyReplacements = [uint64]$Matches[25]
-        $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[26]
-        $expertTieringPolicyBudgetSkips = [uint64]$Matches[27]
-        $expertTieringPolicyScoreSkips = [uint64]$Matches[28]
-        $expertTieringStatesSsd = [uint32]$Matches[29]; $expertTieringStatesProbation = [uint32]$Matches[30]
-        $expertTieringStatesWarm = [uint32]$Matches[31]; $expertTieringStatesVram = [uint32]$Matches[32]
-        $expertTieringMassSum = [double]::Parse($Matches[33], [Globalization.CultureInfo]::InvariantCulture)
-        $expertTieringLfruTop = [double]::Parse($Matches[34], [Globalization.CultureInfo]::InvariantCulture)
     }
     $mixedDirectLines = $lines | Where-Object { $_ -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)" }
     foreach ($mixedDirectLine in $mixedDirectLines) {
@@ -1343,6 +1401,24 @@ if ($ExpertTiering -eq "off") {
 } else {
     if ($expertTieringControlLineCount -ne 0) { throw "Expert tiering measurement failed: control telemetry was observed" }
     if ($expertTieringFinalLineCount -ne 1 -or -not $expertTieringFinalObserved) { throw "Expert tiering measurement failed: final counters were not observed exactly once" }
+    if ($ComposePrefillMassTiering) {
+        if (-not $expertTieringComposeObserved -or $expertTieringComposeFlag -ne 1) { throw "Expert tiering compose failed: final compose flag was not observed" }
+        if ($expertTieringSnapshotGeneration -le 0 -or $expertTieringSnapshotBackingEntries -le 0) { throw "Expert tiering compose failed: snapshot backing was empty" }
+        if ($expertTieringSnapshotBackingHits -le 0) { throw "Expert tiering compose failed: snapshot backing was not used" }
+        if ($expertTieringSnapshotBackingMisses -ne 0) { throw "Expert tiering compose failed: decode requested an expert outside the closed snapshot" }
+        if ($expertTieringSnapshotToVramBytes -le 0) { throw "Expert tiering compose failed: snapshot backing produced no H2D traffic" }
+        if ($expertTieringForbiddenColdSsdToVram -ne 0) { throw "Expert tiering compose failed: cold SSD to VRAM violation observed" }
+        if ($expertTieringColdToRam -ne 0 -or $expertTieringSsdBytes -ne 0) { throw "Expert tiering compose failed: decode touched cold SSD backing" }
+        if ($expertTieringColdToVram -ne 0) { throw "Expert tiering compose failed: cold_to_vram must remain zero" }
+        if ($expertTieringFailures -ne 0) { throw "Expert tiering compose failed: runtime failures observed" }
+        if ($prefillMassWrapGeneration -le 0 -or $expertTieringSnapshotGeneration -ne $prefillMassWrapGeneration) { throw "Expert tiering compose failed: snapshot generation differs from prefill publish" }
+        if ($expertTieringSnapshotBackingEntries -ne $prefillMassWrapResidentAfter -or
+            $expertTieringSnapshotBackingEntries -ne $prefillMassWrapCandidate) {
+            throw "Expert tiering compose failed: snapshot backing differs from prefill publication"
+        }
+    } elseif ($expertTieringComposeObserved) {
+        throw "Expert tiering measurement failed: compose telemetry appeared while not requested"
+    }
     if ($expertTieringModeObserved -ne $ExpertTiering) { throw "Expert tiering measurement failed: observed mode mismatch" }
     if ($expertTieringPolicyObserved -ne $ExpertTierPolicy) { throw "Expert tiering measurement failed: observed policy mismatch" }
     if ($ExpertTierPolicy -eq "mass-lfru") {
@@ -1393,7 +1469,7 @@ if ($ExpertTiering -eq "off") {
     if ($expertTieringStatesVram -gt $ExpertCacheN) {
         throw "Expert tiering measurement failed: VRAM state count exceeds ExpertCacheN"
     }
-    if ($ExpertTiering -eq "enforce" -and
+    if ($ExpertTiering -eq "enforce" -and -not $ComposePrefillMassTiering -and
         ($expertTieringColdToVram -ne 0 -or
          $expertTieringColdToRam -le 0 -or
          $expertTieringTransient -le 0 -or
@@ -1592,6 +1668,15 @@ $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
 $expertTieringResult = [pscustomobject]@{
     requested_mode = $ExpertTiering
     requested_policy = $ExpertTierPolicy
+    compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
+    compose_prefill_mass_tiering_observed = $expertTieringComposeObserved
+    compose_prefill_mass_tiering_flag = $expertTieringComposeFlag
+    snapshot_generation = $expertTieringSnapshotGeneration
+    snapshot_backing_entries = $expertTieringSnapshotBackingEntries
+    snapshot_backing_hits = $expertTieringSnapshotBackingHits
+    snapshot_backing_misses = $expertTieringSnapshotBackingMisses
+    snapshot_to_vram_bytes = $expertTieringSnapshotToVramBytes
+    forbidden_cold_ssd_to_vram = $expertTieringForbiddenColdSsdToVram
     final_observed = $expertTieringFinalObserved
     final_line_count = $expertTieringFinalLineCount
     control_line_count = $expertTieringControlLineCount
@@ -1761,6 +1846,7 @@ $summary = [pscustomobject]@{
     dynamic_arena_gib_requested = $DynamicArenaGiB
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
+    compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
     reap_mass_observe_requested = [bool]($ReapMassObserve -or $ReapMassWrap)
     reap_mass_wrap_requested = [bool]$ReapMassWrap
     reap_mass_window_requested = $ReapMassWindow
