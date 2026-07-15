@@ -1,7 +1,8 @@
 # G57 Windows sparse-bake loader plan
 
-Status: design frozen; implementation and GPU validation blocked until the
-K60/K75 Windows verifier reports `GPU/DISCO LIBERI`.
+Status: parser, payload-coverage validation, and fail-closed runtime guards are
+implemented through commit `4368674`; K60/K75 artifact validation and every GPU
+run remain blocked until the Windows verifier reports `GPU/DISCO LIBERI`.
 
 ## Purpose
 
@@ -86,9 +87,9 @@ useful parser sketch but must not be applied unchanged because:
 
 ## Required engine contract
 
-Add immutable bake metadata to `ds4_engine` ownership. The model loader may hold
+Add immutable bake metadata to model/engine ownership. The model loader may hold
 the parsed trailer while opening, but the effective allowed set and its identity
-must become per-engine state before any backend cache or request is created.
+must be installed before any backend cache or request is created.
 
 The engine state must include:
 
@@ -98,8 +99,42 @@ The engine state must include:
 - Manifest/mask checksums and source-model identity from the manifest.
 - Per-layer retained counts.
 
-No global mutable bake mask is allowed. Existing external REAP masks remain a
-separate mechanism and must conflict fail closed with a sparse bake.
+The first Windows implementation reuses the existing process-global REAP/CUDA
+mask storage under DS4's exclusive instance lock. It resets that state before
+open and after GPU cleanup on close, so two engines cannot observe one another's
+mask in the currently supported single-engine process. This is an intentional
+deviation from the original per-engine design, not a claim of multi-engine
+safety; the state must move into engine/backend ownership before concurrent
+engines are supported. Existing external REAP masks remain a separate mechanism
+and conflict fail closed with a sparse bake.
+
+## Implemented state
+
+Commits `b86ef4c` through `4368674` now provide:
+
+- strict trailer, manifest, CRC, geometry, bitset, tensor, and extent parsing;
+- a proof that every non-routed GGUF byte range is physically covered and only
+  excluded expert slices may be sparse holes;
+- embedded-mask installation before CUDA map/cache setup;
+- CPU top-k and final selected-expert guards;
+- CUDA selected-load, arena-target, and SPEX-queue guards;
+- fail-closed rejection of whole-block fallback, mapped host windows, full model
+  copies, chunked full copies, external REAP masks, Metal, and MTP combinations
+  that could bypass the sparse allowed set;
+- startup-cache exclusion of complete routed-expert tensor blocks, leaving
+  selected-only transport to read retained slices.
+
+Verification performed without loading a model or using the GPU:
+
+```text
+Release build: PASS (ds4_server.exe and ds4_moe_gate_bench.exe produced)
+ctest -C Release: 1/1 PASS, ds4_bake_test 0.02 s
+git diff --check: PASS (line-ending warnings only)
+independent call-path review: no findings
+```
+
+These are build/parser/safety-structure results only. They do not establish K60
+startup correctness, output quality, TTFT, throughput, cache behavior, or SOTA.
 
 ## Loader gates
 
@@ -151,13 +186,16 @@ plausible-looking but corrupt output.
 
 ## Implementation sequence
 
-1. Parser-only unit tests using tiny synthetic sparse files: normal GGUF,
+1. [done] Parser-only unit tests using tiny synthetic sparse files: normal GGUF,
    valid bake, bad magic/version, overflow, CRC mismatch, bitset/manifest
    mismatch, too few retained experts, and conflicting external mask.
-2. Per-engine metadata and normal-GGUF no-op compatibility.
-3. CPU top-k/hash/use guards with a synthetic route test.
-4. CUDA bias installation and pre-staging guard.
-5. Sparse-aware startup cache enumeration.
+2. [partial] Model-owned metadata and normal-GGUF no-op compatibility. Runtime
+   mask state is process-global but instance-lock serialized, as documented
+   above.
+3. [partial] CPU top-k/hash/use guards. The final selected-use guard is present;
+   a dedicated synthetic route unit test is still missing.
+4. [done, build-only] CUDA bias installation and pre-staging guard.
+5. [done, build-only] Sparse-aware startup cache enumeration.
 6. K60 startup safety run: manifest identity, retained counts, no absent reads,
    server exit zero, and coherent temp0/nothink output. This n=1 run is only a
    functional gate.
@@ -175,8 +213,8 @@ plausible-looking but corrupt output.
 
 ## Current unblock conditions
 
-Implementation can begin from this contract, but local artifact validation and
-all DS4 runs remain blocked until the external verifier completes:
+Local artifact validation and all further DS4 runs remain blocked until the
+external verifier completes:
 
 1. exact downloaded size;
 2. full pack SHA-256 against producer receipts;
