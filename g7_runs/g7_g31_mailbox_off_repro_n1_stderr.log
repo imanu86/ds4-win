@@ -1,0 +1,38 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.743s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 03:50:04 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 03:50:04 ds4-server: listening on http://127.0.0.1:8000
+0715 03:50:05 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 03:50:07 ds4-server: chat ctx=0..5:5 prompt done 1.680s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [routeprof] calls=60 d2h=3.852ms observe=0.000ms map=0.001ms transport=18.263ms publish=0.025ms
+ds4: [routeprof] calls=120 d2h=2.548ms observe=0.000ms map=0.001ms transport=10.802ms publish=0.026ms
+ds4: [routeprof] calls=180 d2h=2.170ms observe=0.000ms map=0.001ms transport=8.219ms publish=0.026ms
+ds4: [routeprof] calls=240 d2h=1.953ms observe=0.000ms map=0.001ms transport=6.897ms publish=0.025ms
+ds4: [routeprof] calls=300 d2h=1.842ms observe=0.000ms map=0.001ms transport=6.260ms publish=0.026ms
+ds4: [routeprof] calls=360 d2h=1.748ms observe=0.000ms map=0.001ms transport=5.611ms publish=0.025ms
+ds4: [routeprof] calls=420 d2h=1.824ms observe=0.000ms map=0.001ms transport=5.230ms publish=0.026ms
+0715 03:50:09 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=4.33 t/s avg=4.33 t/s 2.077s
+0715 03:50:09 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.773s
+0715 03:50:09 ds4-server: chat ctx=0..5:5 prompt start
+0715 03:50:10 ds4-server: chat ctx=0..5:5 prompt done 1.311s
+ds4: [routeprof] calls=480 d2h=2.764ms observe=0.000ms map=0.001ms transport=6.300ms publish=0.025ms
+ds4: [routeprof] calls=540 d2h=2.782ms observe=0.000ms map=0.001ms transport=5.886ms publish=0.025ms
+ds4: [routeprof] calls=600 d2h=2.810ms observe=0.000ms map=0.001ms transport=5.558ms publish=0.025ms
+ds4: [routeprof] calls=660 d2h=2.818ms observe=0.000ms map=0.001ms transport=5.317ms publish=0.025ms
+ds4: [routeprof] calls=720 d2h=2.838ms observe=0.000ms map=0.001ms transport=5.168ms publish=0.026ms
+ds4: [routeprof] calls=780 d2h=2.848ms observe=0.000ms map=0.001ms transport=4.963ms publish=0.026ms
+ds4: [routeprof] calls=840 d2h=2.853ms observe=0.000ms map=0.001ms transport=4.806ms publish=0.026ms
+0715 03:50:13 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.56 t/s avg=3.56 t/s 2.532s
+0715 03:50:13 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.856s
+0715 03:50:13 ds4-server: benchmark request target reached; shutting down cleanly
+0715 03:50:13 ds4-server: shutdown requested, draining requests

@@ -1,0 +1,50 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.772s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 03:50:27 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 03:50:27 ds4-server: listening on http://127.0.0.1:8000
+0715 03:50:28 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 03:50:30 ds4-server: chat ctx=0..5:5 prompt done 1.439s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [routeprof] calls=60 d2h=3.975ms observe=0.000ms map=0.001ms transport=15.212ms publish=0.021ms
+ds4: [router-mailbox] calls=60 fallbacks=0 wait=1.365ms
+ds4: [routeprof] calls=120 d2h=2.644ms observe=0.000ms map=0.001ms transport=9.172ms publish=0.022ms
+ds4: [router-mailbox] calls=120 fallbacks=0 wait=1.284ms
+ds4: [routeprof] calls=180 d2h=2.245ms observe=0.000ms map=0.001ms transport=7.093ms publish=0.023ms
+ds4: [router-mailbox] calls=180 fallbacks=0 wait=1.320ms
+ds4: [routeprof] calls=240 d2h=2.018ms observe=0.000ms map=0.001ms transport=6.033ms publish=0.022ms
+ds4: [router-mailbox] calls=240 fallbacks=0 wait=1.305ms
+ds4: [routeprof] calls=300 d2h=1.914ms observe=0.000ms map=0.001ms transport=5.483ms publish=0.023ms
+ds4: [router-mailbox] calls=300 fallbacks=0 wait=1.329ms
+ds4: [routeprof] calls=360 d2h=1.824ms observe=0.000ms map=0.001ms transport=4.965ms publish=0.023ms
+ds4: [router-mailbox] calls=360 fallbacks=0 wait=1.319ms
+ds4: [routeprof] calls=420 d2h=1.759ms observe=0.000ms map=0.001ms transport=4.627ms publish=0.022ms
+0715 03:50:31 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=4.74 t/s avg=4.74 t/s 1.897s
+0715 03:50:31 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.350s
+0715 03:50:31 ds4-server: chat ctx=0..5:5 prompt start
+0715 03:50:33 ds4-server: chat ctx=0..5:5 prompt done 1.382s
+ds4: [routeprof] calls=480 d2h=2.642ms observe=0.000ms map=0.001ms transport=6.069ms publish=0.023ms
+ds4: [router-mailbox] calls=420 fallbacks=0 wait=1.464ms
+ds4: [routeprof] calls=540 d2h=2.676ms observe=0.000ms map=0.001ms transport=5.786ms publish=0.024ms
+ds4: [router-mailbox] calls=480 fallbacks=0 wait=1.657ms
+ds4: [routeprof] calls=600 d2h=2.723ms observe=0.000ms map=0.001ms transport=5.484ms publish=0.025ms
+ds4: [router-mailbox] calls=540 fallbacks=0 wait=1.796ms
+ds4: [routeprof] calls=660 d2h=2.749ms observe=0.000ms map=0.001ms transport=5.257ms publish=0.025ms
+ds4: [router-mailbox] calls=600 fallbacks=0 wait=1.924ms
+ds4: [routeprof] calls=720 d2h=2.782ms observe=0.000ms map=0.001ms transport=5.068ms publish=0.025ms
+ds4: [router-mailbox] calls=660 fallbacks=0 wait=2.014ms
+ds4: [routeprof] calls=780 d2h=2.797ms observe=0.000ms map=0.001ms transport=4.863ms publish=0.027ms
+ds4: [router-mailbox] calls=720 fallbacks=0 wait=2.100ms
+ds4: [routeprof] calls=840 d2h=2.810ms observe=0.000ms map=0.001ms transport=4.739ms publish=0.027ms
+0715 03:50:35 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.43 t/s avg=3.43 t/s 2.625s
+0715 03:50:35 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 4.022s
+0715 03:50:35 ds4-server: benchmark request target reached; shutting down cleanly
+0715 03:50:35 ds4-server: shutdown requested, draining requests

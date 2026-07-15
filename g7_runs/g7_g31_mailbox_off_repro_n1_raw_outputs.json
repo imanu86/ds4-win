@@ -1,0 +1,33 @@
+﻿{
+    "schema":  "g7_raw_outputs_v1",
+    "tag":  "g31_mailbox_off_repro_n1",
+    "head":  "a924847c52fd5fd23d444f6157065700a981a737",
+    "executable_sha256":  "c8224e792d783cd1a0fcd577f84b878a3dfd4f6c041f22f5ce1870ab2a757523",
+    "ds4_cuda_sha256":  "7b3c49e717c523056d5bdcf28fec4ddd14c477676eb329cddf3b4ca8badb377a",
+    "prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "system_prompt":  "",
+    "system_prompt_sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "warmup_prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "expected_content_sha256":  "",
+    "expected_warmup_content_sha256":  "",
+    "warmup_result":  {
+                          "seconds":  4.148839,
+                          "completion_tokens":  9,
+                          "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                          "content":  "Hello! How can I help you today?"
+                      },
+    "output_hashes":  [
+                          "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5"
+                      ],
+    "outputs_identical":  true,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  3.85494,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.334667,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    }
+                ]
+}

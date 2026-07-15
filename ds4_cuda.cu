@@ -60,6 +60,12 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+struct cuda_moe_selected_mailbox_payload {
+    volatile uint32_t sequence;
+    uint32_t count;
+    int32_t ids[6];
+};
+
 struct ds4_gpu_async_read {
     void *host;
     uint64_t bytes;
@@ -11942,6 +11948,18 @@ __global__ static void moe_gate_up_mid_decode_ptrs_lut_qwarp32_kernel(
     }
 }
 
+__global__ static void moe_selected_mailbox_kernel(
+        cuda_moe_selected_mailbox_payload *mailbox,
+        const int32_t *selected,
+        uint32_t count,
+        uint32_t sequence) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    mailbox->count = count;
+    for (uint32_t i = 0; i < count; i++) mailbox->ids[i] = selected[i];
+    __threadfence_system();
+    mailbox->sequence = sequence;
+}
+
 __global__ static void moe_count_sorted_pairs_kernel(
         uint32_t *counts,
         const int32_t *selected,
@@ -13381,6 +13399,12 @@ struct cuda_moe_gather {
     char *down; uint64_t down_cap;
     int32_t *slot; uint64_t slot_cap;
     uint64_t *route_ptrs; uint64_t route_ptrs_cap;
+    cuda_moe_selected_mailbox_payload *mailbox_host;
+    cuda_moe_selected_mailbox_payload *mailbox_device;
+    uint32_t mailbox_sequence;
+    uint64_t mailbox_calls;
+    uint64_t mailbox_fallbacks;
+    double mailbox_wait_s;
     ds4_gpu_tensor slot_tensor;
     std::vector<int32_t> h_sel;
     std::vector<float> h_weights;
@@ -13558,11 +13582,18 @@ static void cuda_moe_gather_release(void) {
     if (g_moe_gather.down) (void)cudaFree(g_moe_gather.down);
     if (g_moe_gather.slot) (void)cudaFree(g_moe_gather.slot);
     if (g_moe_gather.route_ptrs) (void)cudaFree(g_moe_gather.route_ptrs);
+    if (g_moe_gather.mailbox_host) (void)cudaFreeHost(g_moe_gather.mailbox_host);
     g_moe_gather.gate = NULL;
     g_moe_gather.up = NULL;
     g_moe_gather.down = NULL;
     g_moe_gather.slot = NULL;
     g_moe_gather.route_ptrs = NULL;
+    g_moe_gather.mailbox_host = NULL;
+    g_moe_gather.mailbox_device = NULL;
+    g_moe_gather.mailbox_sequence = 0;
+    g_moe_gather.mailbox_calls = 0;
+    g_moe_gather.mailbox_fallbacks = 0;
+    g_moe_gather.mailbox_wait_s = 0.0;
     g_moe_gather.gate_cap = 0;
     g_moe_gather.up_cap = 0;
     g_moe_gather.down_cap = 0;
@@ -13749,6 +13780,12 @@ static int cuda_moe_expert_cache_copy_to_compact_async(
 static uint64_t g_sel_prof_calls;
 static uint64_t g_sel_prof_experts;
 static double g_sel_prof_fetch_s;
+static uint64_t g_route_prof_calls;
+static double g_route_prof_d2h_s;
+static double g_route_prof_observe_s;
+static double g_route_prof_map_s;
+static double g_route_prof_transport_s;
+static double g_route_prof_publish_s;
 
 static int cuda_model_range_in_window(const void *model_map, uint64_t offset, uint64_t bytes) {
     return g_model_window_bytes && model_map == g_model_host_base && g_model_device_base &&
@@ -13993,6 +14030,92 @@ static int cuda_moe_gather_ensure_i32(int32_t **ptr, uint64_t *cap, uint32_t cou
     return cuda_moe_gather_ensure((char **)ptr, cap, (uint64_t)count * sizeof(int32_t), what);
 }
 
+static int cuda_moe_selected_mailbox_ensure(void) {
+    if (g_moe_gather.mailbox_host && g_moe_gather.mailbox_device) return 1;
+    cuda_moe_selected_mailbox_payload *host = NULL;
+    cuda_moe_selected_mailbox_payload *device = NULL;
+    if (cudaHostAlloc((void **)&host, sizeof(*host), cudaHostAllocMapped) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    memset(host, 0, sizeof(*host));
+    if (cudaHostGetDevicePointer((void **)&device, host, 0) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFreeHost(host);
+        return 0;
+    }
+    g_moe_gather.mailbox_host = host;
+    g_moe_gather.mailbox_device = device;
+    return 1;
+}
+
+static int cuda_moe_selected_mailbox_read(
+        const int32_t *selected,
+        uint32_t count,
+        std::vector<int32_t> &host_selected) {
+    if (!selected || count == 0 || count > 6u ||
+        !cuda_moe_selected_mailbox_ensure()) {
+        return 0;
+    }
+    uint32_t sequence = ++g_moe_gather.mailbox_sequence;
+    if (sequence == 0) sequence = ++g_moe_gather.mailbox_sequence;
+    const double t0 = cuda_wall_sec();
+    moe_selected_mailbox_kernel<<<1, 1>>>(
+        g_moe_gather.mailbox_device, selected, count, sequence);
+    if (cudaGetLastError() != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_moe_gather.mailbox_fallbacks++;
+        return 0;
+    }
+
+    uint64_t spins = 0;
+    while (g_moe_gather.mailbox_host->sequence != sequence) {
+        spins++;
+        if ((spins & 1023ull) == 0) {
+            const cudaError_t q = cudaStreamQuery(0);
+            if (q != cudaSuccess && q != cudaErrorNotReady) {
+                (void)cudaGetLastError();
+                g_moe_gather.mailbox_fallbacks++;
+                return 0;
+            }
+#ifdef _WIN32
+            if ((spins & 16383ull) == 0) (void)SwitchToThread();
+#else
+            if ((spins & 16383ull) == 0) usleep(0);
+#endif
+            if (cuda_wall_sec() - t0 > 2.0) {
+                g_moe_gather.mailbox_fallbacks++;
+                return 0;
+            }
+        }
+    }
+#ifdef _WIN32
+    MemoryBarrier();
+#else
+    __sync_synchronize();
+#endif
+    if (g_moe_gather.mailbox_host->count != count) {
+        g_moe_gather.mailbox_fallbacks++;
+        return 0;
+    }
+    host_selected.resize(count);
+    for (uint32_t i = 0; i < count; i++) {
+        host_selected[i] = g_moe_gather.mailbox_host->ids[i];
+    }
+    g_moe_gather.mailbox_calls++;
+    g_moe_gather.mailbox_wait_s += cuda_wall_sec() - t0;
+    if (getenv("DS4_CUDA_MOE_ROUTER_MAILBOX_STATS") != NULL &&
+        g_moe_gather.mailbox_calls % 60u == 0u) {
+        fprintf(stderr,
+                "ds4: [router-mailbox] calls=%llu fallbacks=%llu wait=%.3fms\n",
+                (unsigned long long)g_moe_gather.mailbox_calls,
+                (unsigned long long)g_moe_gather.mailbox_fallbacks,
+                1000.0 * g_moe_gather.mailbox_wait_s /
+                    (double)g_moe_gather.mailbox_calls);
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_routed_moe_prepare_selected(
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -14071,6 +14194,12 @@ static int cuda_moe_selected_load(
     g_moe_gather.mixed_direct_active = 0;
     g_moe_gather.mixed_cache_routes = 0;
     g_moe_gather.mixed_compact_routes = 0;
+    const int route_prof = getenv("DS4_CUDA_MOE_ROUTE_PROFILE") != NULL;
+    const double route_t0 = route_prof ? cuda_wall_sec() : 0.0;
+    double route_t_d2h = route_t0;
+    double route_t_observe = route_t0;
+    double route_t_map = route_t0;
+    double route_t_transport = route_t0;
     (void)model_size;
     if (n_total_expert == 0 || n_expert == 0 || n_tokens == 0) return 0;
     if (!selected_arg || !selected_arg->ptr) return 0;
@@ -14183,10 +14312,20 @@ static int cuda_moe_selected_load(
             !cuda_ok(cudaStreamSynchronize(0), "moe router D2H sync")) return 0;
     } else {
         g_moe_gather.h_sel.resize(slot_count);
-        if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
+        const int mailbox_requested =
+            getenv("DS4_CUDA_MOE_ROUTER_MAILBOX") != NULL &&
+            n_tokens == 1u && slot_count <= 6u;
+        const int mailbox_ok = mailbox_requested &&
+            cuda_moe_selected_mailbox_read(
+                (const int32_t *)selected_arg->ptr,
+                slot_count,
+                g_moe_gather.h_sel);
+        if (!mailbox_ok &&
+            !cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
                                 (size_t)slot_count * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
     }
+    if (route_prof) route_t_d2h = cuda_wall_sec();
 
     cuda_prefill_mass_observe_selected(
         layer_index, n_tokens, g_moe_gather.h_sel.data(),
@@ -14202,6 +14341,7 @@ static int cuda_moe_selected_load(
      * execution. It does not change router scores, top-k, or the active mask. */
     cuda_dynamic_arena_observe_selected(
         layer_index, n_tokens, g_moe_gather.h_sel.data(), slot_count);
+    if (route_prof) route_t_observe = cuda_wall_sec();
 
     /* 2. dedupe -> compact ids (ascending expert order) + per-slot remap */
     std::vector<int32_t> &e2s = g_moe_gather.h_expert_to_slot;
@@ -14222,6 +14362,7 @@ static int cuda_moe_selected_load(
         slots[i] = e2s[(uint32_t)g_moe_gather.h_sel[i]];
     const uint32_t compact_count = (uint32_t)compact.size();
     if (compact_count == 0 || compact_count > n_total_expert) return 0;
+    if (route_prof) route_t_map = cuda_wall_sec();
 
     /* 3. compact device buffers (grow-only, reused across layers/tokens) */
     const uint64_t cgate = (uint64_t)compact_count * gate_expert_bytes;
@@ -14635,6 +14776,7 @@ static int cuda_moe_selected_load(
                     layer_index, slot_count, compact_count);
         }
     }
+    if (route_prof) route_t_transport = cuda_wall_sec();
     if (mixed_direct_active) {
         const uint64_t route_ptr_count = (uint64_t)slot_count * 3ull;
         const uint64_t route_ptr_bytes = route_ptr_count * sizeof(uint64_t);
@@ -14694,6 +14836,27 @@ static int cuda_moe_selected_load(
     g_moe_gather.slot_tensor.ptr = g_moe_gather.slot;
     g_moe_gather.slot_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
     g_moe_gather.slot_tensor.owner = 0;
+
+    if (route_prof) {
+        const double route_t_publish = cuda_wall_sec();
+        g_route_prof_calls++;
+        g_route_prof_d2h_s += route_t_d2h - route_t0;
+        g_route_prof_observe_s += route_t_observe - route_t_d2h;
+        g_route_prof_map_s += route_t_map - route_t_observe;
+        g_route_prof_transport_s += route_t_transport - route_t_map;
+        g_route_prof_publish_s += route_t_publish - route_t_transport;
+        if (g_route_prof_calls % 60u == 0u) {
+            const double scale = 1000.0 / (double)g_route_prof_calls;
+            fprintf(stderr,
+                    "ds4: [routeprof] calls=%llu d2h=%.3fms observe=%.3fms map=%.3fms transport=%.3fms publish=%.3fms\n",
+                    (unsigned long long)g_route_prof_calls,
+                    g_route_prof_d2h_s * scale,
+                    g_route_prof_observe_s * scale,
+                    g_route_prof_map_s * scale,
+                    g_route_prof_transport_s * scale,
+                    g_route_prof_publish_s * scale);
+        }
+    }
 
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr, "ds4: CUDA MoE selected-load slots=%u compact=%u gate/up %.2f MiB down %.2f MiB\n",
