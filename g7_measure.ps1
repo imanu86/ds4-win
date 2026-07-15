@@ -21,6 +21,7 @@ param(
     [switch]$DisableQ8F16Cache,
     [switch]$EmbedRowStaging,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
+    [switch]$ArenaWrapTrustWorkerChecksum,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
@@ -191,6 +192,11 @@ if ($PrefillMassWrap) {
     $env:DS4_CUDA_PREFILL_MASS_WRAP = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_MASS_WRAP -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapTrustWorkerChecksum) {
+    $env:DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM -ErrorAction SilentlyContinue
 }
 if ($ComposePrefillMassTiering) {
     $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
@@ -1871,6 +1877,7 @@ $summary = [pscustomobject]@{
     q8_f16_cache_disabled = [bool]$DisableQ8F16Cache
     embed_row_staging_requested = [bool]$EmbedRowStaging
     dynamic_arena_gib_requested = $DynamicArenaGiB
+    arena_wrap_trust_worker_checksum_requested = [bool]$ArenaWrapTrustWorkerChecksum
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering

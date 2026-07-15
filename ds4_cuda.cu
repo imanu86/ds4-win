@@ -2569,11 +2569,12 @@ extern "C" int ds4_gpu_dynamic_arena_begin(
     return 1;
 }
 
-extern "C" int ds4_gpu_dynamic_arena_finish_load(
+static int cuda_dynamic_arena_finish_load_impl(
         ds4_gpu_dynamic_arena_txn *txn,
         uint32_t load_index,
         uint64_t checksum,
-        int success) {
+        int success,
+        int verify_checksum) {
     if (!txn || txn != g_dynamic_arena.txn ||
         load_index >= txn->loads.size()) {
         return 0;
@@ -2597,8 +2598,10 @@ extern "C" int ds4_gpu_dynamic_arena_finish_load(
         txn->failed = 1;
         return 0;
     }
-    const uint64_t actual_checksum = cuda_dynamic_arena_fnv1a64(
-        (const uint8_t *)slot.host_ptr, g_dynamic_arena.slot_bytes);
+    const uint64_t actual_checksum = verify_checksum ?
+        cuda_dynamic_arena_fnv1a64(
+            (const uint8_t *)slot.host_ptr, g_dynamic_arena.slot_bytes) :
+        checksum;
     if (actual_checksum != checksum) {
         slot.state = DS4_GPU_ARENA_POISONED;
         g_dynamic_arena.staging[entry].state = DS4_GPU_ARENA_POISONED;
@@ -2609,6 +2612,15 @@ extern "C" int ds4_gpu_dynamic_arena_finish_load(
     slot.state = DS4_GPU_ARENA_STAGED;
     g_dynamic_arena.staging[entry].state = DS4_GPU_ARENA_STAGED;
     return 1;
+}
+
+extern "C" int ds4_gpu_dynamic_arena_finish_load(
+        ds4_gpu_dynamic_arena_txn *txn,
+        uint32_t load_index,
+        uint64_t checksum,
+        int success) {
+    return cuda_dynamic_arena_finish_load_impl(
+        txn, load_index, checksum, success, 1);
 }
 
 extern "C" int ds4_gpu_dynamic_arena_publish(
@@ -2892,6 +2904,21 @@ static void *cuda_dynamic_arena_wrap_worker(void *arg) {
     return NULL;
 }
 
+static int cuda_dynamic_arena_wrap_trust_worker_checksum(void) {
+    const char *value =
+        getenv("DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-profile] invalid trust-worker-checksum value '%s'; disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0;
+}
+
 static int cuda_dynamic_arena_wrap_publish_target(
         const uint8_t *target,
         uint32_t entry_count,
@@ -2899,6 +2926,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
     cuda_dynamic_arena_wrap_result local = {};
     local.reason = "begin";
     const double started_at = cuda_wall_sec();
+    const int trust_worker_checksum =
+        cuda_dynamic_arena_wrap_trust_worker_checksum();
     ds4_gpu_dynamic_arena_txn *txn = NULL;
     const ds4_gpu_dynamic_arena_load *loads = NULL;
     uint32_t load_count = 0;
@@ -2909,6 +2938,9 @@ static int cuda_dynamic_arena_wrap_publish_target(
         if (result) *result = local;
         return 0;
     }
+    const double begin_done_at = cuda_wall_sec();
+    double copy_done_at = begin_done_at;
+    double finish_done_at = begin_done_at;
 
     local.loads = load_count;
     int all_succeeded = loads != NULL || load_count == 0;
@@ -2967,26 +2999,42 @@ static int cuda_dynamic_arena_wrap_publish_target(
         for (uint32_t i = 0; i < started_threads.size(); i++) {
             os_thread_join(started_threads[i]);
         }
+        copy_done_at = cuda_wall_sec();
         for (uint32_t i = 0; i < load_count; i++) {
             if (!success[i]) {
                 local.reason = "copy";
                 all_succeeded = 0;
             }
-            const int finished = ds4_gpu_dynamic_arena_finish_load(
-                txn, i, checksums[i], success[i] ? 1 : 0);
+            const int finished = cuda_dynamic_arena_finish_load_impl(
+                txn, i, checksums[i], success[i] ? 1 : 0,
+                trust_worker_checksum ? 0 : 1);
             if (!finished && success[i]) {
                 local.reason = "finish";
                 all_succeeded = 0;
             }
         }
+        finish_done_at = cuda_wall_sec();
     }
 
-    if (all_succeeded &&
-        ds4_gpu_dynamic_arena_publish(txn, &local.generation)) {
+    const double publish_started_at = cuda_wall_sec();
+    const int published = all_succeeded &&
+        ds4_gpu_dynamic_arena_publish(txn, &local.generation);
+    const double publish_done_at = cuda_wall_sec();
+    if (published) {
         txn = NULL;
         local.reason = "ok";
         local.published = 1;
-        local.seconds = cuda_wall_sec() - started_at;
+        local.seconds = publish_done_at - started_at;
+        fprintf(stderr,
+                "ds4: [arena-wrap-profile] result=published schedule=expert-major source=mmap checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f\n",
+                trust_worker_checksum ? "fnv1a64-worker-only" :
+                    "fnv1a64-worker-plus-finish",
+                local.loads, local.workers,
+                begin_done_at - started_at,
+                copy_done_at - begin_done_at,
+                finish_done_at - copy_done_at,
+                publish_done_at - publish_started_at,
+                local.seconds);
         if (result) *result = local;
         return 1;
     }
@@ -2996,6 +3044,16 @@ static int cuda_dynamic_arena_wrap_publish_target(
         local.aborted = 1;
     }
     local.seconds = cuda_wall_sec() - started_at;
+    fprintf(stderr,
+            "ds4: [arena-wrap-profile] result=failed schedule=expert-major source=mmap checksum=%s loads=%u workers=%u begin=%.3f copy_checksum=%.3f finish=%.3f publish=%.3f total=%.3f reason=%s\n",
+            trust_worker_checksum ? "fnv1a64-worker-only" :
+                "fnv1a64-worker-plus-finish",
+            local.loads, local.workers,
+            begin_done_at - started_at,
+            copy_done_at - begin_done_at,
+            finish_done_at - copy_done_at,
+            publish_done_at - publish_started_at,
+            local.seconds, local.reason ? local.reason : "unknown");
     if (result) *result = local;
     return 0;
 }
