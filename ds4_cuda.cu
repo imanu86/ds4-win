@@ -2907,6 +2907,25 @@ struct cuda_dynamic_arena_part_copy_context {
     uint8_t *success;
     uint8_t phase_part;
     int checksum_parts;
+    int profile_parts;
+    double slow_part_threshold_seconds;
+    std::atomic<uint32_t> profile_worker_next;
+    struct cuda_dynamic_arena_part_worker_profile *profile_workers;
+    uint32_t profile_worker_capacity;
+};
+
+struct alignas(64) cuda_dynamic_arena_part_worker_profile {
+    uint64_t parts;
+    uint64_t bytes;
+    uint64_t max_part_bytes;
+    uint64_t max_part_source_offset;
+    uint32_t max_part_load_index;
+    uint32_t max_part_cursor;
+    uint32_t slow_parts;
+    uint8_t max_part_kind;
+    double active_seconds;
+    double memcpy_seconds;
+    double max_part_seconds;
 };
 
 struct cuda_dynamic_arena_checksum_context {
@@ -3053,6 +3072,48 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
     cuda_dynamic_arena_part_copy_context *context =
         (cuda_dynamic_arena_part_copy_context *)arg;
     const uint8_t *model = (const uint8_t *)g_dynamic_arena.model_map;
+    if (!context->profile_parts) {
+        for (;;) {
+            const uint32_t cursor =
+                context->next.fetch_add(1, std::memory_order_relaxed);
+            if (cursor >= context->part_count) break;
+            const cuda_dynamic_arena_wrap_part &part = context->parts[cursor];
+            if (context->phase_part && part.part != context->phase_part) {
+                continue;
+            }
+            if (part.load_index >= context->load_count ||
+                (part.part != CUDA_DYNAMIC_ARENA_MIRROR_GATE &&
+                 part.part != CUDA_DYNAMIC_ARENA_MIRROR_UP &&
+                 part.part != CUDA_DYNAMIC_ARENA_MIRROR_DOWN)) {
+                continue;
+            }
+            const ds4_gpu_dynamic_arena_load &load =
+                context->loads[part.load_index];
+            if (!load.host_ptr ||
+                part.source_offset > g_dynamic_arena.model_size ||
+                part.bytes > g_dynamic_arena.model_size - part.source_offset ||
+                part.destination_offset > load.host_bytes ||
+                part.bytes > load.host_bytes - part.destination_offset) {
+                continue;
+            }
+            uint8_t *destination =
+                (uint8_t *)load.host_ptr + part.destination_offset;
+            memcpy(destination, model + part.source_offset, (size_t)part.bytes);
+            if (context->checksum_parts) {
+                context->checksums[part.load_index] =
+                    cuda_dynamic_arena_fnv1a64_continue(
+                        destination, part.bytes,
+                        context->checksums[part.load_index]);
+            }
+            context->success[cursor] = 1u;
+        }
+        return NULL;
+    }
+
+    cuda_dynamic_arena_part_worker_profile profile = {};
+    const uint32_t worker_index = context->profile_worker_next.fetch_add(
+        1, std::memory_order_relaxed);
+    const double worker_started_at = cuda_wall_sec();
     for (;;) {
         const uint32_t cursor =
             context->next.fetch_add(1, std::memory_order_relaxed);
@@ -3078,7 +3139,23 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
         }
         uint8_t *destination =
             (uint8_t *)load.host_ptr + part.destination_offset;
+        const double copy_started_at = cuda_wall_sec();
         memcpy(destination, model + part.source_offset, (size_t)part.bytes);
+        const double copy_seconds = cuda_wall_sec() - copy_started_at;
+        profile.parts++;
+        profile.bytes += part.bytes;
+        profile.memcpy_seconds += copy_seconds;
+        if (copy_seconds > profile.max_part_seconds) {
+            profile.max_part_seconds = copy_seconds;
+            profile.max_part_bytes = part.bytes;
+            profile.max_part_source_offset = part.source_offset;
+            profile.max_part_load_index = part.load_index;
+            profile.max_part_cursor = cursor;
+            profile.max_part_kind = part.part;
+        }
+        if (copy_seconds >= context->slow_part_threshold_seconds) {
+            profile.slow_parts++;
+        }
         if (context->checksum_parts) {
             context->checksums[part.load_index] =
                 cuda_dynamic_arena_fnv1a64_continue(
@@ -3086,6 +3163,11 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
                     context->checksums[part.load_index]);
         }
         context->success[cursor] = 1u;
+    }
+    profile.active_seconds = cuda_wall_sec() - worker_started_at;
+    if (worker_index < context->profile_worker_capacity &&
+        context->profile_workers) {
+        context->profile_workers[worker_index] = profile;
     }
     return NULL;
 }
@@ -3144,6 +3226,48 @@ static int cuda_dynamic_arena_wrap_trust_worker_checksum(void) {
     return 0;
 }
 
+static int cuda_dynamic_arena_wrap_part_profile(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_PART_PROFILE");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-part-profile] invalid enable value '%s'; disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0;
+}
+
+static double cuda_dynamic_arena_wrap_slow_part_seconds(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_SLOW_PART_MS");
+    if (!value || !value[0]) return 0.025;
+    char *end = NULL;
+    errno = 0;
+    const double milliseconds = strtod(value, &end);
+    if (errno == 0 && end && *end == '\0' &&
+        isfinite(milliseconds) && milliseconds > 0.0 &&
+        milliseconds <= 600000.0) {
+        return milliseconds / 1000.0;
+    }
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-part-profile] invalid slow-part-ms '%s'; using 25ms\n",
+                value);
+        warned = 1;
+    }
+    return 0.025;
+}
+
+static const char *cuda_dynamic_arena_wrap_part_name(uint8_t part) {
+    if (part == CUDA_DYNAMIC_ARENA_MIRROR_GATE) return "gate";
+    if (part == CUDA_DYNAMIC_ARENA_MIRROR_UP) return "up";
+    if (part == CUDA_DYNAMIC_ARENA_MIRROR_DOWN) return "down";
+    return "unknown";
+}
+
 static int cuda_dynamic_arena_wrap_publish_target(
         const uint8_t *target,
         uint32_t entry_count,
@@ -3153,6 +3277,9 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const double started_at = cuda_wall_sec();
     const int trust_worker_checksum =
         cuda_dynamic_arena_wrap_trust_worker_checksum();
+    const int part_profile = cuda_dynamic_arena_wrap_part_profile();
+    const double slow_part_threshold_seconds =
+        part_profile ? cuda_dynamic_arena_wrap_slow_part_seconds() : 0.025;
     const cuda_dynamic_arena_wrap_schedule schedule =
         cuda_dynamic_arena_wrap_schedule_env();
     const char *schedule_name =
@@ -3178,6 +3305,23 @@ static int cuda_dynamic_arena_wrap_publish_target(
     double source_parts_checksum_seconds = 0;
     uint32_t checksum_workers = 0;
     int source_parts_copy_failed = 0;
+    double source_parts_main_worker_seconds = 0;
+    double source_parts_join_seconds = 0;
+    double source_parts_worker_active_min_seconds = -1;
+    double source_parts_worker_active_max_seconds = 0;
+    double source_parts_memcpy_seconds = 0;
+    double source_parts_max_part_seconds = 0;
+    uint64_t source_parts_profile_parts = 0;
+    uint64_t source_parts_profile_bytes = 0;
+    uint64_t source_parts_worker_parts_min = UINT64_MAX;
+    uint64_t source_parts_worker_parts_max = 0;
+    uint64_t source_parts_max_part_bytes = 0;
+    uint64_t source_parts_max_part_source_offset = 0;
+    uint32_t source_parts_max_part_load_index = 0;
+    uint32_t source_parts_max_part_cursor = 0;
+    uint32_t source_parts_slow_parts = 0;
+    uint32_t source_parts_profile_workers = 0;
+    uint8_t source_parts_max_part_kind = 0;
 
     local.loads = load_count;
     int all_succeeded = loads != NULL || load_count == 0;
@@ -3186,6 +3330,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
     std::vector<uint64_t> checksums;
     std::vector<uint8_t> success;
     std::vector<uint8_t> part_success;
+    std::vector<cuda_dynamic_arena_part_worker_profile> part_worker_profiles;
     std::vector<os_thread_t> threads;
     std::vector<os_thread_t> started_threads;
     if (load_count != 0) {
@@ -3228,6 +3373,10 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 cuda_dynamic_arena_observer_workers(work_count);
             threads.resize(requested_workers > 1 ? requested_workers - 1 : 0);
             started_threads.reserve(threads.size());
+            if (part_profile &&
+                schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS) {
+                part_worker_profiles.resize(threads.size() + 1u);
+            }
         } catch (...) {
             local.reason = "allocation";
             all_succeeded = 0;
@@ -3244,6 +3393,11 @@ static int cuda_dynamic_arena_wrap_publish_target(
             context.checksums = checksums.data();
             context.success = part_success.data();
             context.checksum_parts = trust_worker_checksum;
+            context.profile_parts = part_profile;
+            context.slow_part_threshold_seconds = slow_part_threshold_seconds;
+            context.profile_workers = NULL;
+            context.profile_worker_capacity = 0;
+            context.profile_worker_next.store(0, std::memory_order_relaxed);
             const uint8_t phases[3] = {
                 CUDA_DYNAMIC_ARENA_MIRROR_GATE,
                 CUDA_DYNAMIC_ARENA_MIRROR_UP,
@@ -3254,6 +3408,16 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 context.phase_part = trust_worker_checksum ?
                     phases[phase] : 0;
                 context.next.store(0, std::memory_order_relaxed);
+                if (part_profile) {
+                    std::fill(part_worker_profiles.begin(),
+                              part_worker_profiles.end(),
+                              cuda_dynamic_arena_part_worker_profile{});
+                    context.profile_workers = part_worker_profiles.data();
+                    context.profile_worker_capacity =
+                        (uint32_t)part_worker_profiles.size();
+                    context.profile_worker_next.store(0,
+                        std::memory_order_relaxed);
+                }
                 started_threads.clear();
                 for (uint32_t i = 0; i < threads.size(); i++) {
                     if (os_thread_create(&threads[i],
@@ -3267,14 +3431,89 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 if (phase_workers > local.workers) {
                     local.workers = phase_workers;
                 }
+                const double main_worker_started_at = cuda_wall_sec();
                 (void)cuda_dynamic_arena_part_copy_worker(&context);
+                source_parts_main_worker_seconds +=
+                    cuda_wall_sec() - main_worker_started_at;
+                const double join_started_at = cuda_wall_sec();
                 for (uint32_t i = 0; i < started_threads.size(); i++) {
                     os_thread_join(started_threads[i]);
+                }
+                source_parts_join_seconds += cuda_wall_sec() - join_started_at;
+                if (part_profile) {
+                    const uint32_t profiled_workers =
+                        context.profile_worker_next.load(std::memory_order_relaxed);
+                    if (profiled_workers > source_parts_profile_workers) {
+                        source_parts_profile_workers = profiled_workers;
+                    }
+                    const uint32_t worker_limit = std::min(
+                        profiled_workers, context.profile_worker_capacity);
+                    for (uint32_t i = 0; i < worker_limit; i++) {
+                        const cuda_dynamic_arena_part_worker_profile &profile =
+                            part_worker_profiles[i];
+                        source_parts_profile_parts += profile.parts;
+                        source_parts_profile_bytes += profile.bytes;
+                        source_parts_memcpy_seconds += profile.memcpy_seconds;
+                        source_parts_slow_parts += profile.slow_parts;
+                        source_parts_worker_parts_min = std::min(
+                            source_parts_worker_parts_min, profile.parts);
+                        source_parts_worker_parts_max = std::max(
+                            source_parts_worker_parts_max, profile.parts);
+                        if (source_parts_worker_active_min_seconds < 0 ||
+                            profile.active_seconds <
+                                source_parts_worker_active_min_seconds) {
+                            source_parts_worker_active_min_seconds =
+                                profile.active_seconds;
+                        }
+                        source_parts_worker_active_max_seconds = std::max(
+                            source_parts_worker_active_max_seconds,
+                            profile.active_seconds);
+                        if (profile.max_part_seconds >
+                                source_parts_max_part_seconds) {
+                            source_parts_max_part_seconds =
+                                profile.max_part_seconds;
+                            source_parts_max_part_bytes = profile.max_part_bytes;
+                            source_parts_max_part_source_offset =
+                                profile.max_part_source_offset;
+                            source_parts_max_part_load_index =
+                                profile.max_part_load_index;
+                            source_parts_max_part_cursor =
+                                profile.max_part_cursor;
+                            source_parts_max_part_kind = profile.max_part_kind;
+                        }
+                    }
                 }
             }
             const double source_copy_done_at = cuda_wall_sec();
             source_parts_copy_seconds =
                 source_copy_done_at - begin_done_at;
+            if (part_profile) {
+                if (source_parts_worker_parts_min == UINT64_MAX) {
+                    source_parts_worker_parts_min = 0;
+                }
+                fprintf(stderr,
+                        "ds4: [arena-wrap-part-profile] result=copy-complete phases=%u workers=%u parts=%llu bytes=%llu memcpy_sum=%.3f main_worker=%.3f join=%.3f phase_worker_active_min=%.3f phase_worker_active_max=%.3f phase_worker_parts_min=%llu phase_worker_parts_max=%llu slow_threshold_ms=%.3f slow_parts=%u max_part_ms=%.3f max_part_bytes=%llu max_part_load=%u max_part_cursor=%u max_part_kind=%s max_part_source=%llu\n",
+                        phase_count, source_parts_profile_workers,
+                        (unsigned long long)source_parts_profile_parts,
+                        (unsigned long long)source_parts_profile_bytes,
+                        source_parts_memcpy_seconds,
+                        source_parts_main_worker_seconds,
+                        source_parts_join_seconds,
+                        source_parts_worker_active_min_seconds,
+                        source_parts_worker_active_max_seconds,
+                        (unsigned long long)source_parts_worker_parts_min,
+                        (unsigned long long)source_parts_worker_parts_max,
+                        slow_part_threshold_seconds * 1000.0,
+                        source_parts_slow_parts,
+                        source_parts_max_part_seconds * 1000.0,
+                        (unsigned long long)source_parts_max_part_bytes,
+                        source_parts_max_part_load_index,
+                        source_parts_max_part_cursor,
+                        cuda_dynamic_arena_wrap_part_name(
+                            source_parts_max_part_kind),
+                        (unsigned long long)
+                            source_parts_max_part_source_offset);
+            }
             for (size_t i = 0; i < part_success.size(); i++) {
                 if (!part_success[i]) {
                     local.reason = "copy-part";

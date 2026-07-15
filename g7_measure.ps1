@@ -23,6 +23,8 @@ param(
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [switch]$ArenaWrapTrustWorkerChecksum,
     [switch]$ArenaWrapSourceParts,
+    [switch]$ArenaWrapPartProfile,
+    [ValidateRange(0.001, 600000.0)][double]$ArenaWrapSlowPartMs = 25.0,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
@@ -217,6 +219,14 @@ if ($ArenaWrapSourceParts) {
     $env:DS4_CUDA_ARENA_WRAP_SCHEDULE = "source-parts"
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SCHEDULE -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapPartProfile) {
+    $env:DS4_CUDA_ARENA_WRAP_PART_PROFILE = "1"
+    $env:DS4_CUDA_ARENA_WRAP_SLOW_PART_MS =
+        $ArenaWrapSlowPartMs.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_PART_PROFILE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SLOW_PART_MS -ErrorAction SilentlyContinue
 }
 if ($ComposePrefillMassTiering) {
     $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
@@ -457,6 +467,7 @@ if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMass
 if ($PrefillMassWrap -and -not $ComposePrefillMassTiering -and ($ExpertCacheN -gt 0 -or $ExpertCacheStats)) { throw "PrefillMassWrap must be isolated from the expert cache" }
 if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
 if ($PrefillMassWrap -and ($Warmup -or $Repeats -ne 1)) { throw "PrefillMassWrap first-snapshot measurements require one request and no warmup" }
+if ($ArenaWrapPartProfile -and -not $ArenaWrapSourceParts) { throw "ArenaWrapPartProfile requires ArenaWrapSourceParts" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
 if ($DynamicArenaCarry -ne "default" -and (-not $Warmup -or $DynamicArenaObservedWindow -le 0)) { throw "DynamicArenaCarry requires Warmup and DynamicArenaObservedWindow > 0" }
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
@@ -889,6 +900,17 @@ $arenaWrapProfileFinishSeconds = 0.0; $arenaWrapProfilePublishSeconds = 0.0
 $arenaWrapProfileTotalSeconds = 0.0; $arenaWrapSourcePartsCopySeconds = 0.0
 $arenaWrapSourcePartsChecksumSeconds = 0.0; $arenaWrapPartCount = 0
 $arenaWrapCopyWorkers = 0; $arenaWrapChecksumWorkers = 0
+$arenaWrapPartProfileObserved = $false; $arenaWrapPartProfileResult = "not_observed"
+$arenaWrapPartProfilePhases = 0; $arenaWrapPartProfileWorkers = 0
+$arenaWrapPartProfileParts = 0; $arenaWrapPartProfileBytes = 0
+$arenaWrapPartProfileMemcpySumSeconds = 0.0
+$arenaWrapPartProfileMainWorkerSeconds = 0.0; $arenaWrapPartProfileJoinSeconds = 0.0
+$arenaWrapPartProfileWorkerActiveMinSeconds = 0.0; $arenaWrapPartProfileWorkerActiveMaxSeconds = 0.0
+$arenaWrapPartProfileWorkerPartsMin = 0; $arenaWrapPartProfileWorkerPartsMax = 0
+$arenaWrapPartProfileSlowThresholdMs = 0.0; $arenaWrapPartProfileSlowParts = 0
+$arenaWrapPartProfileMaxPartMs = 0.0; $arenaWrapPartProfileMaxPartBytes = 0
+$arenaWrapPartProfileMaxPartLoad = 0; $arenaWrapPartProfileMaxPartCursor = 0
+$arenaWrapPartProfileMaxPartKind = "not_observed"; $arenaWrapPartProfileMaxPartSource = 0
 $arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
 $arenaObserverPublicationCount = 0; $arenaWrapPublicationCount = 0
@@ -1459,6 +1481,30 @@ if (Test-Path $stderrLog) {
             $arenaWrapChecksumWorkers = [int]$Matches[5]
         }
     }
+    $arenaWrapPartProfileLine = $lines | Where-Object { $_ -match "\[arena-wrap-part-profile\] result=" } | Select-Object -Last 1
+    if ($arenaWrapPartProfileLine -and $arenaWrapPartProfileLine -match "result=([^ ]+) phases=(\d+) workers=(\d+) parts=(\d+) bytes=(\d+) memcpy_sum=([0-9.]+) main_worker=([0-9.]+) join=([0-9.]+) phase_worker_active_min=([0-9.]+) phase_worker_active_max=([0-9.]+) phase_worker_parts_min=(\d+) phase_worker_parts_max=(\d+) slow_threshold_ms=([0-9.]+) slow_parts=(\d+) max_part_ms=([0-9.]+) max_part_bytes=(\d+) max_part_load=(\d+) max_part_cursor=(\d+) max_part_kind=([^ ]+) max_part_source=(\d+)") {
+        $arenaWrapPartProfileObserved = $true
+        $arenaWrapPartProfileResult = $Matches[1]
+        $arenaWrapPartProfilePhases = [int]$Matches[2]
+        $arenaWrapPartProfileWorkers = [int]$Matches[3]
+        $arenaWrapPartProfileParts = [long]$Matches[4]
+        $arenaWrapPartProfileBytes = [long]$Matches[5]
+        $arenaWrapPartProfileMemcpySumSeconds = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileMainWorkerSeconds = [double]::Parse($Matches[7], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileJoinSeconds = [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileWorkerActiveMinSeconds = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileWorkerActiveMaxSeconds = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileWorkerPartsMin = [long]$Matches[11]
+        $arenaWrapPartProfileWorkerPartsMax = [long]$Matches[12]
+        $arenaWrapPartProfileSlowThresholdMs = [double]::Parse($Matches[13], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileSlowParts = [long]$Matches[14]
+        $arenaWrapPartProfileMaxPartMs = [double]::Parse($Matches[15], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapPartProfileMaxPartBytes = [long]$Matches[16]
+        $arenaWrapPartProfileMaxPartLoad = [long]$Matches[17]
+        $arenaWrapPartProfileMaxPartCursor = [long]$Matches[18]
+        $arenaWrapPartProfileMaxPartKind = $Matches[19]
+        $arenaWrapPartProfileMaxPartSource = [long]$Matches[20]
+    }
     $arenaResultLines = @($lines | Where-Object { $_ -match "\[arena-observe\] window complete" })
     $arenaObserverPublicationCount = $arenaResultLines.Count
     $arenaResultLine = $arenaResultLines | Select-Object -Last 1
@@ -1843,6 +1889,24 @@ if ($ArenaWrapSourceParts) {
         throw "Arena WRAP source-parts measurement failed: unexpected cold checksum pass observed"
     }
 }
+if ($ArenaWrapPartProfile) {
+    if (-not $arenaWrapPartProfileObserved -or
+        $arenaWrapPartProfileResult -ne "copy-complete") {
+        throw "Arena WRAP part profile measurement failed: telemetry was not observed"
+    }
+    $expectedPartProfilePhases = if ($ArenaWrapTrustWorkerChecksum) { 3 } else { 1 }
+    if ($arenaWrapPartProfilePhases -ne $expectedPartProfilePhases -or
+        $arenaWrapPartProfileWorkers -ne $arenaWrapCopyWorkers -or
+        $arenaWrapPartProfileParts -ne $arenaWrapPartCount -or
+        $arenaWrapPartProfileBytes -le 0 -or
+        $arenaWrapPartProfileMaxPartBytes -le 0 -or
+        $arenaWrapPartProfileWorkerActiveMaxSeconds -le 0) {
+        throw "Arena WRAP part profile measurement failed: worker/part accounting differs"
+    }
+    if ([math]::Abs($arenaWrapPartProfileSlowThresholdMs - $ArenaWrapSlowPartMs) -gt 0.001) {
+        throw "Arena WRAP part profile measurement failed: slow-part threshold differs"
+    }
+}
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
 $serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
@@ -2039,6 +2103,8 @@ $summary = [pscustomobject]@{
     dynamic_arena_gib_requested = $DynamicArenaGiB
     arena_wrap_trust_worker_checksum_requested = [bool]$ArenaWrapTrustWorkerChecksum
     arena_wrap_schedule_requested = if ($ArenaWrapSourceParts) { "source-parts" } else { "expert-major" }
+    arena_wrap_part_profile_requested = [bool]$ArenaWrapPartProfile
+    arena_wrap_slow_part_ms_requested = $ArenaWrapSlowPartMs
     arena_wrap_profile_observed = $arenaWrapProfileObserved
     arena_wrap_profile_result = $arenaWrapProfileResult
     arena_wrap_schedule_observed = $arenaWrapScheduleObserved
@@ -2055,6 +2121,27 @@ $summary = [pscustomobject]@{
     arena_wrap_part_count = $arenaWrapPartCount
     arena_wrap_copy_workers = $arenaWrapCopyWorkers
     arena_wrap_checksum_workers = $arenaWrapChecksumWorkers
+    arena_wrap_part_profile_observed = $arenaWrapPartProfileObserved
+    arena_wrap_part_profile_result = $arenaWrapPartProfileResult
+    arena_wrap_part_profile_phases = $arenaWrapPartProfilePhases
+    arena_wrap_part_profile_workers = $arenaWrapPartProfileWorkers
+    arena_wrap_part_profile_parts = $arenaWrapPartProfileParts
+    arena_wrap_part_profile_bytes = $arenaWrapPartProfileBytes
+    arena_wrap_part_profile_memcpy_sum_seconds = $arenaWrapPartProfileMemcpySumSeconds
+    arena_wrap_part_profile_main_worker_seconds = $arenaWrapPartProfileMainWorkerSeconds
+    arena_wrap_part_profile_join_seconds = $arenaWrapPartProfileJoinSeconds
+    arena_wrap_part_profile_phase_worker_active_min_seconds = $arenaWrapPartProfileWorkerActiveMinSeconds
+    arena_wrap_part_profile_phase_worker_active_max_seconds = $arenaWrapPartProfileWorkerActiveMaxSeconds
+    arena_wrap_part_profile_phase_worker_parts_min = $arenaWrapPartProfileWorkerPartsMin
+    arena_wrap_part_profile_phase_worker_parts_max = $arenaWrapPartProfileWorkerPartsMax
+    arena_wrap_part_profile_slow_threshold_ms = $arenaWrapPartProfileSlowThresholdMs
+    arena_wrap_part_profile_slow_parts = $arenaWrapPartProfileSlowParts
+    arena_wrap_part_profile_max_part_ms = $arenaWrapPartProfileMaxPartMs
+    arena_wrap_part_profile_max_part_bytes = $arenaWrapPartProfileMaxPartBytes
+    arena_wrap_part_profile_max_part_load = $arenaWrapPartProfileMaxPartLoad
+    arena_wrap_part_profile_max_part_cursor = $arenaWrapPartProfileMaxPartCursor
+    arena_wrap_part_profile_max_part_kind = $arenaWrapPartProfileMaxPartKind
+    arena_wrap_part_profile_max_part_source = $arenaWrapPartProfileMaxPartSource
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
@@ -2404,6 +2491,7 @@ Write-Host ("arena publication/window+WRAP counts: " + $arenaObserverPublication
 Write-Host ("arena growth publications/skips: " + $arenaGrowthPublications + " / " + $arenaGrowthSkips)
 Write-Host ("arena WRAP loads/workers/sec/generation/preloaded/mirror GiB: " + $arenaWrapLoads + " / " + $arenaWrapWorkers + " / " + $arenaWrapSeconds + " / " + $arenaWrapGeneration + " / " + $arenaWrapPreloaded + " / " + $arenaWrapMirrorGiB)
 Write-Host ("arena WRAP profile result/schedule/checksum/total/copy/parts/workers: " + $arenaWrapProfileResult + " / " + $arenaWrapScheduleObserved + " / " + $arenaWrapChecksumObserved + " / " + $arenaWrapProfileTotalSeconds + " / " + $arenaWrapSourcePartsCopySeconds + " / " + $arenaWrapPartCount + " / " + $arenaWrapCopyWorkers)
+Write-Host ("arena WRAP part profile req/obs/workers/parts/memcpy/main/join/max-part-ms/slow: " + [bool]$ArenaWrapPartProfile + " / " + $arenaWrapPartProfileObserved + " / " + $arenaWrapPartProfileWorkers + " / " + $arenaWrapPartProfileParts + " / " + $arenaWrapPartProfileMemcpySumSeconds + " / " + $arenaWrapPartProfileMainWorkerSeconds + " / " + $arenaWrapPartProfileJoinSeconds + " / " + $arenaWrapPartProfileMaxPartMs + " / " + $arenaWrapPartProfileSlowParts)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
 Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaReportedResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
