@@ -505,7 +505,8 @@ static void cuda_reap_mass_observe_selected(
 static void cuda_prefill_mass_observe_selected(
         uint32_t layer_index, uint32_t n_tokens,
         const int32_t *selected, const float *weights,
-        uint32_t selected_count);
+        uint32_t selected_count,
+        const float *full_probs, uint32_t full_prob_count);
 static uint32_t cuda_dynamic_arena_active_count(void);
 static void cuda_dynamic_arena_observe_selected(
         uint32_t layer_index,
@@ -4207,7 +4208,7 @@ static void cuda_prefill_mass_observer_finalize(void) {
     observer.candidate_entries = capacity + (uint32_t)hash_entries;
     if (compose_requested > 0) {
         fprintf(stderr,
-                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u\n",
+                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u mass_source=full-probability-normalized-per-token\n",
                 hash_layers, (uint32_t)hash_entries, capacity,
                 observer.candidate_entries,
                 (uint32_t)residency_capacity);
@@ -4239,7 +4240,8 @@ static void cuda_prefill_mass_observer_finalize(void) {
 static void cuda_prefill_mass_observe_selected(
         uint32_t layer_index, uint32_t n_tokens,
         const int32_t *selected, const float *weights,
-        uint32_t selected_count) {
+        uint32_t selected_count,
+        const float *full_probs, uint32_t full_prob_count) {
     cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
     if (!observer.enabled || !selected || selected_count == 0 ||
         layer_index < 3 || layer_index >= g_dynamic_arena.n_layer) {
@@ -4248,7 +4250,12 @@ static void cuda_prefill_mass_observe_selected(
 
     const uint32_t base = layer_index * g_dynamic_arena.n_expert;
     if (!observer.finalized) {
-        if (!weights) {
+        const uint64_t expected_full_probs =
+            (uint64_t)n_tokens * g_dynamic_arena.n_expert;
+        const int use_full_probs = full_probs &&
+            full_prob_count == expected_full_probs &&
+            cuda_moe_prefill_tier_compose_requested() > 0;
+        if (!use_full_probs && !weights) {
             fprintf(stderr,
                     "ds4: [prefill-mass] weights unavailable; observer disabled\n");
             cuda_prefill_mass_observer_release(0);
@@ -4264,16 +4271,42 @@ static void cuda_prefill_mass_observe_selected(
             observer.rows_by_layer[layer_index] = UINT32_MAX;
         }
         observer.routed_slots += selected_count;
-        for (uint32_t i = 0; i < selected_count; i++) {
-            const int32_t expert = selected[i];
-            if (expert < 0 || (uint32_t)expert >= g_dynamic_arena.n_expert ||
-                !isfinite(weights[i])) {
-                continue;
+        if (use_full_probs) {
+            for (uint32_t token = 0; token < n_tokens; token++) {
+                const float *row = full_probs +
+                    (uint64_t)token * g_dynamic_arena.n_expert;
+                double row_sum = 0.0;
+                for (uint32_t expert = 0;
+                     expert < g_dynamic_arena.n_expert; expert++) {
+                    if (isfinite(row[expert]) && row[expert] > 0.0f) {
+                        row_sum += (double)row[expert];
+                    }
+                }
+                if (!(row_sum > 0.0) || !isfinite(row_sum)) continue;
+                for (uint32_t expert = 0;
+                     expert < g_dynamic_arena.n_expert; expert++) {
+                    if (!isfinite(row[expert]) || row[expert] <= 0.0f) continue;
+                    const uint32_t entry = base + expert;
+                    if (observer.counts[entry] == 0) observer.unique_entries++;
+                    if (observer.counts[entry] != UINT32_MAX) {
+                        observer.counts[entry]++;
+                    }
+                    observer.mass[entry] += (double)row[expert] / row_sum;
+                }
             }
-            const uint32_t entry = base + (uint32_t)expert;
-            if (observer.counts[entry] == 0) observer.unique_entries++;
-            if (observer.counts[entry] != UINT32_MAX) observer.counts[entry]++;
-            observer.mass[entry] += (double)weights[i];
+        } else {
+            for (uint32_t i = 0; i < selected_count; i++) {
+                const int32_t expert = selected[i];
+                if (expert < 0 ||
+                    (uint32_t)expert >= g_dynamic_arena.n_expert ||
+                    !isfinite(weights[i])) {
+                    continue;
+                }
+                const uint32_t entry = base + (uint32_t)expert;
+                if (observer.counts[entry] == 0) observer.unique_entries++;
+                if (observer.counts[entry] != UINT32_MAX) observer.counts[entry]++;
+                observer.mass[entry] += (double)weights[i];
+            }
         }
         return;
     }
@@ -13604,6 +13637,7 @@ struct cuda_moe_gather {
     ds4_gpu_tensor slot_tensor;
     std::vector<int32_t> h_sel;
     std::vector<float> h_weights;
+    std::vector<float> h_probs;
     std::vector<int32_t> h_expert_to_slot;
     std::vector<int32_t> h_compact_ids;
     std::vector<int32_t> h_slot_ids;
@@ -14757,6 +14791,7 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.slot_tensor.owner = 0;
     g_moe_gather.h_sel.clear();
     g_moe_gather.h_weights.clear();
+    g_moe_gather.h_probs.clear();
     g_moe_gather.h_expert_to_slot.clear();
     g_moe_gather.h_compact_ids.clear();
     g_moe_gather.h_slot_ids.clear();
@@ -16518,6 +16553,7 @@ static int cuda_moe_selected_load(
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg,
         const ds4_gpu_tensor *weights_arg,
+        const ds4_gpu_tensor *probs_arg,
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key) {
     g_moe_last_selected.valid = 0;
@@ -16560,6 +16596,8 @@ static int cuda_moe_selected_load(
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
     const int prefill_mass_weights =
         cuda_prefill_mass_observer_needs_weights();
+    const int prefill_mass_full_probs = prefill_mass_weights &&
+        n_tokens > 1u && cuda_moe_prefill_tier_compose_requested() > 0;
     const int reap_mass_requested = n_tokens == 1 &&
         cuda_reap_mass_observer_needs_weights() &&
         g_reap_router_trace_valid;
@@ -16582,6 +16620,17 @@ static int cuda_moe_selected_load(
         (layer_top1 || prefill_mass_weights ||
          (reap_mass_weights && !packed_reap_trace));
     const int host_weights_available = copy_weights || packed_reap_trace;
+    const uint64_t full_prob_count =
+        (uint64_t)n_tokens * n_total_expert;
+    if (prefill_mass_full_probs &&
+        (!probs_arg || !probs_arg->ptr ||
+         probs_arg->bytes < full_prob_count * sizeof(float) ||
+         full_prob_count > UINT32_MAX)) {
+        fprintf(stderr,
+                "ds4: [prefill-mass] full router probabilities unavailable; observer disabled\n");
+        cuda_prefill_mass_observer_release(0);
+        return 0;
+    }
 
     const int prepared =
         g_moe_selected_prepared.valid &&
@@ -16666,12 +16715,23 @@ static int cuda_moe_selected_load(
                                 (size_t)slot_count * sizeof(int32_t),
                                 cudaMemcpyDeviceToHost), "moe selected D2H")) return 0;
     }
+    if (prefill_mass_full_probs) {
+        g_moe_gather.h_probs.resize((size_t)full_prob_count);
+        if (!cuda_ok(cudaMemcpy(
+                g_moe_gather.h_probs.data(), probs_arg->ptr,
+                (size_t)full_prob_count * sizeof(float),
+                cudaMemcpyDeviceToHost), "moe full router probabilities D2H")) {
+            return 0;
+        }
+    }
     if (route_prof) route_t_d2h = cuda_wall_sec();
 
     cuda_prefill_mass_observe_selected(
         layer_index, n_tokens, g_moe_gather.h_sel.data(),
         host_weights_available ? g_moe_gather.h_weights.data() : NULL,
-        slot_count);
+        slot_count,
+        prefill_mass_full_probs ? g_moe_gather.h_probs.data() : NULL,
+        prefill_mass_full_probs ? (uint32_t)full_prob_count : 0u);
     if (reap_mass_weights) {
         cuda_reap_mass_observe_selected(
             layer_index, n_tokens, g_moe_gather.h_sel.data(),
@@ -17594,6 +17654,7 @@ static int routed_moe_launch(
         uint32_t out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs,
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
@@ -17694,7 +17755,8 @@ static int routed_moe_launch(
                                    gate_expert_bytes, down_expert_bytes,
                                    expert_in_dim,
                                    n_total_expert, n_expert, n_tokens,
-                                   selected, weights, spex_queue, spex_key);
+                                   selected, weights, probs,
+                                   spex_queue, spex_key);
         if (!selected_loaded && g_moe_gather.wave_fail_closed) {
             ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
             return 0;
@@ -18602,10 +18664,10 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_expert, clamp, x, 1,
+                             selected, weights, NULL, n_expert, clamp, x, 1,
                              spex_queue, spex_key);
 }
-extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens, bool *mid_is_f16) {
+extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *probs, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              layer_index,
@@ -18614,7 +18676,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_expert, clamp, x, n_tokens,
+                             selected, weights, probs, n_expert, clamp, x, n_tokens,
                              NULL, NULL);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {

@@ -13777,6 +13777,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    (uint32_t)routed_out_dim,
                                                    g->batch_router_selected,
                                                    g->batch_router_weights,
+                                                   g->batch_router_probs,
                                                    DS4_N_EXPERT_USED,
                                                    DS4_SWIGLU_CLAMP_EXP,
                                                    g->batch_ffn_norm,

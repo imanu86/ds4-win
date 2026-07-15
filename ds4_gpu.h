@@ -791,6 +791,7 @@ int ds4_gpu_routed_moe_batch_tensor(
         uint32_t                out_dim,
         const ds4_gpu_tensor *selected,
         const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs,
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
