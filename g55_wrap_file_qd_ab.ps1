@@ -212,7 +212,8 @@ function Invoke-G55Run {
         "arena_wrap_file_qd_observed",
         "arena_wrap_file_submits",
         "arena_wrap_file_completions",
-        "arena_wrap_file_failures")) {
+        "arena_wrap_file_failures",
+        "server_exit_code")) {
         Assert-G55Property -Object $r -Name $name -Tag $Tag
     }
 
@@ -231,6 +232,7 @@ function Invoke-G55Run {
         $r.expected_content_sha256 -ne $expected -or
         $r.results.Count -ne 1 -or
         $r.results[0].content_sha256 -ne $expected -or
+        [int]$r.server_exit_code -ne 0 -or
         $r.budget_gb -ne 2 -or $r.reserve_mb -ne 1024 -or
         $r.dynamic_arena_gib_requested -ne 30 -or
         -not $r.arena_wrap_trust_worker_checksum_requested -or
@@ -350,6 +352,7 @@ function Invoke-G55Run {
         model = $r.model
         model_bytes = $r.model_bytes
         model_last_write_utc = $r.model_last_write_utc
+        server_exit_code = [int]$r.server_exit_code
         build_worktree_dirty = $r.build_manifest_worktree_dirty_at_build_start
         expert_cache_capacity = [int]$r.expert_cache_capacity
         content_sha256 = $r.results[0].content_sha256
@@ -468,6 +471,7 @@ $provenanceFields = @(
     "build_input_fingerprint_sha256", "harness_sha256",
     "runtime_monitor_harness_sha256", "model",
     "model_bytes", "model_last_write_utc", "build_worktree_dirty",
+    "server_exit_code",
     "expert_cache_capacity", "content_sha256", "copy_workers",
     "sequential_workers_requested", "source_requested", "source_observed",
     "sequential_file_requested", "random_file_requested",

@@ -1061,6 +1061,7 @@ if (-not $stopped) {
     $stopped = $proc.WaitForExit(60000)
     if (-not $stopped) { throw "Owned ds4_server process did not exit after forced shutdown" }
 }
+$serverExitCode = [int]$proc.ExitCode
 Start-Sleep -Milliseconds 250
 if ($telemetryProc -and -not $telemetryProc.HasExited) {
     $telemetryProc.WaitForExit(10000) | Out-Null
@@ -2046,6 +2047,9 @@ if ($spexCpuProbeLineCount -gt 0) {
 }
 
 if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
+if ($serverExitCode -ne 0) {
+    throw "Measurement failed: ds4_server exited with code $serverExitCode"
+}
 if (@($results).Count -ne $Repeats) {
     throw "Measurement failed: expected $Repeats results, observed $(@($results).Count)"
 }
@@ -2534,6 +2538,7 @@ $summary = [pscustomobject]@{
     build_manifest_head = $buildManifest.head
     build_manifest_worktree_dirty_at_build_start = [bool]$buildManifest.worktree_dirty_at_build_start
     executable = $exe
+    server_exit_code = $serverExitCode
     model = $model
     model_bytes = [long]$modelInfoAtStart.Length
     model_last_write_utc = $modelInfoAtStart.LastWriteTimeUtc.ToString("o")
