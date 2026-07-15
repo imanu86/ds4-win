@@ -89,6 +89,15 @@ dedicated VRAM by 4.25%, but TTFT regressed 38.56% versus production. Keep it
 opt-in: G39 must double-buffer uploads and recover tile-capable wave kernels
 before any production promotion. See `G38_PREFILL_WAVES_RESULTS.md`.
 
+G39 adds opt-in two-parity weight and metadata slabs behind
+`DS4_CUDA_PREFILL_WAVE_DOUBLE_BUFFER=1`. Persistent compute events fence slab
+reuse across both waves and layer boundaries, while the upload stream stages
+wave N+1 after wave N launches. All 18 measured outputs and six warmups were
+exact. TTFT improved from 10.133 to 8.577 seconds versus the same serial wave31
+path (-15.36%), but remained 12.97% slower than production full-chunk prefill at
+7.592 seconds. Reads remained 20.20% below production. Keep G39 opt-in and next
+restore tile-capable wave kernels. See `G39_PREFILL_WAVE_OVERLAP_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -106,8 +115,9 @@ Follow-on measured gates are:
 1. Validate G36 mass/LFRU on a longer exact workload and a domain switch before
    changing the default from `second-touch`.
 2. P4-A batch-union is measured complete in G37. P4-B serial waved prefill is
-   exact but negative in G38; overlap upload N+1 with compute N and restore
-   tile-capable wave kernels before retesting production promotion.
+   exact but negative in G38. G39 overlap recovered 15.36% versus serial but is
+   still 12.97% behind production; restore tile-capable wave kernels before
+   retesting production promotion.
 3. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
    speculative traffic.
 4. Parallel transfer streams where the trace proves serialization remains.
@@ -119,6 +129,12 @@ Follow-on measured gates are:
    original prompt once. Compare total probe-plus-prefill TTFT, cold misses and
    transport bytes against one ordinary prefill; never claim a win from prefill
    time that excludes the probes.
+7. Request-scoped closed arena: from the prompt-intent mass, build one immutable
+   mask for the remainder of that request whose complete expert set fits pinned
+   RAM plus VRAM. Rank VRAM placement by mass, keep the remainder in pinned RAM,
+   and make outside experts ineligible for SSD transport. Compare against full
+   routing with all probe/build time included; this is not a reusable static
+   domain mask and must be rebuilt on an intent/domain change.
 
 ## Build
 

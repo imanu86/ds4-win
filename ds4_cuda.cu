@@ -1366,6 +1366,16 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
 
 static int cuda_model_stage_pool_alloc(uint64_t bytes) {
     if (g_model_stage_bytes >= bytes) return 1;
+    if (g_model_stage_bytes != 0 && g_model_upload_stream) {
+        cudaError_t err = cudaStreamSynchronize(g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA model staging resize drain failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            return 0;
+        }
+    }
     for (size_t i = 0; i < 4; i++) {
 #ifdef _WIN32
         if (g_moe_io_event[i]) {
@@ -13590,8 +13600,21 @@ struct cuda_moe_gather {
     std::vector<int32_t> h_wave_slots;
     std::vector<uint32_t> h_wave_pairs;
     cudaEvent_t wave_upload_ready;
+    char *wave_gate[2]; uint64_t wave_gate_cap[2];
+    char *wave_up[2];   uint64_t wave_up_cap[2];
+    char *wave_down[2]; uint64_t wave_down_cap[2];
+    int32_t *wave_slot[2]; uint64_t wave_slot_cap[2];
+    uint32_t *wave_pair[2]; uint64_t wave_pair_cap[2];
+    std::vector<int32_t> h_wave_slots_db[2];
+    std::vector<uint32_t> h_wave_pairs_db[2];
+    cudaEvent_t wave_upload_ready_db[2];
+    cudaEvent_t wave_compute_done[2];
+    uint32_t wave_active_pairs_db[2];
+    uint32_t wave_current_experts_db[2];
     uint8_t wave_active;
     uint8_t wave_fail_closed;
+    uint8_t wave_double_buffer;
+    uint8_t wave_compute_recorded[2];
     uint32_t wave_count;
     uint32_t wave_index;
     uint32_t wave_max_experts;
@@ -13641,6 +13664,16 @@ struct cuda_prefill_wave_stats {
     uint32_t max_wave;
 };
 static cuda_prefill_wave_stats g_prefill_wave_stats;
+
+struct cuda_prefill_wave_overlap_stats {
+    uint64_t activations;
+    uint64_t layers;
+    uint64_t waves;
+    uint64_t reuse_waits;
+    uint64_t compute_records;
+    uint64_t failures;
+};
+static cuda_prefill_wave_overlap_stats g_prefill_wave_overlap_stats;
 
 static uint64_t cuda_u64_saturating_add(uint64_t a, uint64_t b) {
     return b > UINT64_MAX - a ? UINT64_MAX : a + b;
@@ -14483,6 +14516,17 @@ static void cuda_moe_gather_release(void) {
                 (unsigned long long)g_prefill_wave_stats.failures);
     }
     g_prefill_wave_stats = {};
+    if (g_prefill_wave_overlap_stats.activations != 0) {
+        fprintf(stderr,
+                "ds4: [prefill-wave-overlap] final activations=%llu layers=%llu waves=%llu reuse_waits=%llu compute_records=%llu failures=%llu\n",
+                (unsigned long long)g_prefill_wave_overlap_stats.activations,
+                (unsigned long long)g_prefill_wave_overlap_stats.layers,
+                (unsigned long long)g_prefill_wave_overlap_stats.waves,
+                (unsigned long long)g_prefill_wave_overlap_stats.reuse_waits,
+                (unsigned long long)g_prefill_wave_overlap_stats.compute_records,
+                (unsigned long long)g_prefill_wave_overlap_stats.failures);
+    }
+    g_prefill_wave_overlap_stats = {};
     g_moe_selected_prepared.valid = 0;
     g_moe_last_selected.valid = 0;
     if (g_moe_gather.gate) (void)cudaFree(g_moe_gather.gate);
@@ -14492,6 +14536,19 @@ static void cuda_moe_gather_release(void) {
     if (g_moe_gather.route_ptrs) (void)cudaFree(g_moe_gather.route_ptrs);
     if (g_moe_gather.wave_upload_ready) {
         (void)cudaEventDestroy(g_moe_gather.wave_upload_ready);
+    }
+    for (uint32_t i = 0; i < 2u; i++) {
+        if (g_moe_gather.wave_gate[i]) (void)cudaFree(g_moe_gather.wave_gate[i]);
+        if (g_moe_gather.wave_up[i]) (void)cudaFree(g_moe_gather.wave_up[i]);
+        if (g_moe_gather.wave_down[i]) (void)cudaFree(g_moe_gather.wave_down[i]);
+        if (g_moe_gather.wave_slot[i]) (void)cudaFree(g_moe_gather.wave_slot[i]);
+        if (g_moe_gather.wave_pair[i]) (void)cudaFree(g_moe_gather.wave_pair[i]);
+        if (g_moe_gather.wave_upload_ready_db[i]) {
+            (void)cudaEventDestroy(g_moe_gather.wave_upload_ready_db[i]);
+        }
+        if (g_moe_gather.wave_compute_done[i]) {
+            (void)cudaEventDestroy(g_moe_gather.wave_compute_done[i]);
+        }
     }
     g_moe_gather.gate = NULL;
     g_moe_gather.up = NULL;
@@ -14523,8 +14580,28 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.h_wave_slots.clear();
     g_moe_gather.h_wave_pairs.clear();
     g_moe_gather.wave_upload_ready = NULL;
+    for (uint32_t i = 0; i < 2u; i++) {
+        g_moe_gather.wave_gate[i] = NULL;
+        g_moe_gather.wave_up[i] = NULL;
+        g_moe_gather.wave_down[i] = NULL;
+        g_moe_gather.wave_slot[i] = NULL;
+        g_moe_gather.wave_pair[i] = NULL;
+        g_moe_gather.wave_gate_cap[i] = 0;
+        g_moe_gather.wave_up_cap[i] = 0;
+        g_moe_gather.wave_down_cap[i] = 0;
+        g_moe_gather.wave_slot_cap[i] = 0;
+        g_moe_gather.wave_pair_cap[i] = 0;
+        g_moe_gather.h_wave_slots_db[i].clear();
+        g_moe_gather.h_wave_pairs_db[i].clear();
+        g_moe_gather.wave_upload_ready_db[i] = NULL;
+        g_moe_gather.wave_compute_done[i] = NULL;
+        g_moe_gather.wave_active_pairs_db[i] = 0;
+        g_moe_gather.wave_current_experts_db[i] = 0;
+        g_moe_gather.wave_compute_recorded[i] = 0;
+    }
     g_moe_gather.wave_active = 0;
     g_moe_gather.wave_fail_closed = 0;
+    g_moe_gather.wave_double_buffer = 0;
     g_moe_gather.wave_count = 0;
     g_moe_gather.wave_index = 0;
     g_moe_gather.wave_max_experts = 0;
@@ -15595,12 +15672,13 @@ static int cuda_moe_fill_spans_overlapped(
                 cuda_moe_io_cancel_pending(pending, count);
                 return 0;
             }
-            if (g_moe_io_stage_used[i]) {
-                if (cudaEventSynchronize(g_model_stage_event[i]) != cudaSuccess) {
-                    (void)cudaGetLastError();
-                    cuda_moe_io_cancel_pending(pending, count);
-                    return 0;
-                }
+            /* The serial and overlapped readers share this pinned staging
+             * ring. Event ownership, not producer-local bookkeeping, decides
+             * when a buffer may be overwritten by the next ReadFile. */
+            if (cudaEventSynchronize(g_model_stage_event[i]) != cudaSuccess) {
+                (void)cudaGetLastError();
+                cuda_moe_io_cancel_pending(pending, count);
+                return 0;
             }
 
             OVERLAPPED &ov = g_moe_io_ov[i];
@@ -15709,6 +15787,16 @@ static int cuda_prefill_waves_requested(void) {
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
+static int cuda_prefill_wave_double_buffer_requested(void) {
+    const char *env = getenv("DS4_CUDA_PREFILL_WAVE_DOUBLE_BUFFER");
+    if (!env || !env[0] || strcmp(env, "0") == 0) return 0;
+    if (strcmp(env, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: [prefill-wave-overlap] invalid DS4_CUDA_PREFILL_WAVE_DOUBLE_BUFFER=%s; request refused\n",
+            env);
+    return -1;
+}
+
 static uint32_t cuda_prefill_wave_force_experts(void) {
     const char *env = getenv("DS4_CUDA_PREFILL_WAVE_FORCE_EXPERTS");
     if (!env || !env[0]) return 0;
@@ -15746,12 +15834,14 @@ static int cuda_prefill_wave_debug_dump_active(void) {
 
 static uint32_t cuda_prefill_wave_budget_experts(
         uint64_t gate_expert_bytes,
-        uint64_t down_expert_bytes) {
+        uint64_t down_expert_bytes,
+        int double_buffer) {
     if (gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
         return 0;
     }
     const uint64_t expert_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
     if (expert_bytes == 0) return 0;
+    if (double_buffer && expert_bytes > UINT64_MAX / 2ull) return 0;
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
         (void)cudaGetLastError();
@@ -15762,12 +15852,71 @@ static uint32_t cuda_prefill_wave_budget_experts(
     const uint64_t reusable = cuda_u64_saturating_add(
         cuda_u64_saturating_add(g_moe_gather.gate_cap, g_moe_gather.up_cap),
         g_moe_gather.down_cap);
+    uint64_t reusable_db = 0;
+    if (double_buffer) {
+        for (uint32_t i = 0; i < 2u; i++) {
+            reusable_db = cuda_u64_saturating_add(
+                reusable_db,
+                cuda_u64_saturating_add(
+                    cuda_u64_saturating_add(g_moe_gather.wave_gate_cap[i],
+                                            g_moe_gather.wave_up_cap[i]),
+                    g_moe_gather.wave_down_cap[i]));
+        }
+    }
     if (free_bytes > reserve) free_bytes -= reserve;
     else free_bytes = 0;
-    const uint64_t budget = cuda_u64_saturating_add(free_bytes, reusable);
-    uint64_t experts = budget / expert_bytes;
+    const uint64_t budget = cuda_u64_saturating_add(
+        free_bytes, double_buffer ? reusable_db : reusable);
+    const uint64_t divisor = double_buffer ? expert_bytes * 2ull : expert_bytes;
+    if (divisor == 0) return 0;
+    uint64_t experts = budget / divisor;
     if (experts > 256ull) experts = 256ull;
     return (uint32_t)experts;
+}
+
+static int cuda_moe_wave_slab_ensure(
+        uint32_t parity,
+        uint32_t wave_experts,
+        uint32_t slot_count,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    if (parity >= 2u) return 0;
+    const uint64_t cgate = (uint64_t)wave_experts * gate_expert_bytes;
+    const uint64_t cdown = (uint64_t)wave_experts * down_expert_bytes;
+    if (!cuda_moe_gather_ensure(&g_moe_gather.wave_gate[parity],
+                                &g_moe_gather.wave_gate_cap[parity],
+                                cgate, "moe wave overlap gate") ||
+        !cuda_moe_gather_ensure(&g_moe_gather.wave_up[parity],
+                                &g_moe_gather.wave_up_cap[parity],
+                                cgate, "moe wave overlap up") ||
+        !cuda_moe_gather_ensure(&g_moe_gather.wave_down[parity],
+                                &g_moe_gather.wave_down_cap[parity],
+                                cdown, "moe wave overlap down") ||
+        !cuda_moe_gather_ensure_i32(&g_moe_gather.wave_slot[parity],
+                                     &g_moe_gather.wave_slot_cap[parity],
+                                     slot_count, "moe wave overlap slots") ||
+        !cuda_moe_gather_ensure(
+            (char **)&g_moe_gather.wave_pair[parity],
+            &g_moe_gather.wave_pair_cap[parity],
+            (uint64_t)slot_count * sizeof(uint32_t),
+            "moe wave overlap pairs")) {
+        return 0;
+    }
+    if (!g_moe_gather.wave_upload_ready_db[parity] &&
+        !cuda_ok(cudaEventCreateWithFlags(
+                     &g_moe_gather.wave_upload_ready_db[parity],
+                     cudaEventDisableTiming),
+                 "moe wave overlap upload event")) {
+        return 0;
+    }
+    if (!g_moe_gather.wave_compute_done[parity] &&
+        !cuda_ok(cudaEventCreateWithFlags(
+                     &g_moe_gather.wave_compute_done[parity],
+                     cudaEventDisableTiming),
+                 "moe wave overlap compute event")) {
+        return 0;
+    }
+    return 1;
 }
 
 static int cuda_moe_selected_stage_wave(
@@ -15794,27 +15943,75 @@ static int cuda_moe_selected_stage_wave(
     if (begin >= compact_count) return 0;
     if (end > compact_count) end = compact_count;
     const uint32_t wave_experts = end - begin;
+    const uint32_t parity = wave_index & 1u;
+    const int double_buffer = g_moe_gather.wave_double_buffer != 0;
     const uint64_t cgate = (uint64_t)wave_experts * gate_expert_bytes;
     const uint64_t cdown = (uint64_t)wave_experts * down_expert_bytes;
-    if (!cuda_moe_gather_ensure(&g_moe_gather.gate, &g_moe_gather.gate_cap,
-                                cgate, "moe wave gate") ||
-        !cuda_moe_gather_ensure(&g_moe_gather.up, &g_moe_gather.up_cap,
-                                cgate, "moe wave up") ||
-        !cuda_moe_gather_ensure(&g_moe_gather.down, &g_moe_gather.down_cap,
-                                cdown, "moe wave down") ||
-        !cuda_moe_gather_ensure_i32(&g_moe_gather.slot, &g_moe_gather.slot_cap,
-                                    slot_count, "moe wave slots")) {
-        return 0;
-    }
-    if (!g_moe_gather.wave_upload_ready &&
-        !cuda_ok(cudaEventCreateWithFlags(
-                     &g_moe_gather.wave_upload_ready, cudaEventDisableTiming),
-                 "moe wave upload event")) {
-        return 0;
+    char *gate_dst_base = NULL;
+    char *up_dst_base = NULL;
+    char *down_dst_base = NULL;
+    int32_t *slot_dst_base = NULL;
+    cudaEvent_t upload_ready = NULL;
+    std::vector<int32_t> *wave_slots_ptr = &g_moe_gather.h_wave_slots;
+    std::vector<uint32_t> *wave_pairs_ptr = &g_moe_gather.h_wave_pairs;
+    if (double_buffer) {
+        if (g_moe_gather.wave_compute_recorded[parity]) {
+            if (!cuda_ok(cudaEventSynchronize(
+                             g_moe_gather.wave_compute_done[parity]),
+                         "moe wave overlap reuse fence")) {
+                return 0;
+            }
+            g_moe_gather.wave_compute_recorded[parity] = 0;
+            g_prefill_wave_overlap_stats.reuse_waits =
+                cuda_u64_saturating_add(
+                    g_prefill_wave_overlap_stats.reuse_waits, 1);
+        }
+        if (!cuda_moe_wave_slab_ensure(parity, wave_experts, slot_count,
+                                       gate_expert_bytes, down_expert_bytes)) {
+            return 0;
+        }
+        gate_dst_base = g_moe_gather.wave_gate[parity];
+        up_dst_base = g_moe_gather.wave_up[parity];
+        down_dst_base = g_moe_gather.wave_down[parity];
+        slot_dst_base = g_moe_gather.wave_slot[parity];
+        upload_ready = g_moe_gather.wave_upload_ready_db[parity];
+        wave_slots_ptr = &g_moe_gather.h_wave_slots_db[parity];
+        wave_pairs_ptr = &g_moe_gather.h_wave_pairs_db[parity];
+        /* slot/pair uploads use pageable std::vector storage. Protect that host
+         * source before the parity vector is rewritten; compute remains async
+         * and device-slab reuse is fenced separately by compute_done above. */
+        if (!cuda_ok(cudaEventSynchronize(upload_ready),
+                     "moe wave overlap host source ready")) {
+            return 0;
+        }
+    } else {
+        if (!cuda_moe_gather_ensure(&g_moe_gather.gate, &g_moe_gather.gate_cap,
+                                    cgate, "moe wave gate") ||
+            !cuda_moe_gather_ensure(&g_moe_gather.up, &g_moe_gather.up_cap,
+                                    cgate, "moe wave up") ||
+            !cuda_moe_gather_ensure(&g_moe_gather.down, &g_moe_gather.down_cap,
+                                    cdown, "moe wave down") ||
+            !cuda_moe_gather_ensure_i32(&g_moe_gather.slot,
+                                        &g_moe_gather.slot_cap,
+                                        slot_count, "moe wave slots")) {
+            return 0;
+        }
+        if (!g_moe_gather.wave_upload_ready &&
+            !cuda_ok(cudaEventCreateWithFlags(
+                         &g_moe_gather.wave_upload_ready,
+                         cudaEventDisableTiming),
+                     "moe wave upload event")) {
+            return 0;
+        }
+        gate_dst_base = g_moe_gather.gate;
+        up_dst_base = g_moe_gather.up;
+        down_dst_base = g_moe_gather.down;
+        slot_dst_base = g_moe_gather.slot;
+        upload_ready = g_moe_gather.wave_upload_ready;
     }
 
-    std::vector<int32_t> &wave_slots = g_moe_gather.h_wave_slots;
-    std::vector<uint32_t> &wave_pairs = g_moe_gather.h_wave_pairs;
+    std::vector<int32_t> &wave_slots = *wave_slots_ptr;
+    std::vector<uint32_t> &wave_pairs = *wave_pairs_ptr;
     wave_slots.assign(slot_count, 0);
     wave_pairs.clear();
     wave_pairs.reserve(slot_count);
@@ -15867,9 +16064,9 @@ static int cuda_moe_selected_stage_wave(
                 cuda_dynamic_arena_copy_expert_async(
                     model_map, layer_index, expert,
                     gate_offset, up_offset, down_offset,
-                    g_moe_gather.gate + gate_dst,
-                    g_moe_gather.up + gate_dst,
-                    g_moe_gather.down + down_dst,
+                    gate_dst_base + gate_dst,
+                    up_dst_base + gate_dst,
+                    down_dst_base + down_dst,
                     gate_expert_bytes, gate_expert_bytes,
                     down_expert_bytes);
             if (arena_status == CUDA_DYNAMIC_ARENA_FATAL) {
@@ -15881,15 +16078,15 @@ static int cuda_moe_selected_stage_wave(
                 continue;
             }
         }
-        append_span(g_moe_gather.gate + gate_dst,
+        append_span(gate_dst_base + gate_dst,
                     gate_offset + (uint64_t)expert * gate_expert_bytes,
                     gate_expert_bytes, expert,
                     CUDA_DYNAMIC_ARENA_MIRROR_GATE);
-        append_span(g_moe_gather.up + gate_dst,
+        append_span(up_dst_base + gate_dst,
                     up_offset + (uint64_t)expert * gate_expert_bytes,
                     gate_expert_bytes, expert,
                     CUDA_DYNAMIC_ARENA_MIRROR_UP);
-        append_span(g_moe_gather.down + down_dst,
+        append_span(down_dst_base + down_dst,
                     down_offset + (uint64_t)expert * down_expert_bytes,
                     down_expert_bytes, expert,
                     CUDA_DYNAMIC_ARENA_MIRROR_DOWN);
@@ -15916,14 +16113,23 @@ static int cuda_moe_selected_stage_wave(
             }
         }
     }
-    if (!fill_ok ||
-        !cuda_ok(cudaMemcpyAsync(g_moe_gather.slot, wave_slots.data(),
-                                 (size_t)slot_count * sizeof(int32_t),
-                                 cudaMemcpyHostToDevice,
-                                 g_model_upload_stream),
-                 "moe wave slots upload") ||
-        !cuda_ok(cudaEventRecord(g_moe_gather.wave_upload_ready,
-                                 g_model_upload_stream),
+    int metadata_ok = fill_ok &&
+        cuda_ok(cudaMemcpyAsync(slot_dst_base, wave_slots.data(),
+                                (size_t)slot_count * sizeof(int32_t),
+                                cudaMemcpyHostToDevice,
+                                g_model_upload_stream),
+                "moe wave slots upload");
+    if (metadata_ok && double_buffer) {
+        metadata_ok = cuda_ok(cudaMemcpyAsync(
+                                  g_moe_gather.wave_pair[parity],
+                                  wave_pairs.data(),
+                                  (size_t)wave_pairs.size() * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice,
+                                  g_model_upload_stream),
+                              "moe wave overlap pairs upload");
+    }
+    if (!metadata_ok ||
+        !cuda_ok(cudaEventRecord(upload_ready, g_model_upload_stream),
                  "moe wave upload ready")) {
         (void)cudaStreamSynchronize(g_model_upload_stream);
         return 0;
@@ -15950,12 +16156,17 @@ static int cuda_moe_selected_stage_wave(
         g_moe_gather.wave_arena_experts, arena_experts);
     g_moe_gather.wave_direct_experts = cuda_u64_saturating_add(
         g_moe_gather.wave_direct_experts, wave_experts - arena_experts);
-    g_moe_gather.slot_tensor.ptr = g_moe_gather.slot;
+    g_moe_gather.slot_tensor.ptr = slot_dst_base;
     g_moe_gather.slot_tensor.bytes = (uint64_t)slot_count * sizeof(int32_t);
     g_moe_gather.slot_tensor.owner = 0;
     g_moe_gather.wave_index = wave_index;
     g_moe_gather.wave_current_experts = wave_experts;
     g_moe_gather.wave_active_pairs = (uint32_t)wave_pairs.size();
+    if (double_buffer) {
+        g_moe_gather.wave_current_experts_db[parity] = wave_experts;
+        g_moe_gather.wave_active_pairs_db[parity] =
+            (uint32_t)wave_pairs.size();
+    }
     return 1;
 }
 
@@ -16049,6 +16260,11 @@ static int cuda_moe_selected_load(
     g_moe_gather.wave_arena_h2d_bytes = 0;
     g_moe_gather.wave_arena_experts = 0;
     g_moe_gather.wave_direct_experts = 0;
+    g_moe_gather.wave_double_buffer = 0;
+    for (uint32_t i = 0; i < 2u; i++) {
+        g_moe_gather.wave_active_pairs_db[i] = 0;
+        g_moe_gather.wave_current_experts_db[i] = 0;
+    }
     const int route_prof = getenv("DS4_CUDA_MOE_ROUTE_PROFILE") != NULL;
     const int prefill_union_stats = n_tokens > 1u &&
         getenv("DS4_CUDA_PREFILL_UNION_STATS") != NULL;
@@ -16220,6 +16436,12 @@ static int cuda_moe_selected_load(
                     layer_index, n_tokens, compact_count);
             return 0;
         }
+        const int double_buffer_requested =
+            cuda_prefill_wave_double_buffer_requested();
+        if (double_buffer_requested < 0) {
+            g_moe_gather.wave_fail_closed = 1;
+            return 0;
+        }
         uint32_t max_wave_experts = cuda_prefill_wave_force_experts();
         if (max_wave_experts == UINT32_MAX) {
             g_moe_gather.wave_fail_closed = 1;
@@ -16228,7 +16450,8 @@ static int cuda_moe_selected_load(
         if (max_wave_experts == 0) {
             const uint32_t budget_experts =
                 cuda_prefill_wave_budget_experts(gate_expert_bytes,
-                                                 down_expert_bytes);
+                                                 down_expert_bytes,
+                                                 double_buffer_requested > 0);
             if (budget_experts != 0 && compact_count > budget_experts) {
                 max_wave_experts = budget_experts;
             }
@@ -16236,6 +16459,8 @@ static int cuda_moe_selected_load(
         if (max_wave_experts != 0 && max_wave_experts < compact_count) {
             g_moe_gather.wave_active = 1;
             g_moe_gather.wave_fail_closed = 1;
+            g_moe_gather.wave_double_buffer =
+                double_buffer_requested > 0 ? 1u : 0u;
             g_moe_gather.wave_max_experts = max_wave_experts;
             g_moe_gather.wave_count =
                 (compact_count + max_wave_experts - 1u) / max_wave_experts;
@@ -16245,6 +16470,11 @@ static int cuda_moe_selected_load(
                     gate_offset, up_offset, down_offset,
                     gate_expert_bytes, down_expert_bytes,
                     n_total_expert, n_expert, n_tokens, 0u)) {
+                if (g_moe_gather.wave_double_buffer) {
+                    g_prefill_wave_overlap_stats.failures =
+                        cuda_u64_saturating_add(
+                            g_prefill_wave_overlap_stats.failures, 1);
+                }
                 return 0;
             }
             g_prefill_wave_stats.activations = cuda_u64_saturating_add(
@@ -16253,6 +16483,11 @@ static int cuda_moe_selected_load(
                 g_prefill_wave_stats.unique_experts, compact_count);
             if (max_wave_experts > g_prefill_wave_stats.max_wave) {
                 g_prefill_wave_stats.max_wave = max_wave_experts;
+            }
+            if (g_moe_gather.wave_double_buffer) {
+                g_prefill_wave_overlap_stats.activations =
+                    cuda_u64_saturating_add(
+                        g_prefill_wave_overlap_stats.activations, 1);
             }
             if (route_prof) {
                 route_t_transport = cuda_wall_sec();
@@ -17086,9 +17321,16 @@ static int routed_moe_launch(
     g_moe_last_selected.valid = 0;
     /* Wave state belongs to this routed-MoE invocation. Decode can take the
      * resident-route path without calling selected-load, so stale prefill
-     * state must never survive into the next layer/token. */
+     * activation must never survive into the next layer/token. Per-parity
+     * compute ownership is persistent and is cleared only by the reuse fence
+     * in cuda_moe_selected_stage_wave(). */
     g_moe_gather.wave_active = 0;
     g_moe_gather.wave_fail_closed = 0;
+    g_moe_gather.wave_double_buffer = 0;
+    for (uint32_t i = 0; i < 2u; i++) {
+        g_moe_gather.wave_active_pairs_db[i] = 0;
+        g_moe_gather.wave_current_experts_db[i] = 0;
+    }
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -17181,9 +17423,15 @@ static int routed_moe_launch(
                 up_w = g_moe_expert_cache.up;
                 down_w = g_moe_expert_cache.down;
             } else {
-                gate_w = g_moe_gather.gate;
-                up_w = g_moe_gather.up;
-                down_w = g_moe_gather.down;
+                if (g_moe_gather.wave_double_buffer) {
+                    gate_w = g_moe_gather.wave_gate[0];
+                    up_w = g_moe_gather.wave_up[0];
+                    down_w = g_moe_gather.wave_down[0];
+                } else {
+                    gate_w = g_moe_gather.gate;
+                    up_w = g_moe_gather.up;
+                    down_w = g_moe_gather.down;
+                }
             }
             use_mixed_route_ptrs = g_moe_gather.mixed_direct_active;
             mixed_route_ptrs = use_mixed_route_ptrs ? g_moe_gather.route_ptrs : NULL;
@@ -17300,39 +17548,69 @@ static int routed_moe_launch(
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && g_moe_gather.wave_active) {
             if (!wave_pairs_dev) ok = 0;
+            const int wave_double_buffer =
+                g_moe_gather.wave_double_buffer != 0;
             for (uint32_t wave = 0; ok && wave < g_moe_gather.wave_count; wave++) {
-                if (wave != 0u) {
+                const uint32_t parity = wave & 1u;
+                const char *wave_gate_w = gate_w;
+                const char *wave_up_w = up_w;
+                const char *wave_down_w = down_w;
+                const int32_t *wave_selected =
+                    (const int32_t *)selected->ptr;
+                uint32_t *wave_pairs_current = wave_pairs_dev;
+                cudaEvent_t wave_upload_ready =
+                    g_moe_gather.wave_upload_ready;
+                std::vector<uint32_t> *wave_pairs_host =
+                    &g_moe_gather.h_wave_pairs;
+                uint32_t wave_pair_count =
+                    g_moe_gather.wave_active_pairs;
+                if (wave_double_buffer) {
+                    wave_gate_w = g_moe_gather.wave_gate[parity];
+                    wave_up_w = g_moe_gather.wave_up[parity];
+                    wave_down_w = g_moe_gather.wave_down[parity];
+                    wave_selected = g_moe_gather.wave_slot[parity];
+                    wave_pairs_current = g_moe_gather.wave_pair[parity];
+                    wave_upload_ready =
+                        g_moe_gather.wave_upload_ready_db[parity];
+                    wave_pairs_host =
+                        &g_moe_gather.h_wave_pairs_db[parity];
+                    wave_pair_count =
+                        g_moe_gather.wave_active_pairs_db[parity];
+                }
+                if (!wave_double_buffer && wave != 0u) {
                     ok = cuda_ok(cudaStreamSynchronize(0),
                                  "moe wave execution sync");
                 }
-                if (ok && wave != 0u) {
+                if (ok && !wave_double_buffer && wave != 0u) {
                     ok = cuda_moe_selected_stage_wave(
                         model_map, layer_index,
                         gate_offset, up_offset, down_offset,
                         gate_expert_bytes, down_expert_bytes,
                         n_total_expert, n_expert, n_tokens, wave);
+                    wave_pair_count = g_moe_gather.wave_active_pairs;
                 }
                 if (ok) {
                     ok = cuda_ok(cudaStreamWaitEvent(
-                                     0, g_moe_gather.wave_upload_ready, 0),
+                                     0, wave_upload_ready, 0),
                                  "moe wave upload wait");
                 }
                 if (!ok) break;
                 g_prefill_wave_stats.upload_waits =
                     cuda_u64_saturating_add(g_prefill_wave_stats.upload_waits, 1);
-                const uint32_t wave_pair_count = g_moe_gather.wave_active_pairs;
                 if (wave_pair_count == 0 ||
                     wave_pair_count > pair_count ||
-                    g_moe_gather.h_wave_pairs.size() != wave_pair_count) {
+                    wave_pairs_host->size() != wave_pair_count) {
                     ok = 0;
                     break;
                 }
-                ok = cuda_ok(cudaMemcpyAsync(
-                                 wave_pairs_dev,
-                                 g_moe_gather.h_wave_pairs.data(),
-                                 (size_t)wave_pair_count * sizeof(uint32_t),
-                                 cudaMemcpyHostToDevice, 0),
-                             "routed_moe wave pairs upload");
+                if (!wave_double_buffer) {
+                    ok = cuda_ok(cudaMemcpyAsync(
+                                     wave_pairs_dev,
+                                     wave_pairs_host->data(),
+                                     (size_t)wave_pair_count * sizeof(uint32_t),
+                                     cudaMemcpyHostToDevice, 0),
+                                 "routed_moe wave pairs upload");
+                }
                 if (!ok) break;
 
                 dim3 mgrid((expert_mid_dim + 31u) / 32u,
@@ -17341,11 +17619,11 @@ static int routed_moe_launch(
                     (float *)gate->ptr,
                     (float *)up->ptr,
                     (float *)mid->ptr,
-                    gate_w,
-                    up_w,
+                    wave_gate_w,
+                    wave_up_w,
                     xq,
-                    wave_pairs_dev,
-                    (const int32_t *)selected->ptr,
+                    wave_pairs_current,
+                    wave_selected,
                     (const float *)weights->ptr,
                     gate_expert_bytes,
                     gate_row_bytes,
@@ -17366,10 +17644,10 @@ static int routed_moe_launch(
                 dim3 dgrid((out_dim + 31u) / 32u, wave_pair_count, 1);
                 moe_down_sorted_qwarp32_kernel<<<dgrid, 256>>>(
                     (float *)down->ptr,
-                    down_w,
+                    wave_down_w,
                     midq,
-                    wave_pairs_dev,
-                    (const int32_t *)selected->ptr,
+                    wave_pairs_current,
+                    wave_selected,
                     down_expert_bytes,
                     down_row_bytes,
                     midq_blocks,
@@ -17377,12 +17655,36 @@ static int routed_moe_launch(
                     n_expert);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe wave down launch");
                 if (!ok) break;
+                if (wave_double_buffer) {
+                    ok = cuda_ok(cudaEventRecord(
+                                     g_moe_gather.wave_compute_done[parity], 0),
+                                 "moe wave overlap compute done");
+                    if (!ok) break;
+                    g_moe_gather.wave_compute_recorded[parity] = 1;
+                    g_prefill_wave_overlap_stats.compute_records =
+                        cuda_u64_saturating_add(
+                            g_prefill_wave_overlap_stats.compute_records, 1);
+                }
 
                 g_prefill_wave_stats.waves =
                     cuda_u64_saturating_add(g_prefill_wave_stats.waves, 1);
                 g_prefill_wave_stats.active_pairs =
                     cuda_u64_saturating_add(g_prefill_wave_stats.active_pairs,
                                             wave_pair_count);
+                if (wave_double_buffer) {
+                    g_prefill_wave_overlap_stats.waves =
+                        cuda_u64_saturating_add(
+                            g_prefill_wave_overlap_stats.waves, 1);
+                    const uint32_t next_wave = wave + 1u;
+                    if (next_wave < g_moe_gather.wave_count) {
+                        ok = cuda_moe_selected_stage_wave(
+                            model_map, layer_index,
+                            gate_offset, up_offset, down_offset,
+                            gate_expert_bytes, down_expert_bytes,
+                            n_total_expert, n_expert, n_tokens, next_wave);
+                        if (!ok) break;
+                    }
+                }
             }
             if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
             if (ok) {
@@ -17398,6 +17700,11 @@ static int routed_moe_launch(
             if (ok) {
                 g_prefill_wave_stats.layers = cuda_u64_saturating_add(
                     g_prefill_wave_stats.layers, 1);
+                if (wave_double_buffer) {
+                    g_prefill_wave_overlap_stats.layers =
+                        cuda_u64_saturating_add(
+                            g_prefill_wave_overlap_stats.layers, 1);
+                }
                 if (getenv("DS4_CUDA_PREFILL_UNION_STATS") != NULL) {
                     g_prefill_union_stats.calls = cuda_u64_saturating_add(
                         g_prefill_union_stats.calls, 1);
@@ -17435,6 +17742,11 @@ static int routed_moe_launch(
             } else {
                 g_prefill_wave_stats.failures = cuda_u64_saturating_add(
                     g_prefill_wave_stats.failures, 1);
+                if (wave_double_buffer) {
+                    g_prefill_wave_overlap_stats.failures =
+                        cuda_u64_saturating_add(
+                            g_prefill_wave_overlap_stats.failures, 1);
+                }
             }
             if (prof_ev[6]) {
                 (void)cudaEventRecord(prof_ev[6], 0);
