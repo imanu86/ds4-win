@@ -437,7 +437,17 @@ if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v1" -or
     $launch.executable_sha256 -ne $provenance.executable_sha256 -or
     $launch.harness_sha256 -ne $provenance.harness_sha256 -or
     $launch.runtime_monitor_harness_sha256 -ne
-        $provenance.runtime_monitor_harness_sha256) {
+        $provenance.runtime_monitor_harness_sha256 -or
+    $launch.ds4_cuda_sha256 -ne $provenance.ds4_cuda_sha256 -or
+    $launch.ds4_c_sha256 -ne $provenance.ds4_c_sha256 -or
+    $launch.ds4_server_c_sha256 -ne $provenance.ds4_server_c_sha256 -or
+    $launch.ds4_bake_c_sha256 -ne $provenance.ds4_bake_c_sha256 -or
+    $launch.ds4_bake_h_sha256 -ne $provenance.ds4_bake_h_sha256 -or
+    $launch.build_manifest_sha256 -ne $provenance.build_manifest_sha256 -or
+    $launch.prompt -ne $Prompt -or
+    [int]$launch.max_tokens -ne $MaxTokens -or
+    $launch.expected_content_sha256 -ne
+        $ExpectedContentSHA256.ToLowerInvariant()) {
     throw "G57 launch provenance mismatch: tag=$effectiveTag"
 }
 if ($launch.pack_path -and
@@ -449,6 +459,7 @@ if ($launch.pack_path -and
 $r = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
 if ($r.tag -ne $effectiveTag -or
     $r.model -ne $resolvedModel -or
+    $r.prompt -ne $Prompt -or
     [int]$r.repeats -ne 1 -or
     [bool]$r.warmup -ne $false -or
     [int]$r.requested_max_tokens -ne $MaxTokens -or
@@ -459,8 +470,19 @@ if ($r.tag -ne $effectiveTag -or
     $r.harness_sha256 -ne $provenance.harness_sha256 -or
     $r.runtime_monitor_harness_sha256 -ne
         $provenance.runtime_monitor_harness_sha256 -or
+    $r.ds4_cuda_sha256 -ne $provenance.ds4_cuda_sha256 -or
+    $r.ds4_c_sha256 -ne $provenance.ds4_c_sha256 -or
+    $r.ds4_server_c_sha256 -ne $provenance.ds4_server_c_sha256 -or
+    $r.build_manifest_sha256 -ne $provenance.build_manifest_sha256 -or
     [bool]$r.gpu_resident_routes_requested -ne $false -or
-    [bool]$r.no_selected_load -ne $false) {
+    [bool]$r.no_selected_load -ne $false -or
+    [double]$r.dynamic_arena_gib_requested -ne 0.0 -or
+    [bool]$r.prefill_mass_wrap_requested -ne $false -or
+    [bool]$r.compose_prefill_mass_tiering_requested -ne $false -or
+    [int]$r.expert_cache_requested -ne 0 -or
+    $r.expert_tiering_requested -ne "off" -or
+    [bool]$r.spex_dry_run_requested -ne $false -or
+    [string]$r.reap_mask_file_requested -ne "") {
     throw "G57 result contract mismatch: tag=$effectiveTag"
 }
 if ($ExpectedContentSHA256 -and
