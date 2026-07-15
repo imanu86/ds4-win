@@ -38,6 +38,7 @@ param(
     [ValidateRange(0, 512)][int]$ExpertCacheN = 0,
     [ValidateRange(0.0, 6.0)][double]$ExpertCacheReserveGB = 0.5,
     [ValidateSet("lru", "layer-top1")][string]$ExpertCachePolicy = "lru",
+    [ValidateSet("off", "observe", "enforce")][string]$ExpertTiering = "off",
     [switch]$DirectCacheHits,
     [switch]$MixedDirectCache,
     [switch]$GpuResidentRoutes,
@@ -239,6 +240,11 @@ if ($ExpertCacheN -gt 0) {
     Remove-Item Env:\DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_MOE_CACHE_POLICY -ErrorAction SilentlyContinue
 }
+if ($ExpertTiering -eq "off") {
+    Remove-Item Env:\DS4_EXPERT_TIERING -ErrorAction SilentlyContinue
+} else {
+    $env:DS4_EXPERT_TIERING = $ExpertTiering
+}
 if ($DirectCacheHits) {
     $env:DS4_CUDA_MOE_DIRECT_CACHE_HITS = "1"
     if ($Diagnostics) {
@@ -316,6 +322,18 @@ if ($SpexDryRun) {
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
 $env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
+if ($ExpertTiering -ne "off") {
+    if (-not $GpuResidentRoutes) { throw "ExpertTiering requires GpuResidentRoutes" }
+    if ($ExpertCacheN -le 0) { throw "ExpertTiering requires ExpertCacheN > 0" }
+    if (-not $DisableQ8F16Cache -or $Q8F16CacheMB -ne 0) { throw "ExpertTiering requires Q8-F16 cache disabled" }
+    if ($SplitHitMiss) { throw "ExpertTiering must be isolated from SplitHitMiss" }
+    if ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0) { throw "ExpertTiering must be isolated from SPEX" }
+    if ($PrefillMassObserve -or $PrefillMassWrap -or $ReapMassObserve -or $ReapMassWrap) { throw "ExpertTiering must be isolated from prefill/REAP mass observe/wrap" }
+    if ($DynamicArenaObservedWindow -gt 0 -or $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default") { throw "ExpertTiering must be isolated from dynamic arena observer/grow/carry" }
+    if ($ReapMaskFile) { throw "ExpertTiering must be isolated from ReapMaskFile" }
+    if ($OverlapShared -or $OverlapSharedFull) { throw "ExpertTiering must be isolated from overlap" }
+    if ($ExpertTiering -eq "enforce" -and $DynamicArenaGiB -le 0.0) { throw "ExpertTiering enforce requires DynamicArenaGiB > 0" }
+}
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
 if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObserve requires DynamicArenaGiB > 0" }
 if ($PrefillMassWrap -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassWrap requires DynamicArenaGiB > 0" }
@@ -659,6 +677,16 @@ $observedIoQD = 1; $overlappedIoObserved = $false; $overlappedIoFallbacks = 0
 $cacheCalls = 0; $cacheLastLayer = -1; $cacheLastCompact = 0
 $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
 $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
+$expertTieringFinalObserved = $false; $expertTieringFinalLineCount = 0; $expertTieringControlLineCount = 0
+$expertTieringModeObserved = ""; $expertTieringCalls = 0; $expertTieringSelected = 0
+$expertTieringCold = 0; $expertTieringRamHits = 0; $expertTieringVramHits = 0
+$expertTieringColdToRam = 0; $expertTieringColdToVram = 0; $expertTieringRamToWarm = 0
+$expertTieringVramPromotions = 0; $expertTieringVramDemotions = 0; $expertTieringRamEvictions = 0
+$expertTieringRamAdmitSkips = 0; $expertTieringTransient = 0; $expertTieringFailures = 0
+$expertTieringSsdBytes = 0; $expertTieringRamH2DBytes = 0
+$expertTieringStatesSsd = 0; $expertTieringStatesProbation = 0
+$expertTieringStatesWarm = 0; $expertTieringStatesVram = 0
+$expertTieringMassSum = 0.0; $expertTieringLfruTop = 0.0
 $mixedDirectObserved = $false; $mixedDirectCalls = 0
 $mixedDirectCacheRoutes = 0; $mixedDirectCompactRoutes = 0
 $routeProfileObserved = $false; $routeProfileCalls = 0
@@ -852,6 +880,30 @@ if (Test-Path $stderrLog) {
         $cacheCapacity = [int]$Matches[4]; $cacheCount = [int]$Matches[5]
         $cacheHits = [long]$Matches[6]; $cacheMisses = [long]$Matches[7]; $cacheAdmissions = [long]$Matches[8]
         $cacheEvictions = [long]$Matches[9]; $cacheDirect = [long]$Matches[10]
+    }
+    $expertTieringControlLineCount = @($lines | Where-Object { $_ -match "\[expert-tiering\] control" }).Count
+    $expertTieringFinalLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[expert-tiering\] final " })
+    $expertTieringFinalLineCount = $expertTieringFinalLines.Count
+    if ($expertTieringFinalLineCount -gt 0) {
+        $expertTieringFinalLine = $expertTieringFinalLines | Select-Object -Last 1
+        $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) lfru_top=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)$"
+        if ($expertTieringFinalLine -notmatch $expertTieringFinalPattern) {
+            throw "Expert tiering measurement failed: final line format mismatch"
+        }
+        $expertTieringFinalObserved = $true
+        $expertTieringModeObserved = $Matches[1]
+        $expertTieringCalls = [uint64]$Matches[2]; $expertTieringSelected = [uint64]$Matches[3]
+        $expertTieringCold = [uint64]$Matches[4]; $expertTieringRamHits = [uint64]$Matches[5]
+        $expertTieringVramHits = [uint64]$Matches[6]; $expertTieringColdToRam = [uint64]$Matches[7]
+        $expertTieringColdToVram = [uint64]$Matches[8]; $expertTieringRamToWarm = [uint64]$Matches[9]
+        $expertTieringVramPromotions = [uint64]$Matches[10]; $expertTieringVramDemotions = [uint64]$Matches[11]
+        $expertTieringRamEvictions = [uint64]$Matches[12]; $expertTieringRamAdmitSkips = [uint64]$Matches[13]
+        $expertTieringTransient = [uint64]$Matches[14]; $expertTieringFailures = [uint64]$Matches[15]
+        $expertTieringSsdBytes = [uint64]$Matches[16]; $expertTieringRamH2DBytes = [uint64]$Matches[17]
+        $expertTieringStatesSsd = [uint32]$Matches[18]; $expertTieringStatesProbation = [uint32]$Matches[19]
+        $expertTieringStatesWarm = [uint32]$Matches[20]; $expertTieringStatesVram = [uint32]$Matches[21]
+        $expertTieringMassSum = [double]::Parse($Matches[22], [Globalization.CultureInfo]::InvariantCulture)
+        $expertTieringLfruTop = [double]::Parse($Matches[23], [Globalization.CultureInfo]::InvariantCulture)
     }
     $mixedDirectLines = $lines | Where-Object { $_ -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)" }
     foreach ($mixedDirectLine in $mixedDirectLines) {
@@ -1138,6 +1190,54 @@ if ($contextObserved -ne $Context) {
     throw "Measurement failed: requested context $Context, observed $contextObserved"
 }
 
+if ($ExpertTiering -eq "off") {
+    if ($expertTieringFinalLineCount -ne 0 -or $expertTieringControlLineCount -ne 0) {
+        throw "Expert tiering measurement failed: telemetry appeared while off"
+    }
+} else {
+    if ($expertTieringControlLineCount -ne 0) { throw "Expert tiering measurement failed: control telemetry was observed" }
+    if ($expertTieringFinalLineCount -ne 1 -or -not $expertTieringFinalObserved) { throw "Expert tiering measurement failed: final counters were not observed exactly once" }
+    if ($expertTieringModeObserved -ne $ExpertTiering) { throw "Expert tiering measurement failed: observed mode mismatch" }
+    if ($expertTieringCalls -le 0 -or $expertTieringSelected -le 0) { throw "Expert tiering measurement failed: no routed calls were observed" }
+    if ($expertTieringFailures -ne 0) { throw "Expert tiering measurement failed: runtime failures observed" }
+    if ($expertTieringSelected -ne ($expertTieringCalls * 6)) { throw "Expert tiering measurement failed: selected count does not equal calls*6" }
+    if ($expertTieringCold -gt $expertTieringSelected -or
+        $expertTieringRamHits -gt $expertTieringSelected -or
+        $expertTieringVramHits -gt $expertTieringSelected -or
+        $expertTieringTransient -gt $expertTieringSelected) {
+        throw "Expert tiering measurement failed: hit counters exceed selected count"
+    }
+    if (($expertTieringCold + $expertTieringRamHits + $expertTieringVramHits) -gt $expertTieringSelected) {
+        throw "Expert tiering measurement failed: hit accounting exceeds selected count"
+    }
+    if ($expertTieringColdToRam -gt $expertTieringCold -or $expertTieringColdToVram -gt $expertTieringCold) {
+        throw "Expert tiering measurement failed: cold transition counters exceed cold count"
+    }
+    if ($expertTieringVramDemotions -gt ($expertTieringVramPromotions + $expertTieringColdToVram)) {
+        throw "Expert tiering measurement failed: VRAM demotions exceed admissions"
+    }
+    if ($expertTieringStatesVram -gt $ExpertCacheN) {
+        throw "Expert tiering measurement failed: VRAM state count exceeds ExpertCacheN"
+    }
+    if ($ExpertTiering -eq "enforce" -and
+        ($expertTieringColdToVram -ne 0 -or
+         $expertTieringColdToRam -le 0 -or
+         $expertTieringTransient -le 0 -or
+         $expertTieringVramPromotions -le 0)) {
+        throw "Expert tiering measurement failed: enforce transition contract was violated"
+    }
+    $expertTieringStateTotal = [uint64]$expertTieringStatesSsd + [uint64]$expertTieringStatesProbation + [uint64]$expertTieringStatesWarm + [uint64]$expertTieringStatesVram
+    if ($expertTieringStateTotal -le 0 -or $expertTieringStateTotal -gt 1000000) {
+        throw "Expert tiering measurement failed: state counters are unreasonable"
+    }
+    if ([double]::IsNaN($expertTieringMassSum) -or [double]::IsInfinity($expertTieringMassSum) -or $expertTieringMassSum -lt 0.0 -or $expertTieringMassSum -gt [double]$expertTieringSelected) {
+        throw "Expert tiering measurement failed: mass_sum is unreasonable"
+    }
+    if ([double]::IsNaN($expertTieringLfruTop) -or [double]::IsInfinity($expertTieringLfruTop) -or $expertTieringLfruTop -lt 0.0) {
+        throw "Expert tiering measurement failed: lfru_top is unreasonable"
+    }
+}
+
 if ($SpexDryRun) {
     $expectedSpexCap = $effectiveSpexCap
     if (-not $spexObserved) { throw "SPEX measurement failed: no runtime counters observed" }
@@ -1315,6 +1415,35 @@ $meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Aver
 $minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
 $maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
+$expertTieringResult = [pscustomobject]@{
+    requested_mode = $ExpertTiering
+    final_observed = $expertTieringFinalObserved
+    final_line_count = $expertTieringFinalLineCount
+    control_line_count = $expertTieringControlLineCount
+    mode = $expertTieringModeObserved
+    calls = $expertTieringCalls
+    selected = $expertTieringSelected
+    cold = $expertTieringCold
+    ram_hits = $expertTieringRamHits
+    vram_hits = $expertTieringVramHits
+    cold_to_ram = $expertTieringColdToRam
+    cold_to_vram = $expertTieringColdToVram
+    ram_to_warm = $expertTieringRamToWarm
+    vram_promotions = $expertTieringVramPromotions
+    vram_demotions = $expertTieringVramDemotions
+    ram_evictions = $expertTieringRamEvictions
+    ram_admit_skips = $expertTieringRamAdmitSkips
+    transient = $expertTieringTransient
+    failures = $expertTieringFailures
+    ssd_bytes = $expertTieringSsdBytes
+    ram_h2d_bytes = $expertTieringRamH2DBytes
+    states_ssd = $expertTieringStatesSsd
+    states_probation = $expertTieringStatesProbation
+    states_warm = $expertTieringStatesWarm
+    states_vram = $expertTieringStatesVram
+    mass_sum = $expertTieringMassSum
+    lfru_top = $expertTieringLfruTop
+}
 $rawOutputs = [pscustomobject]@{
     schema = "g7_raw_outputs_v1"
     tag = $Tag
@@ -1330,6 +1459,7 @@ $rawOutputs = [pscustomobject]@{
     warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
+    expert_tiering = $expertTieringResult
     results = $results
 }
 $rawOutputs | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $rawOutputsPath
@@ -1565,6 +1695,8 @@ $summary = [pscustomobject]@{
     expert_cache_requested = $ExpertCacheN
     expert_cache_reserve_gb = $ExpertCacheReserveGB
     expert_cache_policy = $ExpertCachePolicy
+    expert_tiering_requested = $ExpertTiering
+    expert_tiering = $expertTieringResult
     direct_cache_hits_requested = [bool]$DirectCacheHits
     mixed_direct_cache_requested = [bool]$MixedDirectCache
     mixed_direct_cache_observed = $mixedDirectObserved
@@ -1733,6 +1865,7 @@ Write-Host ("moe_io_qd req/observed: " + $IoQD + " / " + $observedIoQD)
 Write-Host ("moe_io_fallbacks: " + $overlappedIoFallbacks)
 Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapacity + " / " + $cacheCount)
 Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
+Write-Host ("expert_tiering requested/observed/calls/selected/failures/states vram/mass/lfru: " + $ExpertTiering + " / " + $expertTieringModeObserved + " / " + $expertTieringCalls + " / " + $expertTieringSelected + " / " + $expertTieringFailures + " / " + $expertTieringStatesVram + " / " + $expertTieringMassSum + " / " + $expertTieringLfruTop)
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
 Write-Host ("gpu resident routes requested/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms: " + [bool]$GpuResidentRoutes + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs)

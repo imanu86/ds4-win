@@ -16,6 +16,9 @@ host. The working branch is `port/windows-dynamic-arena-0051`.
   Published bindings remain valid until a complete replacement is ready.
 - Direct H2D from arena hits into the compact selected-expert buffer, with model,
   layer, expert, offset, geometry, generation, and checksum validation.
+- Opt-in exact tiering with `DS4_EXPERT_TIERING=enforce`: first cold touch ends
+  in pinned RAM and uses transient GPU staging; persistent VRAM admission starts
+  only on reuse, and VRAM eviction retains a warm RAM copy.
 
 The earlier mapped-register window is not the production path on this 12 GiB
 card. It consumed proportional VRAM, displaced reusable hot weights, and reduced
@@ -46,6 +49,16 @@ Consequently:
 See `G17_PINNED_ARENA_CAPACITY_RESULTS.md` and
 `G18_DYNAMIC_ARENA_WRAP_RESULTS.md` for commands, caveats, and raw-result names.
 
+G35 is the first exact positive physical-tiering checkpoint. With the same
+8 GiB arena allocated in both arms, cache336 LRU and one discarded warmup plus
+three measured requests, server decode increased from 3.228333 to 4.975000 t/s
+(+54.10%). All outputs and warmups matched the expected greedy hash. Enforcement
+recorded 1,005 cold-to-RAM transitions, zero cold-to-VRAM transitions and zero
+runtime failures. The initial fill cost increased by about 7.18 seconds; the
+next gate is slower mass/LFRU promotion with hysteresis to reduce the observed
+4,299 promotions and 3,963 demotions. See
+`G35_REAL_EXPERT_TIERING_RESULTS.md`.
+
 ## 0051 remaining work
 
 G19 connects a session-learned W16/K23 mechanism gate to the G18 transaction.
@@ -60,7 +73,8 @@ a prompt-trained mask. See `G19_0051_POLICY_INTEGRATION_PLAN.md`.
 
 Follow-on measured gates are:
 
-1. A mass-pinned VRAM resident tier using the same published generation.
+1. Replace G35 second-touch promotion with mass/LFRU admission at a slow clock
+   and hysteresis, without weakening the cold-to-RAM invariant.
 2. Chunked, preemptible gate/up/down WRAP so confirmed entrants can preempt
    speculative traffic.
 3. Parallel transfer streams where the trace proves serialization remains.
