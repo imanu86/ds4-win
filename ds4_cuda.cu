@@ -272,6 +272,9 @@ static std::vector<float *> g_reap_router_bias;
 static uint8_t g_sparse_bake_retained[43u * 32u];
 static uint16_t g_sparse_bake_retained_count[43u];
 static int g_sparse_bake_active;
+static uint64_t g_sparse_bake_route_calls;
+static uint64_t g_sparse_bake_route_slots;
+static uint64_t g_sparse_bake_route_rejections;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
@@ -314,6 +317,9 @@ static void cuda_sparse_bake_reset_state(void) {
     memset(g_sparse_bake_retained_count, 0,
            sizeof(g_sparse_bake_retained_count));
     g_sparse_bake_active = 0;
+    g_sparse_bake_route_calls = 0;
+    g_sparse_bake_route_slots = 0;
+    g_sparse_bake_route_rejections = 0;
 }
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
@@ -2003,6 +2009,14 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_moe_expert_cache_release();
     ds4_gpu_dynamic_arena_release();
     cuda_reap_router_bias_release_all();
+    if (g_sparse_bake_active) {
+        fprintf(stderr,
+                "ds4: [sparse-bake-runtime] result=summary "
+                "route_calls=%llu route_slots=%llu rejected=%llu\n",
+                (unsigned long long)g_sparse_bake_route_calls,
+                (unsigned long long)g_sparse_bake_route_slots,
+                (unsigned long long)g_sparse_bake_route_rejections);
+    }
     cuda_sparse_bake_reset_state();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -6867,6 +6881,8 @@ extern "C" int ds4_gpu_sparse_bake_set_retained_mask(
         mask_bytes != sizeof(g_sparse_bake_retained)) return 0;
 
     uint16_t counts[43u] = {0};
+    uint32_t retained_total = 0;
+    uint32_t sparse_layers = 0;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t expert = 0; expert < experts; expert++) {
             const uint32_t bit = layer * experts + expert;
@@ -6874,12 +6890,21 @@ extern "C" int ds4_gpu_sparse_bake_set_retained_mask(
                 (mask[bit >> 3] >> (bit & 7u)) & 1u;
         }
         if (counts[layer] < 6u) return 0;
+        retained_total += counts[layer];
+        if (counts[layer] < experts) sparse_layers++;
     }
     memcpy(g_sparse_bake_retained, mask,
            sizeof(g_sparse_bake_retained));
     memcpy(g_sparse_bake_retained_count, counts,
            sizeof(g_sparse_bake_retained_count));
     g_sparse_bake_active = 1;
+    g_sparse_bake_route_calls = 0;
+    g_sparse_bake_route_slots = 0;
+    g_sparse_bake_route_rejections = 0;
+    fprintf(stderr,
+            "ds4: [sparse-bake-runtime] result=guards-installed "
+            "layers=%u sparse_layers=%u retained=%u\n",
+            layers, sparse_layers, retained_total);
     return 1;
 }
 
@@ -18411,6 +18436,7 @@ static int cuda_moe_selected_load(
             if (expert < 0 || (uint32_t)expert >= n_total_expert ||
                 !cuda_sparse_bake_expert_retained(
                     layer_index, (uint32_t)expert)) {
+                g_sparse_bake_route_rejections++;
                 fprintf(stderr,
                         "ds4: sparse bake rejected routed selection "
                         "layer=%u slot=%u expert=%d\n",
@@ -18418,6 +18444,8 @@ static int cuda_moe_selected_load(
                 return 0;
             }
         }
+        g_sparse_bake_route_calls++;
+        g_sparse_bake_route_slots += slot_count;
     }
     if (route_prof) route_t_d2h = cuda_wall_sec();
 

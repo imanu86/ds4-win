@@ -1578,8 +1578,10 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
     free(spans);
     if (routed_expert_bytes != 0) {
         fprintf(stderr,
-                "ds4: CUDA startup cache excluded %.2f GiB of routed-expert tensors; dedicated expert cache owns residency\n",
-                (double)routed_expert_bytes / 1073741824.0);
+                "ds4: CUDA startup cache excluded %.2f GiB of routed-expert tensors; %s owns residency\n",
+                (double)routed_expert_bytes / 1073741824.0,
+                m->bake_embedded ? "sparse selected-expert transport" :
+                    "dedicated expert cache");
     }
     if (staged_embedding_bytes != 0) {
         fprintf(stderr,
