@@ -3235,6 +3235,30 @@ static int cuda_dynamic_arena_wrap_sequential_file(void) {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
+static uint32_t cuda_dynamic_arena_wrap_sequential_workers(
+        uint32_t work_count) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_SEQUENTIAL_WORKERS");
+    uint32_t workers = 1;
+    if (value && value[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long parsed = strtoul(value, &end, 10);
+        if (errno == 0 && end && *end == '\0' && parsed >= 1 && parsed <= 32) {
+            workers = (uint32_t)parsed;
+        } else {
+            static int warned = 0;
+            if (!warned) {
+                fprintf(stderr,
+                        "ds4: invalid sequential WRAP worker count '%s'; using 1\n",
+                        value);
+                warned = 1;
+            }
+        }
+    }
+    if (work_count != 0 && workers > work_count) workers = work_count;
+    return workers;
+}
+
 static int cuda_dynamic_arena_wrap_trust_worker_checksum(void) {
     const char *value =
         getenv("DS4_CUDA_ARENA_WRAP_TRUST_WORKER_CHECKSUM");
@@ -3375,6 +3399,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
     double source_parts_copy_seconds = 0;
     double source_parts_checksum_seconds = 0;
     uint32_t checksum_workers = 0;
+    uint32_t requested_copy_workers = 0;
     int source_parts_copy_failed = 0;
     double source_parts_main_worker_seconds = 0;
     double source_parts_join_seconds = 0;
@@ -3445,8 +3470,10 @@ static int cuda_dynamic_arena_wrap_publish_target(
                         return ao < bo;
                     });
             }
-            const uint32_t requested_workers = sequential_file_requested ? 1u :
+            const uint32_t requested_workers = sequential_file_requested ?
+                cuda_dynamic_arena_wrap_sequential_workers(work_count) :
                 cuda_dynamic_arena_observer_workers(work_count);
+            requested_copy_workers = requested_workers;
             threads.resize(requested_workers > 1 ? requested_workers - 1 : 0);
             started_threads.reserve(threads.size());
             if (part_profile &&
@@ -3507,6 +3534,12 @@ static int cuda_dynamic_arena_wrap_publish_target(
                     1u + (uint32_t)started_threads.size();
                 if (phase_workers > local.workers) {
                     local.workers = phase_workers;
+                }
+                if (sequential_file_requested &&
+                    phase_workers != requested_copy_workers) {
+                    local.reason = "copy-workers";
+                    source_parts_copy_failed = 1;
+                    all_succeeded = 0;
                 }
                 const double main_worker_started_at = cuda_wall_sec();
                 (void)cuda_dynamic_arena_part_copy_worker(&context);

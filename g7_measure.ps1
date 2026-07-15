@@ -24,6 +24,7 @@ param(
     [switch]$ArenaWrapTrustWorkerChecksum,
     [switch]$ArenaWrapSourceParts,
     [switch]$ArenaWrapSequentialFile,
+    [ValidateRange(1, 32)][int]$ArenaWrapSequentialWorkers = 1,
     [switch]$ArenaWrapPartProfile,
     [ValidateRange(0.001, 600000.0)][double]$ArenaWrapSlowPartMs = 25.0,
     [switch]$ArenaWrapTrimBetweenPhases,
@@ -146,6 +147,9 @@ if ($ArenaWrapTrimBetweenPhases -and
 }
 if ($ArenaWrapSequentialFile -and -not $ArenaWrapSourceParts) {
     throw "ArenaWrapSequentialFile requires -ArenaWrapSourceParts"
+}
+if ($ArenaWrapSequentialWorkers -ne 1 -and -not $ArenaWrapSequentialFile) {
+    throw "ArenaWrapSequentialWorkers other than 1 requires -ArenaWrapSequentialFile"
 }
 if ($QuiescenceProbeOnly -and $SkipSystemQuiescencePreflight) {
     throw "QuiescenceProbeOnly cannot be combined with SkipSystemQuiescencePreflight"
@@ -338,8 +342,10 @@ if ($ArenaWrapSourceParts) {
 }
 if ($ArenaWrapSequentialFile) {
     $env:DS4_CUDA_ARENA_WRAP_SEQUENTIAL_FILE = "1"
+    $env:DS4_CUDA_ARENA_WRAP_SEQUENTIAL_WORKERS = "$ArenaWrapSequentialWorkers"
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SEQUENTIAL_FILE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_SEQUENTIAL_WORKERS -ErrorAction SilentlyContinue
 }
 if ($ArenaWrapPartProfile) {
     $env:DS4_CUDA_ARENA_WRAP_PART_PROFILE = "1"
@@ -2294,6 +2300,10 @@ if ($ArenaWrapSourceParts) {
     if ($arenaWrapSourceObserved -ne $expectedArenaWrapSource) {
         throw "Arena WRAP source-parts measurement failed: observed source differs"
     }
+    if ($ArenaWrapSequentialFile -and
+        $arenaWrapCopyWorkers -ne $ArenaWrapSequentialWorkers) {
+        throw "Arena WRAP sequential-file measurement failed: observed worker count differs"
+    }
     if ($ArenaWrapTrustWorkerChecksum -and
         $arenaWrapChecksumObserved -ne "fnv1a64-worker-only") {
         throw "Arena WRAP source-parts measurement failed: observed checksum mode differs"
@@ -2552,6 +2562,7 @@ $summary = [pscustomobject]@{
     arena_wrap_schedule_requested = if ($ArenaWrapSourceParts) { "source-parts" } else { "expert-major" }
     arena_wrap_source_requested = if ($ArenaWrapSequentialFile) { "sequential-file" } else { "mmap" }
     arena_wrap_sequential_file_requested = [bool]$ArenaWrapSequentialFile
+    arena_wrap_sequential_workers_requested = $ArenaWrapSequentialWorkers
     arena_wrap_part_profile_requested = [bool]$ArenaWrapPartProfile
     arena_wrap_slow_part_ms_requested = $ArenaWrapSlowPartMs
     arena_wrap_trim_between_phases_requested = [bool]$ArenaWrapTrimBetweenPhases
