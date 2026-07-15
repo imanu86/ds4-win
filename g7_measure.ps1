@@ -29,6 +29,7 @@ param(
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
+    [ValidateRange(0, 32)][int]$PrefillVramSeedPerLayer = 0,
     [switch]$ReapMassObserve,
     [switch]$ReapMassWrap,
     [string]$ReapMaskFile = "",
@@ -344,6 +345,11 @@ if ($ComposePrefillMassTiering) {
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_TIER_COMPOSE -ErrorAction SilentlyContinue
 }
+if ($PrefillVramSeedPerLayer -gt 0) {
+    $env:DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER = "$PrefillVramSeedPerLayer"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER -ErrorAction SilentlyContinue
+}
 if ($ReapMassObserve -or $ReapMassWrap) {
     $env:DS4_CUDA_REAP_MASS_OBSERVE = "1"
     $env:DS4_CUDA_REAP_MASS_WINDOW = "$ReapMassWindow"
@@ -546,6 +552,16 @@ if ($ComposePrefillMassTiering) {
     if ($Warmup -or $Repeats -ne 1) { throw "ComposePrefillMassTiering requires one request and no warmup" }
     if ($PrefillMassObserve -or $ReapMassObserve -or $ReapMassWrap) { throw "ComposePrefillMassTiering must be isolated from observe-only prefill and REAP mass" }
     if ($DynamicArenaObservedWindow -gt 0 -or $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default") { throw "ComposePrefillMassTiering must be isolated from dynamic arena observer/grow/carry" }
+}
+if ($PrefillVramSeedPerLayer -gt 0) {
+    if (-not $ComposePrefillMassTiering) { throw "PrefillVramSeedPerLayer requires ComposePrefillMassTiering" }
+    if (-not $PrefillMassWrap) { throw "PrefillVramSeedPerLayer requires PrefillMassWrap" }
+    if ($ExpertTiering -ne "enforce" -or $ExpertTierPolicy -ne "mass-lfru") { throw "PrefillVramSeedPerLayer requires enforce mass-lfru tiering" }
+    if (-not $GpuResidentRoutes) { throw "PrefillVramSeedPerLayer requires GpuResidentRoutes" }
+    $prefillVramSeedSlots = 40 * $PrefillVramSeedPerLayer
+    if ($prefillVramSeedSlots -gt $ExpertCacheN) {
+        throw "PrefillVramSeedPerLayer requires at least $prefillVramSeedSlots expert-cache slots"
+    }
 }
 if ($ExpertTiering -ne "off") {
     if (-not $GpuResidentRoutes) { throw "ExpertTiering requires GpuResidentRoutes" }
@@ -1110,6 +1126,12 @@ $prefillMassComposeObserved = $false; $prefillMassComposeEventCount = 0
 $prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
 $prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
 $prefillMassComposeCapacity = 0
+$prefillVramSeedObserved = $false; $prefillVramSeedLineCount = 0
+$prefillVramSeedResult = "not_observed"; $prefillVramSeedReason = "not_observed"
+$prefillVramSeedRequestedObserved = 0; $prefillVramSeedLayers = 0
+$prefillVramSeedEntries = 0; $prefillVramSeedBytes = 0
+$prefillVramSeedSeconds = 0.0; $prefillVramSeedFailures = 0
+$prefillVramSeedPriorMass = 0.0; $prefillVramSeedSemantics = "not_observed"
 $reapMassArmed = $false; $reapMassResultObserved = $false
 $reapMassWindowObserved = 0; $reapMassTopObserved = 0
 $reapMassFirstLayer = 0; $reapMassLastLayer = 0
@@ -1489,6 +1511,44 @@ if (Test-Path $stderrLog) {
             $expertTieringMassSum = [double]::Parse($Matches[33], [Globalization.CultureInfo]::InvariantCulture)
             $expertTieringLfruTop = [double]::Parse($Matches[34], [Globalization.CultureInfo]::InvariantCulture)
         }
+    }
+    $prefillVramSeedLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[prefill-vram-seed\] " })
+    $prefillVramSeedLineCount = $prefillVramSeedLines.Count
+    if ($prefillVramSeedLineCount -gt 0) {
+        if ($prefillVramSeedLineCount -ne 1) {
+            throw "Prefill VRAM seed measurement failed: expected exactly one telemetry line"
+        }
+        $prefillVramSeedPattern = "^ds4: \[prefill-vram-seed\] result=(ok|failed) reason=([a-z0-9_-]+) requested_per_layer=(\d+) layers=(\d+) entries=(\d+) bytes=(\d+) seconds=([0-9.]+) failures=(\d+) prior_mass=([0-9.eE+-]+) semantics=([a-z0-9_-]+)$"
+        $prefillVramSeedLine = $prefillVramSeedLines[0].Trim()
+        if ($prefillVramSeedLine -notmatch $prefillVramSeedPattern) {
+            throw "Prefill VRAM seed measurement failed: telemetry format mismatch"
+        }
+        $prefillVramSeedObserved = $true
+        $prefillVramSeedResult = $Matches[1]
+        $prefillVramSeedReason = $Matches[2]
+        $prefillVramSeedRequestedObserved = [uint32]$Matches[3]
+        $prefillVramSeedLayers = [uint32]$Matches[4]
+        $prefillVramSeedEntries = [uint32]$Matches[5]
+        $prefillVramSeedBytes = [uint64]$Matches[6]
+        $prefillVramSeedSeconds = [double]::Parse($Matches[7], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillVramSeedFailures = [uint32]$Matches[8]
+        $prefillVramSeedPriorMass = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillVramSeedSemantics = $Matches[10]
+    }
+    if ($PrefillVramSeedPerLayer -gt 0) {
+        $expectedPrefillVramSeedEntries = 40 * $PrefillVramSeedPerLayer
+        if (-not $prefillVramSeedObserved -or $prefillVramSeedResult -ne "ok" -or
+            $prefillVramSeedReason -ne "ok" -or
+            $prefillVramSeedRequestedObserved -ne $PrefillVramSeedPerLayer -or
+            $prefillVramSeedLayers -ne 40 -or
+            $prefillVramSeedEntries -ne $expectedPrefillVramSeedEntries -or
+            $prefillVramSeedBytes -le 0 -or $prefillVramSeedFailures -ne 0 -or
+            $prefillVramSeedPriorMass -le 0.0 -or
+            $prefillVramSeedSemantics -ne "request-scoped-top-per-layer") {
+            throw "PrefillVramSeedPerLayer was requested but successful exact seed telemetry was not observed"
+        }
+    } elseif ($prefillVramSeedLineCount -ne 0) {
+        throw "Prefill VRAM seed activated while not requested"
     }
     $mixedDirectLines = $lines | Where-Object { $_ -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)" }
     foreach ($mixedDirectLine in $mixedDirectLines) {
@@ -2199,6 +2259,19 @@ $expertTieringResult = [pscustomobject]@{
     requested_mode = $ExpertTiering
     requested_policy = $ExpertTierPolicy
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
+    prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
+    prefill_vram_seed_observed = $prefillVramSeedObserved
+    prefill_vram_seed_line_count = $prefillVramSeedLineCount
+    prefill_vram_seed_result = $prefillVramSeedResult
+    prefill_vram_seed_reason = $prefillVramSeedReason
+    prefill_vram_seed_requested_per_layer_observed = $prefillVramSeedRequestedObserved
+    prefill_vram_seed_layers = $prefillVramSeedLayers
+    prefill_vram_seed_entries = $prefillVramSeedEntries
+    prefill_vram_seed_bytes = $prefillVramSeedBytes
+    prefill_vram_seed_seconds = $prefillVramSeedSeconds
+    prefill_vram_seed_failures = $prefillVramSeedFailures
+    prefill_vram_seed_prior_mass = $prefillVramSeedPriorMass
+    prefill_vram_seed_semantics = $prefillVramSeedSemantics
     compose_prefill_mass_tiering_observed = $expertTieringComposeObserved
     compose_prefill_mass_tiering_flag = $expertTieringComposeFlag
     snapshot_generation = $expertTieringSnapshotGeneration
@@ -2426,6 +2499,19 @@ $summary = [pscustomobject]@{
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
+    prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
+    prefill_vram_seed_observed = $prefillVramSeedObserved
+    prefill_vram_seed_line_count = $prefillVramSeedLineCount
+    prefill_vram_seed_result = $prefillVramSeedResult
+    prefill_vram_seed_reason = $prefillVramSeedReason
+    prefill_vram_seed_requested_per_layer_observed = $prefillVramSeedRequestedObserved
+    prefill_vram_seed_layers = $prefillVramSeedLayers
+    prefill_vram_seed_entries = $prefillVramSeedEntries
+    prefill_vram_seed_bytes = $prefillVramSeedBytes
+    prefill_vram_seed_seconds = $prefillVramSeedSeconds
+    prefill_vram_seed_failures = $prefillVramSeedFailures
+    prefill_vram_seed_prior_mass = $prefillVramSeedPriorMass
+    prefill_vram_seed_semantics = $prefillVramSeedSemantics
     reap_mass_observe_requested = [bool]($ReapMassObserve -or $ReapMassWrap)
     reap_mass_wrap_requested = [bool]$ReapMassWrap
     reap_mass_window_requested = $ReapMassWindow
@@ -2765,6 +2851,7 @@ Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [
 Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
 Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
 Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
+Write-Host ("prefill VRAM seed req/obs/result/layers/entries/GiB/sec/failures: " + $PrefillVramSeedPerLayer + " / " + $prefillVramSeedObserved + " / " + $prefillVramSeedResult + " / " + $prefillVramSeedLayers + " / " + $prefillVramSeedEntries + " / " + [math]::Round($prefillVramSeedBytes / 1GB, 3) + " / " + $prefillVramSeedSeconds + " / " + $prefillVramSeedFailures)
 Write-Host ("REAP mass requested/armed/window/top/transport/tokens/slots/unique/top mass/touched: " + [bool]($ReapMassObserve -or $ReapMassWrap) + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTransport + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
 Write-Host ("REAP mass WRAP requested/armed/grow/hysteresis/capacity/router/mask/policy: " + [bool]$ReapMassWrap + " / " + $reapMassWrapArmed + " / " + $reapMassWrapGrowIntervalObserved + " / " + $reapMassWrapHysteresisObserved + " / " + $reapMassWrapCapacity + " / " + $reapMassWrapRouterArmed + " / " + $reapMassWrapMaskArmed + " / " + $reapMassWrapPolicyArmed)
 Write-Host ("REAP mass WRAP events/published/skipped/failed/entrants/victims/loads/sec: " + $reapMassWrapEventCount + " / " + $reapMassWrapPublicationCount + " / " + $reapMassWrapSkippedCount + " / " + $reapMassWrapFailureCount + " / " + $reapMassWrapEntrants + " / " + $reapMassWrapVictims + " / " + $reapMassWrapLoads + " / " + $reapMassWrapSeconds)

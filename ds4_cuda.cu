@@ -14686,6 +14686,7 @@ struct cuda_moe_expert_cache {
     uint32_t requested;
     uint32_t capacity;
     uint32_t count;
+    uint32_t prefill_vram_seed_per_layer;
     std::vector<cuda_moe_cache_slot> slots;
     std::vector<int32_t> host_slot_by_layer_expert;
     int32_t *device_slot_by_layer_expert;
@@ -14744,6 +14745,23 @@ static int cuda_moe_split_hit_miss_requested(void) {
 static int cuda_moe_route_no_default_sync_requested(void) {
     const char *env = getenv("DS4_CUDA_MOE_ROUTE_NO_DEFAULT_SYNC");
     return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int cuda_moe_prefill_vram_seed_per_layer_requested(void) {
+    const char *env = getenv("DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER");
+    if (!env || !env[0] || strcmp(env, "0") == 0) return 0;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == env || errno != 0 || !end || *end != '\0' ||
+        value == 0 || value > 32ul) {
+        fprintf(stderr,
+                "ds4: invalid DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER=%s\n",
+                env);
+        return -1;
+    }
+    return (int)value;
 }
 
 static uint32_t cuda_moe_expert_cache_requested(void) {
@@ -15498,6 +15516,7 @@ static void cuda_moe_expert_cache_release(void) {
     g_moe_expert_cache.requested = 0;
     g_moe_expert_cache.capacity = 0;
     g_moe_expert_cache.count = 0;
+    g_moe_expert_cache.prefill_vram_seed_per_layer = 0;
     g_moe_expert_cache.slots.clear();
     g_moe_expert_cache.host_slot_by_layer_expert.clear();
     g_moe_expert_cache.route_stop = 0;
@@ -15661,6 +15680,234 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.mixed_compact_routes = 0;
 }
 
+struct cuda_moe_prefill_vram_seed_entry {
+    uint32_t entry;
+    double prior_mass;
+    double prior_weight;
+};
+
+static int cuda_moe_prefill_vram_seed(
+        cuda_moe_expert_cache *cache,
+        uint32_t requested_per_layer) {
+    const uint32_t first_layer = 3u;
+    const uint32_t routed_layers = CUDA_MOE_LAYER_COUNT - first_layer;
+    const uint64_t requested_entries_64 =
+        (uint64_t)requested_per_layer * routed_layers;
+    const uint32_t requested_entries =
+        requested_entries_64 <= UINT32_MAX ?
+        (uint32_t)requested_entries_64 : UINT32_MAX;
+    const double started = cuda_wall_sec();
+    const char *reason = "contract";
+    uint64_t uploaded_bytes = 0;
+    double selected_prior_mass = 0.0;
+    std::vector<cuda_moe_prefill_vram_seed_entry> selected;
+
+    if (!cache || requested_per_layer == 0u ||
+        g_moe_tiering.mode != CUDA_MOE_TIER_ENFORCE ||
+        g_moe_tiering.policy != CUDA_MOE_TIER_POLICY_MASS_LFRU ||
+        !g_moe_tiering.compose_prefill_mass_tiering ||
+        !g_prefill_mass_observer.enabled ||
+        !g_prefill_mass_observer.finalized ||
+        !g_prefill_mass_observer.wrap_published ||
+        !cache->device_slot_by_layer_expert ||
+        !cache->route_upload_stream ||
+        cache->capacity < requested_entries ||
+        g_dynamic_arena.snapshot_generation == 0 ||
+        g_dynamic_arena.snapshot_generation !=
+            g_moe_tiering.snapshot_generation ||
+        g_dynamic_arena.n_layer != CUDA_MOE_LAYER_COUNT ||
+        g_dynamic_arena.n_expert != 256u ||
+        g_prefill_mass_observer.mass.size() !=
+            (size_t)CUDA_MOE_LAYER_COUNT * 256u ||
+        g_prefill_mass_observer.counts.size() !=
+            (size_t)CUDA_MOE_LAYER_COUNT * 256u ||
+        g_prefill_mass_observer.candidate.size() !=
+            (size_t)CUDA_MOE_LAYER_COUNT * 256u ||
+        cache->host_slot_by_layer_expert.size() !=
+            (size_t)CUDA_MOE_LAYER_COUNT * 256u) {
+        goto failed;
+    }
+
+    reason = "rank";
+    try {
+        selected.reserve(requested_entries);
+        for (uint32_t layer = first_layer;
+             layer < CUDA_MOE_LAYER_COUNT; layer++) {
+            std::vector<cuda_moe_prefill_vram_seed_entry> ranked;
+            ranked.reserve(256u);
+            const uint32_t base = layer * 256u;
+            for (uint32_t expert = 0; expert < 256u; expert++) {
+                const uint32_t entry = base + expert;
+                if (!g_prefill_mass_observer.candidate[entry] ||
+                    g_prefill_mass_observer.counts[entry] == 0u) {
+                    continue;
+                }
+                const cuda_dynamic_arena_binding &binding =
+                    g_dynamic_arena.active[entry];
+                if (!cuda_dynamic_arena_binding_valid(
+                        binding, layer, expert,
+                        g_dynamic_arena.snapshot_generation,
+                        DS4_GPU_ARENA_READY)) {
+                    continue;
+                }
+                /* Keep the same mass definition used by the prefill snapshot:
+                 * normalized gate weight accumulated over the request. Dividing
+                 * by observations would favor rare high-weight spikes instead
+                 * of the experts expected to save the most decode H2D traffic. */
+                const double prior =
+                    g_prefill_mass_observer.mass[entry];
+                if (!isfinite(prior) || prior <= 0.0) continue;
+                const double prior_weight = prior /
+                    (double)g_prefill_mass_observer.counts[entry];
+                if (!isfinite(prior_weight) || prior_weight <= 0.0) continue;
+                ranked.push_back({entry, prior, prior_weight});
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const cuda_moe_prefill_vram_seed_entry &a,
+                         const cuda_moe_prefill_vram_seed_entry &b) {
+                          if (a.prior_mass != b.prior_mass) {
+                              return a.prior_mass > b.prior_mass;
+                          }
+                          return a.entry < b.entry;
+                      });
+            if (ranked.size() < requested_per_layer) goto failed;
+            for (uint32_t rank = 0; rank < requested_per_layer; rank++) {
+                selected.push_back(ranked[rank]);
+                selected_prior_mass += ranked[rank].prior_mass;
+            }
+        }
+    } catch (...) {
+        reason = "metadata-allocation";
+        goto failed;
+    }
+    if (selected.size() != requested_entries) goto failed;
+
+    reason = "upload";
+    {
+        std::vector<int32_t> seed_map(
+            (size_t)CUDA_MOE_LAYER_COUNT * 256u, -1);
+        int upload_ok = 1;
+        for (uint32_t slot = 0;
+             upload_ok && slot < selected.size(); slot++) {
+            const uint32_t entry = selected[slot].entry;
+            const uint32_t layer = entry / 256u;
+            const uint32_t expert = entry % 256u;
+            const ds4_gpu_dynamic_arena_layer &geometry =
+                g_dynamic_arena.layers[layer];
+            const cuda_dynamic_arena_binding &binding =
+                g_dynamic_arena.active[entry];
+            if (geometry.gate_expert_bytes != cache->gate_expert_bytes ||
+                geometry.up_expert_bytes != cache->gate_expert_bytes ||
+                geometry.down_expert_bytes != cache->down_expert_bytes ||
+                binding.slot >= g_dynamic_arena.slots.size()) {
+                upload_ok = 0;
+                break;
+            }
+            const cuda_dynamic_arena_slot &arena_slot =
+                g_dynamic_arena.slots[binding.slot];
+            if (!arena_slot.host_ptr) {
+                upload_ok = 0;
+                break;
+            }
+            const uint64_t gate_dst =
+                (uint64_t)slot * cache->gate_expert_bytes;
+            const uint64_t down_dst =
+                (uint64_t)slot * cache->down_expert_bytes;
+            const char *host_gate = arena_slot.host_ptr;
+            const char *host_up = host_gate + cache->gate_expert_bytes;
+            const char *host_down = host_up + cache->gate_expert_bytes;
+            if (cudaMemcpyAsync(cache->gate + gate_dst, host_gate,
+                                (size_t)cache->gate_expert_bytes,
+                                cudaMemcpyHostToDevice,
+                                cache->route_upload_stream) != cudaSuccess ||
+                cudaMemcpyAsync(cache->up + gate_dst, host_up,
+                                (size_t)cache->gate_expert_bytes,
+                                cudaMemcpyHostToDevice,
+                                cache->route_upload_stream) != cudaSuccess ||
+                cudaMemcpyAsync(cache->down + down_dst, host_down,
+                                (size_t)cache->down_expert_bytes,
+                                cudaMemcpyHostToDevice,
+                                cache->route_upload_stream) != cudaSuccess) {
+                (void)cudaGetLastError();
+                upload_ok = 0;
+                break;
+            }
+            seed_map[entry] = (int32_t)slot;
+        }
+        if (upload_ok &&
+            cudaMemcpyAsync(cache->device_slot_by_layer_expert,
+                            seed_map.data(),
+                            seed_map.size() * sizeof(int32_t),
+                            cudaMemcpyHostToDevice,
+                            cache->route_upload_stream) != cudaSuccess) {
+            (void)cudaGetLastError();
+            upload_ok = 0;
+        }
+        const cudaError_t upload_sync =
+            cudaStreamSynchronize(cache->route_upload_stream);
+        if (!upload_ok || upload_sync != cudaSuccess) {
+            (void)cudaGetLastError();
+            goto failed;
+        }
+        cache->host_slot_by_layer_expert.swap(seed_map);
+    }
+
+    for (uint32_t slot = 0; slot < selected.size(); slot++) {
+        const uint32_t entry_index = selected[slot].entry;
+        const uint32_t layer = entry_index / 256u;
+        const uint32_t expert = entry_index % 256u;
+        const ds4_gpu_dynamic_arena_layer &geometry =
+            g_dynamic_arena.layers[layer];
+        cuda_moe_cache_slot &cache_entry = cache->slots[slot];
+        cache_entry.key = {
+            geometry.gate_offset +
+                (uint64_t)expert * geometry.gate_expert_bytes,
+            geometry.up_offset +
+                (uint64_t)expert * geometry.up_expert_bytes,
+            geometry.down_offset +
+                (uint64_t)expert * geometry.down_expert_bytes
+        };
+        cache_entry.layer_key = geometry.gate_offset;
+        cache_entry.age = ++cache->tick;
+        cache_entry.layer_index = layer;
+        cache_entry.expert_id = expert;
+        cache_entry.layer_owned = 0;
+        cache_entry.state = CUDA_MOE_CACHE_VALID;
+
+        cuda_moe_tier_entry &tier = g_moe_tiering.entries[entry_index];
+        tier.frequency = 1u;
+        tier.last_call = 0u;
+        /* Rank by cumulative request mass, but seed the decode EMA with one
+         * synthetic observation in weight units so the initial request does
+         * not make the cache permanently sticky. */
+        tier.mass = selected[slot].prior_weight;
+        tier.last_weight = (float)selected[slot].prior_weight;
+        tier.state = CUDA_MOE_TIER_VRAM_PROTECTED;
+    }
+    cache->count = requested_entries;
+    cache->admissions += requested_entries;
+    g_moe_tiering.vram_promotions += requested_entries;
+    g_moe_tiering.policy_free_promotions += requested_entries;
+    uploaded_bytes = (uint64_t)requested_entries *
+        (cache->gate_expert_bytes * 2ull + cache->down_expert_bytes);
+    g_moe_tiering.snapshot_to_vram_bytes += uploaded_bytes;
+    g_moe_tiering.ram_h2d_bytes += uploaded_bytes;
+    fprintf(stderr,
+            "ds4: [prefill-vram-seed] result=ok reason=ok requested_per_layer=%u layers=%u entries=%u bytes=%llu seconds=%.3f failures=0 prior_mass=%.9g semantics=request-scoped-top-per-layer\n",
+            requested_per_layer, routed_layers, requested_entries,
+            (unsigned long long)uploaded_bytes,
+            cuda_wall_sec() - started, selected_prior_mass);
+    return 1;
+
+failed:
+    g_moe_tiering.failures++;
+    fprintf(stderr,
+            "ds4: [prefill-vram-seed] result=failed reason=%s requested_per_layer=%u layers=%u entries=0 bytes=0 seconds=%.3f failures=1 prior_mass=0 semantics=request-scoped-top-per-layer\n",
+            reason, requested_per_layer, routed_layers,
+            cuda_wall_sec() - started);
+    return 0;
+}
+
 static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
@@ -15668,17 +15915,27 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
     const int tier_mode = cuda_moe_tiering_mode_requested();
     const int compose_requested = cuda_moe_prefill_tier_compose_requested();
     const int gpu_routes = cuda_moe_gpu_routes_requested();
+    const int prefill_vram_seed_per_layer =
+        cuda_moe_prefill_vram_seed_per_layer_requested();
     if (compose_requested > 0 && g_prefill_mass_observer.enabled &&
         (!g_prefill_mass_observer.finalized ||
          !g_prefill_mass_observer.wrap_published)) {
         return NULL;
     }
     if (tier_mode < 0 || compose_requested < 0 ||
+        prefill_vram_seed_per_layer < 0 ||
         (tier_mode != CUDA_MOE_TIER_OFF && !gpu_routes)) {
         if (tier_mode != CUDA_MOE_TIER_OFF) {
             fprintf(stderr,
                     "ds4: expert tiering requires GPU-resident routes\n");
         }
+        return NULL;
+    }
+    if (prefill_vram_seed_per_layer > 0 &&
+        (tier_mode != CUDA_MOE_TIER_ENFORCE ||
+         !compose_requested || !gpu_routes)) {
+        fprintf(stderr,
+                "ds4: prefill VRAM seed requires composed enforce tiering and GPU-resident routes\n");
         return NULL;
     }
     if (requested == 0) {
@@ -15693,6 +15950,8 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         g_moe_expert_cache.requested == requested &&
         g_moe_expert_cache.gate_expert_bytes == gate_expert_bytes &&
         g_moe_expert_cache.down_expert_bytes == down_expert_bytes &&
+        g_moe_expert_cache.prefill_vram_seed_per_layer ==
+            (uint32_t)prefill_vram_seed_per_layer &&
         g_moe_tiering.mode == (cuda_moe_tier_mode)tier_mode &&
         g_moe_tiering.compose_prefill_mass_tiering == compose_requested &&
         (tier_mode != CUDA_MOE_TIER_ENFORCE ||
@@ -15828,6 +16087,8 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
             g_moe_expert_cache.down_expert_bytes = down_expert_bytes;
             g_moe_expert_cache.requested = requested;
             g_moe_expert_cache.capacity = cap;
+            g_moe_expert_cache.prefill_vram_seed_per_layer =
+                (uint32_t)prefill_vram_seed_per_layer;
             g_moe_expert_cache.device_slot_by_layer_expert = device_map;
             g_moe_expert_cache.device_route_ptrs = device_routes;
             g_moe_expert_cache.device_route_hit_mask = device_hit_mask;
@@ -15854,6 +16115,14 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
                 return NULL;
             }
             cuda_moe_expert_cache_invalidate();
+            if (prefill_vram_seed_per_layer > 0 &&
+                !cuda_moe_prefill_vram_seed(
+                    &g_moe_expert_cache,
+                    (uint32_t)prefill_vram_seed_per_layer)) {
+                fprintf(stderr, "ds4: prefill VRAM seed failed\n");
+                cuda_moe_expert_cache_release();
+                return NULL;
+            }
             if (gpu_routes &&
                 os_thread_create(&g_moe_expert_cache.route_thread,
                                  cuda_moe_route_worker,
