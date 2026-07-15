@@ -3995,6 +3995,19 @@ static void cuda_prefill_mass_observer_release(int report) {
     g_prefill_mass_observer.decode_candidate_hits = 0;
 }
 
+static void cuda_prefill_mass_compose_fail_closed(void) {
+    if (cuda_moe_prefill_tier_compose_requested() <= 0) return;
+    if (g_prefill_mass_observer.compose_mask_applied) {
+        ds4_gpu_reap_router_bias_reset();
+        g_prefill_mass_observer.compose_mask_applied = 0;
+    }
+    /* A composed snapshot without its complete request mask is unsafe. Keep
+     * the arena poisoned until process teardown and make decode fail instead
+     * of falling back to model-map/SSD transport. */
+    g_dynamic_arena.submissions_blocked = 1;
+    g_dynamic_arena.hits_disabled = 1;
+}
+
 static int cuda_prefill_mass_compose_apply_router_mask(void) {
     cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
     if (cuda_moe_prefill_tier_compose_requested() <= 0) return 1;
@@ -4005,7 +4018,14 @@ static int cuda_prefill_mass_compose_apply_router_mask(void) {
             return 0;
         }
     }
-    std::vector<float> bias(g_dynamic_arena.n_expert, -1.0e9f);
+    std::vector<float> bias;
+    try {
+        bias.assign(g_dynamic_arena.n_expert, -1.0e9f);
+    } catch (...) {
+        fprintf(stderr,
+                "ds4: [prefill-mass-compose-mask] result=failed reason=metadata-allocation layers=0 kept=0 pruned=0\n");
+        return 0;
+    }
     uint32_t layers = 0;
     uint32_t kept = 0;
     uint32_t pruned = 0;
@@ -4149,6 +4169,7 @@ static int cuda_prefill_mass_publish_candidate(void) {
                 terminal = "failed";
                 reason = "compose-mask";
                 g_dynamic_arena.fatal_errors++;
+                cuda_prefill_mass_compose_fail_closed();
             }
         } else {
             terminal = wrap.aborted ? "aborted" : "failed";
@@ -4166,12 +4187,14 @@ static int cuda_prefill_mass_publish_candidate(void) {
         reason = "publish-invariant";
         observer.wrap_published = 0;
         g_dynamic_arena.fatal_errors++;
+        cuda_prefill_mass_compose_fail_closed();
     } else if (!observer.wrap_published &&
                (snapshot_after != snapshot_before ||
                 resident_after != resident_before)) {
         terminal = "failed";
         reason = "rollback-invariant";
         g_dynamic_arena.fatal_errors++;
+        cuda_prefill_mass_compose_fail_closed();
     }
     fprintf(stderr,
             "ds4: [prefill-mass-wrap] result=%s reason=%s candidate=%u loads=%u workers=%u seconds=%.3f snapshot_before=%llu snapshot_after=%llu resident_before=%u resident_after=%u generation=%llu preloaded=0 router=unbiased mask=%s\n",
@@ -16655,8 +16678,18 @@ static int cuda_moe_selected_load(
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
     const int prefill_mass_weights =
         cuda_prefill_mass_observer_needs_weights();
+    const int compose_requested =
+        cuda_moe_prefill_tier_compose_requested();
+    if (n_tokens == 1u && compose_requested > 0 &&
+        g_prefill_mass_observer.enabled &&
+        g_prefill_mass_observer.finalized &&
+        !g_prefill_mass_observer.wrap_published) {
+        fprintf(stderr,
+                "ds4: [prefill-mass-compose] decode refused: closed snapshot publication failed\n");
+        return 0;
+    }
     const int prefill_mass_full_probs = prefill_mass_weights &&
-        n_tokens > 1u && cuda_moe_prefill_tier_compose_requested() > 0;
+        n_tokens > 1u && compose_requested > 0;
     const int reap_mass_requested = n_tokens == 1 &&
         cuda_reap_mass_observer_needs_weights() &&
         g_reap_router_trace_valid;
