@@ -127,6 +127,9 @@ void ds4_gpu_dynamic_arena_observer_reset(void);
 void ds4_gpu_dynamic_arena_release(void);
 
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+int ds4_gpu_model_range_update(const void *model_map, uint64_t offset, const void *data, uint64_t bytes);
+void ds4_gpu_reap_router_bias_reset(void);
+int ds4_gpu_reap_router_bias_update(uint32_t layer_index, const float *bias, uint32_t count);
 void ds4_gpu_model_streaming_begin(void);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);
@@ -690,6 +693,7 @@ int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *probs,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer_index,
         uint64_t                bias_offset,
         uint64_t                hash_offset,
         uint32_t                hash_rows,
@@ -706,6 +710,7 @@ int ds4_gpu_router_select_batch_tensor(
         ds4_gpu_tensor       *probs,
         const void             *model_map,
         uint64_t                model_size,
+        uint32_t                layer_index,
         uint64_t                bias_offset,
         uint64_t                hash_offset,
         uint32_t                hash_rows,

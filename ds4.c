@@ -1387,15 +1387,57 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     return mb * 1048576ull;
 }
 
+static bool accelerator_tensor_name_has_suffix(
+        const ds4_tensor *tensor,
+        const char       *suffix) {
+    if (!tensor || !suffix) return false;
+    const size_t suffix_len = strlen(suffix);
+    return tensor->name.len >= suffix_len &&
+        memcmp(tensor->name.ptr + tensor->name.len - suffix_len,
+               suffix, suffix_len) == 0;
+}
+
+static bool accelerator_tensor_is_routed_expert(const ds4_tensor *tensor) {
+    return accelerator_tensor_name_has_suffix(tensor, ".ffn_gate_exps.weight") ||
+        accelerator_tensor_name_has_suffix(tensor, ".ffn_up_exps.weight") ||
+        accelerator_tensor_name_has_suffix(tensor, ".ffn_down_exps.weight");
+}
+
+static bool accelerator_tensor_uses_embedding_row_staging(const ds4_tensor *tensor) {
+    return getenv("DS4_CUDA_EMBED_ROW_STAGING") != NULL &&
+        accelerator_tensor_name_has_suffix(tensor, "token_embd.weight");
+}
+
+static bool accelerator_has_dedicated_expert_cache(void) {
+    const char *cache = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_N");
+    if (!cache || !cache[0] || getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") != NULL) {
+        return false;
+    }
+    char *end = NULL;
+    const unsigned long value = strtoul(cache, &end, 10);
+    return end != cache && value != 0;
+}
+
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
     accelerator_tensor_span *spans = xmalloc((size_t)m->n_tensors * sizeof(spans[0]));
     uint64_t nspan = 0;
+    uint64_t routed_expert_bytes = 0;
+    uint64_t staged_embedding_bytes = 0;
+    const bool dedicated_expert_cache = accelerator_has_dedicated_expert_cache();
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         const ds4_tensor *t = &m->tensors[i];
         if (t->bytes == 0) continue;
         if (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) {
             free(spans);
             return false;
+        }
+        if (dedicated_expert_cache && accelerator_tensor_is_routed_expert(t)) {
+            routed_expert_bytes += t->bytes;
+            continue;
+        }
+        if (accelerator_tensor_uses_embedding_row_staging(t)) {
+            staged_embedding_bytes += t->bytes;
+            continue;
         }
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
@@ -1412,7 +1454,8 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
         i++;
-        while (i < nspan && spans[i].off <= end + 65536u && spans[i].end - off <= max_span) {
+        while (i < nspan && spans[i].off <= end + 65536u &&
+               spans[i].end - off <= max_span) {
             if (spans[i].end > end) end = spans[i].end;
             i++;
         }
@@ -1437,6 +1480,16 @@ static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *c
         }
     }
     free(spans);
+    if (routed_expert_bytes != 0) {
+        fprintf(stderr,
+                "ds4: CUDA startup cache excluded %.2f GiB of routed-expert tensors; dedicated expert cache owns residency\n",
+                (double)routed_expert_bytes / 1073741824.0);
+    }
+    if (staged_embedding_bytes != 0) {
+        fprintf(stderr,
+                "ds4: CUDA startup cache excluded %.2f GiB token embedding table; row staging owns access\n",
+                (double)staged_embedding_bytes / 1073741824.0);
+    }
     if (deferred != 0)
         fprintf(stderr, "ds4: CUDA startup cache deferred %.2f GiB of tensor spans to on-demand streaming\n",
                 (double)deferred / 1073741824.0);
@@ -5246,6 +5299,219 @@ static void topk_desc(const float *score, int n, int k, int *idx) {
 
 /* Later layers choose the six experts by biased top-k, but weight them using
  * the unbiased router probabilities. */
+typedef struct {
+    uint64_t mtime;
+    uint64_t size;
+} ds4_reap_mask_stamp;
+
+static bool g_reap_mask_env_checked;
+static bool g_reap_mask_loaded;
+static char *g_reap_mask_path;
+static ds4_reap_mask_stamp g_reap_mask_stamp;
+static uint8_t g_reap_mask_pruned[DS4_N_LAYER][DS4_N_EXPERT];
+static uint8_t g_reap_mask_layer_active[DS4_N_LAYER];
+static float g_reap_bias_masked[DS4_N_LAYER][DS4_N_EXPERT];
+static const void *g_reap_bias_tensor[DS4_N_LAYER];
+static uint32_t g_reap_bias_n;
+static uint32_t g_reap_mask_pruned_count;
+static uint32_t g_reap_mask_layer_count;
+static uint32_t g_reap_mask_range_updates;
+static uint32_t g_reap_mask_range_creates;
+static uint32_t g_reap_mask_range_failures;
+static bool g_reap_mask_gpu_applied;
+
+static bool ds4_reap_mask_file_stamp(const char *path, ds4_reap_mask_stamp *out) {
+    if (!path || !out) return false;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) return false;
+    ULARGE_INTEGER ft;
+    ft.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    ft.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    ULARGE_INTEGER sz;
+    sz.LowPart = data.nFileSizeLow;
+    sz.HighPart = data.nFileSizeHigh;
+    out->mtime = ft.QuadPart;
+    out->size = sz.QuadPart;
+    return true;
+#else
+    struct stat st;
+    if (stat(path, &st) != 0) return false;
+#if defined(__APPLE__)
+    out->mtime = (uint64_t)st.st_mtimespec.tv_sec * 1000000000ull +
+                 (uint64_t)st.st_mtimespec.tv_nsec;
+#elif defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200809L
+    out->mtime = (uint64_t)st.st_mtim.tv_sec * 1000000000ull +
+                 (uint64_t)st.st_mtim.tv_nsec;
+#else
+    out->mtime = (uint64_t)st.st_mtime;
+#endif
+    out->size = (uint64_t)st.st_size;
+    return true;
+#endif
+}
+
+static const float *ds4_reap_mask_cpu_bias(const void *bias_tensor) {
+    if (!g_reap_mask_loaded || !bias_tensor) return NULL;
+    for (uint32_t i = 0; i < g_reap_bias_n; i++) {
+        if (g_reap_bias_tensor[i] == bias_tensor) return g_reap_bias_masked[i];
+    }
+    return NULL;
+}
+
+static void ds4_reap_mask_apply(const ds4_model *model, const ds4_weights *weights, bool update_gpu) {
+    if (!model || !weights || !g_reap_mask_loaded) return;
+    uint32_t slot = 0;
+    uint32_t updates = 0;
+    uint32_t creates = 0;
+    uint32_t failures = 0;
+    uint32_t hash_layers = 0;
+    if (update_gpu) {
+#ifndef DS4_NO_GPU
+        ds4_gpu_reap_router_bias_reset();
+#endif
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER && slot < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (!g_reap_mask_layer_active[il]) continue;
+        if (layer->ffn_gate_tid2eid) hash_layers++;
+        const float *orig = layer->ffn_exp_probs_b
+            ? (const float *)tensor_data(model, layer->ffn_exp_probs_b)
+            : NULL;
+        for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+            g_reap_bias_masked[slot][e] =
+                (orig ? orig[e] : 0.0f) +
+                (g_reap_mask_pruned[il][e] ? -1.0e9f : 0.0f);
+        }
+        g_reap_bias_tensor[slot] = layer->ffn_exp_probs_b;
+        if (update_gpu) {
+#ifndef DS4_NO_GPU
+            const int rc = ds4_gpu_reap_router_bias_update(
+                il, g_reap_bias_masked[slot], DS4_N_EXPERT);
+            if (rc == 1) updates++;
+            else if (rc == 2) creates++;
+            else failures++;
+#endif
+        }
+        slot++;
+    }
+    g_reap_bias_n = slot;
+    g_reap_mask_range_updates = updates;
+    g_reap_mask_range_creates = creates;
+    g_reap_mask_range_failures = failures;
+    if (update_gpu) {
+        g_reap_mask_gpu_applied = failures == 0 && updates + creates == slot;
+    }
+    fprintf(stderr,
+            "ds4: REAP mask applied path=\"%s\" pruned=%u layers=%u bias_layers=%u ranges_updated=%u ranges_created=%u ranges_failed=%u\n",
+            g_reap_mask_path ? g_reap_mask_path : "",
+            g_reap_mask_pruned_count,
+            g_reap_mask_layer_count,
+            g_reap_bias_n,
+            g_reap_mask_range_updates,
+            g_reap_mask_range_creates,
+            g_reap_mask_range_failures);
+    fprintf(stderr,
+            "ds4: REAP mask router modes bias_layers=%u hash_layers=%u\n",
+            g_reap_bias_n,
+            hash_layers);
+    if (update_gpu && !g_reap_mask_gpu_applied) {
+        ds4_die("REAP mask GPU bias override is incomplete");
+    }
+}
+
+static void ds4_reap_mask_poll(const ds4_model *model, const ds4_weights *weights, bool update_gpu) {
+    if (!g_reap_mask_env_checked) {
+        g_reap_mask_env_checked = true;
+        const char *p = getenv("DS4_REAP_MASK_FILE");
+        if (p && p[0]) g_reap_mask_path = ds4_strdup(p);
+    }
+    if (!g_reap_mask_path || !model || !weights) return;
+
+    ds4_reap_mask_stamp stamp;
+    if (!ds4_reap_mask_file_stamp(g_reap_mask_path, &stamp)) return;
+    if (g_reap_mask_loaded &&
+        stamp.mtime == g_reap_mask_stamp.mtime &&
+        stamp.size == g_reap_mask_stamp.size) {
+        if (update_gpu && !g_reap_mask_gpu_applied) {
+            ds4_reap_mask_apply(model, weights, true);
+        }
+        return;
+    }
+
+    FILE *f = fopen(g_reap_mask_path, "r");
+    if (!f) return;
+    memset(g_reap_mask_pruned, 0, sizeof(g_reap_mask_pruned));
+    memset(g_reap_mask_layer_active, 0, sizeof(g_reap_mask_layer_active));
+    uint8_t layer_seen[DS4_N_LAYER] = {0};
+    uint16_t layer_pruned[DS4_N_LAYER] = {0};
+    uint32_t pruned = 0;
+    uint32_t layers = 0;
+    uint32_t invalid = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '#') continue;
+        unsigned l = 0, e = 0;
+        char extra = '\0';
+        if (sscanf(p, "%u %u %c", &l, &e, &extra) != 2) {
+            invalid++;
+            continue;
+        }
+        if (l >= DS4_N_LAYER || e >= DS4_N_EXPERT) {
+            invalid++;
+            continue;
+        }
+        if (!g_reap_mask_pruned[l][e]) {
+            g_reap_mask_pruned[l][e] = 1;
+            layer_pruned[l]++;
+            pruned++;
+            if (!layer_seen[l]) {
+                layer_seen[l] = 1;
+                g_reap_mask_layer_active[l] = 1;
+                layers++;
+            }
+        }
+    }
+    fclose(f);
+
+    if (invalid != 0 || pruned == 0 || layers == 0) {
+        fprintf(stderr,
+                "ds4: invalid REAP mask path=\"%s\" invalid=%u pruned=%u layers=%u\n",
+                g_reap_mask_path,
+                invalid,
+                pruned,
+                layers);
+        ds4_die("REAP mask parse failed closed");
+    }
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (layer_pruned[il] > DS4_N_EXPERT - DS4_N_EXPERT_USED) {
+            fprintf(stderr,
+                    "ds4: invalid REAP mask layer=%u pruned=%u leaves=%u required=%u\n",
+                    il,
+                    (unsigned)layer_pruned[il],
+                    (unsigned)(DS4_N_EXPERT - layer_pruned[il]),
+                    (unsigned)DS4_N_EXPERT_USED);
+            ds4_die("REAP mask leaves too few experts for router top-k");
+        }
+    }
+
+    g_reap_mask_stamp = stamp;
+    g_reap_mask_loaded = true;
+    g_reap_mask_gpu_applied = false;
+    g_reap_mask_pruned_count = pruned;
+    g_reap_mask_layer_count = layers;
+    fprintf(stderr,
+            "ds4: REAP mask reload path=\"%s\" pruned=%u layers=%u mtime=%" PRIu64 " size=%" PRIu64 "\n",
+            g_reap_mask_path,
+            g_reap_mask_pruned_count,
+            g_reap_mask_layer_count,
+            g_reap_mask_stamp.mtime,
+            g_reap_mask_stamp.size);
+    ds4_reap_mask_apply(model, weights, update_gpu);
+}
+
 static void layer_topk_selected_experts_from_probs(
         int                    selected[DS4_N_EXPERT_USED],
         float                  expert_weight[DS4_N_EXPERT_USED],
@@ -5277,6 +5543,8 @@ static void layer_topk_selected_experts_from_probs(
 
     if (layer->ffn_exp_probs_b) {
         const float *bias = tensor_data(model, layer->ffn_exp_probs_b);
+        const float *reap_bias = ds4_reap_mask_cpu_bias(layer->ffn_exp_probs_b);
+        if (reap_bias) bias = reap_bias;
         for (int i = 0; i < DS4_N_EXPERT; i++) selection[i] += bias[i];
     }
 
@@ -10202,8 +10470,9 @@ static bool metal_graph_encode_decode_layer(
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
     if (ok) ok = ds4_gpu_router_select_tensor(g->router_selected, g->router_weights, g->router_probs,
-                                                model->map, model->size,
-                                                layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
+                                                 model->map, model->size,
+                                                il,
+                                                 layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
                                                 layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
                                                 layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
                                                 (uint32_t)token,
@@ -13013,6 +13282,7 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                       g->batch_router_probs,
                                                       model->map,
                                                       model->size,
+                                                      il,
                                                       layer->ffn_exp_probs_b ? layer->ffn_exp_probs_b->abs_offset : 0,
                                                       layer->ffn_gate_tid2eid ? layer->ffn_gate_tid2eid->abs_offset : 0,
                                                       layer->ffn_gate_tid2eid ? (uint32_t)layer->ffn_gate_tid2eid->dim[1] : 0,
@@ -15767,6 +16037,7 @@ static int generate_raw_swa_cpu(
         return 1;
     }
 
+    ds4_reap_mask_poll(model, weights, false);
     prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
                             directional_steering_dirs,
                             directional_steering_attn,
@@ -15808,6 +16079,7 @@ static int generate_raw_swa_cpu(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        ds4_reap_mask_poll(model, weights, false);
         /* The CPU decode step is expected to reuse buffers from
          * cpu_decode_scratch.  Keep the allocation guard tightly scoped to the
          * decode math itself; sampling, token emission, tracing, and callbacks
@@ -15900,6 +16172,7 @@ static int generate_metal_graph_raw_swa(
     const bool trace_top = getenv("DS4_TRACE_TOP") != NULL;
     const bool token_timing = getenv("DS4_TOKEN_TIMING") != NULL;
 
+    ds4_reap_mask_poll(model, weights, true);
     const double t_prefill0 = now_sec();
     if (prefill_cap < (uint32_t)prompt->len) {
         ok = metal_graph_prefill_chunked(&g, model, weights, prompt, prompt->len, logits, false, progress, progress_ud);
@@ -15947,6 +16220,7 @@ static int generate_metal_graph_raw_swa(
         }
 
         const double t_eval0 = token_timing ? now_sec() : 0.0;
+        ds4_reap_mask_poll(model, weights, true);
         ok = metal_graph_eval_token_raw_swa(&g,
                                             model,
                                             weights,
@@ -17753,6 +18027,12 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        /* Static REAP masks must be resident before a session captures model
+         * pointers in its graph. Reloads then update these persistent bias
+         * buffers in place, so the graph never observes a stale router. */
+        ds4_reap_mask_poll(&e->model,
+                           &e->weights,
+                           e->backend == DS4_BACKEND_CUDA);
         fprintf(stderr, "ds4: %s backend initialized for graph diagnostics\n",
                 ds4_backend_name(e->backend));
     }
@@ -18218,12 +18498,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        ds4_reap_mask_poll(&e->model, &e->weights, false);
         if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
         {
             s->mtp_draft_valid = false;
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
+                ds4_reap_mask_poll(&e->model, &e->weights, false);
                 forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                          &e->model,
                                                          &e->weights,
@@ -18264,6 +18546,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 #else
     ds4_engine *e = s->engine;
     const char *backend_name = ds4_backend_name(e->backend);
+    ds4_reap_mask_poll(&e->model, &e->weights, e->backend == DS4_BACKEND_CUDA);
     if (e->backend == DS4_BACKEND_CUDA) {
         ds4_gpu_dynamic_arena_request_begin();
     }
@@ -18307,6 +18590,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         }
 
         for (int i = s->checkpoint.len; i < prompt->len; i++) {
+            ds4_reap_mask_poll(&e->model, &e->weights, e->backend == DS4_BACKEND_CUDA);
             if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
                                                 (uint32_t)prompt->v[i],
                                                 (uint32_t)s->checkpoint.len,
@@ -18508,6 +18792,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     if (!s) return 1;
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
+        ds4_reap_mask_poll(&e->model, &e->weights, false);
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
                                                  &e->model,
                                                  &e->weights,
@@ -18532,6 +18817,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
+    ds4_reap_mask_poll(&e->model, &e->weights, e->backend == DS4_BACKEND_CUDA);
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&

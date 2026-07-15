@@ -2,23 +2,30 @@
 # Usage: powershell -File g7_measure.ps1 -MaxTokens 8 -TimeoutSec 900 -Tag new [-NoSelectedLoad]
 param(
     [int]$MaxTokens = 8,
+    [ValidateRange(0, 131072)][int]$WarmupMaxTokens = 0,
     [int]$Repeats = 1,
     [int]$TimeoutSec = 900,
     [string]$Tag = "run",
     [string]$Prompt = "Hi",
+    [string]$PromptFile = "",
+    [string]$SystemPrompt = "",
     [string]$WarmupPrompt = "",
     [switch]$NoSelectedLoad,
     [switch]$Warmup,
     [switch]$Diagnostics,
     [int]$ReserveMB = 2048,
+    [ValidateRange(0, 65536)][int]$RuntimeReserveMB = 0,
     [int]$BudgetGB = 28,
     [ValidateRange(0, 8192)][int]$Q8F16CacheMB = 0,
     [ValidateRange(0, 8192)][int]$Q8F16CacheReserveMB = 4096,
+    [switch]$DisableQ8F16Cache,
+    [switch]$EmbedRowStaging,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ReapMassObserve,
     [switch]$ReapMassWrap,
+    [string]$ReapMaskFile = "",
     [ValidateRange(1, 256)][int]$ReapMassWindow = 16,
     [ValidateRange(1, 256)][int]$ReapMassGrowInterval = 4,
     [ValidateRange(1.0, 100.0)][double]$ReapMassHysteresis = 1.25,
@@ -55,6 +62,13 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+if ($PromptFile) {
+    $PromptFile = (Resolve-Path -LiteralPath $PromptFile).Path
+    $Prompt = [IO.File]::ReadAllText($PromptFile, [Text.Encoding]::UTF8)
+}
+$Prompt = [string]::Concat($Prompt)
+$SystemPrompt = [string]::Concat($SystemPrompt)
+$WarmupPrompt = [string]::Concat($WarmupPrompt)
 $memoryPreflightHelper = Join-Path $PSScriptRoot "g7_memory_preflight.ps1"
 $runtimeMonitorHelper = Join-Path $PSScriptRoot "g7_runtime_monitor.ps1"
 . $memoryPreflightHelper
@@ -70,10 +84,14 @@ if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[
 if ($WarmupPrompt -and -not $Warmup) {
     throw "WarmupPrompt requires -Warmup"
 }
+if ($WarmupMaxTokens -gt 0 -and -not $Warmup) {
+    throw "WarmupMaxTokens requires -Warmup"
+}
 if ($ExpectedWarmupContentSHA256 -and -not $Warmup) {
     throw "ExpectedWarmupContentSHA256 requires -Warmup"
 }
 $effectiveWarmupPrompt = if ($WarmupPrompt) { $WarmupPrompt } else { $Prompt }
+$effectiveWarmupMaxTokens = if ($WarmupMaxTokens -gt 0) { $WarmupMaxTokens } else { $MaxTokens }
 $effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $buildManifestPath = Join-Path $PSScriptRoot "build\Release\g7_build_manifest.json"
@@ -103,12 +121,27 @@ foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | 
 }
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
+if ($RuntimeReserveMB -gt 0) {
+    $env:DS4_CUDA_STREAM_RUNTIME_RESERVE_MB = "$RuntimeReserveMB"
+} else {
+    Remove-Item Env:\DS4_CUDA_STREAM_RUNTIME_RESERVE_MB -ErrorAction SilentlyContinue
+}
 if ($Q8F16CacheMB -gt 0) {
     $env:DS4_CUDA_Q8_F16_CACHE_MB = "$Q8F16CacheMB"
 } else {
     Remove-Item Env:\DS4_CUDA_Q8_F16_CACHE_MB -ErrorAction SilentlyContinue
 }
 $env:DS4_CUDA_Q8_F16_CACHE_RESERVE_MB = "$Q8F16CacheReserveMB"
+if ($DisableQ8F16Cache) {
+    $env:DS4_CUDA_NO_Q8_F16_CACHE = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_NO_Q8_F16_CACHE -ErrorAction SilentlyContinue
+}
+if ($EmbedRowStaging) {
+    $env:DS4_CUDA_EMBED_ROW_STAGING = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_EMBED_ROW_STAGING -ErrorAction SilentlyContinue
+}
 if ($DynamicArenaGiB -gt 0.0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_GB = $DynamicArenaGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
 } else {
@@ -139,6 +172,14 @@ if ($ReapMassWrap) {
     Remove-Item Env:\DS4_CUDA_REAP_MASS_WRAP -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_REAP_MASS_GROW_INTERVAL -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_REAP_MASS_HYSTERESIS -ErrorAction SilentlyContinue
+}
+if ($ReapMaskFile) {
+    if (-not (Test-Path -LiteralPath $ReapMaskFile -PathType Leaf)) {
+        throw "ReapMaskFile does not exist: $ReapMaskFile"
+    }
+    $env:DS4_REAP_MASK_FILE = (Resolve-Path -LiteralPath $ReapMaskFile).Path
+} else {
+    Remove-Item Env:\DS4_REAP_MASK_FILE -ErrorAction SilentlyContinue
 }
 if ($DynamicArenaObservedWindow -gt 0) {
     $env:DS4_CUDA_DYNAMIC_ARENA_OBSERVED_WINDOW = "$DynamicArenaObservedWindow"
@@ -227,6 +268,13 @@ if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObser
 if ($PrefillMassWrap -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassWrap requires DynamicArenaGiB > 0" }
 if ($ReapMassObserve -and $DynamicArenaGiB -le 0.0) { throw "ReapMassObserve requires DynamicArenaGiB > 0" }
 if ($ReapMassWrap -and $DynamicArenaGiB -le 0.0) { throw "ReapMassWrap requires DynamicArenaGiB > 0" }
+if ($ReapMaskFile -and ($PrefillMassObserve -or $PrefillMassWrap -or
+        $ReapMassObserve -or $ReapMassWrap -or
+        $DynamicArenaGiB -gt 0.0 -or $DynamicArenaObservedWindow -gt 0 -or
+        $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default" -or
+        $SpexDryRun -or $SpexPrefetchK -gt 0)) {
+    throw "ReapMaskFile static bake must be isolated from adaptive arena, REAP mass, prefill mass, and SPEX"
+}
 if ($PrefillMassWrap -and $DynamicArenaObservedWindow -gt 0) { throw "PrefillMassWrap must be isolated from the decode observer" }
 if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassWrap must be isolated from arena growth" }
 if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
@@ -286,6 +334,8 @@ $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPa
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
+$systemPromptBytes = [Text.Encoding]::UTF8.GetBytes($SystemPrompt)
+$systemPromptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($systemPromptBytes)).Replace("-", "").ToLowerInvariant()
 $warmupPromptBytes = [Text.Encoding]::UTF8.GetBytes($effectiveWarmupPrompt)
 $warmupPromptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($warmupPromptBytes)).Replace("-", "").ToLowerInvariant()
 $buildManifest = $null
@@ -339,7 +389,8 @@ try {
     }
 } catch { $gpuIdentity = $null }
 
-$argList = @("-m", $model, "--cuda", "-c", "$Context", "-n", "$MaxTokens", "--host", "127.0.0.1", "--port", "$Port")
+$serverMaxTokens = [math]::Max($MaxTokens, $effectiveWarmupMaxTokens)
+$argList = @("-m", $model, "--cuda", "-c", "$Context", "-n", "$serverMaxTokens", "--host", "127.0.0.1", "--port", "$Port")
 Write-Host ("[g7] launching: " + $exe + " " + ($argList -join " "))
 Write-Host ("[g7] NoSelectedLoad=" + $NoSelectedLoad + " MaxTokens=" + $MaxTokens)
 
@@ -373,20 +424,28 @@ if (-not $ready) {
 }
 Write-Host ("[g7] server READY in " + [int]$loadSec + "s")
 
+$messages = @()
+if ($SystemPrompt) { $messages += @{ role = "system"; content = $SystemPrompt } }
+$messages += @{ role = "user"; content = $Prompt }
+$warmupMessages = @()
+if ($SystemPrompt) { $warmupMessages += @{ role = "system"; content = $SystemPrompt } }
+$warmupMessages += @{ role = "user"; content = $effectiveWarmupPrompt }
 $body = @{
     model = "deepseek-chat"
-    messages = @(@{ role = "user"; content = $Prompt })
+    messages = $messages
     max_tokens = $MaxTokens
     temperature = 0
     think = $false
 } | ConvertTo-Json -Depth 5
 $warmupBody = @{
     model = "deepseek-chat"
-    messages = @(@{ role = "user"; content = $effectiveWarmupPrompt })
-    max_tokens = $MaxTokens
+    messages = $warmupMessages
+    max_tokens = $effectiveWarmupMaxTokens
     temperature = 0
     think = $false
 } | ConvertTo-Json -Depth 5
+$bodyBytes = [Text.Encoding]::UTF8.GetBytes($body)
+$warmupBodyBytes = [Text.Encoding]::UTF8.GetBytes($warmupBody)
 
 $results = @()
 $warmupResult = $null
@@ -396,7 +455,7 @@ $uri = "http://127.0.0.1:" + $Port + "/v1/chat/completions"
 try {
     if ($Warmup) {
         $tw = Get-Date
-        $warmResp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $warmupBody -TimeoutSec $TimeoutSec
+        $warmResp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body $warmupBodyBytes -TimeoutSec $TimeoutSec
         $warmSec = ((Get-Date) - $tw).TotalSeconds
         $warmContent = [string]$warmResp.choices[0].message.content
         $warmCompletionTokens = [int]$warmResp.usage.completion_tokens
@@ -418,7 +477,7 @@ try {
     }
     for ($i = 1; $i -le $Repeats; $i++) {
         $t0 = Get-Date
-        $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json" -Body $body -TimeoutSec $TimeoutSec
+        $resp = Invoke-RestMethod -Uri $uri -Method Post -ContentType "application/json; charset=utf-8" -Body $bodyBytes -TimeoutSec $TimeoutSec
         $genSec = ((Get-Date) - $t0).TotalSeconds
         $content = [string]$resp.choices[0].message.content
         $completionTokens = [int]$resp.usage.completion_tokens
@@ -439,7 +498,18 @@ try {
     }
     $httpOk = $true
 } catch {
-    Write-Host ("[g7] request FAILED: " + $_.Exception.Message)
+    $responseBody = ""
+    if ($_.Exception.Response) {
+        try {
+            $responseStream = $_.Exception.Response.GetResponseStream()
+            if ($responseStream) {
+                $responseReader = New-Object System.IO.StreamReader($responseStream)
+                $responseBody = $responseReader.ReadToEnd()
+                $responseReader.Dispose()
+            }
+        } catch {}
+    }
+    Write-Host ("[g7] request FAILED: " + $_.Exception.Message + $(if ($responseBody) { " body=" + $responseBody } else { "" }))
 }
 
 if (-not $httpOk -and -not $proc.HasExited) { $proc.Kill() }
@@ -529,7 +599,8 @@ $runtimeTelemetry = [pscustomobject]@{
 # Analyze stderr
 $evicts = 0; $selLoads = 0; $lastSel = ""; $streamsExpert = 0; $streamsHot = 0
 $observedIoQD = 1; $overlappedIoObserved = $false; $overlappedIoFallbacks = 0
-$cacheCalls = 0; $cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
+$cacheCalls = 0; $cacheLastLayer = -1; $cacheLastCompact = 0
+$cacheCapacity = 0; $cacheCount = 0; $cacheHits = 0; $cacheMisses = 0
 $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
 $overlapSharedObserved = $false
 $overlapSharedFullObserved = $false
@@ -582,6 +653,10 @@ $reapMassWrapLastTokens = 0; $reapMassWrapLastFreeBefore = 0
 $reapMassWrapLastSnapshotBefore = 0; $reapMassWrapLastSnapshotAfter = 0
 $reapMassWrapLastWorkers = 0; $reapMassWrapLastRouter = "not_observed"
 $reapMassWrapLastMask = "not_observed"
+$reapMaskReloadObserved = $false; $reapMaskAppliedObserved = $false
+$reapMaskPathObserved = ""; $reapMaskReloadPruned = 0; $reapMaskReloadLayers = 0
+$reapMaskAppliedPruned = 0; $reapMaskAppliedLayers = 0; $reapMaskBiasLayers = 0
+$reapMaskRangesUpdated = 0; $reapMaskRangesCreated = 0; $reapMaskRangesFailed = 0
 $arenaObserverFirstLayer = 0; $arenaObserverLastLayer = 0
 $arenaObserverTokens = 0; $arenaObserverResident = 0
 $arenaWrapObserved = $false; $arenaWrapLoads = 0; $arenaWrapWorkers = 0
@@ -699,10 +774,12 @@ if (Test-Path $stderrLog) {
         $cacheCapacity = [int]$Matches[1]
     }
     $cacheLine = $lines | Where-Object { $_ -match "\[moecache\]" } | Select-Object -Last 1
-    if ($cacheLine -and $cacheLine -match "calls=(\d+) cap=(\d+) count=(\d+) hits=(\d+) misses=(\d+).*admissions=(\d+) evictions=(\d+) direct=(\d+)") {
-        $cacheCalls = [long]$Matches[1]; $cacheCapacity = [int]$Matches[2]; $cacheCount = [int]$Matches[3]
-        $cacheHits = [long]$Matches[4]; $cacheMisses = [long]$Matches[5]; $cacheAdmissions = [long]$Matches[6]
-        $cacheEvictions = [long]$Matches[7]; $cacheDirect = [long]$Matches[8]
+    if ($cacheLine -and $cacheLine -match "calls=(\d+)(?: layer=(\d+) compact=(\d+))? cap=(\d+) count=(\d+) hits=(\d+) misses=(\d+).*admissions=(\d+) evictions=(\d+) direct=(\d+)") {
+        $cacheCalls = [long]$Matches[1]
+        if ($Matches[2]) { $cacheLastLayer = [int]$Matches[2]; $cacheLastCompact = [int]$Matches[3] }
+        $cacheCapacity = [int]$Matches[4]; $cacheCount = [int]$Matches[5]
+        $cacheHits = [long]$Matches[6]; $cacheMisses = [long]$Matches[7]; $cacheAdmissions = [long]$Matches[8]
+        $cacheEvictions = [long]$Matches[9]; $cacheDirect = [long]$Matches[10]
     }
     $contextLine = $lines | Where-Object { $_ -match "context buffers .*ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)" } | Select-Object -Last 1
     if ($contextLine -and $contextLine -match "ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)") {
@@ -710,6 +787,24 @@ if (Test-Path $stderrLog) {
         $prefillChunkObserved = [int]$Matches[2]
         $rawKvRowsObserved = [int]$Matches[3]
         $compressedKvRowsObserved = [int]$Matches[4]
+    }
+    $reapMaskReloadLine = $lines | Where-Object { $_ -match "REAP mask reload" } | Select-Object -Last 1
+    if ($reapMaskReloadLine -and $reapMaskReloadLine -match '^ds4: REAP mask reload path="([^"]*)" pruned=(\d+) layers=(\d+) mtime=(\d+) size=(\d+)$') {
+        $reapMaskReloadObserved = $true
+        $reapMaskPathObserved = $Matches[1]
+        $reapMaskReloadPruned = [int]$Matches[2]
+        $reapMaskReloadLayers = [int]$Matches[3]
+    }
+    $reapMaskAppliedLine = $lines | Where-Object { $_ -match "REAP mask applied" } | Select-Object -Last 1
+    if ($reapMaskAppliedLine -and $reapMaskAppliedLine -match '^ds4: REAP mask applied path="([^"]*)" pruned=(\d+) layers=(\d+) bias_layers=(\d+) ranges_updated=(\d+) ranges_created=(\d+) ranges_failed=(\d+)$') {
+        $reapMaskAppliedObserved = $true
+        if (-not $reapMaskPathObserved) { $reapMaskPathObserved = $Matches[1] }
+        $reapMaskAppliedPruned = [int]$Matches[2]
+        $reapMaskAppliedLayers = [int]$Matches[3]
+        $reapMaskBiasLayers = [int]$Matches[4]
+        $reapMaskRangesUpdated = [int]$Matches[5]
+        $reapMaskRangesCreated = [int]$Matches[6]
+        $reapMaskRangesFailed = [int]$Matches[7]
     }
     $arenaReadyLine = $lines | Where-Object { $_ -match "CUDA dynamic arena ready" } | Select-Object -Last 1
     if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready [0-9.]+ GiB, (\d+) slots.*bytes=(\d+) slot_bytes=(\d+)") {
@@ -980,6 +1075,29 @@ if ($PrefillMassWrap) {
 } elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
     throw "Prefill mass WRAP activated while not requested"
 }
+if ($ReapMaskFile) {
+    $resolvedReapMaskFile = (Resolve-Path -LiteralPath $ReapMaskFile).Path
+    if (-not $reapMaskReloadObserved -or -not $reapMaskAppliedObserved) {
+        throw "REAP mask measurement failed: exact reload/applied telemetry was not observed"
+    }
+    if ($reapMaskPathObserved -ne $resolvedReapMaskFile) {
+        throw "REAP mask measurement failed: observed mask path differs from requested path"
+    }
+    if ($reapMaskReloadPruned -le 0 -or $reapMaskReloadLayers -le 0) {
+        throw "REAP mask measurement failed: invalid reload counters"
+    }
+    if ($reapMaskAppliedPruned -ne $reapMaskReloadPruned -or
+        $reapMaskAppliedLayers -ne $reapMaskReloadLayers -or
+        $reapMaskBiasLayers -le 0) {
+        throw "REAP mask measurement failed: applied counters differ from reload counters"
+    }
+    if ($reapMaskRangesFailed -ne 0 -or
+        ($reapMaskRangesUpdated + $reapMaskRangesCreated) -ne $reapMaskBiasLayers) {
+        throw "REAP mask measurement failed: device bias range upload was incomplete"
+    }
+} elseif ($reapMaskReloadObserved -or $reapMaskAppliedObserved) {
+    throw "REAP mask activated while not requested"
+}
 if ($ReapMassObserve -or $ReapMassWrap) {
     if (-not $reapMassArmed -or -not $reapMassResultObserved) { throw "REAP mass measurement failed: observer did not arm/report" }
     if ($reapMassWindowObserved -ne $ReapMassWindow -or $reapMassTopObserved -le 0 -or $reapMassTransport -ne "packed-router-d2h") { throw "REAP mass measurement failed: observed policy/transport differs from requested policy" }
@@ -1060,6 +1178,8 @@ $rawOutputs = [pscustomobject]@{
     executable_sha256 = $exeHashAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
     prompt_sha256 = $promptHash
+    system_prompt = $SystemPrompt
+    system_prompt_sha256 = $systemPromptHash
     warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     expected_content_sha256 = if ($ExpectedContentSHA256) { $ExpectedContentSHA256.ToLowerInvariant() } else { "" }
     expected_warmup_content_sha256 = if ($ExpectedWarmupContentSHA256) { $ExpectedWarmupContentSHA256.ToLowerInvariant() } else { "" }
@@ -1109,7 +1229,10 @@ $summary = [pscustomobject]@{
     model_bytes = [long]$modelInfoAtStart.Length
     model_last_write_utc = $modelInfoAtStart.LastWriteTimeUtc.ToString("o")
     prompt = $Prompt
+    prompt_file = $PromptFile
     prompt_sha256 = $promptHash
+    system_prompt = $SystemPrompt
+    system_prompt_sha256 = $systemPromptHash
     warmup_prompt = $(if ($Warmup) { $effectiveWarmupPrompt } else { "" })
     warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     warmup_prompt_distinct = [bool]($Warmup -and $effectiveWarmupPrompt -ne $Prompt)
@@ -1117,6 +1240,7 @@ $summary = [pscustomobject]@{
     expected_warmup_content_sha256 = $ExpectedWarmupContentSHA256.ToLowerInvariant()
     warmup_result = $warmupResult
     requested_max_tokens = $MaxTokens
+    requested_warmup_max_tokens = $(if ($Warmup) { $effectiveWarmupMaxTokens } else { 0 })
     context_requested = $Context
     context_observed = $contextObserved
     prefill_chunk_observed = $prefillChunkObserved
@@ -1132,6 +1256,8 @@ $summary = [pscustomobject]@{
     reserve_mb = $ReserveMB
     q8_f16_cache_mb_requested = $Q8F16CacheMB
     q8_f16_cache_reserve_mb_requested = $Q8F16CacheReserveMB
+    q8_f16_cache_disabled = [bool]$DisableQ8F16Cache
+    embed_row_staging_requested = [bool]$EmbedRowStaging
     dynamic_arena_gib_requested = $DynamicArenaGiB
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
@@ -1181,6 +1307,17 @@ $summary = [pscustomobject]@{
     reap_mass_wrap_last_workers = $reapMassWrapLastWorkers
     reap_mass_wrap_last_router = $reapMassWrapLastRouter
     reap_mass_wrap_last_mask = $reapMassWrapLastMask
+    reap_mask_file_requested = $(if ($ReapMaskFile) { (Resolve-Path -LiteralPath $ReapMaskFile).Path } else { "" })
+    reap_mask_reload_observed = $reapMaskReloadObserved
+    reap_mask_applied_observed = $reapMaskAppliedObserved
+    reap_mask_path_observed = $reapMaskPathObserved
+    reap_mask_pruned_entries = $reapMaskAppliedPruned
+    reap_mask_layers = $reapMaskAppliedLayers
+    reap_mask_bias_layers = $reapMaskBiasLayers
+    reap_mask_ranges_updated = $reapMaskRangesUpdated
+    reap_mask_ranges_created = $reapMaskRangesCreated
+    reap_mask_ranges_failed = $reapMaskRangesFailed
+    reap_mask_ranges_applied = ($reapMaskRangesUpdated + $reapMaskRangesCreated)
     prefill_mass_observer_armed = $prefillMassArmed
     prefill_mass_finalized = $prefillMassFinalized
     prefill_mass_policy_observed = $prefillMassPolicy
@@ -1338,6 +1475,8 @@ $summary = [pscustomobject]@{
     spex_ring_full = $spexRingFull
     spex_stale = $spexStale
     expert_cache_calls = $cacheCalls
+    expert_cache_last_layer = $cacheLastLayer
+    expert_cache_last_compact = $cacheLastCompact
     expert_cache_capacity = $cacheCapacity
     expert_cache_count = $cacheCount
     expert_cache_hits = $cacheHits
