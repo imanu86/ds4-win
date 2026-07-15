@@ -12021,16 +12021,6 @@ __global__ static void moe_resolve_resident_routes_kernel(
         }
     }
     *route_hit_mask = hit_mask;
-    if (miss_count == 0u) {
-        request->miss_count = 0u;
-        request->route_count = 6u;
-        request->layer_index = layer_index;
-        __threadfence_system();
-        request->sequence = sequence;
-        __threadfence_system();
-        *ready_sequence = sequence;
-        return;
-    }
     request->layer_index = layer_index;
     request->miss_count = miss_count;
     request->route_count = 6u;
@@ -12042,6 +12032,13 @@ __global__ static void moe_resolve_resident_routes_kernel(
     for (uint32_t route = 0; route < 6u; route++) {
         request->selected[route] = selected_local[route];
         request->hit_slots[route] = hit_slots_local[route];
+    }
+    if (miss_count == 0u) {
+        __threadfence_system();
+        request->sequence = sequence;
+        __threadfence_system();
+        *ready_sequence = sequence;
+        return;
     }
     for (uint32_t miss = 0; miss < miss_count; miss++) {
         request->miss_routes[miss] = miss_routes_local[miss];
@@ -15591,6 +15588,16 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
                 sequence);
         cuda_moe_expert_cache_invalidate();
         return NULL;
+    }
+    const cuda_moe_route_request *request = cache->route_request_host;
+    if (request && request->sequence == sequence &&
+        request->route_count == CUDA_MOE_ROUTE_COUNT &&
+        request->layer_index == layer_index) {
+        g_moe_last_selected.gate_offset = request->gate_offset;
+        g_moe_last_selected.count = CUDA_MOE_ROUTE_COUNT;
+        memcpy(g_moe_last_selected.ids, request->selected,
+               CUDA_MOE_ROUTE_COUNT * sizeof(g_moe_last_selected.ids[0]));
+        g_moe_last_selected.valid = 1;
     }
     if (sequence <= 2u) {
         fprintf(stderr,

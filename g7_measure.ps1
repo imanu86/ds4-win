@@ -50,11 +50,13 @@ param(
     [switch]$DisableSharedDownFusion,
     [switch]$SpexDryRun,
     [string]$SpexFile = "",
+    [string]$ExpectedSpexSHA256 = "",
     [ValidateRange(0, 6)][int]$SpexCap = 0,
     [ValidateSet("resident", "score", "topk", "full")][string]$SpexStage = "full",
     [switch]$SpexFusedTopK,
     [ValidateSet(1, 2, 4, 8)][int]$SpexRingSlots = 1,
     [ValidateSet(0, 1)][int]$SpexPrefetchK = 0,
+    [ValidateSet(0, 1, 2)][int]$SpexCpuProbeK = 0,
     [ValidateRange(1, 1000000)][int]$SpexStatsEvery = 1000000,
     [string]$ExpectedContentSHA256 = "",
     [string]$ExpectedWarmupContentSHA256 = "",
@@ -82,6 +84,9 @@ if (-not (Test-Path -LiteralPath $runtimeMonitorHelper)) {
 }
 if ($ExpectedContentSHA256 -and $ExpectedContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedContentSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($ExpectedSpexSHA256 -and $ExpectedSpexSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedSpexSHA256 must be a 64-character hexadecimal SHA-256"
 }
 if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedWarmupContentSHA256 must be a 64-character hexadecimal SHA-256"
@@ -295,6 +300,8 @@ if ($SpexDryRun) {
     $env:DS4_SPEX_DRY_RUN_STATS_EVERY = "$SpexStatsEvery"
     if ($SpexPrefetchK -gt 0) { $env:DS4_SPEX_PREFETCH_K = "$SpexPrefetchK" }
     else { Remove-Item Env:\DS4_SPEX_PREFETCH_K -ErrorAction SilentlyContinue }
+    if ($SpexCpuProbeK -gt 0) { $env:DS4_SPEX_CPU_PROBE_K = "$SpexCpuProbeK" }
+    else { Remove-Item Env:\DS4_SPEX_CPU_PROBE_K -ErrorAction SilentlyContinue }
 } else {
     Remove-Item Env:\DS4_SPEX_HIDDEN_GPU_DRY_RUN -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_FILE -ErrorAction SilentlyContinue
@@ -304,6 +311,7 @@ if ($SpexDryRun) {
     Remove-Item Env:\DS4_SPEX_RING_SLOTS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_DRY_RUN_STATS_EVERY -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_SPEX_PREFETCH_K -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_SPEX_CPU_PROBE_K -ErrorAction SilentlyContinue
 }
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
@@ -317,14 +325,14 @@ if ($ReapMaskFile -and ($PrefillMassObserve -or $PrefillMassWrap -or
         $ReapMassObserve -or $ReapMassWrap -or
         $DynamicArenaGiB -gt 0.0 -or $DynamicArenaObservedWindow -gt 0 -or
         $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default" -or
-        $SpexDryRun -or $SpexPrefetchK -gt 0)) {
+        $SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0)) {
     throw "ReapMaskFile static bake must be isolated from adaptive arena, REAP mass, prefill mass, and SPEX"
 }
 if ($PrefillMassWrap -and $DynamicArenaObservedWindow -gt 0) { throw "PrefillMassWrap must be isolated from the decode observer" }
 if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassWrap must be isolated from arena growth" }
 if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
 if ($PrefillMassWrap -and ($ExpertCacheN -gt 0 -or $ExpertCacheStats)) { throw "PrefillMassWrap must be isolated from the expert cache" }
-if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
+if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
 if ($PrefillMassWrap -and ($Warmup -or $Repeats -ne 1)) { throw "PrefillMassWrap first-snapshot measurements require one request and no warmup" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
 if ($DynamicArenaCarry -ne "default" -and (-not $Warmup -or $DynamicArenaObservedWindow -le 0)) { throw "DynamicArenaCarry requires Warmup and DynamicArenaObservedWindow > 0" }
@@ -334,6 +342,7 @@ if ($SpexRingSlots -gt 1 -and (-not $SpexDryRun -or $SpexStage -ne "full")) { th
 if ($SpexPrefetchK -gt 0 -and (-not $SpexDryRun -or $SpexStage -ne "full" -or $effectiveSpexCap -lt $SpexPrefetchK)) { throw "SpexPrefetchK requires full SpexDryRun with SpexCap >= SpexPrefetchK" }
 if ($SpexPrefetchK -gt 0 -and $ExpertCacheN -gt 0) { throw "SpexPrefetchK is incompatible with ExpertCacheN > 0" }
 if ($SpexPrefetchK -gt 0 -and $NoSelectedLoad) { throw "SpexPrefetchK is incompatible with NoSelectedLoad" }
+if ($SpexCpuProbeK -gt 0 -and (-not $SpexDryRun -or $SpexStage -ne "full" -or $effectiveSpexCap -lt $SpexCpuProbeK -or $SpexPrefetchK -ne 0)) { throw "SpexCpuProbeK requires full SpexDryRun with SpexCap >= SpexCpuProbeK and SpexPrefetchK=0" }
 if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap policy" }
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
@@ -376,6 +385,9 @@ $buildManifestHashAtStart = if (Test-Path -LiteralPath $buildManifestPath) {
     (Get-FileHash -Algorithm SHA256 $buildManifestPath).Hash.ToLowerInvariant()
 } else { "" }
 $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPath $SpexFile).Hash.ToLowerInvariant() } else { "" }
+if ($ExpectedSpexSHA256 -and $spexHashAtStart -ine $ExpectedSpexSHA256) {
+    throw "SPEX provenance failed: expected $($ExpectedSpexSHA256.ToLowerInvariant()), observed $spexHashAtStart"
+}
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
@@ -669,6 +681,12 @@ $spexPrefetchLoaded = 0; $spexPrefetchMatched = 0; $spexPrefetchHits = 0; $spexP
 $spexPrefetchLate = 0; $spexPrefetchCanceled = 0; $spexPrefetchPoisoned = 0
 $spexPrefetchErrors = 0; $spexPrefetchDisabled = $false
 $spexPrefetchBytesRead = 0; $spexPrefetchBytesUsed = 0
+$spexCpuProbeFinalObserved = $false; $spexCpuProbeLineCount = 0; $spexCpuProbeKObserved = 0
+$spexCpuProbeSubmitted = 0; $spexCpuProbeDropped = 0; $spexCpuProbeCompleted = 0
+$spexCpuProbePredicted = 0; $spexCpuProbeMatched = 0
+$spexCpuProbeReadyAtTransport = 0; $spexCpuProbeUsefulReady = 0; $spexCpuProbeFailures = 0
+$spexCpuProbeD2HWaitMs = 0.0; $spexCpuProbeCpuMs = 0.0; $spexCpuProbeQueueMs = 0.0
+$spexCpuProbeChecksum = 0.0
 $arenaObserverArmed = $false; $arenaObserverWindowObserved = 0
 $arenaObserverMinHitsObserved = 0; $arenaObserverGrowIntervalObserved = 0
 $prefillMassArmed = $false; $prefillMassFinalized = $false
@@ -1088,6 +1106,30 @@ if (Test-Path $stderrLog) {
     }
 }
 
+$spexCpuProbeLines = @()
+if (Test-Path $stderrLog) {
+    $spexCpuProbeLines += @(Get-Content -LiteralPath $stderrLog | Where-Object { $_ -match "\[spex-cpu\] final" })
+}
+if (Test-Path $stdoutLog) {
+    $spexCpuProbeLines += @(Get-Content -LiteralPath $stdoutLog | Where-Object { $_ -match "\[spex-cpu\] final" })
+}
+$spexCpuProbeLineCount = @($spexCpuProbeLines).Count
+if ($spexCpuProbeLineCount -gt 0) {
+    $spexCpuProbeFinalLine = @($spexCpuProbeLines)[-1]
+    if ($spexCpuProbeFinalLine -match "final k=(\d+) submitted=(\d+) dropped=(\d+) completed=(\d+) predicted=(\d+) matched=(\d+) ready_at_transport=(\d+) useful_ready=(\d+) failures=(\d+) d2h_wait_ms=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) cpu_ms=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) queue_ms=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) checksum=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)") {
+        $spexCpuProbeFinalObserved = $true
+        $spexCpuProbeKObserved = [int]$Matches[1]
+        $spexCpuProbeSubmitted = [long]$Matches[2]; $spexCpuProbeDropped = [long]$Matches[3]
+        $spexCpuProbeCompleted = [long]$Matches[4]; $spexCpuProbePredicted = [long]$Matches[5]
+        $spexCpuProbeMatched = [long]$Matches[6]; $spexCpuProbeReadyAtTransport = [long]$Matches[7]
+        $spexCpuProbeUsefulReady = [long]$Matches[8]; $spexCpuProbeFailures = [long]$Matches[9]
+        $spexCpuProbeD2HWaitMs = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+        $spexCpuProbeCpuMs = [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
+        $spexCpuProbeQueueMs = [double]::Parse($Matches[12], [Globalization.CultureInfo]::InvariantCulture)
+        $spexCpuProbeChecksum = [double]::Parse($Matches[13], [Globalization.CultureInfo]::InvariantCulture)
+    }
+}
+
 if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
 if (@($results).Count -ne $Repeats) {
     throw "Measurement failed: expected $Repeats results, observed $(@($results).Count)"
@@ -1137,6 +1179,19 @@ if ($SpexPrefetchK -gt 0) {
     if (($spexPrefetchBytesRead / $spexPrefetchLoaded) -ne ($spexPrefetchBytesUsed / $spexPrefetchHits)) { throw "SPEX prefetch measurement failed: read/consumed expert sizes differ" }
 } elseif ($spexPrefetchObserved -or $spexPrefetchFinalObserved) {
     throw "SPEX prefetch measurement failed: worker activated while not requested"
+}
+if ($SpexCpuProbeK -gt 0) {
+    if ($spexCpuProbeLineCount -ne 1 -or -not $spexCpuProbeFinalObserved) { throw "SPEX CPU probe measurement failed: final counters were not observed exactly once" }
+    if ($spexCpuProbeKObserved -ne $SpexCpuProbeK) { throw "SPEX CPU probe measurement failed: observed K mismatch" }
+    if ($spexCpuProbeSubmitted -le 0 -or $spexCpuProbeCompleted -le 0) { throw "SPEX CPU probe measurement failed: no jobs completed" }
+    if ($spexCpuProbeFailures -ne 0) { throw "SPEX CPU probe measurement failed: runtime failures observed" }
+    if ($spexCpuProbeCompleted -ne $spexCpuProbeSubmitted) { throw "SPEX CPU probe measurement failed: final submitted/completed accounting does not balance" }
+    if ($spexCpuProbePredicted -ne ($spexCpuProbeKObserved * $spexCpuProbeSubmitted)) { throw "SPEX CPU probe measurement failed: predicted width does not match K*submitted" }
+    if ($spexCpuProbeMatched -gt $spexCpuProbePredicted) { throw "SPEX CPU probe measurement failed: matched predictions exceed predicted count" }
+    if ($spexCpuProbeReadyAtTransport -gt $spexCpuProbeCompleted) { throw "SPEX CPU probe measurement failed: ready jobs exceed completed jobs" }
+    if ($spexCpuProbeUsefulReady -gt $spexCpuProbeMatched) { throw "SPEX CPU probe measurement failed: useful-ready count exceeds matched count" }
+} elseif ($spexCpuProbeLineCount -gt 0) {
+    throw "SPEX CPU probe measurement failed: final counters appeared while not requested"
 }
 if ($PrefillMassObserve -or $PrefillMassWrap) {
     if (-not $prefillMassArmed -or -not $prefillMassFinalized) { throw "Prefill mass measurement failed: observer did not arm/finalize" }
@@ -1546,11 +1601,28 @@ $summary = [pscustomobject]@{
     spex_dry_run_requested = [bool]$SpexDryRun
     spex_file = $SpexFile
     spex_file_sha256 = $spexHashAtStart
+    expected_spex_file_sha256 = if ($ExpectedSpexSHA256) { $ExpectedSpexSHA256.ToLowerInvariant() } else { "" }
     spex_cap_requested = $(if ($SpexDryRun) { $effectiveSpexCap } else { 0 })
     spex_stage_requested = $(if ($SpexDryRun) { $SpexStage } else { "off" })
     spex_fused_topk_requested = [bool]$SpexFusedTopK
     spex_ring_slots_requested = $(if ($SpexDryRun) { $SpexRingSlots } else { 0 })
     spex_prefetch_k_requested = $SpexPrefetchK
+    spex_cpu_probe_k_requested = $SpexCpuProbeK
+    spex_cpu_probe_final_observed = $spexCpuProbeFinalObserved
+    spex_cpu_probe_line_count = $spexCpuProbeLineCount
+    spex_cpu_probe_k_observed = $spexCpuProbeKObserved
+    spex_cpu_probe_submitted = $spexCpuProbeSubmitted
+    spex_cpu_probe_dropped = $spexCpuProbeDropped
+    spex_cpu_probe_completed = $spexCpuProbeCompleted
+    spex_cpu_probe_predicted = $spexCpuProbePredicted
+    spex_cpu_probe_matched = $spexCpuProbeMatched
+    spex_cpu_probe_ready_at_transport = $spexCpuProbeReadyAtTransport
+    spex_cpu_probe_useful_ready = $spexCpuProbeUsefulReady
+    spex_cpu_probe_failures = $spexCpuProbeFailures
+    spex_cpu_probe_d2h_wait_ms = $spexCpuProbeD2HWaitMs
+    spex_cpu_probe_cpu_ms = $spexCpuProbeCpuMs
+    spex_cpu_probe_queue_ms = $spexCpuProbeQueueMs
+    spex_cpu_probe_checksum = $spexCpuProbeChecksum
     spex_prefetch_observed = $spexPrefetchObserved
     spex_prefetch_k_observed = $spexPrefetchKObserved
     spex_prefetch_slots_observed = $spexPrefetchSlotsObserved
@@ -1671,6 +1743,8 @@ Write-Host ("spex requested/observed stage/cap: " + [bool]$SpexDryRun + " / " + 
 Write-Host ("spex layers/hits/actual recall: " + $spexLayers + " / " + $spexHits + " / " + $spexActual + " / " + $spexRecall)
 Write-Host ("spex recall scope/ready coverage: " + $spexRecallScope + " / " + $(if ($null -eq $spexReadyCoverage) { "n/a" } else { $spexReadyCoverage }))
 Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLate + " / " + $spexRingFull + " / " + $spexStale)
+Write-Host ("spex cpu probe req/observed/submitted/dropped/completed/predicted/matched/ready/useful/failures: " + $SpexCpuProbeK + " / " + $spexCpuProbeKObserved + " / " + $spexCpuProbeSubmitted + " / " + $spexCpuProbeDropped + " / " + $spexCpuProbeCompleted + " / " + $spexCpuProbePredicted + " / " + $spexCpuProbeMatched + " / " + $spexCpuProbeReadyAtTransport + " / " + $spexCpuProbeUsefulReady + " / " + $spexCpuProbeFailures)
+Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitMs + " / " + $spexCpuProbeCpuMs + " / " + $spexCpuProbeQueueMs + " / " + $spexCpuProbeChecksum)
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="

@@ -8333,6 +8333,8 @@ static void print_vec_stats(const char *name, const float *x, uint64_t n) {
 }
 
 #ifndef DS4_NO_GPU
+typedef struct ds4_spex_cpu_probe ds4_spex_cpu_probe;
+
 /* =========================================================================
  * Metal Release Graph State.
  * =========================================================================
@@ -8444,6 +8446,7 @@ typedef struct {
     ds4_gpu_tensor *spex_topk[8];
     ds4_gpu_async_read *spex_readback;
     ds4_gpu_spex_queue *spex_prefetch;
+    ds4_spex_cpu_probe *spex_cpu_probe;
     const ds4_weights *spex_model_weights;
     uint64_t spex_epoch;
     uint64_t spex_decode_seq;
@@ -8553,6 +8556,372 @@ enum {
     DS4_SPEX_STAGE_FULL = 4,
 };
 
+#define DS4_SPEX_CPU_PROBE_SLOTS 8u
+
+enum {
+    DS4_SPEX_CPU_FREE = 0,
+    DS4_SPEX_CPU_RESERVED = 1,
+    DS4_SPEX_CPU_QUEUED = 2,
+    DS4_SPEX_CPU_RUNNING = 3,
+    DS4_SPEX_CPU_DONE = 4,
+};
+
+typedef struct {
+    uint64_t decode_seq;
+    uint32_t layer;
+    uint32_t count;
+    uint32_t ids[2];
+    uint32_t matched;
+    double submitted_s;
+    bool exact_known;
+    uint8_t state;
+} ds4_spex_cpu_job;
+
+struct ds4_spex_cpu_probe {
+    os_thread_t thread;
+    os_mutex_t mutex;
+    os_cond_t work_cond;
+    ds4_gpu_async_read *readback;
+    const ds4_model *model;
+    const ds4_weights *weights;
+    block_q8_K *xq;
+    ds4_spex_cpu_job job[DS4_SPEX_CPU_PROBE_SLOTS];
+    uint32_t k;
+    bool thread_started;
+    bool shutdown;
+    uint64_t submitted;
+    uint64_t dropped;
+    uint64_t completed;
+    uint64_t predicted;
+    uint64_t matched;
+    uint64_t ready_at_transport;
+    uint64_t useful_ready;
+    uint64_t failures;
+    double d2h_wait_s;
+    double cpu_s;
+    double queue_s;
+    double checksum;
+};
+
+static uint32_t metal_graph_spex_cpu_probe_k(void) {
+    const char *value = getenv("DS4_SPEX_CPU_PROBE_K");
+    if (!value || !value[0]) return 0;
+    char *end = NULL;
+    const unsigned long parsed = strtoul(value, &end, 10);
+    return end != value && *end == '\0' && (parsed == 1ul || parsed == 2ul)
+        ? (uint32_t)parsed : 0u;
+}
+
+static int metal_graph_spex_cpu_eval_expert(
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        const block_q8_K *xq,
+        uint32_t expert,
+        double *checksum) {
+    if (!model || !layer || !xq || !checksum || expert >= DS4_N_EXPERT ||
+        !layer->ffn_gate_exps || !layer->ffn_up_exps ||
+        layer->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        layer->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS) {
+        return 0;
+    }
+
+    uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
+    uint64_t up_in = 0, up_out = 0, up_row_bytes = 0;
+    const uint8_t *gate_base = tensor_expert_bytes(
+        model, layer->ffn_gate_exps, expert,
+        &gate_in, &gate_out, &gate_row_bytes);
+    const uint8_t *up_base = tensor_expert_bytes(
+        model, layer->ffn_up_exps, expert,
+        &up_in, &up_out, &up_row_bytes);
+    if (!gate_base || !up_base || gate_in != up_in || gate_out != up_out ||
+        gate_in != DS4_N_EMBD || gate_in % QK_K != 0) {
+        return 0;
+    }
+
+    double sum = 0.0;
+    for (uint64_t row = 0; row < gate_out; row++) {
+        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(
+            gate_base + row * gate_row_bytes);
+        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(
+            up_base + row * up_row_bytes);
+        float gate = 0.0f;
+        float up = 0.0f;
+        ds4_vec_dot_iq2_xxs_pair_q8_K(
+            (int)gate_in, &gate, &up, gate_row, up_row, xq);
+        if (DS4_SWIGLU_CLAMP_EXP > 1.0e-6f) {
+            if (gate > DS4_SWIGLU_CLAMP_EXP) gate = DS4_SWIGLU_CLAMP_EXP;
+            if (up > DS4_SWIGLU_CLAMP_EXP) up = DS4_SWIGLU_CLAMP_EXP;
+            if (up < -DS4_SWIGLU_CLAMP_EXP) up = -DS4_SWIGLU_CLAMP_EXP;
+        }
+        sum += (double)(silu(gate) * up);
+    }
+    *checksum += sum;
+    return 1;
+}
+
+static void *metal_graph_spex_cpu_worker(void *arg) {
+    ds4_spex_cpu_probe *probe = (ds4_spex_cpu_probe *)arg;
+    for (;;) {
+        uint32_t slot = DS4_SPEX_CPU_PROBE_SLOTS;
+        os_mutex_lock(&probe->mutex);
+        for (;;) {
+            double oldest = 0.0;
+            for (uint32_t i = 0; i < DS4_SPEX_CPU_PROBE_SLOTS; i++) {
+                if (probe->job[i].state != DS4_SPEX_CPU_QUEUED) continue;
+                if (slot == DS4_SPEX_CPU_PROBE_SLOTS ||
+                    probe->job[i].submitted_s < oldest) {
+                    slot = i;
+                    oldest = probe->job[i].submitted_s;
+                }
+            }
+            if (slot != DS4_SPEX_CPU_PROBE_SLOTS) break;
+            if (probe->shutdown) {
+                os_mutex_unlock(&probe->mutex);
+                return NULL;
+            }
+            os_cond_wait(&probe->work_cond, &probe->mutex);
+        }
+        ds4_spex_cpu_job *job = &probe->job[slot];
+        job->state = DS4_SPEX_CPU_RUNNING;
+        const double start_s = now_sec();
+        probe->queue_s += start_s - job->submitted_s;
+        const uint32_t count = job->count;
+        uint32_t ids[2] = {job->ids[0], job->ids[1]};
+        const uint32_t layer_index = job->layer;
+        os_mutex_unlock(&probe->mutex);
+
+        const double d2h0 = now_sec();
+        const int read_ok = ds4_gpu_async_read_wait_slot(probe->readback, slot);
+        const double d2h1 = now_sec();
+        int eval_ok = read_ok;
+        double checksum = 0.0;
+        const double cpu0 = now_sec();
+        if (eval_ok) {
+            const float *hidden = (const float *)ds4_gpu_async_read_host_slot(
+                probe->readback, slot);
+            if (!hidden || !probe->weights || layer_index >= DS4_N_LAYER) {
+                eval_ok = 0;
+            } else {
+                ds4_quantize_row_q8_K(hidden, probe->xq, DS4_N_EMBD);
+                const ds4_layer_weights *layer = &probe->weights->layer[layer_index];
+                for (uint32_t i = 0; eval_ok && i < count; i++) {
+                    eval_ok = metal_graph_spex_cpu_eval_expert(
+                        probe->model, layer, probe->xq, ids[i], &checksum);
+                }
+            }
+        }
+        const double cpu1 = now_sec();
+
+        os_mutex_lock(&probe->mutex);
+        probe->d2h_wait_s += d2h1 - d2h0;
+        probe->cpu_s += cpu1 - cpu0;
+        probe->checksum += checksum;
+        probe->completed++;
+        if (!eval_ok) probe->failures++;
+        if (job->exact_known) {
+            job->state = DS4_SPEX_CPU_FREE;
+        } else {
+            job->state = DS4_SPEX_CPU_DONE;
+        }
+        os_mutex_unlock(&probe->mutex);
+    }
+}
+
+static void metal_graph_spex_cpu_release(ds4_gpu_graph *g) {
+    if (!g || !g->spex_cpu_probe) return;
+    ds4_spex_cpu_probe *probe = g->spex_cpu_probe;
+    os_mutex_lock(&probe->mutex);
+    probe->shutdown = true;
+    os_cond_broadcast(&probe->work_cond);
+    os_mutex_unlock(&probe->mutex);
+    if (probe->thread_started) os_thread_join(probe->thread);
+
+    fprintf(stderr,
+            "ds4: [spex-cpu] final k=%u submitted=%llu dropped=%llu completed=%llu "
+            "predicted=%llu matched=%llu ready_at_transport=%llu useful_ready=%llu "
+            "failures=%llu d2h_wait_ms=%.3f cpu_ms=%.3f queue_ms=%.3f checksum=%.9g\n",
+            probe->k,
+            (unsigned long long)probe->submitted,
+            (unsigned long long)probe->dropped,
+            (unsigned long long)probe->completed,
+            (unsigned long long)probe->predicted,
+            (unsigned long long)probe->matched,
+            (unsigned long long)probe->ready_at_transport,
+            (unsigned long long)probe->useful_ready,
+            (unsigned long long)probe->failures,
+            1000.0 * probe->d2h_wait_s,
+            1000.0 * probe->cpu_s,
+            1000.0 * probe->queue_s,
+            probe->checksum);
+
+    ds4_gpu_async_read_free(probe->readback);
+    free(probe->xq);
+    os_cond_destroy(&probe->work_cond);
+    os_mutex_destroy(&probe->mutex);
+    free(probe);
+    g->spex_cpu_probe = NULL;
+}
+
+static void metal_graph_spex_cpu_init(
+        ds4_gpu_graph *g,
+        const ds4_model *model,
+        const ds4_weights *weights) {
+    const uint32_t k = metal_graph_spex_cpu_probe_k();
+    if (!g || k == 0) return;
+    if (!model || !weights || g->spex_stage != DS4_SPEX_STAGE_FULL ||
+        g->spex_cap < k || g->spex_prefetch) {
+        fprintf(stderr,
+                "ds4: SPEX CPU probe requested but requires full dry-run, cap>=k, and GPU prefetch off\n");
+        return;
+    }
+
+    ds4_spex_cpu_probe *probe = calloc(1, sizeof(*probe));
+    if (!probe) return;
+    probe->k = k;
+    probe->model = model;
+    probe->weights = weights;
+    os_mutex_init(&probe->mutex);
+    os_cond_init(&probe->work_cond);
+    probe->readback = ds4_gpu_async_read_ring_alloc(
+        (uint64_t)DS4_N_EMBD * sizeof(float), DS4_SPEX_CPU_PROBE_SLOTS);
+    probe->xq = xmalloc(
+        (size_t)(DS4_N_EMBD / QK_K) * sizeof(probe->xq[0]));
+    os_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    if (!probe->readback ||
+        os_thread_create(&probe->thread, metal_graph_spex_cpu_worker, probe) != 0) {
+        ds4_gpu_async_read_free(probe->readback);
+        free(probe->xq);
+        os_cond_destroy(&probe->work_cond);
+        os_mutex_destroy(&probe->mutex);
+        free(probe);
+        fprintf(stderr, "ds4: SPEX CPU probe allocation/thread creation failed\n");
+        return;
+    }
+    probe->thread_started = true;
+    g->spex_cpu_probe = probe;
+    fprintf(stderr,
+            "ds4: SPEX CPU observe-only active k=%u slots=%u hidden_d2h=%u bytes; routing/output unchanged\n",
+            k, DS4_SPEX_CPU_PROBE_SLOTS,
+            (unsigned)(DS4_N_EMBD * sizeof(float)));
+}
+
+static uint32_t metal_graph_spex_prediction_for_layer(
+        const ds4_gpu_graph *g,
+        uint32_t il,
+        uint32_t *ids,
+        uint32_t cap) {
+    if (!g || !ids || cap == 0 || il >= DS4_N_LAYER) return 0;
+    const int32_t *source = NULL;
+    uint32_t count = 0;
+    if (g->spex_early_prediction_valid[il]) {
+        source = g->spex_early_prediction_ids[il];
+        count = g->spex_early_prediction_count[il];
+    } else if (g->spex_prediction_valid && g->spex_prediction_layer == il) {
+        source = g->spex_prediction_ids;
+        count = g->spex_prediction_count;
+    }
+    if (!source) return 0;
+    if (count > cap) count = cap;
+    for (uint32_t i = 0; i < count; i++) {
+        if (source[i] < 0 || source[i] >= DS4_N_EXPERT) return 0;
+        ids[i] = (uint32_t)source[i];
+    }
+    return count;
+}
+
+static void metal_graph_spex_cpu_schedule(ds4_gpu_graph *g, uint32_t il) {
+    if (!g || !g->spex_cpu_probe || !g->spex_active ||
+        !g->spex_decode_active || il >= DS4_N_LAYER) return;
+    ds4_spex_cpu_probe *probe = g->spex_cpu_probe;
+    uint32_t ids[2] = {0, 0};
+    const uint32_t count = metal_graph_spex_prediction_for_layer(
+        g, il, ids, probe->k);
+    if (count == 0) return;
+
+    uint32_t slot = DS4_SPEX_CPU_PROBE_SLOTS;
+    os_mutex_lock(&probe->mutex);
+    for (uint32_t i = 0; i < DS4_SPEX_CPU_PROBE_SLOTS; i++) {
+        if (probe->job[i].state == DS4_SPEX_CPU_FREE) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == DS4_SPEX_CPU_PROBE_SLOTS) {
+        probe->dropped++;
+        os_mutex_unlock(&probe->mutex);
+        return;
+    }
+    ds4_spex_cpu_job *job = &probe->job[slot];
+    memset(job, 0, sizeof(*job));
+    job->decode_seq = g->spex_decode_seq;
+    job->layer = il;
+    job->count = count;
+    job->ids[0] = ids[0];
+    job->ids[1] = ids[1];
+    job->submitted_s = now_sec();
+    job->state = DS4_SPEX_CPU_RESERVED;
+    os_mutex_unlock(&probe->mutex);
+
+    if (!ds4_gpu_tensor_read_async_ordered_slot(
+            probe->readback, slot, g->ffn_norm, 0,
+            (uint64_t)DS4_N_EMBD * sizeof(float))) {
+        os_mutex_lock(&probe->mutex);
+        job->state = DS4_SPEX_CPU_FREE;
+        probe->dropped++;
+        probe->failures++;
+        os_mutex_unlock(&probe->mutex);
+        return;
+    }
+
+    os_mutex_lock(&probe->mutex);
+    job->state = DS4_SPEX_CPU_QUEUED;
+    probe->submitted++;
+    os_cond_signal(&probe->work_cond);
+    os_mutex_unlock(&probe->mutex);
+}
+
+static void metal_graph_spex_cpu_observe_exact(
+        ds4_gpu_graph *g,
+        const ds4_layer_weights *layer,
+        uint32_t il) {
+    if (!g || !g->spex_cpu_probe || !layer || !layer->ffn_gate_exps) return;
+    int32_t actual[DS4_N_EXPERT_USED];
+    const uint32_t actual_n = ds4_gpu_routed_moe_last_selected(
+        layer->ffn_gate_exps->abs_offset, actual, DS4_N_EXPERT_USED);
+    if (actual_n == 0) return;
+
+    ds4_spex_cpu_probe *probe = g->spex_cpu_probe;
+    os_mutex_lock(&probe->mutex);
+    for (uint32_t slot = 0; slot < DS4_SPEX_CPU_PROBE_SLOTS; slot++) {
+        ds4_spex_cpu_job *job = &probe->job[slot];
+        if (job->state == DS4_SPEX_CPU_FREE ||
+            job->state == DS4_SPEX_CPU_RESERVED || job->exact_known ||
+            job->decode_seq != g->spex_decode_seq || job->layer != il) {
+            continue;
+        }
+        uint32_t hits = 0;
+        for (uint32_t p = 0; p < job->count; p++) {
+            for (uint32_t a = 0; a < actual_n; a++) {
+                if ((int32_t)job->ids[p] == actual[a]) {
+                    hits++;
+                    break;
+                }
+            }
+        }
+        job->matched = hits;
+        job->exact_known = true;
+        probe->predicted += job->count;
+        probe->matched += hits;
+        if (job->state == DS4_SPEX_CPU_DONE) {
+            probe->ready_at_transport++;
+            probe->useful_ready += hits;
+            job->state = DS4_SPEX_CPU_FREE;
+        }
+        break;
+    }
+    os_mutex_unlock(&probe->mutex);
+}
+
 static bool metal_graph_spex_dry_run_requested(void) {
     const char *value = getenv("DS4_SPEX_HIDDEN_GPU_DRY_RUN");
     return value && value[0] && strcmp(value, "0") != 0;
@@ -8649,6 +9018,7 @@ static void metal_graph_spex_print_stats(const ds4_gpu_graph *g, const char *why
 
 static void metal_graph_spex_release(ds4_gpu_graph *g) {
     if (!g) return;
+    metal_graph_spex_cpu_release(g);
     ds4_gpu_spex_queue_destroy(g->spex_prefetch);
     ds4_gpu_async_read_free(g->spex_readback);
     for (uint32_t i = 0; i < 8; i++) {
@@ -8788,6 +9158,7 @@ static void metal_graph_spex_init(
                 "ds4: SPEX K1 prefetch disabled by incompatible selected-load configuration\n");
     }
     g->spex_active = true;
+    metal_graph_spex_cpu_init(g, base_model, base_weights);
     fprintf(stderr,
             "ds4: SPEX hidden GPU dry-run active file='%s' stage=%s cap=%u fused=%u ring=%u weights=%.2f MiB; routing unchanged\n",
             path, metal_graph_spex_stage_name(g->spex_stage), g->spex_cap,
@@ -10462,6 +10833,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_norm", g->ffn_norm, DS4_N_EMBD, il, pos);
     }
+    if (ok) metal_graph_spex_cpu_schedule(g, il);
     if (ok) metal_graph_spex_score_next(g, il);
     const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
@@ -10559,8 +10931,11 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
-                                                 g->spex_prefetch,
-                                                 g->spex_prefetch ? &spex_key : NULL) != 0;
+                                                  g->spex_prefetch,
+                                                  g->spex_prefetch ? &spex_key : NULL) != 0;
+    if (ok) {
+        metal_graph_spex_cpu_observe_exact(g, layer, il);
+    }
     DS4_METAL_PROFILE_DECODE_STAGE(
         overlap_shared_full ? "shared_full+routed_moe" :
         (overlap_shared ? "shared_gate_up+routed_moe" : "routed_moe"));

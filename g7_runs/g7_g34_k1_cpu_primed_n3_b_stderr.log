@@ -1,0 +1,42 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 1.728s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 05:28:29 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: SPEX CPU observe-only active k=1 slots=8 hidden_d2h=16384 bytes; routing/output unchanged
+ds4: SPEX hidden GPU dry-run active file='C:\Users\imanu\source\repos\moe-aggressive-commit\runs\spex\spex_model\ds4flash_d2_nextlayer.spex' stage=full cap=1 fused=0 ring=1 weights=86.00 MiB; routing unchanged
+0715 05:28:29 ds4-server: listening on http://127.0.0.1:8000
+0715 05:28:30 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 336 slots
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 05:28:31 ds4-server: chat ctx=0..5:5 prompt done 1.570s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [gpu-route-debug] request seq=1 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=1
+ds4: [gpu-route-debug] request seq=2 layer=2 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=2
+0715 05:28:33 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.87 t/s avg=3.87 t/s 2.323s
+0715 05:28:34 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.908s
+0715 05:28:34 ds4-server: chat ctx=0..5:5 prompt start
+0715 05:28:35 ds4-server: chat ctx=0..5:5 prompt done 1.317s
+0715 05:28:38 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.04 t/s avg=3.04 t/s 2.959s
+0715 05:28:38 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 4.306s
+0715 05:28:38 ds4-server: chat ctx=0..5:5 prompt start
+0715 05:28:39 ds4-server: chat ctx=0..5:5 prompt done 1.428s
+0715 05:28:42 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.09 t/s avg=3.09 t/s 2.908s
+0715 05:28:42 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 4.353s
+0715 05:28:42 ds4-server: chat ctx=0..5:5 prompt start
+0715 05:28:44 ds4-server: chat ctx=0..5:5 prompt done 1.288s
+0715 05:28:47 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.12 t/s avg=3.12 t/s 2.888s
+0715 05:28:47 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 4.190s
+0715 05:28:47 ds4-server: benchmark request target reached; shutting down cleanly
+0715 05:28:47 ds4-server: shutdown requested, draining requests
+ds4: [spex-dry] final stage=full cap=1 scheduled=1512 ready=1512 not_ready=35 layers=1512 actual=9072 predicted=1512 hits=812 recall=0.0895 precision=0.5370 no_actual=0 ring=1 late=0 ring_full=0 stale=0
+ds4: [spex-cpu] final k=1 submitted=1510 dropped=2 completed=1510 predicted=1510 matched=811 ready_at_transport=629 useful_ready=305 failures=0 d2h_wait_ms=2924.746 cpu_ms=6693.039 queue_ms=2162.823 checksum=4902.13535
+ds4: [gpu-resident-routes] final calls=1512 split_calls=0 all_hit=12 worker_jobs=1500 miss_experts=5240 errors=0 worker=3.874ms/job resolve=2.614ms/call wait=3.841ms/call queries=0
