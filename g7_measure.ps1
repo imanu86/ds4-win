@@ -1578,7 +1578,8 @@ if ($PrefillMassWrap) {
         $prefillMassWrapSnapshotAfter -le 0 -or $prefillMassWrapGeneration -le 0) {
         throw "Prefill mass WRAP failed: first-snapshot invariants differ"
     }
-    if ($prefillMassWrapPreloaded -ne 0 -or $prefillMassWrapRouter -ne "unbiased" -or $prefillMassWrapMask -ne "off") {
+    $expectedPrefillMassMask = if ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" }
+    if ($prefillMassWrapPreloaded -ne 0 -or $prefillMassWrapRouter -ne "unbiased" -or $prefillMassWrapMask -ne $expectedPrefillMassMask) {
         throw "Prefill mass WRAP failed: isolation telemetry differs"
     }
     if ($ComposePrefillMassTiering) {

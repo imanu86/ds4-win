@@ -420,6 +420,7 @@ struct cuda_prefill_mass_observer {
     int wrap_requested;
     int wrap_attempted;
     int wrap_published;
+    int compose_mask_applied;
     uint32_t unique_entries;
     uint32_t layers_seen;
     uint32_t candidate_entries;
@@ -488,6 +489,9 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes);
 extern "C" void ds4_gpu_dynamic_arena_release(void);
 extern "C" void ds4_gpu_dynamic_arena_abort(ds4_gpu_dynamic_arena_txn *txn);
 extern "C" void ds4_gpu_dynamic_arena_observer_reset(void);
+extern "C" void ds4_gpu_reap_router_bias_reset(void);
+extern "C" int ds4_gpu_reap_router_bias_update(
+        uint32_t layer_index, const float *bias, uint32_t count);
 static void cuda_dynamic_arena_observer_release(void);
 static void cuda_prefill_mass_observer_reset(void);
 static void cuda_prefill_mass_observer_finalize(void);
@@ -3966,6 +3970,9 @@ static void cuda_prefill_mass_observer_report_decode(const char *reason) {
 
 static void cuda_prefill_mass_observer_release(int report) {
     if (report) cuda_prefill_mass_observer_report_decode("request-end");
+    if (g_prefill_mass_observer.compose_mask_applied) {
+        ds4_gpu_reap_router_bias_reset();
+    }
     g_prefill_mass_observer.mass.clear();
     g_prefill_mass_observer.counts.clear();
     g_prefill_mass_observer.rows_by_layer.clear();
@@ -3977,6 +3984,7 @@ static void cuda_prefill_mass_observer_release(int report) {
     g_prefill_mass_observer.wrap_requested = 0;
     g_prefill_mass_observer.wrap_attempted = 0;
     g_prefill_mass_observer.wrap_published = 0;
+    g_prefill_mass_observer.compose_mask_applied = 0;
     g_prefill_mass_observer.unique_entries = 0;
     g_prefill_mass_observer.layers_seen = 0;
     g_prefill_mass_observer.candidate_entries = 0;
@@ -3985,6 +3993,50 @@ static void cuda_prefill_mass_observer_release(int report) {
     g_prefill_mass_observer.routed_slots = 0;
     g_prefill_mass_observer.decode_slots = 0;
     g_prefill_mass_observer.decode_candidate_hits = 0;
+}
+
+static int cuda_prefill_mass_compose_apply_router_mask(void) {
+    cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
+    if (cuda_moe_prefill_tier_compose_requested() <= 0) return 1;
+    for (float *device_bias : g_reap_router_bias) {
+        if (device_bias) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-compose-mask] result=failed reason=existing-router-bias layers=0 kept=0 pruned=0\n");
+            return 0;
+        }
+    }
+    std::vector<float> bias(g_dynamic_arena.n_expert, -1.0e9f);
+    uint32_t layers = 0;
+    uint32_t kept = 0;
+    uint32_t pruned = 0;
+    for (uint32_t layer = 3; layer < g_dynamic_arena.n_layer; layer++) {
+        uint32_t layer_kept = 0;
+        const uint32_t base = layer * g_dynamic_arena.n_expert;
+        for (uint32_t expert = 0;
+             expert < g_dynamic_arena.n_expert; expert++) {
+            const int resident = observer.candidate[base + expert] != 0;
+            bias[expert] = resident ? 0.0f : -1.0e9f;
+            layer_kept += resident;
+        }
+        if (layer_kept < 6u ||
+            !ds4_gpu_reap_router_bias_update(
+                layer, bias.data(), g_dynamic_arena.n_expert)) {
+            ds4_gpu_reap_router_bias_reset();
+            fprintf(stderr,
+                    "ds4: [prefill-mass-compose-mask] result=failed reason=layer-mask layer=%u kept=%u pruned=%u\n",
+                    layer, layer_kept,
+                    g_dynamic_arena.n_expert - layer_kept);
+            return 0;
+        }
+        layers++;
+        kept += layer_kept;
+        pruned += g_dynamic_arena.n_expert - layer_kept;
+    }
+    observer.compose_mask_applied = 1;
+    fprintf(stderr,
+            "ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=%u kept=%u pruned=%u semantics=request-scoped-closed\n",
+            layers, kept, pruned);
+    return 1;
 }
 
 static void cuda_prefill_mass_observer_reset(void) {
@@ -4089,9 +4141,15 @@ static int cuda_prefill_mass_publish_candidate(void) {
 
         if (cuda_dynamic_arena_wrap_publish_target(
                 observer.candidate.data(), entry_count, &wrap)) {
-            terminal = "published";
-            reason = "ok";
-            observer.wrap_published = 1;
+            if (cuda_prefill_mass_compose_apply_router_mask()) {
+                terminal = "published";
+                reason = "ok";
+                observer.wrap_published = 1;
+            } else {
+                terminal = "failed";
+                reason = "compose-mask";
+                g_dynamic_arena.fatal_errors++;
+            }
         } else {
             terminal = wrap.aborted ? "aborted" : "failed";
             reason = wrap.reason ? wrap.reason : "publish";
@@ -4116,13 +4174,14 @@ static int cuda_prefill_mass_publish_candidate(void) {
         g_dynamic_arena.fatal_errors++;
     }
     fprintf(stderr,
-            "ds4: [prefill-mass-wrap] result=%s reason=%s candidate=%u loads=%u workers=%u seconds=%.3f snapshot_before=%llu snapshot_after=%llu resident_before=%u resident_after=%u generation=%llu preloaded=0 router=unbiased mask=off\n",
+            "ds4: [prefill-mass-wrap] result=%s reason=%s candidate=%u loads=%u workers=%u seconds=%.3f snapshot_before=%llu snapshot_after=%llu resident_before=%u resident_after=%u generation=%llu preloaded=0 router=unbiased mask=%s\n",
             terminal, reason, observer.candidate_entries,
             wrap.loads, wrap.workers, wrap.seconds,
             (unsigned long long)snapshot_before,
             (unsigned long long)snapshot_after,
             resident_before, resident_after,
-            (unsigned long long)wrap.generation);
+            (unsigned long long)wrap.generation,
+            observer.compose_mask_applied ? "request-scoped-closed" : "off");
     return observer.wrap_published;
 }
 
