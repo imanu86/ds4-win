@@ -41,6 +41,7 @@ param(
     [switch]$DirectCacheHits,
     [switch]$MixedDirectCache,
     [switch]$GpuResidentRoutes,
+    [switch]$SplitHitMiss,
     [switch]$RouteProfile,
     [switch]$ExpertCacheStats,
     [ValidateRange(1, 1000000)][int]$ExpertCacheStatsInterval = 128,
@@ -96,6 +97,9 @@ if ($ExpectedWarmupContentSHA256 -and -not $Warmup) {
 }
 if ($GpuResidentRoutes -and $ExpertCacheN -le 0) {
     throw "GpuResidentRoutes requires -ExpertCacheN greater than zero"
+}
+if ($SplitHitMiss -and -not $GpuResidentRoutes) {
+    throw "SplitHitMiss requires -GpuResidentRoutes"
 }
 $effectiveWarmupPrompt = if ($WarmupPrompt) { $WarmupPrompt } else { $Prompt }
 $effectiveWarmupMaxTokens = if ($WarmupMaxTokens -gt 0) { $WarmupMaxTokens } else { $MaxTokens }
@@ -256,6 +260,11 @@ if ($GpuResidentRoutes) {
     $env:DS4_CUDA_MOE_GPU_RESIDENT_ROUTES = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_MOE_GPU_RESIDENT_ROUTES -ErrorAction SilentlyContinue
+}
+if ($SplitHitMiss) {
+    $env:DS4_CUDA_MOE_SPLIT_HIT_MISS = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_MOE_SPLIT_HIT_MISS -ErrorAction SilentlyContinue
 }
 if ($RouteProfile) { $env:DS4_CUDA_MOE_ROUTE_PROFILE = "1" }
 else { Remove-Item Env:\DS4_CUDA_MOE_ROUTE_PROFILE -ErrorAction SilentlyContinue }
@@ -644,7 +653,7 @@ $routeProfileObserved = $false; $routeProfileCalls = 0
 $routeProfileD2HMs = 0.0; $routeProfileObserveMs = 0.0
 $routeProfileMapMs = 0.0; $routeProfileTransportMs = 0.0
 $routeProfilePublishMs = 0.0
-$gpuRoutesObserved = $false; $gpuRoutesCalls = 0; $gpuRoutesAllHit = 0
+$gpuRoutesObserved = $false; $gpuRoutesCalls = 0; $gpuRoutesSplitCalls = 0; $gpuRoutesAllHit = 0
 $gpuRoutesWorkerJobs = 0; $gpuRoutesMissExperts = 0; $gpuRoutesErrors = 0
 $gpuRoutesWorkerMs = 0.0; $gpuRoutesResolveMs = 0.0; $gpuRoutesWaitMs = 0.0
 $overlapSharedObserved = $false
@@ -846,16 +855,20 @@ if (Test-Path $stderrLog) {
         $routeProfilePublishMs = [double]$Matches[6]
     }
     $gpuRoutesLine = $lines | Where-Object { $_ -match "\[gpu-resident-routes\] final" } | Select-Object -Last 1
-    if ($gpuRoutesLine -and $gpuRoutesLine -match "calls=(\d+) all_hit=(\d+) worker_jobs=(\d+) miss_experts=(\d+) errors=(\d+) worker=([0-9.]+)ms/job resolve=([0-9.]+)ms/call wait=([0-9.]+)ms/call") {
+    if ($gpuRoutesLine -and $gpuRoutesLine -match "calls=(\d+) split_calls=(\d+) all_hit=(\d+) worker_jobs=(\d+) miss_experts=(\d+) errors=(\d+) worker=([0-9.]+)ms/job resolve=([0-9.]+)ms/call wait=([0-9.]+)ms/call") {
         $gpuRoutesObserved = $true
         $gpuRoutesCalls = [long]$Matches[1]
-        $gpuRoutesAllHit = [long]$Matches[2]
-        $gpuRoutesWorkerJobs = [long]$Matches[3]
-        $gpuRoutesMissExperts = [long]$Matches[4]
-        $gpuRoutesErrors = [long]$Matches[5]
-        $gpuRoutesWorkerMs = [double]$Matches[6]
-        $gpuRoutesResolveMs = [double]$Matches[7]
-        $gpuRoutesWaitMs = [double]$Matches[8]
+        $gpuRoutesSplitCalls = [long]$Matches[2]
+        $gpuRoutesAllHit = [long]$Matches[3]
+        $gpuRoutesWorkerJobs = [long]$Matches[4]
+        $gpuRoutesMissExperts = [long]$Matches[5]
+        $gpuRoutesErrors = [long]$Matches[6]
+        $gpuRoutesWorkerMs = [double]$Matches[7]
+        $gpuRoutesResolveMs = [double]$Matches[8]
+        $gpuRoutesWaitMs = [double]$Matches[9]
+    }
+    if ($SplitHitMiss -and (-not $gpuRoutesObserved -or $gpuRoutesSplitCalls -le 0)) {
+        throw "SplitHitMiss was requested but the runtime did not report any split calls"
     }
     $contextLine = $lines | Where-Object { $_ -match "context buffers .*ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)" } | Select-Object -Last 1
     if ($contextLine -and $contextLine -match "ctx=(\d+).*prefill_chunk=(\d+).*raw_kv_rows=(\d+).*compressed_kv_rows=(\d+)") {
@@ -1512,8 +1525,10 @@ $summary = [pscustomobject]@{
     route_profile_transport_ms_per_call = $routeProfileTransportMs
     route_profile_publish_ms_per_call = $routeProfilePublishMs
     gpu_resident_routes_requested = [bool]$GpuResidentRoutes
+    split_hit_miss_requested = [bool]$SplitHitMiss
     gpu_resident_routes_observed = $gpuRoutesObserved
     gpu_resident_routes_calls = $gpuRoutesCalls
+    gpu_resident_routes_split_calls = $gpuRoutesSplitCalls
     gpu_resident_routes_all_hit = $gpuRoutesAllHit
     gpu_resident_routes_worker_jobs = $gpuRoutesWorkerJobs
     gpu_resident_routes_miss_experts = $gpuRoutesMissExperts
@@ -1648,7 +1663,7 @@ Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapac
 Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
-Write-Host ("gpu resident routes requested/observed/calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms: " + [bool]$GpuResidentRoutes + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs)
+Write-Host ("gpu resident routes requested/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms: " + [bool]$GpuResidentRoutes + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs)
 Write-Host ("overlap_shared requested/observed: " + [bool]$OverlapShared + " / " + $overlapSharedObserved)
 Write-Host ("overlap_shared_full requested/observed: " + [bool]$OverlapSharedFull + " / " + $overlapSharedFullObserved)
 Write-Host ("shared_down_fusion_disabled: " + [bool]$DisableSharedDownFusion)

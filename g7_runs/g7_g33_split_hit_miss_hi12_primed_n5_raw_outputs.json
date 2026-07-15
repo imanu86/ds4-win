@@ -1,0 +1,65 @@
+﻿{
+    "schema":  "g7_raw_outputs_v1",
+    "tag":  "g33_split_hit_miss_hi12_primed_n5",
+    "head":  "1126211c24409108ebeaaedb8498db4426a39fb8",
+    "executable_sha256":  "0f8c431940846e85e7bb46d6ac29ed3a963f1047647d564719ec74143a110001",
+    "ds4_cuda_sha256":  "6356d32dea0961c414b4901bdbd0705af24375eeb5e9d7d461ec5306266076a1",
+    "prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "system_prompt":  "",
+    "system_prompt_sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "warmup_prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "expected_content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+    "expected_warmup_content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+    "warmup_result":  {
+                          "seconds":  3.949329,
+                          "completion_tokens":  9,
+                          "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                          "content":  "Hello! How can I help you today?"
+                      },
+    "output_hashes":  [
+                          "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5"
+                      ],
+    "outputs_identical":  true,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  4.255423,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.114948,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    },
+                    {
+                        "repeat":  2,
+                        "seconds":  4.301072,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.092501,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    },
+                    {
+                        "repeat":  3,
+                        "seconds":  4.070786,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.210875,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    },
+                    {
+                        "repeat":  4,
+                        "seconds":  4.157722,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.164647,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    },
+                    {
+                        "repeat":  5,
+                        "seconds":  4.221451,
+                        "completion_tokens":  9,
+                        "tokens_per_second":  2.131968,
+                        "content_sha256":  "fda564ba3f7a0f028106d468420f674898ed99ac5bf2765ac9586206e39d73c5",
+                        "content":  "Hello! How can I help you today?"
+                    }
+                ]
+}

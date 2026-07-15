@@ -1,0 +1,38 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA registered 2.00 GiB contiguous host window (of 80.76 GiB model) for zero-copy device access
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup cache deferred 0.52 GiB of tensor spans to on-demand streaming
+ds4: CUDA startup model cache prepared 6.69 GiB of tensor spans in 2.082s
+ds4: CUDA stream reserve startup=4.00 GiB runtime=0.12 GiB switch=expert-cache-ready
+ds4: cuda backend initialized for graph diagnostics
+0715 04:48:48 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0715 04:48:48 ds4-server: listening on http://127.0.0.1:8000
+0715 04:48:49 ds4-server: chat ctx=0..5:5 prompt start
+ds4: CUDA resident expert cache ready: 336/336 experts, 6.75 MiB/expert, 2.21 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 336 slots
+ds4: CUDA stream runtime reserve activated: 4.00 GiB -> 0.12 GiB
+0715 04:48:50 ds4-server: chat ctx=0..5:5 prompt done 1.509s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [gpu-route-debug] request seq=1 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=1
+ds4: [gpu-route-debug] request seq=2 layer=2 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=2
+0715 04:48:53 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.72 t/s avg=3.72 t/s 2.423s
+0715 04:48:53 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.947s
+0715 04:48:53 ds4-server: chat ctx=0..5:5 prompt start
+0715 04:48:54 ds4-server: chat ctx=0..5:5 prompt done 1.319s
+0715 04:48:57 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.38 t/s avg=3.38 t/s 2.661s
+0715 04:48:57 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 3.995s
+0715 04:48:57 ds4-server: chat ctx=0..5:5 prompt start
+0715 04:48:58 ds4-server: chat ctx=0..5:5 prompt done 1.267s
+0715 04:49:01 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.27 t/s avg=3.27 t/s 2.752s
+0715 04:49:01 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 4.033s
+0715 04:49:01 ds4-server: chat ctx=0..5:5 prompt start
+0715 04:49:02 ds4-server: chat ctx=0..5:5 prompt done 1.602s
+0715 04:49:05 ds4-server: chat ctx=0..5:5 gen=9 decoding chunk=3.14 t/s avg=3.14 t/s 2.867s
+0715 04:49:05 ds4-server: chat ctx=0..5:5 gen=9 finish=stop 4.544s
+0715 04:49:05 ds4-server: benchmark request target reached; shutting down cleanly
+0715 04:49:05 ds4-server: shutdown requested, draining requests
+ds4: [gpu-resident-routes] final calls=1512 split_calls=1512 all_hit=12 worker_jobs=1500 miss_experts=5240 errors=0 worker=3.920ms/job resolve=2.734ms/call wait=3.630ms/call queries=0
