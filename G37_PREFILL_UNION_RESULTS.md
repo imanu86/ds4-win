@@ -1,8 +1,8 @@
 # G37: Existing Prefill Union and Chunk Amplification
 
-Date: 2026-07-15  
-Hardware: RTX 3060 12 GiB, native Windows/WDDM, 64 GiB host RAM  
-Branch: `port/windows-dynamic-arena-0051`  
+Date: 2026-07-15
+Hardware: RTX 3060 12 GiB, native Windows/WDDM, 64 GiB host RAM
+Branch: `port/windows-dynamic-arena-0051`
 Measured base HEAD: `b1ef49c5c8208f7a74a965545a34dde8468a6721`
 
 ## Question
