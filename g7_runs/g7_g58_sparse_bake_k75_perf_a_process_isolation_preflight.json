@@ -1,0 +1,19 @@
+﻿{
+    "schema":  "g7_process_isolation_preflight_v1",
+    "checked_utc":  "2026-07-16T06:01:39.2040860Z",
+    "mutex_name":  "Local\\DS4_G7_MEASUREMENT_LOCK",
+    "mutex_acquired":  true,
+    "current_harness_pid":  19952,
+    "ancestor_process_ids":  [
+                                 14240,
+                                 18204,
+                                 3476,
+                                 21076,
+                                 19968
+                             ],
+    "conflict_count":  0,
+    "conflicts":  [
+
+                  ],
+    "ready_to_launch":  true
+}
