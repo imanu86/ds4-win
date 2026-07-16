@@ -133,6 +133,20 @@ Output:
   note should identify the deterministic input recipe or receipt used to create
   both vectors.
 
+## Structural diagnostics
+
+`g7_measure.ps1` can restrict sidecar substitution to an inclusive layer range
+with `-Iq1SLayerFirst` and `-Iq1SLayerLast`. The default remains the full
+`0..42` range. This is an isolation control only; it does not define the final
+cold-expert policy.
+
+Repeated n=1 structural diagnostics may pass `-ReuseVerifiedIq1SReceipt` to
+avoid re-reading the 61.5 GB sidecar solely for SHA-256. The switch is refused
+unless `-GateKind structural-safety` is active. Path, byte count, expected hash,
+receipt status, and receipt provenance are still checked, and the result records
+`iq1_s_sidecar_hash_method=verified_receipt_reuse`. Benchmark and quality gates
+must continue to compute the full file hash.
+
 ## G75 measured gate
 
 The real-weight gate sampled only the required byte ranges from

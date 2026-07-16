@@ -99,6 +99,7 @@ param(
     [string]$Iq1SExpertSidecar = "",
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
+    [switch]$ReuseVerifiedIq1SReceipt,
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [ValidateSet("benchmark", "structural-safety", "quality")][string]$GateKind = "benchmark",
@@ -301,6 +302,12 @@ if ($Iq1SExpertSidecar) {
         [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.imatrix_provenance)) {
         throw "IQ1_S sidecar receipt does not match requested path/bytes/SHA-256"
     }
+}
+if ($ReuseVerifiedIq1SReceipt -and -not $Iq1SExpertSidecar) {
+    throw "ReuseVerifiedIq1SReceipt requires Iq1SExpertSidecar"
+}
+if ($ReuseVerifiedIq1SReceipt -and $GateKind -ne "structural-safety") {
+    throw "ReuseVerifiedIq1SReceipt is restricted to structural-safety diagnostics"
 }
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
@@ -904,9 +911,20 @@ $modelHashAtStart = if ($ExpectedModelSHA256) {
 if ($ExpectedModelSHA256 -and $modelHashAtStart -ine $ExpectedModelSHA256) {
     throw "Model provenance failed: expected $($ExpectedModelSHA256.ToLowerInvariant()), observed $modelHashAtStart"
 }
-$iq1SSidecarHashAtStart = if ($iq1SSidecarInfoAtStart) {
+$iq1SSidecarHashMethod = if (-not $iq1SSidecarInfoAtStart) {
+    "not_applicable"
+} elseif ($ReuseVerifiedIq1SReceipt) {
+    "verified_receipt_reuse"
+} else {
+    "full_file_sha256"
+}
+$iq1SSidecarHashAtStart = if (-not $iq1SSidecarInfoAtStart) {
+    ""
+} elseif ($ReuseVerifiedIq1SReceipt) {
+    $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
+} else {
     (Get-FileHash -Algorithm SHA256 -LiteralPath $Iq1SExpertSidecar).Hash.ToLowerInvariant()
-} else { "" }
+}
 if ($iq1SSidecarInfoAtStart -and
     $iq1SSidecarHashAtStart -ine $ExpectedIq1SExpertSidecarSHA256) {
     throw "IQ1_S sidecar provenance failed: expected $($ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()), observed $iq1SSidecarHashAtStart"
@@ -3423,6 +3441,7 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_sidecar_size_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
     iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
     iq1_s_sidecar_sha256 = $iq1SSidecarHashAtStart
+    iq1_s_sidecar_hash_method = $iq1SSidecarHashMethod
     iq1_s_sidecar_receipt_path = $iq1SSidecarReceiptPath
     iq1_s_sidecar_receipt_sha256 = $iq1SSidecarReceiptHashAtStart
     iq1_s_sidecar_runtime_observed = $iq1SSidecarRuntimeObserved
@@ -3489,6 +3508,7 @@ $summary = [pscustomobject]@{
     iq1_s_sidecar_last_write_utc = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.LastWriteTimeUtc.ToString("o") } else { "" })
     iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
     iq1_s_sidecar_sha256 = $iq1SSidecarHashAtStart
+    iq1_s_sidecar_hash_method = $iq1SSidecarHashMethod
     iq1_s_sidecar_receipt_path = $iq1SSidecarReceiptPath
     iq1_s_sidecar_receipt_sha256 = $iq1SSidecarReceiptHashAtStart
     iq1_s_sidecar_source = $(if ($iq1SSidecarReceiptAtStart) { [string]$iq1SSidecarReceiptAtStart.source } else { "" })
