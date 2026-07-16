@@ -1,0 +1,359 @@
+﻿{
+    "schema":  "g56_wrap_layout_profile_v1",
+    "question":  "Single functional/profile run for arena WRAP layout on the exact G45/G54 sequential-file QD1 configuration.",
+    "prompt":  "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
+    "context":  256,
+    "max_tokens":  64,
+    "expected_content_sha256":  "31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8",
+    "tag":  "g56_wrap_layout_profile_functional",
+    "functional_profile_run":  true,
+    "benchmark":  false,
+    "independent_processes":  1,
+    "within_process_repeats":  1,
+    "no_n3_claim":  true,
+    "timing_valid":  true,
+    "timing_valid_reason":  "system quiescence preflight was not skipped",
+    "system_quiescence_skipped":  false,
+    "execution_runner_sha256":  "aeedbc4ce0edab16f25a4e722a37756c8937d0fa99483c7ec91469f660aadc0c",
+    "summary_runner_sha256":  "aeedbc4ce0edab16f25a4e722a37756c8937d0fa99483c7ec91469f660aadc0c",
+    "launch_provenance_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g7_g56_wrap_layout_profile_functional_g56_launch_provenance.json",
+    "launch_provenance_sha256":  "0105bb62c3790a9595949793d9cfefb4b7080cdd3ba53ac141dc5934b3153e61",
+    "result_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g7_g56_wrap_layout_profile_functional_result.json",
+    "result_sha256":  "de19caaa405ee9ce3e2a5ce1cafcdfb161c07f36441465495136e0d1265952c7",
+    "provenance":  {
+                       "head":  "93cb19310bb255a2c799bb8c963787c51528b0aa",
+                       "executable_sha256":  "18b8e53627690d950ad37329fb32354a2b278a30b30df012df56b99d374419e1",
+                       "ds4_cuda_sha256":  "da31759e63ed14a24eda5b615110a8ded5afbcbd39078231eaf2755b14d10a3b",
+                       "ds4_c_sha256":  "9ad3a269b2e7a5557f8189668792af23461bb2d07255133092c1c288ca16b71b",
+                       "ds4_server_c_sha256":  "3358c8e053439306838763e5cac4774d40277a96e73e1f757a4a7cbffeb5c8c4",
+                       "build_manifest_sha256":  "959b32c9cbcb596168da4db772557f3a4bb7de79887fe0eaf0c4d541e9c9c379",
+                       "build_input_fingerprint_sha256":  "9821365dc16fb02291101b9b9ef436336b446f90797a8aecb21e526f3d5b06aa",
+                       "harness_sha256":  "35a8cd5acb51246d8e76938ff0bbd1e86b29b9f2fc5df4c1bc50975cc763cf45",
+                       "runtime_monitor_harness_sha256":  "94b7d3c7df52764696073d4a4f9651b349e471ba0b252d88d7f76102da67e3e6",
+                       "model":  "C:\\ds4-models\\ds4-2bit.gguf",
+                       "model_bytes":  86720111488,
+                       "model_last_write_utc":  "2026-07-04T05:29:32.5463725Z",
+                       "build_worktree_dirty":  true
+                   },
+    "validation":  {
+                       "server_exit_code":  0,
+                       "content_sha256":  "31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8",
+                       "outputs_identical":  true,
+                       "snapshot_backing_misses":  0,
+                       "ssd_bytes":  0,
+                       "tier_failures":  0,
+                       "arena_wrap_file_failures":  0,
+                       "candidate_mask_fnv1a64":  "c59a437fe9c6c376",
+                       "memory_preflight_ready":  true,
+                       "process_preflight_ready":  true,
+                       "system_preflight_ready":  true,
+                       "contamination_abort_observed":  false
+                   },
+    "config":  {
+                   "source":  "sequential-file",
+                   "file_qd":  1,
+                   "copy_workers":  1,
+                   "arena_gib":  30,
+                   "cache_experts":  320,
+                   "cache_reserve_gib":  0.125,
+                   "route_no_default_sync":  true,
+                   "trusted_worker_checksum":  true
+               },
+    "raw_layout_profile":  [
+                               {
+                                   "result":  "ok",
+                                   "phase":  "gate",
+                                   "parts":  4551,
+                                   "payload":  9842393088,
+                                   "gaps":  4550,
+                                   "overlaps":  0,
+                                   "gap_eq0":  2156,
+                                   "gap_1_4k":  0,
+                                   "gap_4k_64k":  0,
+                                   "gap_64k_1m":  0,
+                                   "gap_gt1m":  2394,
+                                   "t0_reads":  2395,
+                                   "t0_bytes":  9842393088,
+                                   "t4096_reads":  2395,
+                                   "t4096_bytes":  9842393088,
+                                   "t65536_reads":  2395,
+                                   "t65536_bytes":  9842393088,
+                                   "t1048576_reads":  2395,
+                                   "t1048576_bytes":  9842393088,
+                                   "page_size":  4096,
+                                   "source_aligned":  0,
+                                   "bytes_aligned":  4551,
+                                   "destination_aligned":  4551
+                               },
+                               {
+                                   "result":  "ok",
+                                   "phase":  "up",
+                                   "parts":  4551,
+                                   "payload":  9842393088,
+                                   "gaps":  4550,
+                                   "overlaps":  0,
+                                   "gap_eq0":  2156,
+                                   "gap_1_4k":  0,
+                                   "gap_4k_64k":  0,
+                                   "gap_64k_1m":  0,
+                                   "gap_gt1m":  2394,
+                                   "t0_reads":  2395,
+                                   "t0_bytes":  9842393088,
+                                   "t4096_reads":  2395,
+                                   "t4096_bytes":  9842393088,
+                                   "t65536_reads":  2395,
+                                   "t65536_bytes":  9842393088,
+                                   "t1048576_reads":  2395,
+                                   "t1048576_bytes":  9842393088,
+                                   "page_size":  4096,
+                                   "source_aligned":  0,
+                                   "bytes_aligned":  4551,
+                                   "destination_aligned":  4551
+                               },
+                               {
+                                   "result":  "ok",
+                                   "phase":  "down",
+                                   "parts":  4551,
+                                   "payload":  12526682112,
+                                   "gaps":  4550,
+                                   "overlaps":  0,
+                                   "gap_eq0":  2156,
+                                   "gap_1_4k":  0,
+                                   "gap_4k_64k":  0,
+                                   "gap_64k_1m":  0,
+                                   "gap_gt1m":  2394,
+                                   "t0_reads":  2395,
+                                   "t0_bytes":  12526682112,
+                                   "t4096_reads":  2395,
+                                   "t4096_bytes":  12526682112,
+                                   "t65536_reads":  2395,
+                                   "t65536_bytes":  12526682112,
+                                   "t1048576_reads":  2395,
+                                   "t1048576_bytes":  12526682112,
+                                   "page_size":  4096,
+                                   "source_aligned":  0,
+                                   "bytes_aligned":  4551,
+                                   "destination_aligned":  4551
+                               }
+                           ],
+    "layout_phase_projections":  [
+                                     {
+                                         "phase":  "gate",
+                                         "result":  "ok",
+                                         "parts":  4551,
+                                         "payload":  9842393088,
+                                         "gaps":  4550,
+                                         "overlaps":  0,
+                                         "gap_buckets":  {
+                                                             "eq0":  2156,
+                                                             "gap_1_4k":  0,
+                                                             "gap_4k_64k":  0,
+                                                             "gap_64k_1m":  0,
+                                                             "gap_gt1m":  2394
+                                                         },
+                                         "page_size":  4096,
+                                         "alignment":  {
+                                                           "source_aligned":  0,
+                                                           "bytes_aligned":  4551,
+                                                           "destination_aligned":  4551,
+                                                           "source_aligned_ratio":  0,
+                                                           "bytes_aligned_ratio":  1,
+                                                           "destination_aligned_ratio":  1
+                                                       },
+                                         "threshold_projections":  [
+                                                                       {
+                                                                           "threshold":  "t0",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t4096",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t65536",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t1048576",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       }
+                                                                   ]
+                                     },
+                                     {
+                                         "phase":  "up",
+                                         "result":  "ok",
+                                         "parts":  4551,
+                                         "payload":  9842393088,
+                                         "gaps":  4550,
+                                         "overlaps":  0,
+                                         "gap_buckets":  {
+                                                             "eq0":  2156,
+                                                             "gap_1_4k":  0,
+                                                             "gap_4k_64k":  0,
+                                                             "gap_64k_1m":  0,
+                                                             "gap_gt1m":  2394
+                                                         },
+                                         "page_size":  4096,
+                                         "alignment":  {
+                                                           "source_aligned":  0,
+                                                           "bytes_aligned":  4551,
+                                                           "destination_aligned":  4551,
+                                                           "source_aligned_ratio":  0,
+                                                           "bytes_aligned_ratio":  1,
+                                                           "destination_aligned_ratio":  1
+                                                       },
+                                         "threshold_projections":  [
+                                                                       {
+                                                                           "threshold":  "t0",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t4096",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t65536",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t1048576",
+                                                                           "reads":  2395,
+                                                                           "bytes":  9842393088,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       }
+                                                                   ]
+                                     },
+                                     {
+                                         "phase":  "down",
+                                         "result":  "ok",
+                                         "parts":  4551,
+                                         "payload":  12526682112,
+                                         "gaps":  4550,
+                                         "overlaps":  0,
+                                         "gap_buckets":  {
+                                                             "eq0":  2156,
+                                                             "gap_1_4k":  0,
+                                                             "gap_4k_64k":  0,
+                                                             "gap_64k_1m":  0,
+                                                             "gap_gt1m":  2394
+                                                         },
+                                         "page_size":  4096,
+                                         "alignment":  {
+                                                           "source_aligned":  0,
+                                                           "bytes_aligned":  4551,
+                                                           "destination_aligned":  4551,
+                                                           "source_aligned_ratio":  0,
+                                                           "bytes_aligned_ratio":  1,
+                                                           "destination_aligned_ratio":  1
+                                                       },
+                                         "threshold_projections":  [
+                                                                       {
+                                                                           "threshold":  "t0",
+                                                                           "reads":  2395,
+                                                                           "bytes":  12526682112,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t4096",
+                                                                           "reads":  2395,
+                                                                           "bytes":  12526682112,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t65536",
+                                                                           "reads":  2395,
+                                                                           "bytes":  12526682112,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       },
+                                                                       {
+                                                                           "threshold":  "t1048576",
+                                                                           "reads":  2395,
+                                                                           "bytes":  12526682112,
+                                                                           "reads_per_part":  0.526258,
+                                                                           "bytes_per_payload":  1
+                                                                       }
+                                                                   ]
+                                     }
+                                 ],
+    "layout_aggregate_projection":  {
+                                        "phases":  [
+                                                       "gate",
+                                                       "up",
+                                                       "down"
+                                                   ],
+                                        "parts":  13653,
+                                        "payload":  32211468288,
+                                        "gaps":  13650,
+                                        "overlaps":  0,
+                                        "gap_buckets":  {
+                                                            "eq0":  6468,
+                                                            "gap_1_4k":  0,
+                                                            "gap_4k_64k":  0,
+                                                            "gap_64k_1m":  0,
+                                                            "gap_gt1m":  7182
+                                                        },
+                                        "alignment":  {
+                                                          "source_aligned":  0,
+                                                          "bytes_aligned":  13653,
+                                                          "destination_aligned":  13653,
+                                                          "source_aligned_ratio":  0,
+                                                          "bytes_aligned_ratio":  1,
+                                                          "destination_aligned_ratio":  1
+                                                      },
+                                        "threshold_projections":  [
+                                                                      {
+                                                                          "threshold":  "t0",
+                                                                          "reads":  7185,
+                                                                          "bytes":  32211468288,
+                                                                          "reads_per_part":  0.526258,
+                                                                          "bytes_per_payload":  1
+                                                                      },
+                                                                      {
+                                                                          "threshold":  "t4096",
+                                                                          "reads":  7185,
+                                                                          "bytes":  32211468288,
+                                                                          "reads_per_part":  0.526258,
+                                                                          "bytes_per_payload":  1
+                                                                      },
+                                                                      {
+                                                                          "threshold":  "t65536",
+                                                                          "reads":  7185,
+                                                                          "bytes":  32211468288,
+                                                                          "reads_per_part":  0.526258,
+                                                                          "bytes_per_payload":  1
+                                                                      },
+                                                                      {
+                                                                          "threshold":  "t1048576",
+                                                                          "reads":  7185,
+                                                                          "bytes":  32211468288,
+                                                                          "reads_per_part":  0.526258,
+                                                                          "bytes_per_payload":  1
+                                                                      }
+                                                                  ]
+                                    }
+}
