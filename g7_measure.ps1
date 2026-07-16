@@ -34,6 +34,8 @@ param(
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
+    [ValidateRange(0, 40)][int]$PrefillMassLayerFullEvery = 0,
+    [ValidateRange(0, 39)][int]$PrefillMassLayerFullPhase = 0,
     [ValidateRange(0, 32)][int]$PrefillVramSeedPerLayer = 0,
     [switch]$ReapMassObserve,
     [switch]$ReapMassWrap,
@@ -414,6 +416,13 @@ if ($ComposePrefillMassTiering) {
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_TIER_COMPOSE -ErrorAction SilentlyContinue
 }
+if ($PrefillMassLayerFullEvery -gt 0) {
+    $env:DS4_CUDA_PREFILL_MASS_LAYER_FULL_EVERY = "$PrefillMassLayerFullEvery"
+    $env:DS4_CUDA_PREFILL_MASS_LAYER_FULL_PHASE = "$PrefillMassLayerFullPhase"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_MASS_LAYER_FULL_EVERY -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_CUDA_PREFILL_MASS_LAYER_FULL_PHASE -ErrorAction SilentlyContinue
+}
 if ($PrefillVramSeedPerLayer -gt 0) {
     $env:DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER = "$PrefillVramSeedPerLayer"
 } else {
@@ -621,6 +630,16 @@ if ($ComposePrefillMassTiering) {
     if ($Warmup -or $Repeats -ne 1) { throw "ComposePrefillMassTiering requires one request and no warmup" }
     if ($PrefillMassObserve -or $ReapMassObserve -or $ReapMassWrap) { throw "ComposePrefillMassTiering must be isolated from observe-only prefill and REAP mass" }
     if ($DynamicArenaObservedWindow -gt 0 -or $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default") { throw "ComposePrefillMassTiering must be isolated from dynamic arena observer/grow/carry" }
+}
+if ($PrefillMassLayerFullEvery -gt 0) {
+    if (-not $ComposePrefillMassTiering -or -not $PrefillMassWrap) {
+        throw "PrefillMassLayerFullEvery requires ComposePrefillMassTiering and PrefillMassWrap"
+    }
+    if ($PrefillMassLayerFullPhase -ge $PrefillMassLayerFullEvery) {
+        throw "PrefillMassLayerFullPhase must be lower than PrefillMassLayerFullEvery"
+    }
+} elseif ($PrefillMassLayerFullPhase -ne 0) {
+    throw "PrefillMassLayerFullPhase requires PrefillMassLayerFullEvery > 0"
 }
 if ($PrefillVramSeedPerLayer -gt 0) {
     if (-not $ComposePrefillMassTiering) { throw "PrefillVramSeedPerLayer requires ComposePrefillMassTiering" }
@@ -1270,6 +1289,15 @@ $prefillMassComposeObserved = $false; $prefillMassComposeEventCount = 0
 $prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
 $prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
 $prefillMassComposeCapacity = 0; $prefillMassComposeCandidateFNV1A64 = "not_observed"
+$prefillMassLayerStripeObserved = $false; $prefillMassLayerStripeEventCount = 0
+$prefillMassLayerStripeFailedCount = 0; $prefillMassLayerStripeResult = "not_observed"
+$prefillMassLayerStripeReason = "not_observed"; $prefillMassLayerStripeStride = 0
+$prefillMassLayerStripePhase = 0; $prefillMassLayerStripeRoutedLayers = 0
+$prefillMassLayerStripeFullLayers = 0; $prefillMassLayerStripePartialLayers = 0
+$prefillMassLayerStripeFullKeep = 0; $prefillMassLayerStripePartialKeepMin = 0
+$prefillMassLayerStripePartialKeepMax = 0; $prefillMassLayerStripeRoutedCandidate = 0
+$prefillMassLayerStripeTotalCandidate = 0; $prefillMassLayerStripeCapacity = 0
+$prefillMassLayerStripeSemantics = "not_observed"
 $prefillVramSeedObserved = $false; $prefillVramSeedLineCount = 0
 $prefillVramSeedResult = "not_observed"; $prefillVramSeedReason = "not_observed"
 $prefillVramSeedRequestedObserved = 0; $prefillVramSeedLayers = 0
@@ -1810,6 +1838,32 @@ if (Test-Path $stderrLog) {
         $prefillMassComposeCapacity = [long]$Matches[5]
         $prefillMassComposeCandidateFNV1A64 = $Matches[6]
     }
+    $prefillMassLayerStripeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-layer-stripe\] result=" })
+    $prefillMassLayerStripeEventCount = $prefillMassLayerStripeLines.Count
+    $prefillMassLayerStripeFailedCount = @($prefillMassLayerStripeLines | Where-Object { $_ -match "result=failed" }).Count
+    $prefillMassLayerStripeAppliedLine = $prefillMassLayerStripeLines | Where-Object { $_ -match "result=applied" } | Select-Object -Last 1
+    if ($prefillMassLayerStripeAppliedLine -and $prefillMassLayerStripeAppliedLine -match "result=applied stride=(\d+) phase=(\d+) routed_layers=(\d+) full_layers=(\d+) partial_layers=(\d+) full_keep=(\d+) partial_keep_min=(\d+) partial_keep_max=(\d+) routed_candidate=(\d+) total_candidate=(\d+) capacity=(\d+) semantics=([a-z-]+)") {
+        $prefillMassLayerStripeObserved = $true
+        $prefillMassLayerStripeResult = "applied"
+        $prefillMassLayerStripeStride = [int]$Matches[1]
+        $prefillMassLayerStripePhase = [int]$Matches[2]
+        $prefillMassLayerStripeRoutedLayers = [int]$Matches[3]
+        $prefillMassLayerStripeFullLayers = [int]$Matches[4]
+        $prefillMassLayerStripePartialLayers = [int]$Matches[5]
+        $prefillMassLayerStripeFullKeep = [int]$Matches[6]
+        $prefillMassLayerStripePartialKeepMin = [int]$Matches[7]
+        $prefillMassLayerStripePartialKeepMax = [int]$Matches[8]
+        $prefillMassLayerStripeRoutedCandidate = [long]$Matches[9]
+        $prefillMassLayerStripeTotalCandidate = [long]$Matches[10]
+        $prefillMassLayerStripeCapacity = [long]$Matches[11]
+        $prefillMassLayerStripeSemantics = $Matches[12]
+    } elseif ($prefillMassLayerStripeFailedCount -gt 0) {
+        $prefillMassLayerStripeResult = "failed"
+        $prefillMassLayerStripeFailedLine = $prefillMassLayerStripeLines | Where-Object { $_ -match "result=failed" } | Select-Object -Last 1
+        if ($prefillMassLayerStripeFailedLine -match "reason=([a-z-]+)") {
+            $prefillMassLayerStripeReason = $Matches[1]
+        }
+    }
     $prefillMassDecodeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" } | Select-Object -Last 1
     if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=([a-z-]+)") {
         $prefillMassDecodeTokens = [long]$Matches[1]
@@ -2302,6 +2356,44 @@ if ($PrefillMassWrap) {
     }
 } elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
     throw "Prefill mass WRAP activated while not requested"
+}
+if ($PrefillMassLayerFullEvery -gt 0) {
+    if ($prefillMassLayerStripeEventCount -ne 1 -or
+        $prefillMassLayerStripeFailedCount -ne 0 -or
+        -not $prefillMassLayerStripeObserved -or
+        $prefillMassLayerStripeResult -ne "applied") {
+        throw "Prefill mass layer stripe failed: expected exactly one applied event and no failures"
+    }
+    if ($prefillMassLayerStripeStride -ne $PrefillMassLayerFullEvery -or
+        $prefillMassLayerStripePhase -ne $PrefillMassLayerFullPhase) {
+        throw "Prefill mass layer stripe failed: observed stride/phase differ from request"
+    }
+    $expectedStripeFullLayers = 0
+    for ($relativeLayer = 0; $relativeLayer -lt $prefillMassLayerStripeRoutedLayers; $relativeLayer++) {
+        if (($relativeLayer % $PrefillMassLayerFullEvery) -eq $PrefillMassLayerFullPhase) {
+            $expectedStripeFullLayers++
+        }
+    }
+    if ($prefillMassLayerStripeRoutedLayers -ne 40 -or
+        $prefillMassLayerStripeFullLayers -ne $expectedStripeFullLayers -or
+        $prefillMassLayerStripeFullLayers + $prefillMassLayerStripePartialLayers -ne $prefillMassLayerStripeRoutedLayers) {
+        throw "Prefill mass layer stripe failed: layer accounting differs"
+    }
+    if ($prefillMassLayerStripeFullKeep -ne 256 -or
+        $prefillMassLayerStripePartialKeepMin -lt 6 -or
+        $prefillMassLayerStripePartialKeepMax -lt $prefillMassLayerStripePartialKeepMin -or
+        ($prefillMassLayerStripePartialKeepMax - $prefillMassLayerStripePartialKeepMin) -gt 1) {
+        throw "Prefill mass layer stripe failed: full/partial quotas differ"
+    }
+    if ($prefillMassLayerStripeRoutedCandidate -ne $prefillMassComposeRankedEntries -or
+        $prefillMassLayerStripeRoutedCandidate + $prefillMassComposeHashSeedEntries -ne $prefillMassLayerStripeTotalCandidate -or
+        $prefillMassLayerStripeTotalCandidate -ne $prefillMassCandidate -or
+        $prefillMassLayerStripeCapacity -ne $prefillMassCapacity -or
+        $prefillMassLayerStripeSemantics -ne "budget-preserving") {
+        throw "Prefill mass layer stripe failed: capacity/accounting telemetry differs"
+    }
+} elseif ($prefillMassLayerStripeEventCount -ne 0 -or $prefillMassLayerStripeObserved) {
+    throw "Prefill mass layer stripe activated while not requested"
 }
 $embeddedBakeMaskObserved = $reapMaskAppliedObserved -and
     $reapMaskPathObserved -like "embedded-bake:*"
@@ -2809,6 +2901,8 @@ $summary = [pscustomobject]@{
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
+    prefill_mass_layer_full_every_requested = $PrefillMassLayerFullEvery
+    prefill_mass_layer_full_phase_requested = $PrefillMassLayerFullPhase
     prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
     prefill_vram_seed_observed = $prefillVramSeedObserved
     prefill_vram_seed_line_count = $prefillVramSeedLineCount
@@ -2910,6 +3004,23 @@ $summary = [pscustomobject]@{
     prefill_mass_compose_total_candidate = $prefillMassComposeTotalCandidate
     prefill_mass_compose_capacity = $prefillMassComposeCapacity
     prefill_mass_compose_candidate_fnv1a64 = $prefillMassComposeCandidateFNV1A64
+    prefill_mass_layer_stripe_observed = $prefillMassLayerStripeObserved
+    prefill_mass_layer_stripe_event_count = $prefillMassLayerStripeEventCount
+    prefill_mass_layer_stripe_failed_count = $prefillMassLayerStripeFailedCount
+    prefill_mass_layer_stripe_result = $prefillMassLayerStripeResult
+    prefill_mass_layer_stripe_reason = $prefillMassLayerStripeReason
+    prefill_mass_layer_stripe_stride = $prefillMassLayerStripeStride
+    prefill_mass_layer_stripe_phase = $prefillMassLayerStripePhase
+    prefill_mass_layer_stripe_routed_layers = $prefillMassLayerStripeRoutedLayers
+    prefill_mass_layer_stripe_full_layers = $prefillMassLayerStripeFullLayers
+    prefill_mass_layer_stripe_partial_layers = $prefillMassLayerStripePartialLayers
+    prefill_mass_layer_stripe_full_keep = $prefillMassLayerStripeFullKeep
+    prefill_mass_layer_stripe_partial_keep_min = $prefillMassLayerStripePartialKeepMin
+    prefill_mass_layer_stripe_partial_keep_max = $prefillMassLayerStripePartialKeepMax
+    prefill_mass_layer_stripe_routed_candidate = $prefillMassLayerStripeRoutedCandidate
+    prefill_mass_layer_stripe_total_candidate = $prefillMassLayerStripeTotalCandidate
+    prefill_mass_layer_stripe_capacity = $prefillMassLayerStripeCapacity
+    prefill_mass_layer_stripe_semantics = $prefillMassLayerStripeSemantics
     prefill_mass_layers = $prefillMassLayers
     prefill_mass_rows_min = $prefillMassRowsMin
     prefill_mass_rows_max = $prefillMassRowsMax
@@ -2925,7 +3036,7 @@ $summary = [pscustomobject]@{
     prefill_mass_decode_slots = $prefillMassDecodeSlots
     prefill_mass_decode_candidate_hits = $prefillMassDecodeHits
     prefill_mass_decode_hit_rate = $prefillMassDecodeHitRate
-    prefill_mass_residency_semantics = $(if ($PrefillMassWrap) { "ranked prefill candidate published transactionally into pinned RAM; router and mask unchanged" } else { "observe-only; no router, mask, arena publication, or residency changes" })
+    prefill_mass_residency_semantics = $(if ($PrefillMassLayerFullEvery -gt 0) { "budget-preserving per-layer mass profile published transactionally into pinned RAM; periodic routed layers remain full; router unbiased; request-scoped closed mask" } elseif ($PrefillMassWrap) { "ranked prefill candidate published transactionally into pinned RAM; router and mask unchanged" } else { "observe-only; no router, mask, arena publication, or residency changes" })
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
     dynamic_arena_grow_interval_requested = $DynamicArenaGrowInterval
@@ -3165,6 +3276,7 @@ Write-Host ("prefill mass observe/wrap requested, policy, armed/finalized: " + [
 Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rate: " + $prefillMassUnique + " / " + $prefillMassCandidate + " / " + $prefillMassCapacity + " / " + $prefillMassCoverage + " / " + $prefillMassDecodeHitRate)
 Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
 Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
+Write-Host ("prefill layer stripe req every/phase, result, layers full/partial, keep full/min/max, candidate/capacity: " + $PrefillMassLayerFullEvery + " / " + $PrefillMassLayerFullPhase + " / " + $prefillMassLayerStripeResult + " / " + $prefillMassLayerStripeFullLayers + " / " + $prefillMassLayerStripePartialLayers + " / " + $prefillMassLayerStripeFullKeep + " / " + $prefillMassLayerStripePartialKeepMin + " / " + $prefillMassLayerStripePartialKeepMax + " / " + $prefillMassLayerStripeTotalCandidate + " / " + $prefillMassLayerStripeCapacity)
 Write-Host ("prefill VRAM seed req/obs/result/layers/entries/GiB/sec/failures: " + $PrefillVramSeedPerLayer + " / " + $prefillVramSeedObserved + " / " + $prefillVramSeedResult + " / " + $prefillVramSeedLayers + " / " + $prefillVramSeedEntries + " / " + [math]::Round($prefillVramSeedBytes / 1GB, 3) + " / " + $prefillVramSeedSeconds + " / " + $prefillVramSeedFailures)
 Write-Host ("REAP mass requested/armed/window/top/transport/tokens/slots/unique/top mass/touched: " + [bool]($ReapMassObserve -or $ReapMassWrap) + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTransport + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
 Write-Host ("REAP mass WRAP requested/armed/grow/hysteresis/capacity/router/mask/policy: " + [bool]$ReapMassWrap + " / " + $reapMassWrapArmed + " / " + $reapMassWrapGrowIntervalObserved + " / " + $reapMassWrapHysteresisObserved + " / " + $reapMassWrapCapacity + " / " + $reapMassWrapRouterArmed + " / " + $reapMassWrapMaskArmed + " / " + $reapMassWrapPolicyArmed)

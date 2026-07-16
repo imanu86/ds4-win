@@ -4676,6 +4676,43 @@ static int cuda_prefill_mass_observe_requested(void) {
     return 0;
 }
 
+static int cuda_prefill_mass_layer_stripe_config(
+        uint32_t *full_every,
+        uint32_t *full_phase) {
+    if (!full_every || !full_phase) return -1;
+    *full_every = 0;
+    *full_phase = 0;
+    const char *value =
+        getenv("DS4_CUDA_PREFILL_MASS_LAYER_FULL_EVERY");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+
+    char *end = NULL;
+    const unsigned long stride = strtoul(value, &end, 10);
+    if (!end || *end != '\0' || stride == 0 || stride > 40u) {
+        fprintf(stderr,
+                "ds4: [prefill-mass-layer-stripe] result=failed reason=invalid-stride value=%s\n",
+                value);
+        return -1;
+    }
+
+    const char *phase_value =
+        getenv("DS4_CUDA_PREFILL_MASS_LAYER_FULL_PHASE");
+    unsigned long phase = 0;
+    if (phase_value && phase_value[0]) {
+        end = NULL;
+        phase = strtoul(phase_value, &end, 10);
+        if (!end || *end != '\0' || phase >= stride) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-layer-stripe] result=failed reason=invalid-phase value=%s stride=%lu\n",
+                    phase_value, stride);
+            return -1;
+        }
+    }
+    *full_every = (uint32_t)stride;
+    *full_phase = (uint32_t)phase;
+    return 1;
+}
+
 static int cuda_prefill_mass_observer_needs_weights(void) {
     return g_prefill_mass_observer.enabled &&
         !g_prefill_mass_observer.finalized;
@@ -5540,21 +5577,177 @@ static void cuda_prefill_mass_observer_finalize(void) {
         return;
     }
     const size_t ranked_capacity = residency_capacity - hash_entries;
-    const uint32_t capacity = (uint32_t)std::min(
+    uint32_t stripe_stride = 0;
+    uint32_t stripe_phase = 0;
+    const int stripe_config = cuda_prefill_mass_layer_stripe_config(
+        &stripe_stride, &stripe_phase);
+    if (stripe_config < 0 ||
+        (stripe_config > 0 && compose_requested <= 0)) {
+        fprintf(stderr,
+                "ds4: [prefill-mass-layer-stripe] result=failed reason=%s\n",
+                stripe_config < 0 ? "invalid-config" : "compose-required");
+        cuda_prefill_mass_compose_fail_closed();
+        cuda_request_phase_trace("prefill-finalize-return");
+        return;
+    }
+
+    uint32_t capacity = (uint32_t)std::min(
         ranked.size(), ranked_capacity);
-    double total_mass = 0.0;
-    double candidate_mass = 0.0;
-    for (uint32_t i = 0; i < ranked.size(); i++) {
-        total_mass += ranked[i].mass;
-        if (i < capacity) {
+    if (stripe_config > 0) {
+        const uint32_t first_layer = 3u;
+        const uint32_t routed_layers =
+            g_dynamic_arena.n_layer > first_layer ?
+            g_dynamic_arena.n_layer - first_layer : 0u;
+        if (ranked_capacity >
+                (size_t)routed_layers * g_dynamic_arena.n_expert ||
+            ranked_capacity > UINT32_MAX || routed_layers == 0) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-layer-stripe] result=failed reason=invalid-capacity stride=%u phase=%u routed_layers=%u capacity=%llu\n",
+                    stripe_stride, stripe_phase, routed_layers,
+                    (unsigned long long)ranked_capacity);
+            cuda_prefill_mass_compose_fail_closed();
+            cuda_request_phase_trace("prefill-finalize-return");
+            return;
+        }
+
+        std::vector<uint8_t> full_layer;
+        std::vector<uint32_t> quota;
+        std::vector<uint32_t> selected_by_layer;
+        try {
+            full_layer.assign(g_dynamic_arena.n_layer, 0);
+            quota.assign(g_dynamic_arena.n_layer, 0);
+            selected_by_layer.assign(g_dynamic_arena.n_layer, 0);
+        } catch (...) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-layer-stripe] result=failed reason=metadata-allocation\n");
+            cuda_prefill_mass_compose_fail_closed();
+            cuda_request_phase_trace("prefill-finalize-return");
+            return;
+        }
+
+        uint32_t full_layers = 0;
+        for (uint32_t layer = first_layer;
+             layer < g_dynamic_arena.n_layer; layer++) {
+            const uint32_t relative = layer - first_layer;
+            if (relative % stripe_stride == stripe_phase) {
+                full_layer[layer] = 1;
+                quota[layer] = g_dynamic_arena.n_expert;
+                full_layers++;
+            }
+        }
+        const uint32_t partial_layers = routed_layers - full_layers;
+        const uint64_t full_entries =
+            (uint64_t)full_layers * g_dynamic_arena.n_expert;
+        if (full_layers == 0 || full_entries > ranked_capacity ||
+            (partial_layers == 0 && full_entries != ranked_capacity)) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-layer-stripe] result=failed reason=full-layer-capacity stride=%u phase=%u full_layers=%u partial_layers=%u full_entries=%llu capacity=%llu\n",
+                    stripe_stride, stripe_phase, full_layers, partial_layers,
+                    (unsigned long long)full_entries,
+                    (unsigned long long)ranked_capacity);
+            cuda_prefill_mass_compose_fail_closed();
+            cuda_request_phase_trace("prefill-finalize-return");
+            return;
+        }
+
+        const uint32_t partial_entries =
+            (uint32_t)(ranked_capacity - full_entries);
+        const uint32_t partial_keep_min = partial_layers ?
+            partial_entries / partial_layers : 0u;
+        const uint32_t partial_keep_extra = partial_layers ?
+            partial_entries % partial_layers : 0u;
+        const uint32_t partial_keep_max = partial_keep_min +
+            (partial_keep_extra ? 1u : 0u);
+        if (partial_layers &&
+            (partial_keep_min < 6u ||
+             partial_keep_max > g_dynamic_arena.n_expert)) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-layer-stripe] result=failed reason=partial-layer-capacity stride=%u phase=%u partial_min=%u partial_max=%u\n",
+                    stripe_stride, stripe_phase,
+                    partial_keep_min, partial_keep_max);
+            cuda_prefill_mass_compose_fail_closed();
+            cuda_request_phase_trace("prefill-finalize-return");
+            return;
+        }
+
+        uint32_t extra_left = partial_keep_extra;
+        for (uint32_t layer = first_layer;
+             layer < g_dynamic_arena.n_layer; layer++) {
+            if (full_layer[layer]) continue;
+            quota[layer] = partial_keep_min + (extra_left ? 1u : 0u);
+            if (extra_left) extra_left--;
+        }
+        for (uint32_t layer = first_layer;
+             layer < g_dynamic_arena.n_layer; layer++) {
+            if (!full_layer[layer]) continue;
+            const uint32_t base = layer * g_dynamic_arena.n_expert;
+            for (uint32_t expert = 0;
+                 expert < g_dynamic_arena.n_expert; expert++) {
+                observer.candidate[base + expert] = 1;
+            }
+            selected_by_layer[layer] = g_dynamic_arena.n_expert;
+        }
+        for (const ranked_entry &item : ranked) {
+            const uint32_t layer = item.entry / g_dynamic_arena.n_expert;
+            if (layer < first_layer || layer >= g_dynamic_arena.n_layer ||
+                full_layer[layer] ||
+                selected_by_layer[layer] >= quota[layer]) {
+                continue;
+            }
+            observer.candidate[item.entry] = 1;
+            selected_by_layer[layer]++;
+        }
+        for (uint32_t layer = first_layer;
+             layer < g_dynamic_arena.n_layer; layer++) {
+            if (full_layer[layer]) continue;
+            const uint32_t base = layer * g_dynamic_arena.n_expert;
+            for (uint32_t expert = 0;
+                 expert < g_dynamic_arena.n_expert &&
+                 selected_by_layer[layer] < quota[layer]; expert++) {
+                const uint32_t entry = base + expert;
+                if (observer.candidate[entry]) continue;
+                observer.candidate[entry] = 1;
+                selected_by_layer[layer]++;
+            }
+            if (selected_by_layer[layer] != quota[layer]) {
+                fprintf(stderr,
+                        "ds4: [prefill-mass-layer-stripe] result=failed reason=quota-fill layer=%u selected=%u quota=%u\n",
+                        layer, selected_by_layer[layer], quota[layer]);
+                cuda_prefill_mass_compose_fail_closed();
+                cuda_request_phase_trace("prefill-finalize-return");
+                return;
+            }
+        }
+        capacity = (uint32_t)ranked_capacity;
+        fprintf(stderr,
+                "ds4: [prefill-mass-layer-stripe] result=applied stride=%u phase=%u routed_layers=%u full_layers=%u partial_layers=%u full_keep=%u partial_keep_min=%u partial_keep_max=%u routed_candidate=%u total_candidate=%u capacity=%u semantics=budget-preserving\n",
+                stripe_stride, stripe_phase, routed_layers,
+                full_layers, partial_layers, g_dynamic_arena.n_expert,
+                partial_keep_min, partial_keep_max, capacity,
+                capacity + (uint32_t)hash_entries,
+                (uint32_t)residency_capacity);
+    } else {
+        for (uint32_t i = 0; i < capacity; i++) {
             observer.candidate[ranked[i].entry] = 1;
-            candidate_mass += ranked[i].mass;
         }
     }
     for (uint32_t entry = 0; entry < hash_entries; entry++) {
         observer.candidate[entry] = 1;
     }
     observer.candidate_entries = capacity + (uint32_t)hash_entries;
+    double total_mass = 0.0;
+    double candidate_mass = 0.0;
+    double cutoff = 0.0;
+    int cutoff_set = 0;
+    for (const ranked_entry &item : ranked) {
+        total_mass += item.mass;
+        if (!observer.candidate[item.entry]) continue;
+        candidate_mass += item.mass;
+        if (!cutoff_set || item.mass < cutoff) {
+            cutoff = item.mass;
+            cutoff_set = 1;
+        }
+    }
     if (compose_requested > 0) {
         const uint64_t candidate_hash = cuda_dynamic_arena_fnv1a64(
             observer.candidate.data(), observer.candidate.size());
@@ -5575,7 +5768,6 @@ static void cuda_prefill_mass_observer_finalize(void) {
     }
     if (rows_min == UINT32_MAX) rows_min = 0;
     const double coverage = total_mass > 0.0 ? candidate_mass / total_mass : 0.0;
-    const double cutoff = capacity ? ranked[capacity - 1u].mass : 0.0;
     const int wrap = observer.wrap_requested;
     fprintf(stderr,
             "ds4: [prefill-mass] finalize layers=%u rows_min=%u rows_max=%u routed_slots=%llu unique=%u candidate=%u capacity=%u mass_total=%.6f mass_candidate=%.6f mass_coverage=%.4f cutoff=%.6f router=unbiased residency=%s policy=%s\n",
