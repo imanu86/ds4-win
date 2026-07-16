@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory=$true)][ValidateSet("K60", "K75")][string]$BakeId,
     [Parameter(Mandatory=$true)][string]$ExpectedPackSHA256,
     [Parameter(Mandatory=$true)][string]$ExpectedMaskSHA256,
+    [Parameter(Mandatory=$true)][string]$ExpectedEmbeddedMaskSHA256,
     [Parameter(Mandatory=$true)][string]$ExpectedPayloadSHA256,
     [string]$PackPath = "",
     [ValidateRange(1, 131072)][int]$MaxTokens = 64,
@@ -253,6 +254,7 @@ function Get-G57Property {
 
 Assert-G57Hex64 "ExpectedPackSHA256" $ExpectedPackSHA256
 Assert-G57Hex64 "ExpectedMaskSHA256" $ExpectedMaskSHA256
+Assert-G57Hex64 "ExpectedEmbeddedMaskSHA256" $ExpectedEmbeddedMaskSHA256
 Assert-G57Hex64 "ExpectedPayloadSHA256" $ExpectedPayloadSHA256
 if ($ExpectedContentSHA256) {
     Assert-G57Hex64 "ExpectedContentSHA256" $ExpectedContentSHA256
@@ -320,8 +322,9 @@ if (($Resume -or $SummarizeExisting) -and
 } else {
     Write-Host ("[g57] validate sparse bake artifact tag=" + $effectiveTag)
     $sparse = Get-G57SparseBakeManifest -Path $resolvedModel
-    if ($sparse.mask_sha256 -ne $ExpectedMaskSHA256.ToLowerInvariant()) {
-        throw "G57 mask SHA mismatch"
+    if ($sparse.mask_sha256 -ne
+        $ExpectedEmbeddedMaskSHA256.ToLowerInvariant()) {
+        throw "G57 embedded mask SHA mismatch"
     }
     if ([string]$sparse.manifest.mask_sha256 -ne
         $ExpectedMaskSHA256.ToLowerInvariant()) {
@@ -341,7 +344,7 @@ if (($Resume -or $SummarizeExisting) -and
         $packVerified = $true
     }
     $launchProvenance = [pscustomobject]@{
-        schema = "g57_sparse_bake_launch_provenance_v1"
+        schema = "g57_sparse_bake_launch_provenance_v2"
         tag = $effectiveTag
         bake_id = $BakeId
         purpose = "functional-safety-only"
@@ -355,7 +358,10 @@ if (($Resume -or $SummarizeExisting) -and
         observed_pack_sha256 = $packSha
         pack_sha256_verified = $packVerified
         expected_mask_sha256 = $ExpectedMaskSHA256.ToLowerInvariant()
-        observed_mask_sha256 = $sparse.mask_sha256
+        observed_mask_sha256 = [string]$sparse.manifest.mask_sha256
+        expected_embedded_mask_sha256 =
+            $ExpectedEmbeddedMaskSHA256.ToLowerInvariant()
+        observed_embedded_mask_sha256 = $sparse.mask_sha256
         expected_payload_sha256 = $ExpectedPayloadSHA256.ToLowerInvariant()
         observed_payload_sha256 = $payloadSha
         sparse_manifest_sha256 = $sparse.manifest_sha256
@@ -419,7 +425,7 @@ if (-not (Test-Path -LiteralPath $launchProvenancePath -PathType Leaf)) {
 }
 $launch = Get-Content -LiteralPath $launchProvenancePath -Raw |
     ConvertFrom-Json
-if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v1" -or
+if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v2" -or
     $launch.tag -ne $effectiveTag -or
     $launch.bake_id -ne $BakeId -or
     $launch.purpose -ne "functional-safety-only" -or
@@ -431,6 +437,10 @@ if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v1" -or
     $launch.expected_pack_sha256 -ne $ExpectedPackSHA256.ToLowerInvariant() -or
     $launch.expected_mask_sha256 -ne $ExpectedMaskSHA256.ToLowerInvariant() -or
     $launch.observed_mask_sha256 -ne $ExpectedMaskSHA256.ToLowerInvariant() -or
+    $launch.expected_embedded_mask_sha256 -ne
+        $ExpectedEmbeddedMaskSHA256.ToLowerInvariant() -or
+    $launch.observed_embedded_mask_sha256 -ne
+        $ExpectedEmbeddedMaskSHA256.ToLowerInvariant() -or
     $launch.expected_payload_sha256 -ne $ExpectedPayloadSHA256.ToLowerInvariant() -or
     $launch.observed_payload_sha256 -ne $ExpectedPayloadSHA256.ToLowerInvariant() -or
     $launch.execution_runner_sha256 -ne $executionRunnerHashForRuns -or
