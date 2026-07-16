@@ -1,0 +1,23 @@
+ds4: sparse bake validated: logical=86720111488 mapped=86720315096 mask_sha256=5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 source_sha256=efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668
+ds4: sparse bake mask installed mask_sha256=5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 pruned=4080 layers=40
+ds4: REAP mask applied path="embedded-bake:5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97" pruned=4080 layers=40 bias_layers=40 ranges_updated=0 ranges_created=0 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: [sparse-bake-runtime] result=guards-installed layers=43 sparse_layers=40 retained=6928 rejected=0
+ds4: REAP mask applied path="embedded-bake:5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97" pruned=4080 layers=40 bias_layers=40 ranges_updated=0 ranges_created=40 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; sparse selected-expert transport owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 5.956s
+ds4: cuda backend initialized for graph diagnostics
+0716 11:19:05 ds4-server: context buffers 333.21 MiB (ctx=8192, backend=cuda, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=2050)
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=16.98 GiB bytes=32211468288 slot_bytes=7077888
+0716 11:19:08 ds4-server: listening on http://127.0.0.1:8000
+0716 11:19:09 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: CUDA loading model tensors 6.22 GiB cached
+ds4: CUDA loading model tensors 6.03 GiB cached
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 candidate_fnv1a64=89721b350e5fbc02 sparse_skipped_ranked=1579 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=4551 capacity=4551 mass_total=1720.000000 mass_candidate=938.993003 mass_coverage=0.5459 cutoff=0.141082 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=0 target=1 resident=4551 loads=4551 slots=4551

@@ -1,6 +1,6 @@
 ﻿{
     "schema":  "g64_long_g46_full_vs_g63_k60_authorization_v1",
-    "created_utc":  "2026-07-16T09:06:59.3896954Z",
+    "created_utc":  "2026-07-16T09:18:44.5926023Z",
     "purpose":  "verify K60 payload/hash/manifest/embedded-mask before G64 long quality comparison",
     "prompt":  "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
     "max_tokens":  64,
@@ -8,7 +8,7 @@
     "temperature":  0,
     "think":  false,
     "quality_claims":  "none",
-    "execution_runner_sha256":  "88e89c9eb87286a202706b2b27613c54b9192f8e7ae293ac67523d6247216bfa",
+    "execution_runner_sha256":  "8916be8882eb9dfd62b5fad449c299b134ccb41571d475dc888e87e9ea0953f1",
     "provenance":  {
                        "executable_sha256":  "63f1a24285bac089df1db6ecd2024f812b6905b7e7d31a49d95e7b2dcd983399",
                        "harness_sha256":  "e95b0f827f63efefa195e839943a60b4578ffe6ca6886dcc6a92c7d8fd3bc7cb",
@@ -23,7 +23,7 @@
                    },
     "k60_authorization":  {
                               "bake_id":  "K60",
-                              "authorized_utc":  "2026-07-16T09:06:59.3746635Z",
+                              "authorized_utc":  "2026-07-16T09:18:44.5795998Z",
                               "model_path":  "C:\\ds4-models\\ds4-2bit-k60-mass-full-decode.gguf",
                               "model_sha256_not_verified":  true,
                               "expected_pack_sha256":  "3b464ee43514c8caa841be61da70190a4a7ba3c760c22849d2d723e5da5b7d71",
@@ -34,7 +34,7 @@
                               "expected_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                               "observed_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                               "payload_verify_method":  "python-hashlib-extents",
-                              "payload_verify_elapsed_seconds":  58.212044900006731,
+                              "payload_verify_elapsed_seconds":  67.2874729000032,
                               "payload_verify_extent_count":  7155,
                               "payload_verifier_path":  "C:\\Users\\imanu\\source\\repos\\reap-loop\\scripts\\ds4_windows_sparse_bake.py",
                               "payload_verifier_sha256":  "cf9cf279fe2a41eb7b924ae0c90ad383ca5a9271368c9fa2ad4205dc2f44a38a",

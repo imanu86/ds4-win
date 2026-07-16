@@ -63,8 +63,60 @@ not a general cold-start claim.
 
 ## Next Gate
 
-Run a K60-only context-8192 safety arm to determine whether the physically
-sparse source can complete the same 30 GiB WRAP without crossing the unchanged
-memory guard. This remains `n=1` safety evidence only. Do not launch the six
-long quality rows until both capacity and source-cache symmetry are resolved.
+The isolated K60 safety arm below answered the original next-gate question.
+Do not launch the six long quality rows until the shared WRAP capacity failure
+and source-cache symmetry are resolved.
 
+## Isolated K60 Safety
+
+The runner was extended without changing DS4 flags or guards so one safety arm
+could be selected independently.
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\g64_long_g46_full_vs_g63_k60.ps1 -SafetyOnly -SafetyArm g63_k60 -MaxTokens 64 -Context 8192 -TimeoutSec 1800
+```
+
+- Runner commit: `ac518c7`
+- Runner SHA-256: `8916be8882eb9dfd62b5fad449c299b134ccb41571d475dc888e87e9ea0953f1`
+- Arm: `g63_k60`
+- Model: `C:\ds4-models\ds4-2bit-k60-mass-full-decode.gguf`
+- Preflight available memory after cleanup: `51,288,727,552 bytes`
+- Embedded mask verified and installed: `4080` pruned experts across `40` layers
+- Sparse runtime guards: retained `6928`, rejected `0`
+- Sparse candidates skipped and replaced during compose: `1579`
+
+The K60 arm also failed closed during the initial WRAP arena fill, before the
+first generated token:
+
+- DynamicArena: `30.00 GiB`, `4551` slots, `6.75 MiB/slot`
+- Arena transition reached: `base=0 target=1 resident=4551 loads=4551`
+- Runtime-monitor elapsed at abort: `56.458 s`
+- Windows available memory at abort: `272,769,024 bytes` (`0.254 GiB`)
+- Consecutive low-memory samples: `3`
+- `contamination_abort`: `true`
+- Peak process working set: `50,192,482,304 bytes`
+- Peak private bytes: `44,099,170,304 bytes`
+- Process read transfer: `33,894,227,872 bytes`
+- Page faults at abort: `16,954,373`
+- Peak disk queue length: `11`
+- GPU utilization at abort: `0%`; dedicated VRAM: `10,838 MiB`
+- Post-run: no `ds4_server` process remained and VRAM returned to baseline
+
+This is a second `n=1` safety result, not a quality or throughput verdict. It
+demonstrates that physically removing SSD payload alone does not solve the
+context-8192 capacity gate while both arms still construct the same 30 GiB,
+4551-slot runtime arena.
+
+## Measured Comparison
+
+| Safety arm | Abort elapsed | Available at abort | Process reads | Arena slots | First token |
+|---|---:|---:|---:|---:|---:|
+| G46 full | 59.873 s | 0.251 GiB | 36.265 GB | 4551 | no |
+| G63 K60 | 56.458 s | 0.254 GiB | 33.894 GB | 4551 | no |
+
+The next frozen experiment is an identical-arm capacity A/B with the existing
+`ArenaWrapTrimBetweenPhases` enabled. That implementation trims between the
+`gate`, `up` and `down` source-parts phases. If the unchanged guard still
+aborts, the next implementation target is finer-grained trim after completed
+source parts, before final snapshot publication, with per-trim memory and
+latency telemetry.
