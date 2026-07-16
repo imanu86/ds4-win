@@ -1,5 +1,5 @@
 # G63 sparse-bake K60 G46 composite runner (PowerShell 5.1, ASCII).
-# Candidate-only K60 sparse bake + exact measured G46 composite against frozen G58 K60.
+# Candidate-only K60 sparse bake + measured G46 composite with frozen G63 exactness.
 param(
     [switch]$SafetyOnly,
     [switch]$Resume,
@@ -24,6 +24,7 @@ $csvPath = Join-Path $outdir "g63_sparse_bake_g46_composite_runs.csv"
 $authPath = Join-Path $outdir "g63_sparse_bake_g46_composite_authorization.json"
 $prompt = "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document."
 $baselineG58K60ContentSHA256 = "ceced6c1b481bb2c6f68bd116c06e554502017a44b40b4e5e6bc9fc5d710edc7"
+$expectedG63K60ContentSHA256 = "4aaf0f0813f4cb15ac21a88f195f4f7d2c2af797e81524935e22eea60603c6b1"
 $expertCacheN = 320
 $expertCacheReserveGB = 0.125
 $expertCachePolicy = "lru"
@@ -424,6 +425,7 @@ function Invoke-G63Run {
             think = $false
             quality_claims = "none"
             baseline_g58_k60_content_sha256 = $baselineG58K60ContentSHA256
+            expected_g63_k60_content_sha256 = $expectedG63K60ContentSHA256
             expert_cache_n = $expertCacheN
             expert_cache_reserve_gb = $expertCacheReserveGB
             expert_cache_policy = $expertCachePolicy
@@ -520,7 +522,7 @@ function Invoke-G63Run {
             "-AllowEmbeddedBakeMask",
             "-ExpectedEmbeddedBakeMaskSHA256", $Authorization.expected_mask_sha256,
             "-ReapPrefetchThreads", "8",
-            "-ExpectedContentSHA256", $baselineG58K60ContentSHA256,
+            "-ExpectedContentSHA256", $expectedG63K60ContentSHA256,
             "-ModelPath", $Authorization.model_path,
             "-TimeoutSec", ([string]$TimeoutSec)
         )
@@ -578,6 +580,7 @@ function Invoke-G63Run {
         [bool]$launchRead.think -ne $false -or
         $launchRead.quality_claims -ne "none" -or
         $launchRead.baseline_g58_k60_content_sha256 -ne $baselineG58K60ContentSHA256 -or
+        $launchRead.expected_g63_k60_content_sha256 -ne $expectedG63K60ContentSHA256 -or
         [int]$launchRead.expert_cache_n -ne $expertCacheN -or
         [double]$launchRead.expert_cache_reserve_gb -ne $expertCacheReserveGB -or
         $launchRead.expert_cache_policy -ne $expertCachePolicy -or
@@ -641,8 +644,8 @@ function Invoke-G63Run {
         $r.ds4_c_sha256 -ne $Provenance.ds4_c_sha256 -or
         $r.ds4_server_c_sha256 -ne $Provenance.ds4_server_c_sha256 -or
         $r.build_manifest_sha256 -ne $Provenance.build_manifest_sha256 -or
-        [string]$r.expected_content_sha256 -ne $baselineG58K60ContentSHA256 -or
-        [string]$r.results[0].content_sha256 -ne $baselineG58K60ContentSHA256 -or
+        [string]$r.expected_content_sha256 -ne $expectedG63K60ContentSHA256 -or
+        [string]$r.results[0].content_sha256 -ne $expectedG63K60ContentSHA256 -or
         [bool]$r.gpu_resident_routes_requested -ne $true -or
         [bool]$r.gpu_resident_routes_observed -ne $true -or
         [int64]$r.gpu_resident_routes_calls -le 0 -or
@@ -843,7 +846,8 @@ function Invoke-G63Run {
         server_exit_code = [int]$r.server_exit_code
         content_sha256 = [string]$r.results[0].content_sha256
         baseline_g58_k60_content_sha256 = $baselineG58K60ContentSHA256
-        output_hash_matches_baseline = ([string]$r.results[0].content_sha256 -eq $baselineG58K60ContentSHA256)
+        expected_g63_k60_content_sha256 = $expectedG63K60ContentSHA256
+        output_hash_matches_g63_baseline = ([string]$r.results[0].content_sha256 -eq $expectedG63K60ContentSHA256)
         completion_tokens = [int]$r.results[0].completion_tokens
         wall_seconds = [double]$r.results[0].seconds
         load_seconds = [double]$r.load_seconds
@@ -1085,8 +1089,8 @@ foreach ($bakeId in @("K60")) {
     if ($hashes.Count -ne 1) {
         throw "G63 output not deterministic within bake: bake=$bakeId"
     }
-    if ($hashes[0] -ne $baselineG58K60ContentSHA256) {
-        throw "G63 output hash differs from frozen G58 K60 baseline"
+    if ($hashes[0] -ne $expectedG63K60ContentSHA256) {
+        throw "G63 output hash differs from frozen G63 K60 composite baseline"
     }
 }
 $order = @($runs | ForEach-Object { $_.bake_id })
@@ -1152,7 +1156,7 @@ foreach ($bakeId in @("K60")) {
 
 $summary = [pscustomobject]@{
     schema = "g63_sparse_bake_g46_composite_v1"
-    question = "K60 sparse-bake candidate-only exact G46 composite recipe versus frozen G58 K60 hash."
+    question = "Can K60 run the measured G46 composite deterministically with its request mask composed over the embedded sparse base?"
     safety_only = [bool]$SafetyOnly
     summarized_existing_results = [bool]$SummarizeExisting
     authorization_path = $authPath
@@ -1164,8 +1168,12 @@ $summary = [pscustomobject]@{
     temperature = 0
     think = $false
     quality_claims = "none; do not declare L0-L3 quality from 64-token runs"
-    baseline = [pscustomobject]@{
-        source = "frozen G58 K60"
+    exactness_baseline = [pscustomobject]@{
+        source = "G63 structurally valid candidate safety; no quality claim"
+        content_sha256 = $expectedG63K60ContentSHA256
+    }
+    comparison_baseline = [pscustomobject]@{
+        source = "frozen G58 K60 static bake"
         content_sha256 = $baselineG58K60ContentSHA256
     }
     candidate = [pscustomobject]@{
@@ -1209,7 +1217,7 @@ $summary = [pscustomobject]@{
     }
     independent_processes_per_bake = $independentProcessCount
     within_process_repeats = 1
-    order_contract = "K60 candidate only; safety n=1 or performance n=3; every output must equal frozen G58 K60"
+    order_contract = "K60 candidate only; safety n=1 or performance n=3; every output must equal frozen G63 composite hash"
     order = @($runs | ForEach-Object { $_.tag })
     order_bake = @($runs | ForEach-Object { $_.bake_id })
     required_guards = @(
@@ -1234,7 +1242,7 @@ $summary = [pscustomobject]@{
         "expert cache requested/capacity 320",
         "GPU-route cache count positive",
         "direct GPU-route cache hits/misses/direct telemetry coherent",
-        "output hash equals frozen G58 K60",
+        "output hash equals frozen G63 K60 composite baseline",
         "process isolation conflict_count=0",
         "VRAM peak metric present for baseline comparison",
         "no absent expert, zero-filled, selected-load fail-closed, or external mask logs")
@@ -1246,7 +1254,7 @@ $summary = [pscustomobject]@{
     comparisons = @(
         [pscustomobject]@{
             source = "G58 K60"
-            role = "frozen exactness baseline"
+            role = "static-bake comparison baseline"
             declared_metric = "content_sha256"
             value = $baselineG58K60ContentSHA256
         },
@@ -1275,7 +1283,7 @@ $summary = [pscustomobject]@{
     runs = $runs
     arm_summary = $armSummary
 }
-$runs | Select-Object tag,bake_id,order_index,content_sha256,output_hash_matches_baseline,
+$runs | Select-Object tag,bake_id,order_index,content_sha256,output_hash_matches_g63_baseline,
     load_seconds,ttft_seconds,decode_tokens_per_second,wall_seconds,
     aggregate_disk_read_gib,process_read_gib,page_fault_delta,
     dynamic_arena_gib_requested,dynamic_arena_allocated_slots,
