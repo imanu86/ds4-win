@@ -1,7 +1,8 @@
 # G94 IQ1_S mixed GPU-plan A/B (PowerShell 5.1, ASCII).
 param(
     [switch]$StaticCheckOnly,
-    [switch]$Resume
+    [switch]$Resume,
+    [ValidateRange(1.0, 8.0)][double]$Iq1CacheGiB = 8.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,7 +14,6 @@ $runtimeMonitor = Join-Path $root "g7_runtime_monitor.ps1"
 $outdir = Join-Path $root "g7_runs"
 $executable = Join-Path $root "build\Release\ds4_server.exe"
 $buildManifest = Join-Path $root "build\Release\g7_build_manifest.json"
-$summaryPath = Join-Path $outdir "g94_iq1_gpu_plan_ab_result.json"
 
 $model = "C:\ds4-models\ds4-2bit.gguf"
 $expectedModelSHA256 =
@@ -26,9 +26,15 @@ $prompt = "Create a complete single-file HTML landing page for a cyberpunk AI pr
 $expectedPromptSHA256 =
     "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6"
 
+$cacheLabel = $Iq1CacheGiB.ToString(
+    "0.###", [Globalization.CultureInfo]::InvariantCulture).Replace(".", "p")
+$cacheArgument = $Iq1CacheGiB.ToString(
+    "0.###", [Globalization.CultureInfo]::InvariantCulture)
+$summaryPath = Join-Path $outdir (
+    "g94_iq1_cache" + $cacheLabel + "_gpu_plan_ab_result.json")
 $armPlan = @(
-    @{ Tag = "g94_iq1_gpu_plan_off_n3"; Arm = "baseline-mixed"; Planner = $false },
-    @{ Tag = "g94_iq1_gpu_plan_on_n3"; Arm = "gpu-plan-on"; Planner = $true }
+    @{ Tag = ("g94_iq1_cache" + $cacheLabel + "_gpu_plan_off_n3"); Arm = "baseline-mixed"; Planner = $false },
+    @{ Tag = ("g94_iq1_cache" + $cacheLabel + "_gpu_plan_on_n3"); Arm = "gpu-plan-on"; Planner = $true }
 )
 
 function Get-G94SHA256 {
@@ -194,7 +200,7 @@ function New-G94Args {
         "-Iq1SLayerFirst", "3",
         "-Iq1SLayerLast", "42",
         "-Iq1SMixedColdOne",
-        "-Iq1SRamCacheGiB", "8",
+        "-Iq1SRamCacheGiB", $cacheArgument,
         "-GateKind", "benchmark"
     )
     if ($Planner) { $args += "-Iq1SMixedGpuPlan" }
@@ -333,7 +339,7 @@ function Assert-G94RunContract {
             "3" -or
         [string]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_LAST -ne
             "42" -or
-        [double]$Result.iq1_s_ram_cache_requested_gib -ne 8.0 -or
+        [double]$Result.iq1_s_ram_cache_requested_gib -ne $Iq1CacheGiB -or
         [bool]$Result.iq1_s_ram_cache_runtime_observed -ne $true -or
         [UInt64]$Result.iq1_s_ram_cache_failures -ne 0 -or
         [bool]$Result.iq1_s_mixed_gpu_plan_requested -ne
@@ -518,6 +524,7 @@ $staticChecks = [pscustomobject]@{
     no_profile = $true
     quiescence_required = $true
     no_quality_or_general_sota_claim = $true
+    iq1_s_ram_cache_gib = $Iq1CacheGiB
     runner_sha256 = $selfSha
 }
 
@@ -652,7 +659,7 @@ $summary = [pscustomobject]@{
     budget_gb = 2
     reserve_mb = 1024
     dynamic_arena_gib = 20
-    iq1_s_ram_cache_gib = 8
+    iq1_s_ram_cache_gib = $Iq1CacheGiB
     iq1_s_layers = "3..42"
     mixed_cold_one = $true
     q8_f16_cache = "disabled"
