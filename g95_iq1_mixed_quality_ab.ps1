@@ -26,6 +26,7 @@ $maxTokens = 768
 $context = 1024
 $warmupMaxTokens = 64
 $stopSequence = "</html>"
+$quiescenceCooldownSec = 30
 $timeoutSec = 7200
 $cacheLabel = $Iq1CacheGiB.ToString(
     "0.###", [Globalization.CultureInfo]::InvariantCulture).Replace(".", "p")
@@ -80,7 +81,8 @@ function Assert-G95StaticContract {
         throw "G95 requires n>=3 per arm"
     }
     if ($maxTokens -ne 768 -or $context -ne 1024 -or
-        $warmupMaxTokens -ne 64 -or $stopSequence -ne "</html>") {
+        $warmupMaxTokens -ne 64 -or $stopSequence -ne "</html>" -or
+        $quiescenceCooldownSec -ne 30) {
         throw "G95 token/context/warmup contract mismatch"
     }
 
@@ -96,6 +98,7 @@ function Assert-G95StaticContract {
             '[switch]$Iq1SMixedColdOne',
             '[switch]$Iq1SMixedGpuPlan',
             '[ValidateRange(0.0, 48.0)][double]$Iq1SRamCacheGiB',
+            '[ValidateRange(0, 600)][int]$QuiescenceCooldownSec',
             'iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls',
             'quality_eligible = $qualityEligible',
             'sota_eligible = $sotaEligible',
@@ -147,6 +150,7 @@ function New-G95BaseMeasureArgs([string]$Tag) {
         "-ExpertTierReplacementBudget", "32",
         "-ExpertTierMinFrequency", "3",
         "-ExpertTierHysteresis", "1.25",
+        "-QuiescenceCooldownSec", "$quiescenceCooldownSec",
         "-TimeoutSec", "$timeoutSec"
     )
 }
@@ -534,6 +538,7 @@ $summary = [ordered]@{
         reap_prefetch_threads = 8
         iq1_s_ram_cache_gib = $Iq1CacheGiB
         system_quiescence_required = $true
+        quiescence_cooldown_seconds = $quiescenceCooldownSec
     }
     arms = @(
         [ordered]@{

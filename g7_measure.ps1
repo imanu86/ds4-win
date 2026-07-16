@@ -134,7 +134,8 @@ param(
     [ValidateRange(0.0, 100.0)][double]$MaximumCpuMedianPercent = 60.0,
     [ValidateRange(0.0, 10000.0)][double]$MaximumDiskMedianPercent = 30.0,
     [ValidateRange(0.0, 1048576.0)][double]$MaximumDiskIoMedianMiBps = 64.0,
-    [ValidateRange(0.0, 100.0)][double]$MaximumGpuMedianPercent = 85.0
+    [ValidateRange(0.0, 100.0)][double]$MaximumGpuMedianPercent = 85.0,
+    [ValidateRange(0, 600)][int]$QuiescenceCooldownSec = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -1068,6 +1069,29 @@ try {
     }
 } catch { $gpuIdentity = $null }
 
+$quiescenceCooldownStartedUtc = [DateTime]::UtcNow
+$quiescenceCooldownStopwatch = [Diagnostics.Stopwatch]::StartNew()
+if (-not $SkipSystemQuiescencePreflight -and $QuiescenceCooldownSec -gt 0) {
+    Start-Sleep -Seconds $QuiescenceCooldownSec
+}
+$quiescenceCooldownStopwatch.Stop()
+
+# Full-file provenance hashing can leave storage busy. Cool down before the
+# quiescence probe, then fail closed if either model changed during the wait.
+$modelInfoAfterCooldown = Get-Item -LiteralPath $model
+if ($modelInfoAfterCooldown.Length -ne $modelInfoAtStart.Length -or
+    $modelInfoAfterCooldown.LastWriteTimeUtc -ne $modelInfoAtStart.LastWriteTimeUtc) {
+    throw "Model provenance changed during quiescence cooldown"
+}
+if ($iq1SSidecarInfoAtStart) {
+    $iq1SSidecarInfoAfterCooldown = Get-Item -LiteralPath $Iq1SExpertSidecar
+    if ($iq1SSidecarInfoAfterCooldown.Length -ne $iq1SSidecarInfoAtStart.Length -or
+        $iq1SSidecarInfoAfterCooldown.LastWriteTimeUtc -ne
+            $iq1SSidecarInfoAtStart.LastWriteTimeUtc) {
+        throw "IQ1_S sidecar provenance changed during quiescence cooldown"
+    }
+}
+
 $quiescenceThresholds = [pscustomobject][ordered]@{
     maximum_cpu_median_percent = $MaximumCpuMedianPercent
     maximum_disk_median_percent = $MaximumDiskMedianPercent
@@ -1183,6 +1207,12 @@ $systemQuiescencePreflight = [pscustomobject][ordered]@{
     requested_samples = $QuiescenceSamples
     completed_samples = $quiescenceRows.Count
     requested_sleep_interval_ms = $QuiescenceIntervalMs
+    requested_cooldown_seconds = $QuiescenceCooldownSec
+    cooldown_started_utc = $quiescenceCooldownStartedUtc.ToString(
+        "o", [Globalization.CultureInfo]::InvariantCulture)
+    cooldown_observed_ms = [math]::Round(
+        $quiescenceCooldownStopwatch.Elapsed.TotalMilliseconds, 3)
+    provenance_metadata_rechecked_after_cooldown = $true
     observed_interval_median_ms = $observedIntervalMedianMs
     observed_window_ms = [math]::Round($quiescenceStopwatch.Elapsed.TotalMilliseconds, 3)
     gpu_scope = "maximum-utilization-across-visible-gpus"
