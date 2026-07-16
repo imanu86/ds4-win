@@ -239,7 +239,8 @@ if (-not (Test-Path -LiteralPath $harness -PathType Leaf)) {
     throw "g7_measure.ps1 missing"
 }
 foreach ($parameter in @("ModelPath", "MaxTokens", "ExpectedContentSHA256",
-        "SkipMemoryPreflight", "SkipSystemQuiescencePreflight")) {
+        "SkipMemoryPreflight", "SkipSystemQuiescencePreflight",
+        "AllowEmbeddedBakeMask", "ExpectedEmbeddedBakeMaskSHA256")) {
     if (-not (Test-G57HarnessParameter -ParameterName $parameter)) {
         throw "Harness does not expose -$parameter; refusing to launch model."
     }
@@ -410,6 +411,8 @@ if (($Resume -or $SummarizeExisting) -and
         "-ReserveMB", "1024",
         "-DisableQ8F16Cache",
         "-EmbedRowStaging",
+        "-AllowEmbeddedBakeMask",
+        "-ExpectedEmbeddedBakeMaskSHA256", $ExpectedMaskSHA256,
         "-ReapPrefetchThreads", "8",
         "-ModelPath", $resolvedModel,
         "-TimeoutSec", ([string]$TimeoutSec)
@@ -505,7 +508,13 @@ if ($r.tag -ne $effectiveTag -or
     [int]$r.expert_cache_requested -ne 0 -or
     $r.expert_tiering_requested -ne "off" -or
     [bool]$r.spex_dry_run_requested -ne $false -or
-    [string]$r.reap_mask_file_requested -ne "") {
+    [string]$r.reap_mask_file_requested -ne "" -or
+    [bool]$r.embedded_bake_mask_allowed -ne $true -or
+    [bool]$r.embedded_bake_mask_observed -ne $true -or
+    $r.expected_embedded_bake_mask_sha256 -ne
+        $ExpectedMaskSHA256.ToLowerInvariant() -or
+    $r.reap_mask_path_observed -ne
+        ("embedded-bake:" + $ExpectedMaskSHA256.ToLowerInvariant())) {
     throw "G57 result contract mismatch: tag=$effectiveTag"
 }
 if ($ExpectedContentSHA256 -and

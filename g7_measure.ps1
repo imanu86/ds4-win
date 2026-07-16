@@ -38,6 +38,8 @@ param(
     [switch]$ReapMassObserve,
     [switch]$ReapMassWrap,
     [string]$ReapMaskFile = "",
+    [switch]$AllowEmbeddedBakeMask,
+    [string]$ExpectedEmbeddedBakeMaskSHA256 = "",
     [ValidateRange(1, 256)][int]$ReapMassWindow = 16,
     [ValidateRange(1, 256)][int]$ReapMassGrowInterval = 4,
     [ValidateRange(1.0, 100.0)][double]$ReapMassHysteresis = 1.25,
@@ -134,6 +136,16 @@ if ($ExpectedSpexSHA256 -and $ExpectedSpexSHA256 -notmatch '^[0-9a-fA-F]{64}$') 
 }
 if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedWarmupContentSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($AllowEmbeddedBakeMask -and
+    $ExpectedEmbeddedBakeMaskSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "AllowEmbeddedBakeMask requires ExpectedEmbeddedBakeMaskSHA256"
+}
+if (-not $AllowEmbeddedBakeMask -and $ExpectedEmbeddedBakeMaskSHA256) {
+    throw "ExpectedEmbeddedBakeMaskSHA256 requires AllowEmbeddedBakeMask"
+}
+if ($AllowEmbeddedBakeMask -and $ReapMaskFile) {
+    throw "AllowEmbeddedBakeMask cannot be combined with ReapMaskFile"
 }
 if ($WarmupPrompt -and -not $Warmup) {
     throw "WarmupPrompt requires -Warmup"
@@ -423,6 +435,8 @@ if ($ReapMassWrap) {
     Remove-Item Env:\DS4_CUDA_REAP_MASS_GROW_INTERVAL -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_REAP_MASS_HYSTERESIS -ErrorAction SilentlyContinue
 }
+$embeddedBakeMaskObserved = $reapMaskAppliedObserved -and
+    $reapMaskPathObserved -like "embedded-bake:*"
 if ($ReapMaskFile) {
     if (-not (Test-Path -LiteralPath $ReapMaskFile -PathType Leaf)) {
         throw "ReapMaskFile does not exist: $ReapMaskFile"
@@ -2311,6 +2325,22 @@ if ($ReapMaskFile) {
         ($reapMaskRangesUpdated + $reapMaskRangesCreated) -ne $reapMaskBiasLayers) {
         throw "REAP mask measurement failed: device bias range upload was incomplete"
     }
+} elseif ($AllowEmbeddedBakeMask) {
+    $expectedEmbeddedBakePath = "embedded-bake:" +
+        $ExpectedEmbeddedBakeMaskSHA256.ToLowerInvariant()
+    if ($reapMaskReloadObserved -or -not $embeddedBakeMaskObserved -or
+        $reapMaskPathObserved -ne $expectedEmbeddedBakePath) {
+        throw "Embedded bake mask measurement failed: provenance mismatch"
+    }
+    if ($reapMaskAppliedPruned -le 0 -or $reapMaskAppliedLayers -le 0 -or
+        $reapMaskBiasLayers -le 0) {
+        throw "Embedded bake mask measurement failed: invalid counters"
+    }
+    if ($reapMaskRangesFailed -ne 0 -or
+        ($reapMaskRangesUpdated + $reapMaskRangesCreated) -ne
+            $reapMaskBiasLayers) {
+        throw "Embedded bake mask measurement failed: range upload incomplete"
+    }
 } elseif ($reapMaskReloadObserved -or $reapMaskAppliedObserved) {
     throw "REAP mask activated while not requested"
 }
@@ -2839,6 +2869,9 @@ $summary = [pscustomobject]@{
     reap_mass_wrap_last_router = $reapMassWrapLastRouter
     reap_mass_wrap_last_mask = $reapMassWrapLastMask
     reap_mask_file_requested = $(if ($ReapMaskFile) { (Resolve-Path -LiteralPath $ReapMaskFile).Path } else { "" })
+    embedded_bake_mask_allowed = [bool]$AllowEmbeddedBakeMask
+    expected_embedded_bake_mask_sha256 = $(if ($ExpectedEmbeddedBakeMaskSHA256) { $ExpectedEmbeddedBakeMaskSHA256.ToLowerInvariant() } else { "" })
+    embedded_bake_mask_observed = [bool]$embeddedBakeMaskObserved
     reap_mask_reload_observed = $reapMaskReloadObserved
     reap_mask_applied_observed = $reapMaskAppliedObserved
     reap_mask_path_observed = $reapMaskPathObserved
