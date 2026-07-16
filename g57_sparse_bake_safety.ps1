@@ -7,6 +7,8 @@ param(
     [Parameter(Mandatory=$true)][string]$ExpectedMaskSHA256,
     [Parameter(Mandatory=$true)][string]$ExpectedEmbeddedMaskSHA256,
     [Parameter(Mandatory=$true)][string]$ExpectedPayloadSHA256,
+    [Parameter(Mandatory=$true)][string]$PayloadVerifierPath,
+    [string]$PythonPath = "python",
     [string]$PackPath = "",
     [ValidateRange(1, 131072)][int]$MaxTokens = 64,
     [string]$ExpectedContentSHA256 = "",
@@ -137,32 +139,6 @@ function ConvertTo-G57Extents {
     $rows
 }
 
-function Get-G57PayloadSHA256 {
-    param([Parameter(Mandatory=$true)][string]$Path,
-          [Parameter(Mandatory=$true)][object[]]$Extents)
-    $sha = [Security.Cryptography.SHA256]::Create()
-    $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
-        [IO.FileShare]::Read)
-    try {
-        $buffer = New-Object byte[] (4MB)
-        foreach ($extent in $Extents) {
-            $fs.Seek([int64]$extent.offset, [IO.SeekOrigin]::Begin) | Out-Null
-            $remaining = [uint64]$extent.bytes
-            while ($remaining -gt 0) {
-                $want = [int][Math]::Min([uint64]$buffer.Length, $remaining)
-                Read-G57Exact -Stream $fs -Buffer $buffer -Count $want
-                $remaining -= [uint64]$want
-                $null = $sha.TransformBlock($buffer, 0, $want, $null, 0)
-            }
-        }
-        $null = $sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
-        [BitConverter]::ToString($sha.Hash).Replace("-", "").ToLowerInvariant()
-    } finally {
-        $fs.Dispose()
-        $sha.Dispose()
-    }
-}
-
 function Get-G57SparseBakeManifest {
     param([Parameter(Mandatory=$true)][string]$Path)
     $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
@@ -273,6 +249,11 @@ $resolvedModel = (Resolve-Path -LiteralPath $ModelPath).Path
 if ($resolvedModel -like "D:\ds4-models\*") {
     throw "Refusing to read D:\ds4-models per G57 safety handoff"
 }
+$resolvedPayloadVerifier =
+    (Resolve-Path -LiteralPath $PayloadVerifierPath).Path
+if (-not (Test-Path -LiteralPath $resolvedPayloadVerifier -PathType Leaf)) {
+    throw "G57 payload verifier missing: $resolvedPayloadVerifier"
+}
 $resolvedPack = ""
 if ($PackPath) {
     $resolvedPack = (Resolve-Path -LiteralPath $PackPath).Path
@@ -306,6 +287,7 @@ $provenance = [pscustomobject]@{
     ds4_bake_c_sha256 = Get-G57SHA256 (Join-Path $root "ds4_bake.c")
     ds4_bake_h_sha256 = Get-G57SHA256 (Join-Path $root "ds4_bake.h")
     build_manifest_sha256 = Get-G57SHA256 $buildManifest
+    payload_verifier_sha256 = Get-G57SHA256 $resolvedPayloadVerifier
 }
 $executionRunnerHashAtStart = Get-G57SHA256 $MyInvocation.MyCommand.Path
 $executionRunnerHashForRuns = if ($SummarizeExisting) {
@@ -330,8 +312,28 @@ if (($Resume -or $SummarizeExisting) -and
         $ExpectedMaskSHA256.ToLowerInvariant()) {
         throw "G57 manifest mask_sha256 mismatch"
     }
-    $payloadSha = Get-G57PayloadSHA256 -Path $resolvedModel -Extents $sparse.extents
-    if ($payloadSha -ne $ExpectedPayloadSHA256.ToLowerInvariant()) {
+    Write-Host "[g57] verify retained payload with native hashlib"
+    $payloadVerifyOutput = @(& $PythonPath $resolvedPayloadVerifier `
+        verify-payload --bake $resolvedModel 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        throw ("G57 payload verifier failed: " +
+            ($payloadVerifyOutput -join [Environment]::NewLine))
+    }
+    try {
+        $payloadVerify = ($payloadVerifyOutput -join [Environment]::NewLine) |
+            ConvertFrom-Json
+    } catch {
+        throw ("G57 payload verifier returned invalid JSON: " +
+            ($payloadVerifyOutput -join [Environment]::NewLine))
+    }
+    $payloadSha = [string]$payloadVerify.measured_sha256
+    if (-not [bool]$payloadVerify.verified -or
+        [string]$payloadVerify.expected_sha256 -ne
+            $ExpectedPayloadSHA256.ToLowerInvariant() -or
+        $payloadSha -ne $ExpectedPayloadSHA256.ToLowerInvariant() -or
+        [uint64]$payloadVerify.payload_bytes -ne
+            [uint64]$sparse.manifest.payload_bytes -or
+        [int]$payloadVerify.extent_count -ne @($sparse.extents).Count) {
         throw "G57 payload SHA mismatch"
     }
     $packSha = ""
@@ -344,7 +346,7 @@ if (($Resume -or $SummarizeExisting) -and
         $packVerified = $true
     }
     $launchProvenance = [pscustomobject]@{
-        schema = "g57_sparse_bake_launch_provenance_v2"
+        schema = "g57_sparse_bake_launch_provenance_v3"
         tag = $effectiveTag
         bake_id = $BakeId
         purpose = "functional-safety-only"
@@ -364,6 +366,12 @@ if (($Resume -or $SummarizeExisting) -and
         observed_embedded_mask_sha256 = $sparse.mask_sha256
         expected_payload_sha256 = $ExpectedPayloadSHA256.ToLowerInvariant()
         observed_payload_sha256 = $payloadSha
+        payload_verify_method = "python-hashlib-extents"
+        payload_verify_elapsed_seconds =
+            [double]$payloadVerify.elapsed_seconds
+        payload_verify_extent_count = [int]$payloadVerify.extent_count
+        payload_verifier_path = $resolvedPayloadVerifier
+        payload_verifier_sha256 = $provenance.payload_verifier_sha256
         sparse_manifest_sha256 = $sparse.manifest_sha256
         sparse_manifest_crc32 = $sparse.manifest_crc32
         sparse_mask_crc32 = $sparse.mask_crc32
@@ -425,7 +433,7 @@ if (-not (Test-Path -LiteralPath $launchProvenancePath -PathType Leaf)) {
 }
 $launch = Get-Content -LiteralPath $launchProvenancePath -Raw |
     ConvertFrom-Json
-if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v2" -or
+if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v3" -or
     $launch.tag -ne $effectiveTag -or
     $launch.bake_id -ne $BakeId -or
     $launch.purpose -ne "functional-safety-only" -or
@@ -443,6 +451,11 @@ if ($launch.schema -ne "g57_sparse_bake_launch_provenance_v2" -or
         $ExpectedEmbeddedMaskSHA256.ToLowerInvariant() -or
     $launch.expected_payload_sha256 -ne $ExpectedPayloadSHA256.ToLowerInvariant() -or
     $launch.observed_payload_sha256 -ne $ExpectedPayloadSHA256.ToLowerInvariant() -or
+    $launch.payload_verify_method -ne "python-hashlib-extents" -or
+    [int]$launch.payload_verify_extent_count -le 0 -or
+    [double]$launch.payload_verify_elapsed_seconds -le 0.0 -or
+    $launch.payload_verifier_path -ne $resolvedPayloadVerifier -or
+    $launch.payload_verifier_sha256 -ne $provenance.payload_verifier_sha256 -or
     $launch.execution_runner_sha256 -ne $executionRunnerHashForRuns -or
     $launch.executable_sha256 -ne $provenance.executable_sha256 -or
     $launch.harness_sha256 -ne $provenance.harness_sha256 -or
