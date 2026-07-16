@@ -73,12 +73,65 @@ Output:
 .\build\Release\ds4_iq1_s_bench.exe 200 98304
 ```
 
-- Optional real-weight command. The file must contain exactly 98,304 IQ1_S
-  blocks, ordered as one DS4 expert's gate, up, and down tensors:
+- Optional flat real-weight command. The file must contain exactly 98,304
+  IQ1_S blocks, ordered as one DS4 expert's gate, up, and down tensors:
 
 ```powershell
 .\build\Release\ds4_iq1_s_bench.exe 200 98304 C:\path\expert_iq1_s.bin
 ```
+
+- Optional representative GGUF command. The benchmark opens the GGUF read-only
+  and accepts either one GGUF v3 shard or a byte-for-byte physical
+  concatenation of split GGUF v3 shards. It samples expert 0 from:
+  - `blk.0.ffn_gate_exps.weight` IQ1_S
+  - `blk.0.ffn_up_exps.weight` IQ1_S
+  - `blk.0.ffn_down_exps.weight` Q2_K
+  - `blk.1.ffn_down_exps.weight` Q2_K
+  - `blk.2.ffn_down_exps.weight` Q2_K
+  - `blk.3.ffn_gate_exps.weight` IQ1_S
+  - `blk.3.ffn_up_exps.weight` IQ1_S
+  - `blk.3.ffn_down_exps.weight` IQ1_S
+  - `blk.42.ffn_gate_exps.weight` IQ1_S
+  - `blk.42.ffn_up_exps.weight` IQ1_S
+  - `blk.42.ffn_down_exps.weight` IQ1_S
+
+  Each sampled tensor must have the exact DS4 routed-expert shape and expected
+  quant type. Missing tensors, wrong types, wrong shapes, or short reads are
+  fatal before measurement:
+
+```powershell
+.\build\Release\ds4_iq1_s_bench.exe 200 1 D:\ds4-models\DeepSeek-V4-Flash-IQ1_S-XL.gguf
+```
+
+  Concatenated input follows the production loader contract. The maximum tensor
+  extent in shard N is the physical header offset of shard N+1. Every shard
+  must carry coherent `split.no`, `split.count`, and `split.tensors.count`
+  metadata in ascending order; duplicate tensor names, unsupported tensor types
+  needed for extent discovery, count mismatches, truncated shards, and trailing
+  or missing bytes are fatal. Tensor-relative offsets are adjusted by each
+  shard's physical base. Every `real_samples` JSON item records
+  `source_shard`, shard count/base/data base, tensor-relative offset, final
+  physical offset, and sampled byte count.
+
+- Optional CPU-only cross-quant checkpoint-correlation mode. This mode does not
+  initialize CUDA. It accepts two extracted `.f32` row-output vectors produced
+  from the same deterministic input and reports cosine, Pearson correlation,
+  relative L2 error, and max absolute error. Use this to separate kernel/offset
+  bugs from expected checkpoint differences when comparing main-model
+  IQ2_XXS/Q2_K expert outputs with sidecar IQ1_S/Q2_K outputs:
+
+```powershell
+.\build\Release\ds4_iq1_s_bench.exe --correlate-outputs `
+  C:\path\main_blk3_gate_expert0_output.f32 `
+  C:\path\sidecar_blk3_gate_expert0_output.f32 `
+  blk.3:gate:expert0 `
+  deterministic_input_v1
+```
+
+  Extraction inputs must be raw little-endian `float32` vectors with identical
+  length. The metadata argument must identify `layer:part:expert`; the source
+  note should identify the deterministic input recipe or receipt used to create
+  both vectors.
 
 ## G75 measured gate
 
