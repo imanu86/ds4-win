@@ -1,0 +1,23 @@
+ds4: sparse bake validated: logical=86720111488 mapped=86720289813 mask_sha256=e4b6059f7d53c45f8b186a9b688567b808d1503178fcfb0d13f0cdb1ebb894e1 source_sha256=efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668
+ds4: sparse bake mask installed mask_sha256=e4b6059f7d53c45f8b186a9b688567b808d1503178fcfb0d13f0cdb1ebb894e1 pruned=2560 layers=40
+ds4: REAP mask applied path="embedded-bake:e4b6059f7d53c45f8b186a9b688567b808d1503178fcfb0d13f0cdb1ebb894e1" pruned=2560 layers=40 bias_layers=40 ranges_updated=0 ranges_created=0 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: [sparse-bake-runtime] result=guards-installed layers=43 sparse_layers=40 retained=8448
+ds4: REAP mask applied path="embedded-bake:e4b6059f7d53c45f8b186a9b688567b808d1503178fcfb0d13f0cdb1ebb894e1" pruned=2560 layers=40 bias_layers=40 ranges_updated=0 ranges_created=40 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; sparse selected-expert transport owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 4.455s
+ds4: cuda backend initialized for graph diagnostics
+0716 06:52:48 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0716 06:52:49 ds4-server: listening on http://127.0.0.1:8000
+0716 06:52:49 ds4-server: chat ctx=0..13:13 prompt start
+0716 06:53:00 ds4-server: chat ctx=0..13:13 prompt done 10.691s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+0716 06:53:04 ds4-server: chat ctx=0..13:13 gen=6 decoding chunk=1.58 t/s avg=1.58 t/s 3.792s
+0716 06:53:04 ds4-server: chat ctx=0..13:13 gen=6 finish=length 14.499s
+0716 06:53:04 ds4-server: benchmark request target reached; shutting down cleanly
+0716 06:53:04 ds4-server: shutdown requested, draining requests
+ds4: [sparse-bake-runtime] result=summary route_calls=301 route_slots=4902 rejected=0
