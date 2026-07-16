@@ -1,0 +1,40 @@
+ds4: sparse bake validated: logical=86720111488 mapped=86720315096 mask_sha256=5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 source_sha256=efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668
+ds4: sparse bake mask installed mask_sha256=5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 pruned=4080 layers=40
+ds4: REAP mask applied path="embedded-bake:5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97" pruned=4080 layers=40 bias_layers=40 ranges_updated=0 ranges_created=0 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: [sparse-bake-runtime] result=guards-installed layers=43 sparse_layers=40 retained=6928
+ds4: CUDA sequential WRAP model-file source enabled
+ds4: REAP mask applied path="embedded-bake:5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97" pruned=4080 layers=40 bias_layers=40 ranges_updated=0 ranges_created=40 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; sparse selected-expert transport owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 5.826s
+ds4: cuda backend initialized for graph diagnostics
+0716 08:36:57 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=16.73 GiB bytes=32211468288 slot_bytes=7077888
+0716 08:36:59 ds4-server: listening on http://127.0.0.1:8000
+0716 08:37:00 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=2322 candidate=2322 capacity=4551 mass_total=2580.000000 mass_candidate=2580.000000 mass_coverage=1.0000 cutoff=0.000005 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=0 target=1 resident=2322 loads=2322 slots=4551
+ds4: [arena] publish generation=1 loads=2322
+ds4: [arena-wrap-profile] result=published schedule=source-parts source=sequential-file checksum=fnv1a64-worker-only loads=2322 workers=1 begin=0.007 copy_checksum=17.075 finish=0.000 publish=0.004 total=17.086 source_parts_copy=17.075 source_parts_checksum=0.000 parts=6966 copy_workers=1 checksum_workers=0 file_qd=8 file_qd_observed=8 file_submits=6966 file_completions=6966 file_failures=0
+ds4: [prefill-mass-wrap] result=published reason=ok candidate=2322 loads=2322 workers=1 seconds=17.086 snapshot_before=0 snapshot_after=1 resident_before=0 resident_after=2322 generation=1 preloaded=0 router=unbiased mask=off
+0716 08:37:39 ds4-server: chat ctx=0..43:43 prompt done 38.527s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [prefill-mass] decode reason=checkpoint tokens=1 slots=240 candidate_hits=196 hit_rate=0.8167 policy=bulk-wrap
+ds4: [prefill-mass] decode reason=checkpoint tokens=2 slots=480 candidate_hits=406 hit_rate=0.8458 policy=bulk-wrap
+ds4: [prefill-mass] decode reason=checkpoint tokens=4 slots=960 candidate_hits=831 hit_rate=0.8656 policy=bulk-wrap
+ds4: [prefill-mass] decode reason=checkpoint tokens=8 slots=1920 candidate_hits=1683 hit_rate=0.8766 policy=bulk-wrap
+ds4: [prefill-mass] decode reason=checkpoint tokens=16 slots=3840 candidate_hits=3364 hit_rate=0.8760 policy=bulk-wrap
+ds4: [prefill-mass] decode reason=checkpoint tokens=32 slots=7680 candidate_hits=6642 hit_rate=0.8648 policy=bulk-wrap
+0716 08:38:01 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=2.29 t/s avg=2.29 t/s 21.858s
+0716 08:38:07 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=2.18 t/s avg=2.26 t/s 28.284s
+0716 08:38:07 ds4-server: chat ctx=0..43:43 gen=64 finish=length 66.825s
+0716 08:38:07 ds4-server: benchmark request target reached; shutting down cleanly
+0716 08:38:07 ds4-server: shutdown requested, draining requests
+ds4: [arena] final hits=12343 misses=4169 fatal=0 uploaded=81.36 GiB
+ds4: [prefill-mass] decode reason=request-end tokens=64 slots=15360 candidate_hits=12343 hit_rate=0.8036 policy=bulk-wrap
+ds4: [sparse-bake-runtime] result=summary route_calls=2795 route_slots=27606 rejected=0
