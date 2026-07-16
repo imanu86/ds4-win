@@ -1,0 +1,39 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 5.037s
+ds4: cuda backend initialized for graph diagnostics
+0716 13:44:10 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: [arena-cap] requested_gib=29.999 min_available_gib=0.000 available_before_gib=36.667 requested_bytes=32211468288 requested_slots=4551 chosen_bytes=32211468288 chosen_slots=4551 capped=0 result=ready reason=ok
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=6.88 GiB bytes=32211468288 slot_bytes=7077888
+0716 13:44:15 ds4-server: listening on http://127.0.0.1:8000
+0716 13:44:16 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 candidate_fnv1a64=c59a437fe9c6c376 sparse_skipped_ranked=0 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=4551 capacity=4551 mass_total=1720.000000 mass_candidate=1010.291848 mass_coverage=0.5874 cutoff=0.170601 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=0 target=1 resident=4551 loads=4551 slots=4551
+ds4: [arena-wrap-source-unlock] result=ok phase=gate waves=3 max_wave_bytes=4293894144 parts=4551 ranges=2395 bytes_requested=9852203008 calls=2395 true=0 error_not_locked=2395 failed=0 seconds=1.009671 available_before=2316791808 available_after=6821834752 working_set_before=37234892800 working_set_after=32856797184 page_fault_before=9138752 page_fault_after=10500205 read_transfer_before=29602347765 read_transfer_after=29602347765 last_error=0
+ds4: [arena-wrap-source-unlock] result=ok phase=up waves=3 max_wave_bytes=4293894144 parts=4551 ranges=2395 bytes_requested=9852203008 calls=2395 true=0 error_not_locked=2395 failed=0 seconds=0.981598 available_before=2571014144 available_after=6836989952 working_set_before=37117034496 working_set_after=32731238400 page_fault_before=11551314 page_fault_after=12912714 read_transfer_before=29602347765 read_transfer_after=29602347765 last_error=0
+ds4: [arena-wrap-source-unlock] result=ok phase=down waves=3 max_wave_bytes=4293083136 parts=4551 ranges=2397 bytes_requested=12536500224 calls=2397 true=0 error_not_locked=2397 failed=0 seconds=1.390777 available_before=2580529152 available_after=6573998080 working_set_before=37039394816 working_set_after=32616411136 page_fault_before=13983433 page_fault_after=16010121 read_transfer_before=29602347765 read_transfer_after=29602347765 last_error=0
+ds4: [arena-wrap-source-unlock-summary] result=complete phases=3 waves=9 wave_gib=4.000000 max_wave_bytes=4293894144 parts=13653 ranges=7187 bytes_requested=32240906240 calls=7187 true=0 error_not_locked=7187 failed=0 seconds=3.382046
+ds4: [arena] publish generation=1 loads=4551
+ds4: [arena-wrap-profile] result=published schedule=source-parts source=mmap checksum=fnv1a64-worker-only loads=4551 workers=8 begin=0.007 copy_checksum=29.336 finish=0.000 publish=0.005 total=29.349 source_parts_copy=29.336 source_parts_checksum=0.000 parts=13653 copy_workers=8 checksum_workers=0 file_qd=1 file_qd_observed=1 file_submits=0 file_completions=0 file_failures=0
+ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=40 kept=3783 pruned=6457 semantics=request-scoped-closed base=none existing_layers=0
+ds4: [prefill-mass-wrap] result=published reason=ok candidate=4551 loads=4551 workers=8 seconds=29.349 snapshot_before=0 snapshot_after=1 resident_before=0 resident_after=4551 generation=1 preloaded=0 router=unbiased mask=request-scoped-closed
+0716 13:45:09 ds4-server: chat ctx=0..43:43 prompt done 52.886s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: expert tiering active mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 snapshot_generation=1 snapshot_backing_entries=4551 clock_calls=430 replacement_budget=32 min_frequency=3 hysteresis=1.25 entries=11008 ram_slots=4551
+ds4: CUDA resident expert cache ready: 320/320 experts, 6.75 MiB/expert, 2.11 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 320 slots
+ds4: [gpu-route-debug] request seq=1 layer=0 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=0
+ds4: [gpu-route-debug] request seq=2 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=1
+0716 13:45:20 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=4.61 t/s avg=4.61 t/s 10.855s
+0716 13:45:23 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=4.54 t/s avg=4.59 t/s 13.941s
+0716 13:45:23 ds4-server: chat ctx=0..43:43 gen=64 finish=length 66.844s
+0716 13:45:23 ds4-server: benchmark request target reached; shutting down cleanly
+0716 13:45:23 ds4-server: shutdown requested, draining requests
+ds4: [gpu-resident-routes] final calls=2752 split_calls=0 all_hit=19 worker_jobs=2733 miss_experts=10692 errors=0 worker=1.601ms/job resolve=0.000ms/call wait=4.351ms/call queries=0 default_sync=0 no_default_sync=2752 cache_count=320 cache_calls=2752 cache_hits=5820 cache_misses=10692 cache_admissions=512 cache_evictions=192 direct_loads=0
+ds4: [expert-tiering] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 snapshot_generation=1 snapshot_backing_entries=4551 snapshot_backing_hits=10692 snapshot_backing_misses=0 snapshot_to_vram_bytes=75676778496 forbidden_cold_ssd_to_vram=0 clock_calls=430 replacement_budget=32 min_frequency=3 hysteresis=1.25 calls=2752 selected=16512 cold=0 ram_hits=10692 vram_hits=5820 cold_to_ram=0 cold_to_vram=0 ram_to_warm=512 vram_promotions=512 vram_demotions=192 ram_evictions=0 ram_admit_skips=0 transient=10180 failures=0 ssd_bytes=0 ram_h2d_bytes=75676778496 policy_epochs=6 policy_free_promotions=320 policy_replacements=192 policy_min_frequency_skips=5398 policy_budget_skips=4731 policy_score_skips=51 states_ssd=6457 states_probation=4231 states_warm=0 states_vram=320 mass_sum=2969.89552 lfru_top=28.8409946
