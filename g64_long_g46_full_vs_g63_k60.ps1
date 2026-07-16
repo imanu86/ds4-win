@@ -2,6 +2,7 @@
 # Builds on the G63 sparse-bake authorization contract and the G46 full composite flags.
 param(
     [switch]$SafetyOnly,
+    [ValidateSet("both", "g46_full", "g63_k60")][string]$SafetyArm = "both",
     [switch]$Resume,
     [switch]$AuthorizeOnly,
     [string]$PythonPath = "python",
@@ -34,6 +35,11 @@ $expertTierReplacementBudget = 16
 $expertTierMinFrequency = 3
 $expertTierHysteresis = 1.25
 $independentProcessCount = if ($SafetyOnly) { 1 } else { 3 }
+$summaryArms = if ($SafetyOnly -and $SafetyArm -ne "both") {
+    @($SafetyArm)
+} else {
+    @("g46_full", "g63_k60")
+}
 
 function Assert-G64Hex64 {
     param([Parameter(Mandatory=$true)][string]$Name,
@@ -1021,10 +1027,16 @@ if ($AuthorizeOnly) {
 }
 
 $plan = if ($SafetyOnly) {
-    @(
-        @{ Arm = "g46_full"; Suffix = "safety" },
-        @{ Arm = "g63_k60"; Suffix = "safety" }
-    )
+    if ($SafetyArm -eq "g46_full") {
+        @(@{ Arm = "g46_full"; Suffix = "safety" })
+    } elseif ($SafetyArm -eq "g63_k60") {
+        @(@{ Arm = "g63_k60"; Suffix = "safety" })
+    } else {
+        @(
+            @{ Arm = "g46_full"; Suffix = "safety" },
+            @{ Arm = "g63_k60"; Suffix = "safety" }
+        )
+    }
 } else {
     @(
         @{ Arm = "g46_full"; Suffix = "a" },
@@ -1046,7 +1058,7 @@ foreach ($item in $plan) {
 }
 
 $expectedOrder = if ($SafetyOnly) {
-    @("g46_full", "g63_k60")
+    @($plan | ForEach-Object { $_.Arm })
 } else {
     @("g46_full", "g63_k60", "g63_k60", "g46_full", "g46_full", "g63_k60")
 }
@@ -1054,7 +1066,7 @@ $observedOrder = @($runs | ForEach-Object { $_.arm })
 if (($observedOrder -join ",") -ne ($expectedOrder -join ",")) {
     throw "G64 order contract mismatch"
 }
-foreach ($arm in @("g46_full", "g63_k60")) {
+foreach ($arm in $summaryArms) {
     $rows = @($runs | Where-Object { $_.arm -eq $arm })
     if ($rows.Count -ne $independentProcessCount) {
         throw "G64 replication mismatch: arm=$arm"
@@ -1062,7 +1074,7 @@ foreach ($arm in @("g46_full", "g63_k60")) {
 }
 
 $armSummary = @()
-foreach ($arm in @("g46_full", "g63_k60")) {
+foreach ($arm in $summaryArms) {
     $rows = @($runs | Where-Object { $_.arm -eq $arm })
     $armSummary += [pscustomobject]@{
         arm = $arm
@@ -1100,6 +1112,7 @@ $summary = [pscustomobject]@{
     schema = "g64_long_g46_full_vs_g63_k60_v1"
     question = "Long quality comparison of G46 full model versus G63 K60 using identical G46 full flags, with K60 adding only embedded-bake authorization flags."
     safety_only = [bool]$SafetyOnly
+    safety_arm = if ($SafetyOnly) { $SafetyArm } else { "not_applicable" }
     authorization_path = $authPath
     authorization_sha256 = Get-G64SHA256 $authPath
     csv_path = $csvPath
@@ -1122,7 +1135,7 @@ $summary = [pscustomobject]@{
     independent_processes_per_arm = $independentProcessCount
     within_process_repeats = 1
     order_contract = if ($SafetyOnly) {
-        "SafetyOnly: one process per arm in order g46_full,g63_k60"
+        "SafetyOnly: one process for selected arm(s): " + ($expectedOrder -join ",")
     } else {
         "Performance/quality: n=3 per arm interleaved g46a,k60a,k60b,g46b,g46c,k60c"
     }
