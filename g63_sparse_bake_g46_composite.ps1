@@ -796,23 +796,8 @@ function Invoke-G63Run {
         -Pattern "\[expert-tiering\] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 .*snapshot_backing_misses=0 .*forbidden_cold_ssd_to_vram=0 .*clock_calls=430 replacement_budget=16 min_frequency=3 hysteresis=1\.25 .*failures=0 ssd_bytes=0 .*states_vram=320 " `
         -Label "expert tiering mass-lfru compose final counters" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
-        -Pattern "arena WRAP profile result/schedule/source/checksum/total/copy/parts/workers: published / source-parts / mmap / fnv1a64-worker-only /" `
+        -Pattern "\[arena-wrap-profile\] result=published schedule=source-parts source=mmap checksum=fnv1a64-worker-only .*file_qd=1 file_qd_observed=1 file_submits=0 file_completions=0 file_failures=0" `
         -Label "arena wrap source-parts profile" -Tag $Tag
-    Assert-G63LogContains -Lines $logLines `
-        -Pattern "arena WRAP file QD req/line/obs/submits/completions/failures: 1 / 1 / 1 / 0 / 0 / 0" `
-        -Label "G46 source-parts default file QD1" -Tag $Tag
-    Assert-G63LogContains -Lines $logLines `
-        -Pattern "expert tiering requested/policy/observed/compose/failures/ssd GiB/ram_h2d GiB/states_vram: enforce / mass-lfru / True / True / 0 / 0 / .* / 320" `
-        -Label "expert tiering summary line" -Tag $Tag
-    Assert-G63LogContains -Lines $logLines `
-        -Pattern "gpu resident routes requested/no-sync/split/observed/calls/.* True / True / False / True /" `
-        -Label "route no-default-sync summary line" -Tag $Tag
-    Assert-G63LogContains -Lines $logLines `
-        -Pattern "gpu resident routes requested/no-sync/split/observed/calls/.* / 0 / [1-9][0-9]*" `
-        -Label "route no-default-sync summary accounting" -Tag $Tag
-    Assert-G63LogContains -Lines $logLines `
-        -Pattern "gpu resident routes cache count/calls/hits/misses/admissions/evictions/direct_loads: [1-9][0-9]* / [1-9][0-9]* / [0-9]+ / [0-9]+ / [0-9]+ / [0-9]+ / [0-9]+" `
-        -Label "direct GPU route cache telemetry" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
         -Pattern "\[gpu-resident-routes\] final calls=[1-9][0-9]* split_calls=0 all_hit=[0-9]+ worker_jobs=[1-9][0-9]* miss_experts=[0-9]+ errors=0.*cache_count=[1-9][0-9]* cache_calls=[1-9][0-9]* cache_hits=[0-9]+ cache_misses=[0-9]+ cache_admissions=[0-9]+ cache_evictions=[0-9]+ direct_loads=[0-9]+" `
         -Label "GPU resident route final direct cache counters" -Tag $Tag
