@@ -1,0 +1,126 @@
+﻿{
+    "schema":  "g7_system_quiescence_preflight_v1",
+    "checked_utc":  "2026-07-16T07:05:29.9212593Z",
+    "sample_window_started_utc":  "2026-07-16T07:05:22.8472826Z",
+    "tag":  "g62_sparse_bake_k60_gpu_cache_safety",
+    "command_line":  "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_measure.ps1 -MaxTokens 64 -Repeats 1 -Tag g62_sparse_bake_k60_gpu_cache_safety -Prompt \"Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.\" -Context 256 -BudgetGB 2 -ReserveMB 1024 -DisableQ8F16Cache -EmbedRowStaging -ExpertCacheN 320 -ExpertCacheReserveGB 0.125 -ExpertCachePolicy lru -GpuResidentRoutes -AllowEmbeddedBakeMask -ExpectedEmbeddedBakeMaskSHA256 5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 -ReapPrefetchThreads 8 -ExpectedContentSHA256 ceced6c1b481bb2c6f68bd116c06e554502017a44b40b4e5e6bc9fc5d710edc7 -ModelPath C:\\ds4-models\\ds4-2bit-k60-mass-full-decode.gguf -TimeoutSec 1800",
+    "harness_sha256":  "3df0e087273f93f2efd0238411861369c78b8c52346f37ed0230e02f9716541d",
+    "git_head":  "b887b416d52635eac89f9eb353f1c46a327adf15",
+    "worktree_dirty":  true,
+    "executable_sha256":  "107fc08720e4b2269eb6bb34e614bd130f36267415a24c2dfc794cf51dbca2e9",
+    "build_manifest_sha256":  "e36a2e59dc3b6c6a4270dbb1e750ab82b59cf474c5d36041895e8870f5b52f1f",
+    "model_path":  "C:\\ds4-models\\ds4-2bit-k60-mass-full-decode.gguf",
+    "model_size_bytes":  86720315096,
+    "prompt_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+    "context":  256,
+    "max_tokens":  64,
+    "probe_only":  false,
+    "skipped":  false,
+    "requested_samples":  5,
+    "completed_samples":  5,
+    "requested_sleep_interval_ms":  1000,
+    "observed_interval_median_ms":  1605.948,
+    "observed_window_ms":  7033.423,
+    "gpu_scope":  "maximum-utilization-across-visible-gpus",
+    "thresholds":  {
+                       "maximum_cpu_median_percent":  60,
+                       "maximum_disk_median_percent":  30,
+                       "maximum_disk_io_median_mib_per_second":  64,
+                       "maximum_gpu_median_percent":  85
+                   },
+    "cpu_median_percent":  13,
+    "disk_median_percent":  0,
+    "disk_io_median_mib_per_second":  0.25826644897460938,
+    "gpu_median_percent":  0,
+    "failures":  [
+
+                 ],
+    "samples":  [
+                    {
+                        "sample":  1,
+                        "timestamp_utc":  "2026-07-16T07:05:23.4670355Z",
+                        "elapsed_ms":  610.292,
+                        "cpu_percent":  12,
+                        "disk_percent":  3,
+                        "disk_read_mib_per_second":  0,
+                        "disk_write_mib_per_second":  63.94395637512207,
+                        "disk_io_mib_per_second":  63.94395637512207,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  2,
+                        "timestamp_utc":  "2026-07-16T07:05:25.0595969Z",
+                        "elapsed_ms":  2200.456,
+                        "cpu_percent":  15,
+                        "disk_percent":  0,
+                        "disk_read_mib_per_second":  0,
+                        "disk_write_mib_per_second":  0.25826644897460938,
+                        "disk_io_mib_per_second":  0.25826644897460938,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  3,
+                        "timestamp_utc":  "2026-07-16T07:05:26.6664353Z",
+                        "elapsed_ms":  3808.105,
+                        "cpu_percent":  21,
+                        "disk_percent":  0,
+                        "disk_read_mib_per_second":  0,
+                        "disk_write_mib_per_second":  0.16600227355957031,
+                        "disk_io_mib_per_second":  0.16600227355957031,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  4,
+                        "timestamp_utc":  "2026-07-16T07:05:28.2867923Z",
+                        "elapsed_ms":  5428.297,
+                        "cpu_percent":  13,
+                        "disk_percent":  0,
+                        "disk_read_mib_per_second":  0,
+                        "disk_write_mib_per_second":  0.15108585357666016,
+                        "disk_io_mib_per_second":  0.15108585357666016,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  5,
+                        "timestamp_utc":  "2026-07-16T07:05:29.8856356Z",
+                        "elapsed_ms":  7032.544,
+                        "cpu_percent":  10,
+                        "disk_percent":  0,
+                        "disk_read_mib_per_second":  0,
+                        "disk_write_mib_per_second":  0.27181625366210938,
+                        "disk_io_mib_per_second":  0.27181625366210938,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    }
+                ],
+    "ready_to_launch":  true
+}

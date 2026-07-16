@@ -1,0 +1,31 @@
+ds4: sparse bake validated: logical=86720111488 mapped=86720315096 mask_sha256=5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 source_sha256=efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668
+ds4: sparse bake mask installed mask_sha256=5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97 pruned=4080 layers=40
+ds4: REAP mask applied path="embedded-bake:5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97" pruned=4080 layers=40 bias_layers=40 ranges_updated=0 ranges_created=0 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: [sparse-bake-runtime] result=guards-installed layers=43 sparse_layers=40 retained=6928 rejected=0
+ds4: REAP mask applied path="embedded-bake:5b6d98504ba830c1a50945a93d1a6017b1956bd17c56df8c0b1bdf92c1564e97" pruned=4080 layers=40 bias_layers=40 ranges_updated=0 ranges_created=40 ranges_failed=0
+ds4: REAP mask router modes bias_layers=40 hash_layers=0
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; sparse selected-expert transport owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 5.954s
+ds4: cuda backend initialized for graph diagnostics
+0716 09:05:42 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+0716 09:05:42 ds4-server: listening on http://127.0.0.1:8000
+0716 09:05:43 ds4-server: chat ctx=0..43:43 prompt start
+ds4: CUDA resident expert cache ready: 320/320 experts, 6.75 MiB/expert, 2.11 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 320 slots
+0716 09:06:02 ds4-server: chat ctx=0..43:43 prompt done 18.952s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: [gpu-route-debug] request seq=1 layer=0 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=0
+ds4: [gpu-route-debug] request seq=2 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=1
+0716 09:06:25 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=2.18 t/s avg=2.18 t/s 22.981s
+0716 09:06:32 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=1.87 t/s avg=2.10 t/s 30.487s
+0716 09:06:32 ds4-server: chat ctx=0..43:43 gen=64 finish=length 49.455s
+0716 09:06:32 ds4-server: benchmark request target reached; shutting down cleanly
+0716 09:06:32 ds4-server: shutdown requested, draining requests
+ds4: [gpu-resident-routes] final calls=2752 split_calls=0 all_hit=18 worker_jobs=2734 miss_experts=10082 errors=0 worker=7.552ms/job resolve=2.732ms/call wait=7.497ms/call queries=0 default_sync=2752 no_default_sync=0 cache_count=320 cache_calls=2795 cache_hits=6430 cache_misses=12835 cache_admissions=12835 cache_evictions=12515 direct_loads=0
+ds4: [sparse-bake-runtime] result=summary route_calls=2795 route_slots=27606 rejected=0
