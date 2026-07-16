@@ -18,6 +18,19 @@ SSD IQ1_S
 This is a transport and residency policy, not a claim that IQ1_S is lossless.
 The router, selected expert ids, and gate weights remain unchanged.
 
+## Current Measured Status
+
+As of 2026-07-16, the first decode-only mixed-format fixture is operational.
+On layer 3 it executed five primary 2-bit contributions plus the router's
+lowest-weight contribution in IQ1_S and produced `Hello!`, with exact `5:1`
+telemetry and zero runtime failures. This is a structural `n=1` result, not a
+quality or speed verdict.
+
+The fixture still invokes the six-slot primary path with the cold weight set to
+zero before adding the IQ1_S contribution. It therefore does not yet reduce
+primary transport. The immediate next step is physical work-list separation:
+five primary ids/weights, one IQ1_S id/weight, and one final join.
+
 ## Required Residency Contract
 
 ### SSD Cold Tier

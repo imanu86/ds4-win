@@ -102,6 +102,7 @@ param(
     [switch]$ReuseVerifiedIq1SReceipt,
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
+    [switch]$Iq1SMixedColdOne,
     [ValidateSet("benchmark", "structural-safety", "quality")][string]$GateKind = "benchmark",
     [int]$Port = 8000,
     [ValidateRange(64, 131072)][int]$Context = 256,
@@ -306,6 +307,9 @@ if ($Iq1SExpertSidecar) {
 if ($ReuseVerifiedIq1SReceipt -and -not $Iq1SExpertSidecar) {
     throw "ReuseVerifiedIq1SReceipt requires Iq1SExpertSidecar"
 }
+if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar) {
+    throw "Iq1SMixedColdOne requires Iq1SExpertSidecar"
+}
 if ($ReuseVerifiedIq1SReceipt -and $GateKind -ne "structural-safety") {
     throw "ReuseVerifiedIq1SReceipt is restricted to structural-safety diagnostics"
 }
@@ -427,6 +431,11 @@ if ($Iq1SExpertSidecar) {
     Remove-Item Env:\DS4_IQ1_S_EXPERT_SIDECAR -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_IQ1_S_LAYER_FIRST -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_IQ1_S_LAYER_LAST -ErrorAction SilentlyContinue
+}
+if ($Iq1SMixedColdOne) {
+    $env:DS4_IQ1_S_MIXED_COLD_K = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_MIXED_COLD_K -ErrorAction SilentlyContinue
 }
 if ($RuntimeReserveMB -gt 0) {
     $env:DS4_CUDA_STREAM_RUNTIME_RESERVE_MB = "$RuntimeReserveMB"
@@ -2690,6 +2699,42 @@ if ($Iq1SExpertSidecar) {
     throw "IQ1_S sidecar runtime summary appeared while sidecar was disabled"
 }
 
+$iq1MixedCalls = [UInt64]0
+$iq1MixedHotMain = [UInt64]0
+$iq1MixedColdIq1 = [UInt64]0
+$iq1MixedFailures = [UInt64]0
+$iq1MixedLastLayer = [UInt32]::MaxValue
+$iq1MixedLastSlot = [UInt32]::MaxValue
+$iq1MixedLastExpert = -1
+$iq1MixedRuntimeObserved = $false
+$iq1MixedSummaryMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-mixed\] result=summary calls=(\d+) hot_main=(\d+) cold_iq1=(\d+) failures=(\d+) last_layer=(\d+) last_slot=(\d+) last_expert=(-?\d+)')
+if ($Iq1SMixedColdOne) {
+    if ($iq1MixedSummaryMatches.Count -ne 1) {
+        throw "IQ1_S mixed decode requires exactly one runtime summary; observed $($iq1MixedSummaryMatches.Count)"
+    }
+    $iq1MixedSummary = $iq1MixedSummaryMatches[0]
+    $iq1MixedCalls = [UInt64]$iq1MixedSummary.Groups[1].Value
+    $iq1MixedHotMain = [UInt64]$iq1MixedSummary.Groups[2].Value
+    $iq1MixedColdIq1 = [UInt64]$iq1MixedSummary.Groups[3].Value
+    $iq1MixedFailures = [UInt64]$iq1MixedSummary.Groups[4].Value
+    $iq1MixedLastLayer = [UInt32]$iq1MixedSummary.Groups[5].Value
+    $iq1MixedLastSlot = [UInt32]$iq1MixedSummary.Groups[6].Value
+    $iq1MixedLastExpert = [int]$iq1MixedSummary.Groups[7].Value
+    if ($iq1MixedCalls -eq 0 -or
+        $iq1MixedHotMain -ne (5 * $iq1MixedCalls) -or
+        $iq1MixedColdIq1 -ne $iq1MixedCalls -or
+        $iq1MixedFailures -ne 0 -or
+        $iq1MixedLastSlot -ge 6 -or
+        $iq1MixedLastExpert -lt 0) {
+        throw "IQ1_S mixed decode runtime counters are inconsistent"
+    }
+    $iq1MixedRuntimeObserved = $true
+} elseif ($iq1MixedSummaryMatches.Count -ne 0) {
+    throw "IQ1_S mixed decode summary appeared while mixed mode was disabled"
+}
+
 if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
 if ($serverExitCode -ne 0) {
     throw "Measurement failed: ds4_server exited with code $serverExitCode"
@@ -3449,6 +3494,15 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_sidecar_route_slots = $iq1SSidecarSlots
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
+    iq1_s_mixed_cold_one = [bool]$Iq1SMixedColdOne
+    iq1_s_mixed_runtime_observed = $iq1MixedRuntimeObserved
+    iq1_s_mixed_calls = $iq1MixedCalls
+    iq1_s_mixed_hot_main = $iq1MixedHotMain
+    iq1_s_mixed_cold_iq1 = $iq1MixedColdIq1
+    iq1_s_mixed_failures = $iq1MixedFailures
+    iq1_s_mixed_last_layer = $iq1MixedLastLayer
+    iq1_s_mixed_last_slot = $iq1MixedLastSlot
+    iq1_s_mixed_last_expert = $iq1MixedLastExpert
     warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
@@ -3519,6 +3573,15 @@ $summary = [pscustomobject]@{
     iq1_s_sidecar_route_slots = $iq1SSidecarSlots
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
+    iq1_s_mixed_cold_one = [bool]$Iq1SMixedColdOne
+    iq1_s_mixed_runtime_observed = $iq1MixedRuntimeObserved
+    iq1_s_mixed_calls = $iq1MixedCalls
+    iq1_s_mixed_hot_main = $iq1MixedHotMain
+    iq1_s_mixed_cold_iq1 = $iq1MixedColdIq1
+    iq1_s_mixed_failures = $iq1MixedFailures
+    iq1_s_mixed_last_layer = $iq1MixedLastLayer
+    iq1_s_mixed_last_slot = $iq1MixedLastSlot
+    iq1_s_mixed_last_expert = $iq1MixedLastExpert
     prompt = $Prompt
     prompt_file = $PromptFile
     prompt_sha256 = $promptHash

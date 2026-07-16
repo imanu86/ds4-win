@@ -198,6 +198,13 @@ static uint64_t g_iq1_s_route_calls;
 static uint64_t g_iq1_s_route_slots;
 static uint64_t g_iq1_s_selected_loads;
 static uint64_t g_iq1_s_selected_load_failures;
+static uint64_t g_iq1_mixed_calls;
+static uint64_t g_iq1_mixed_hot_main;
+static uint64_t g_iq1_mixed_cold_iq1;
+static uint64_t g_iq1_mixed_failures;
+static uint32_t g_iq1_mixed_last_layer = UINT32_MAX;
+static uint32_t g_iq1_mixed_last_slot = UINT32_MAX;
+static int32_t g_iq1_mixed_last_expert = -1;
 static os_file_t g_model_file_sequential;
 static int g_model_file_sequential_valid;
 static int g_model_direct_fd = -1;
@@ -369,6 +376,8 @@ static void cuda_sparse_bake_reset_state(void) {
 }
 static void *g_cuda_tmp;
 static uint64_t g_cuda_tmp_bytes;
+static void *g_iq1_mixed_scratch;
+static uint64_t g_iq1_mixed_scratch_bytes;
 static void *g_embed_row_host;
 static __half *g_embed_row_device;
 static uint64_t g_embed_row_capacity;
@@ -1461,6 +1470,19 @@ static void cuda_iq1_s_sidecar_clear(void) {
                 (unsigned long long)g_iq1_s_selected_loads,
                 (unsigned long long)g_iq1_s_selected_load_failures);
     }
+    if (g_iq1_mixed_calls != 0) {
+        fprintf(stderr,
+                "ds4: [iq1-mixed] result=summary calls=%llu hot_main=%llu "
+                "cold_iq1=%llu failures=%llu last_layer=%u last_slot=%u "
+                "last_expert=%d\n",
+                (unsigned long long)g_iq1_mixed_calls,
+                (unsigned long long)g_iq1_mixed_hot_main,
+                (unsigned long long)g_iq1_mixed_cold_iq1,
+                (unsigned long long)g_iq1_mixed_failures,
+                g_iq1_mixed_last_layer,
+                g_iq1_mixed_last_slot,
+                (int)g_iq1_mixed_last_expert);
+    }
     if (g_iq1_s_sidecar_file_valid) {
         os_file_close(&g_iq1_s_sidecar_file);
         g_iq1_s_sidecar_file_valid = 0;
@@ -1473,6 +1495,18 @@ static void cuda_iq1_s_sidecar_clear(void) {
     g_iq1_s_route_slots = 0;
     g_iq1_s_selected_loads = 0;
     g_iq1_s_selected_load_failures = 0;
+    g_iq1_mixed_calls = 0;
+    g_iq1_mixed_hot_main = 0;
+    g_iq1_mixed_cold_iq1 = 0;
+    g_iq1_mixed_failures = 0;
+    g_iq1_mixed_last_layer = UINT32_MAX;
+    g_iq1_mixed_last_slot = UINT32_MAX;
+    g_iq1_mixed_last_expert = -1;
+    if (g_iq1_mixed_scratch) {
+        (void)cudaFree(g_iq1_mixed_scratch);
+        g_iq1_mixed_scratch = NULL;
+        g_iq1_mixed_scratch_bytes = 0;
+    }
 }
 
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
@@ -10915,6 +10949,12 @@ __global__ static void swiglu_kernel(float *out, const float *gate, const float 
 
 __global__ static void add_kernel(float *out, const float *a, const float *b, uint32_t n) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] + b[i];
+}
+
+__global__ static void add_f32_u64_kernel(float *out, const float *a, const float *b, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = a[i] + b[i];
 }
@@ -22715,6 +22755,195 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              selected, weights, NULL, n_expert, clamp, x, 1,
                              spex_queue, spex_key);
 }
+
+static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
+    if (bytes == 0) return 0;
+    if (g_iq1_mixed_scratch && g_iq1_mixed_scratch_bytes >= bytes) return 1;
+    if (g_iq1_mixed_scratch) {
+        (void)cudaFree(g_iq1_mixed_scratch);
+        g_iq1_mixed_scratch = NULL;
+        g_iq1_mixed_scratch_bytes = 0;
+    }
+    cudaError_t err = cudaMalloc(&g_iq1_mixed_scratch, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA IQ1 mixed scratch alloc failed (%.2f MiB): %s\n",
+                (double)bytes / 1048576.0, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_iq1_mixed_scratch_bytes = bytes;
+    return 1;
+}
+
+extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *main_model_map,
+        uint64_t main_model_size,
+        uint32_t layer_index,
+        uint64_t main_gate_offset,
+        uint64_t main_up_offset,
+        uint64_t main_down_offset,
+        uint32_t main_gate_type,
+        uint32_t main_down_type,
+        uint64_t main_gate_expert_bytes,
+        uint64_t main_gate_row_bytes,
+        uint64_t main_down_expert_bytes,
+        uint64_t main_down_row_bytes,
+        const void *iq1_model_map,
+        uint64_t iq1_model_size,
+        uint64_t iq1_gate_offset,
+        uint64_t iq1_up_offset,
+        uint64_t iq1_down_offset,
+        uint32_t iq1_down_type,
+        uint64_t iq1_gate_expert_bytes,
+        uint64_t iq1_gate_row_bytes,
+        uint64_t iq1_down_expert_bytes,
+        uint64_t iq1_down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        ds4_gpu_spex_queue *spex_queue,
+        const ds4_gpu_spex_key *spex_key) {
+    g_iq1_mixed_calls++;
+    const uint32_t slot_count = 6u;
+    int32_t h_selected[6];
+    float h_weights[6];
+    if (!out || !gate || !up || !mid || !down ||
+        !main_model_map || !iq1_model_map || !selected || !weights || !x ||
+        n_expert != slot_count || expert_in_dim == 0 || expert_mid_dim == 0 ||
+        out_dim == 0 || main_gate_type != 16u || main_down_type != 10u ||
+        (iq1_down_type != 19u && iq1_down_type != 10u) ||
+        selected->bytes < slot_count * sizeof(int32_t) ||
+        weights->bytes < slot_count * sizeof(float)) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+    if (!cuda_ok(cudaMemcpy(h_selected, selected->ptr,
+                            sizeof(h_selected), cudaMemcpyDeviceToHost),
+                 "iq1 mixed selected D2H") ||
+        !cuda_ok(cudaMemcpy(h_weights, weights->ptr,
+                            sizeof(h_weights), cudaMemcpyDeviceToHost),
+                 "iq1 mixed weights D2H")) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+
+    uint32_t cold_slot = 0;
+    float cold_weight = h_weights[0];
+    for (uint32_t i = 1; i < slot_count; i++) {
+        if (h_weights[i] < cold_weight) {
+            cold_weight = h_weights[i];
+            cold_slot = i;
+        }
+    }
+    const int32_t cold_expert = h_selected[cold_slot];
+    g_iq1_mixed_last_layer = layer_index;
+    g_iq1_mixed_last_slot = cold_slot;
+    g_iq1_mixed_last_expert = cold_expert;
+    if (cold_expert < 0) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+    const uint64_t xq_bytes = (uint64_t)xq_blocks * sizeof(cuda_block_q8_K);
+    const uint64_t cold_down_bytes = std::max(out_bytes, xq_bytes);
+    const uint64_t off_selected = 0;
+    const uint64_t off_weight = off_selected + sizeof(int32_t);
+    const uint64_t off_main_weights = off_weight + sizeof(float);
+    const uint64_t off_cold_out = cuda_round_up(off_main_weights + slot_count * sizeof(float), 256u);
+    const uint64_t off_cold_down = cuda_round_up(off_cold_out + out_bytes, 256u);
+    if (out_bytes == 0 || cold_down_bytes > UINT64_MAX - off_cold_down) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+    const uint64_t scratch_bytes = off_cold_down + cold_down_bytes;
+    if (!cuda_iq1_mixed_scratch_ensure(scratch_bytes)) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+    char *scratch = (char *)g_iq1_mixed_scratch;
+    int32_t *d_cold_selected = (int32_t *)(scratch + off_selected);
+    float *d_cold_weight = (float *)(scratch + off_weight);
+    float *d_main_weights = (float *)(scratch + off_main_weights);
+    float *d_cold_out = (float *)(scratch + off_cold_out);
+    float *d_cold_down = (float *)(scratch + off_cold_down);
+
+    float h_main_weights[6];
+    memcpy(h_main_weights, h_weights, sizeof(h_main_weights));
+    h_main_weights[cold_slot] = 0.0f;
+    if (!cuda_ok(cudaMemcpy(d_main_weights, h_main_weights,
+                            sizeof(h_main_weights), cudaMemcpyHostToDevice),
+                 "iq1 mixed main weights H2D") ||
+        !cuda_ok(cudaMemcpy(d_cold_selected, &cold_expert,
+                            sizeof(cold_expert), cudaMemcpyHostToDevice),
+                 "iq1 mixed cold selected H2D") ||
+        !cuda_ok(cudaMemcpy(d_cold_weight, &cold_weight,
+                            sizeof(cold_weight), cudaMemcpyHostToDevice),
+                 "iq1 mixed cold weight H2D")) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+
+    ds4_gpu_tensor main_weights = { d_main_weights, slot_count * sizeof(float), 0 };
+    int ok = routed_moe_launch(out, gate, up, mid, down,
+                               main_model_map, main_model_size, layer_index,
+                               main_gate_offset, main_up_offset, main_down_offset,
+                               main_gate_type, main_down_type,
+                               main_gate_expert_bytes, main_gate_row_bytes,
+                               main_down_expert_bytes, main_down_row_bytes,
+                               expert_in_dim, expert_mid_dim, out_dim,
+                               selected, &main_weights, NULL, slot_count, clamp,
+                               x, 1u, spex_queue, spex_key);
+    if (!ok) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+    g_iq1_mixed_hot_main += slot_count - 1u;
+    if (!cuda_ok(cudaStreamSynchronize(0), "iq1 mixed main preserve sync")) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+
+    ds4_gpu_tensor cold_selected = { d_cold_selected, sizeof(int32_t), 0 };
+    ds4_gpu_tensor cold_weight_tensor = { d_cold_weight, sizeof(float), 0 };
+    ds4_gpu_tensor cold_out = { d_cold_out, out_bytes, 0 };
+    ds4_gpu_tensor cold_down = { d_cold_down, cold_down_bytes, 0 };
+    ok = routed_moe_launch(&cold_out, gate, up, mid, &cold_down,
+                           iq1_model_map, iq1_model_size, layer_index,
+                           iq1_gate_offset, iq1_up_offset, iq1_down_offset,
+                           19u, iq1_down_type,
+                           iq1_gate_expert_bytes, iq1_gate_row_bytes,
+                           iq1_down_expert_bytes, iq1_down_row_bytes,
+                           expert_in_dim, expert_mid_dim, out_dim,
+                           &cold_selected, &cold_weight_tensor, NULL, 1u, clamp,
+                           x, 1u, NULL, NULL);
+    if (!ok) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+    g_iq1_mixed_cold_iq1++;
+
+    add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
+        (float *)out->ptr, (const float *)out->ptr, d_cold_out, out_dim);
+    if (!cuda_ok(cudaGetLastError(), "iq1 mixed cold add launch")) {
+        g_iq1_mixed_failures++;
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *probs, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,

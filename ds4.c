@@ -2430,6 +2430,21 @@ typedef struct {
 
 static ds4_iq1_s_sidecar g_iq1_s_sidecar;
 
+static bool iq1_s_mixed_cold_one_requested(void) {
+    const char *value = getenv("DS4_IQ1_S_MIXED_COLD_K");
+    return value && strcmp(value, "1") == 0;
+}
+
+static bool iq1_s_sidecar_layer_active(
+        const ds4_model *model,
+        uint32_t layer_index) {
+    return g_iq1_s_sidecar.ready &&
+           model == g_iq1_s_sidecar.primary_model &&
+           layer_index >= g_iq1_s_sidecar.first_layer &&
+           layer_index <= g_iq1_s_sidecar.last_layer &&
+           layer_index < DS4_N_LAYER;
+}
+
 static ds4_routed_expert_source routed_expert_source(
         const ds4_model *model,
         const ds4_layer_weights *layer,
@@ -2441,11 +2456,8 @@ static ds4_routed_expert_source routed_expert_source(
         layer ? layer->ffn_down_exps : NULL,
         false,
     };
-    if (g_iq1_s_sidecar.ready &&
-        model == g_iq1_s_sidecar.primary_model &&
-        layer_index >= g_iq1_s_sidecar.first_layer &&
-        layer_index <= g_iq1_s_sidecar.last_layer &&
-        layer_index < DS4_N_LAYER) {
+    if (!iq1_s_mixed_cold_one_requested() &&
+        iq1_s_sidecar_layer_active(model, layer_index)) {
         source.model = g_iq1_s_sidecar.model;
         source.gate = g_iq1_s_sidecar.gate[layer_index];
         source.up = g_iq1_s_sidecar.up[layer_index];
@@ -10898,6 +10910,9 @@ static bool metal_graph_encode_decode_layer(
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
     const ds4_routed_expert_source route =
         routed_expert_source(model, layer, il);
+    const bool iq1_mixed_cold_one =
+        iq1_s_mixed_cold_one_requested() &&
+        iq1_s_sidecar_layer_active(model, il);
     const uint64_t expert_in_dim = route.gate->dim[0];
     const uint64_t expert_mid_dim = route.gate->dim[1];
     const uint64_t down_in_dim = route.down->dim[0];
@@ -11557,7 +11572,53 @@ static bool metal_graph_encode_decode_layer(
                                               g->shared_mid, 1) != 0;
         }
     }
-    if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
+    if (ok && iq1_mixed_cold_one) {
+        const ds4_tensor *iq1_gate = g_iq1_s_sidecar.gate[il];
+        const ds4_tensor *iq1_up = g_iq1_s_sidecar.up[il];
+        const ds4_tensor *iq1_down = g_iq1_s_sidecar.down[il];
+        const uint64_t iq1_gate_row_bytes = routed_expert_row_bytes(iq1_gate);
+        const uint64_t iq1_gate_expert_bytes = expert_mid_dim * iq1_gate_row_bytes;
+        const uint64_t iq1_down_row_bytes = routed_expert_row_bytes(iq1_down);
+        const uint64_t iq1_down_expert_bytes = routed_out_dim * iq1_down_row_bytes;
+        ok = ds4_gpu_routed_moe_mixed_iq1_one_tensor(
+                g->routed_out,
+                g->routed_gate,
+                g->routed_up,
+                g->routed_mid,
+                g->routed_down,
+                route.model->map,
+                route.model->size,
+                il,
+                route.gate->abs_offset,
+                route.up->abs_offset,
+                route.down->abs_offset,
+                route.gate->type,
+                route.down->type,
+                gate_expert_bytes,
+                gate_row_bytes,
+                down_expert_bytes,
+                down_row_bytes,
+                g_iq1_s_sidecar.model->map,
+                g_iq1_s_sidecar.model->size,
+                iq1_gate->abs_offset,
+                iq1_up->abs_offset,
+                iq1_down->abs_offset,
+                iq1_down->type,
+                iq1_gate_expert_bytes,
+                iq1_gate_row_bytes,
+                iq1_down_expert_bytes,
+                iq1_down_row_bytes,
+                (uint32_t)expert_in_dim,
+                (uint32_t)down_in_dim,
+                (uint32_t)routed_out_dim,
+                g->router_selected,
+                g->router_weights,
+                DS4_N_EXPERT_USED,
+                DS4_SWIGLU_CLAMP_EXP,
+                g->ffn_norm,
+                g->spex_prefetch,
+                g->spex_prefetch ? &spex_key : NULL) != 0;
+    } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
                                                  g->routed_gate,
                                                  g->routed_up,
                                                  g->routed_mid,
@@ -19080,6 +19141,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->iq1_s_sidecar_ready = true;
         fprintf(stderr, "ds4: IQ1_S expert sidecar source: %s\n",
                 iq1_s_sidecar_path);
+    }
+    if (iq1_s_mixed_cold_one_requested() && !e->iq1_s_sidecar_ready) {
+        fprintf(stderr,
+                "ds4: DS4_IQ1_S_MIXED_COLD_K=1 requires an IQ1_S expert sidecar\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (iq1_s_mixed_cold_one_requested()) {
+        fprintf(stderr,
+                "ds4: IQ1_S mixed decode fixture enabled: hot_main=5 cold_iq1=1 prefill=main\n");
     }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);

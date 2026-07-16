@@ -147,6 +147,45 @@ receipt status, and receipt provenance are still checked, and the result records
 `iq1_s_sidecar_hash_method=verified_receipt_reuse`. Benchmark and quality gates
 must continue to compute the full file hash.
 
+`-Iq1SMixedColdOne` enables the first bounded mixed-format decode fixture. It
+requires the validated sidecar, leaves prefill on the primary 2-bit model, and
+for each active decode layer preserves the router's six selected ids and gate
+weights while executing the lowest-weight slot through IQ1_S. The other five
+slots remain on the primary 2-bit path. Runtime telemetry must report exactly
+`hot_main=5*calls`, `cold_iq1=calls`, and zero failures.
+
+This first fixture deliberately zeroes the cold slot's weight in a six-slot
+primary launch and then adds the one-slot IQ1_S result. It proves mixed-format
+calculation and single accumulation, but still loads/calculates the zero-weight
+primary slot. Therefore its timings and transport volume are not performance
+evidence. The next implementation gate must build separate five-slot and
+one-slot work lists so the primary copy of the cold expert is never fetched.
+
+### G77 mixed layer-3 smoke
+
+The first end-to-end structural run used the same short prompt and launch
+controls as the coherent G76 layer-3 diagnostic, with mixed mode active only
+for layer 3:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\g7_measure.ps1 `
+  -Tag g77_mixed_iq1_cold1_layer3_n1 `
+  -ModelPath C:\ds4-models\ds4-2bit.gguf `
+  -Iq1SExpertSidecar D:\ds4-models\DeepSeek-V4-Flash-IQ1_S-XL.gguf `
+  -ExpectedIq1SExpertSidecarSHA256 b049d1eb34c068f19ab007b33c22a7d758b578bf2b10d9276e79654f85d35047 `
+  -ExpectedIq1SExpertSidecarBytes 61540805344 `
+  -ReuseVerifiedIq1SReceipt -Iq1SLayerFirst 3 -Iq1SLayerLast 3 `
+  -Iq1SMixedColdOne -Prompt "Say hello in one short sentence." `
+  -MaxTokens 32 -Repeats 1 -GateKind structural-safety -Context 256 `
+  -BudgetGB 28 -ReserveMB 1024 -RuntimeReserveMB 256 `
+  -DisableQ8F16Cache -EmbedRowStaging -IoQD 4 -OverlapSharedFull
+```
+
+Measured result: output `Hello!`; mixed calls `2`; primary hot contributions
+`10`; IQ1_S cold contributions `2`; sidecar selected loads `2`; failures `0`;
+last active layer `3`. This is a structural `n=1` PASS only. It is explicitly
+not quality-eligible or SOTA-eligible.
+
 ## G75 measured gate
 
 The real-weight gate sampled only the required byte ranges from
