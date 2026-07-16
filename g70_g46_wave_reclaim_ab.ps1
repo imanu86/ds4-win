@@ -258,7 +258,8 @@ function Invoke-G70Run {
     }
 
     try {
-        if ($Resume -and (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
+        if (($Resume -or $SummarizeExisting) -and
+            (Test-Path -LiteralPath $resultPath -PathType Leaf)) {
             Write-Host ("[g70] resume tag=" + $Tag + " arm=" + $Arm)
         } elseif ($SummarizeExisting) {
             throw "SummarizeExisting result missing: tag=$Tag"
@@ -296,12 +297,13 @@ function Invoke-G70Run {
 }
 
 function Assert-G70SameProvenance {
-    param([object[]]$Rows)
+    param([object[]]$Rows, [bool]$RequireHead = $true)
     $provenanceFields = @(
-        "head", "executable_sha256", "ds4_cuda_sha256", "ds4_c_sha256",
+        "executable_sha256", "ds4_cuda_sha256", "ds4_c_sha256",
         "build_manifest_sha256", "build_input_fingerprint_sha256",
         "harness_sha256", "model", "model_bytes", "model_last_write_utc"
     )
+    if ($RequireHead) { $provenanceFields = @("head") + $provenanceFields }
     foreach ($field in $provenanceFields) {
         $values = @($Rows | ForEach-Object { [string]($_.$field) } | Select-Object -Unique)
         if ($values.Count -ne 1) { throw "G70 mixed provenance: field=$field" }
@@ -364,14 +366,28 @@ function Write-G70Summary {
     )
     $successful = @($Rows | Where-Object { -not $_.failed })
     $matrix = @($successful | Where-Object { -not $_.safety })
-    if ($successful.Count -gt 0) { Assert-G70SameProvenance $successful }
+    $primaryMatrix = $matrix
+    $excludedMatrix = @()
+    if ($CapacityAsymmetry -and $OutlierExtensionTriggered) {
+        $extension = @($matrix | Where-Object { $_.tag -match "_x[123]$" })
+        if ($extension.Count -eq 3) {
+            $primaryMatrix = $extension
+            $excludedMatrix = @($matrix | Where-Object { $_.tag -notmatch "_x[123]$" })
+        }
+    }
+    if ($successful.Count -gt 0) {
+        Assert-G70SameProvenance -Rows $successful -RequireHead $false
+    }
+    if ($primaryMatrix.Count -gt 0) {
+        Assert-G70SameProvenance -Rows $primaryMatrix -RequireHead $true
+    }
 
     $summary = [pscustomobject]@{
         schema = "g70_g46_wave_reclaim_ab_v1"
         status = $Status
         stop_reason = $StopReason
         capacity_asymmetry_recorded = $CapacityAsymmetry
-        performance_claim_allowed = ($Status -eq "matrix_complete" -and -not $CapacityAsymmetry -and $matrix.Count -ge 6)
+        performance_claim_allowed = ($Status -eq "matrix_complete" -and -not $CapacityAsymmetry -and $primaryMatrix.Count -ge 6)
         outlier_extension_triggered = $OutlierExtensionTriggered
         outlier_rule = "If either arm has >20% max/min spread in decode_tokens_per_second, wrap_seconds or ttft_minus_wrap_seconds after n=3, run exactly three additional independent processes per measured arm before any verdict."
         prompt = $prompt
@@ -396,20 +412,26 @@ function Write-G70Summary {
         )
         order = @($Rows | ForEach-Object { $_.tag })
         runs = $Rows
-        arm_summary = New-G70ArmSummary $successful
-        provenance = if ($successful.Count -gt 0) {
+        primary_run_tags = @($primaryMatrix | ForEach-Object { $_.tag })
+        excluded_descriptive_run_tags = @($excludedMatrix | ForEach-Object { $_.tag })
+        primary_selection_reason = if ($excludedMatrix.Count -gt 0) {
+            "The outlier extension x1-x3 is the authoritative same-HEAD n=3 cohort. Earlier a-c rows remain diagnostic because the summary/outlier runner fix changed HEAD without changing the runtime binary, CUDA source, harness, model or launch contract."
+        } else { "All accepted matrix rows share the required provenance." }
+        runtime_heads_observed = @($successful | ForEach-Object { $_.head } | Select-Object -Unique)
+        arm_summary = New-G70ArmSummary $primaryMatrix
+        provenance = if ($primaryMatrix.Count -gt 0) {
             [pscustomobject]@{
-                head = $successful[0].head
-                executable_sha256 = $successful[0].executable_sha256
-                ds4_cuda_sha256 = $successful[0].ds4_cuda_sha256
-                ds4_c_sha256 = $successful[0].ds4_c_sha256
-                build_manifest_sha256 = $successful[0].build_manifest_sha256
-                build_input_fingerprint_sha256 = $successful[0].build_input_fingerprint_sha256
-                harness_sha256 = $successful[0].harness_sha256
-                model = $successful[0].model
-                model_bytes = $successful[0].model_bytes
-                model_last_write_utc = $successful[0].model_last_write_utc
-                runner_sha256 = (Get-FileHash -LiteralPath $runnerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                head = $primaryMatrix[0].head
+                executable_sha256 = $primaryMatrix[0].executable_sha256
+                ds4_cuda_sha256 = $primaryMatrix[0].ds4_cuda_sha256
+                ds4_c_sha256 = $primaryMatrix[0].ds4_c_sha256
+                build_manifest_sha256 = $primaryMatrix[0].build_manifest_sha256
+                build_input_fingerprint_sha256 = $primaryMatrix[0].build_input_fingerprint_sha256
+                harness_sha256 = $primaryMatrix[0].harness_sha256
+                model = $primaryMatrix[0].model
+                model_bytes = $primaryMatrix[0].model_bytes
+                model_last_write_utc = $primaryMatrix[0].model_last_write_utc
+                summary_runner_sha256 = (Get-FileHash -LiteralPath $runnerPath -Algorithm SHA256).Hash.ToLowerInvariant()
             }
         } else { $null }
     }

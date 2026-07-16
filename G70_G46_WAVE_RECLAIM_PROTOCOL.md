@@ -129,6 +129,13 @@ occur inside WRAP rather than after it.
 The final summary must report whether this extension was triggered. No result
 may be promoted from a single safety run.
 
+If a docs/summary-only runner repair changes git HEAD between the initial
+cohort and its required extension, the cohorts must not be silently pooled.
+The authoritative performance summary must select an `n>=3` same-HEAD cohort,
+verify identical executable/source/harness/model provenance across every raw
+row, and retain the excluded cohort as diagnostic evidence with the reason
+recorded explicitly.
+
 ## Interpretation
 
 If legacy cannot pass the first safety under the current host state, a clean
