@@ -682,8 +682,8 @@ $executionRunnerHashForRuns = if ($SummarizeExisting) {
 }
 
 $receipts = @(
-    Read-G58SafetyReceipt -BakeId "K60",
-    Read-G58SafetyReceipt -BakeId "K75"
+    (Read-G58SafetyReceipt -BakeId "K60")
+    (Read-G58SafetyReceipt -BakeId "K75")
 )
 $authorizations = @()
 if ($SummarizeExisting) {
