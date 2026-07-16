@@ -147,11 +147,12 @@ static int g_ds4_lock_fd = -1;
  * GGUF Quant Block Formats.
  * =========================================================================
  *
- * These layouts and IQ2 tables match the GGUF quantized tensor format,
+ * These layouts and IQ tables match the GGUF quantized tensor format,
  * reduced to only the formats ds4.c currently reads:
  *   - Q2_K routed down experts
  *   - Q4_K routed experts in the high-memory variant
  *   - IQ2_XXS routed gate/up experts
+ *   - IQ1_S routed experts in the cold-tier variant
  *   - Q8_K temporary activation blocks for dot products
  */
 #define QK_K 256
@@ -181,11 +182,18 @@ typedef struct {
     uint16_t qs[QK_K / 8];
 } block_iq2_xxs;
 
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK_K / 8];
+    uint16_t qh[QK_K / 32];
+} block_iq1_s;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
+DS4_STATIC_ASSERT(ds4_block_iq1_s_size, sizeof(block_iq1_s) == 50);
 
 typedef struct {
     uint32_t ctx_size;
@@ -909,7 +917,7 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
+    [19] = {"iq1_s",  256,  50},
     [20] = {"iq4_nl", 256,  50},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
@@ -930,6 +938,7 @@ enum {
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ1_S    = 19,
     DS4_TENSOR_I32      = 26,
 };
 
@@ -1099,6 +1108,64 @@ static bool model_get_bool(const ds4_model *m, const char *key, bool *out) {
     return true;
 }
 
+static bool model_get_nonnegative_u64(
+        const ds4_model *m,
+        const char      *key,
+        uint64_t        *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv || !out) return false;
+
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    switch (kv->type) {
+    case GGUF_VALUE_UINT8: {
+        uint8_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    case GGUF_VALUE_UINT16: {
+        uint16_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    case GGUF_VALUE_UINT32: {
+        uint32_t v = 0;
+        if (!cursor_u32(&c, &v)) return false;
+        *out = v;
+        return true;
+    }
+    case GGUF_VALUE_UINT64:
+        return cursor_u64(&c, out);
+    case GGUF_VALUE_INT8: {
+        int8_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    case GGUF_VALUE_INT16: {
+        int16_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    case GGUF_VALUE_INT32: {
+        int32_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    case GGUF_VALUE_INT64: {
+        int64_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (uint64_t)v;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 typedef struct {
     uint32_t type;
     uint64_t len;
@@ -1220,6 +1287,142 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+static uint64_t model_tensor_extent_end(const ds4_model *m) {
+    uint64_t end = m->tensor_data_pos;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0) {
+            fprintf(stderr,
+                    "ds4: cannot locate a split boundary after unsupported tensor %.*s\n",
+                    (int)t->name.len, t->name.ptr);
+            exit(1);
+        }
+        if (t->abs_offset > UINT64_MAX - t->bytes) {
+            ds4_die("split GGUF tensor extent overflow");
+        }
+        const uint64_t tensor_end = t->abs_offset + t->bytes;
+        if (tensor_end > end) end = tensor_end;
+    }
+    return end;
+}
+
+static void model_append_split_tensors(
+        ds4_model       *model,
+        const ds4_model *shard,
+        uint64_t         shard_base) {
+    if (shard->n_tensors > UINT64_MAX - model->n_tensors ||
+        model->n_tensors + shard->n_tensors > SIZE_MAX / sizeof(ds4_tensor))
+    {
+        ds4_die("split GGUF tensor count overflow");
+    }
+
+    const uint64_t old_count = model->n_tensors;
+    const uint64_t new_count = old_count + shard->n_tensors;
+    ds4_tensor *all = xrealloc(
+        model->tensors, (size_t)new_count * sizeof(model->tensors[0]));
+
+    for (uint64_t i = 0; i < shard->n_tensors; i++) {
+        ds4_tensor tensor = shard->tensors[i];
+        for (uint64_t j = 0; j < old_count; j++) {
+            if (ds4_str_eq(all[j].name, tensor.name)) {
+                fprintf(stderr,
+                        "ds4: duplicate tensor across split GGUF shards: %.*s\n",
+                        (int)tensor.name.len, tensor.name.ptr);
+                exit(1);
+            }
+        }
+        if (tensor.abs_offset > UINT64_MAX - shard_base) {
+            ds4_die("split GGUF global tensor offset overflow");
+        }
+        tensor.abs_offset += shard_base;
+        all[old_count + i] = tensor;
+    }
+
+    model->tensors = all;
+    model->n_tensors = new_count;
+}
+
+/*
+ * Some public DeepSeek GGUF distributions expose their normal split shards as
+ * one byte-for-byte concatenated object. Keeping that representation is useful
+ * here: CUDA still sees one mmap and one file handle, so all existing direct
+ * range reads and packed expert transfers retain their global-offset contract.
+ */
+static void model_parse_concatenated_splits(ds4_model *m) {
+    uint64_t split_count = 1;
+    if (!model_get_nonnegative_u64(m, "split.count", &split_count) ||
+        split_count <= 1)
+    {
+        return;
+    }
+
+    uint64_t split_no = UINT64_MAX;
+    uint64_t expected_tensors = 0;
+    if (!model_get_nonnegative_u64(m, "split.no", &split_no) ||
+        !model_get_nonnegative_u64(
+            m, "split.tensors.count", &expected_tensors) ||
+        split_no != 0 || split_count > 16)
+    {
+        ds4_die("unsupported or invalid concatenated split GGUF metadata");
+    }
+
+    uint64_t shard_base = model_tensor_extent_end(m);
+    for (uint64_t shard_index = 1; shard_index < split_count; shard_index++) {
+        if (shard_base > m->size || m->size - shard_base < 24) {
+            ds4_die("concatenated split GGUF is truncated before the next shard");
+        }
+
+        ds4_model shard = {0};
+        shard.map = m->map + shard_base;
+        shard.size = m->size - shard_base;
+
+        ds4_cursor c = cursor_at(&shard, 0);
+        uint32_t magic = 0;
+        if (!cursor_u32(&c, &magic) || magic != DS4_GGUF_MAGIC ||
+            !cursor_u32(&c, &shard.version) || shard.version != 3 ||
+            !cursor_u64(&c, &shard.n_tensors) ||
+            !cursor_u64(&c, &shard.n_kv))
+        {
+            ds4_die("invalid GGUF header at concatenated split boundary");
+        }
+
+        parse_metadata(&shard, &c);
+        parse_tensors(&shard, &c);
+
+        uint64_t got_no = UINT64_MAX;
+        uint64_t got_count = 0;
+        uint64_t got_total = 0;
+        if (!model_get_nonnegative_u64(&shard, "split.no", &got_no) ||
+            !model_get_nonnegative_u64(&shard, "split.count", &got_count) ||
+            !model_get_nonnegative_u64(
+                &shard, "split.tensors.count", &got_total) ||
+            got_no != shard_index || got_count != split_count ||
+            got_total != expected_tensors)
+        {
+            ds4_die("concatenated split GGUF shard metadata mismatch");
+        }
+
+        const uint64_t shard_bytes = model_tensor_extent_end(&shard);
+        model_append_split_tensors(m, &shard, shard_base);
+        free(shard.kv);
+        free(shard.tensors);
+
+        if (shard_bytes > UINT64_MAX - shard_base) {
+            ds4_die("concatenated split GGUF size overflow");
+        }
+        shard_base += shard_bytes;
+    }
+
+    if (m->n_tensors != expected_tensors || shard_base != m->size) {
+        ds4_die("concatenated split GGUF tensor count or final size mismatch");
+    }
+
+    fprintf(stderr,
+            "ds4: validated concatenated split GGUF: shards=%" PRIu64
+            " tensors=%" PRIu64 " bytes=%" PRIu64 "\n",
+            split_count, m->n_tensors, m->size);
+}
+
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
@@ -1284,6 +1487,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
 
     parse_metadata(m, &c);
     parse_tensors(m, &c);
+    model_parse_concatenated_splits(m);
     model_validate_bake_tensors(m);
 
     if (!m->bake_embedded && !metal_mapping && prefetch_cpu) {
@@ -2206,6 +2410,48 @@ typedef struct {
 } ds4_weights;
 
 typedef struct {
+    const ds4_model *model;
+    const ds4_model *primary_model;
+    ds4_tensor *gate[DS4_N_LAYER];
+    ds4_tensor *up[DS4_N_LAYER];
+    ds4_tensor *down[DS4_N_LAYER];
+    bool ready;
+} ds4_iq1_s_sidecar;
+
+typedef struct {
+    const ds4_model *model;
+    const ds4_tensor *gate;
+    const ds4_tensor *up;
+    const ds4_tensor *down;
+    bool sidecar;
+} ds4_routed_expert_source;
+
+static ds4_iq1_s_sidecar g_iq1_s_sidecar;
+
+static ds4_routed_expert_source routed_expert_source(
+        const ds4_model *model,
+        const ds4_layer_weights *layer,
+        uint32_t layer_index) {
+    ds4_routed_expert_source source = {
+        model,
+        layer ? layer->ffn_gate_exps : NULL,
+        layer ? layer->ffn_up_exps : NULL,
+        layer ? layer->ffn_down_exps : NULL,
+        false,
+    };
+    if (g_iq1_s_sidecar.ready &&
+        model == g_iq1_s_sidecar.primary_model &&
+        layer_index < DS4_N_LAYER) {
+        source.model = g_iq1_s_sidecar.model;
+        source.gate = g_iq1_s_sidecar.gate[layer_index];
+        source.up = g_iq1_s_sidecar.up[layer_index];
+        source.down = g_iq1_s_sidecar.down[layer_index];
+        source.sidecar = true;
+    }
+    return source;
+}
+
+typedef struct {
     ds4_tensor *e_proj;
     ds4_tensor *h_proj;
     ds4_tensor *enorm;
@@ -2395,6 +2641,7 @@ static void tensor_expect_plain_layout(
 
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
+           type == DS4_TENSOR_IQ1_S ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K;
 }
@@ -2402,6 +2649,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
+    case DS4_TENSOR_IQ1_S:   return sizeof(block_iq1_s);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     default:                 ds4_die("unsupported routed expert tensor type");
@@ -2698,8 +2946,20 @@ static void config_validate_model(const ds4_model *m) {
     config_expect_u32("expert_feed_forward_length", n_ff_exp,        DS4_N_FF_EXP);
     config_expect_u32("expert_shared_count",         n_expert_shared, DS4_N_EXPERT_SHARED);
     config_expect_u32("hash_layer_count",            n_hash_layer,    DS4_N_HASH_LAYER);
-    config_expect_u32("expert_group_count",         n_expert_groups, 0);
-    config_expect_u32("expert_group_used_count",    n_group_used,    0);
+    if (!((n_expert_groups == 0 && n_group_used == 0) ||
+          (n_expert_groups == 8 && n_group_used == 4)))
+    {
+        fprintf(stderr,
+                "ds4: unsupported legacy expert grouping metadata: groups=%u used=%u\n",
+                n_expert_groups, n_group_used);
+        exit(1);
+    }
+    if (n_expert_groups != 0) {
+        fprintf(stderr,
+                "ds4: ignoring legacy V3 expert grouping metadata (%u/%u); "
+                "DeepSeek V4 routing is ungrouped\n",
+                n_expert_groups, n_group_used);
+    }
 
     const uint32_t n_swa = required_u32(m, "deepseek4.attention.sliding_window");
     config_expect_u32("attention.sliding_window",     n_swa,                   DS4_N_SWA);
@@ -2806,6 +3066,135 @@ static void weights_bind(ds4_weights *w, const ds4_model *m) {
     }
 
     weights_validate_layout(w);
+}
+
+static uint64_t iq1_s_identity_hash_update(
+        uint64_t h,
+        const void *ptr,
+        uint64_t len) {
+    const uint8_t *p = ptr;
+    for (uint64_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+static void iq1_s_identity_compare_tensor(
+        const ds4_model *sidecar,
+        const ds4_model *primary,
+        const char *name,
+        uint64_t *fingerprint,
+        uint64_t *matched_bytes,
+        uint32_t *matched_tensors) {
+    ds4_tensor *a = required_tensor(sidecar, name);
+    ds4_tensor *b = required_tensor(primary, name);
+    if (a->type != DS4_TENSOR_F32 || b->type != DS4_TENSOR_F32 ||
+        a->ndim != b->ndim || a->bytes != b->bytes ||
+        a->bytes > SIZE_MAX) {
+        fprintf(stderr,
+                "ds4: IQ1_S checkpoint identity layout mismatch: %s\n",
+                name);
+        ds4_die("IQ1_S sidecar checkpoint identity failed");
+    }
+    for (uint32_t d = 0; d < a->ndim; d++) {
+        if (a->dim[d] != b->dim[d]) {
+            fprintf(stderr,
+                    "ds4: IQ1_S checkpoint identity shape mismatch: %s\n",
+                    name);
+            ds4_die("IQ1_S sidecar checkpoint identity failed");
+        }
+    }
+    const void *ap = sidecar->map + a->abs_offset;
+    const void *bp = primary->map + b->abs_offset;
+    if (memcmp(ap, bp, (size_t)a->bytes) != 0) {
+        fprintf(stderr,
+                "ds4: IQ1_S checkpoint identity bytes mismatch: %s\n",
+                name);
+        ds4_die("IQ1_S sidecar checkpoint identity failed");
+    }
+    *fingerprint = iq1_s_identity_hash_update(
+        *fingerprint, name, (uint64_t)strlen(name));
+    *fingerprint = iq1_s_identity_hash_update(
+        *fingerprint, ap, a->bytes);
+    *matched_bytes += a->bytes;
+    (*matched_tensors)++;
+}
+
+static void iq1_s_sidecar_validate_checkpoint_identity(
+        const ds4_model *sidecar,
+        const ds4_model *primary) {
+    ds4_str sidecar_name = {0};
+    ds4_str primary_name = {0};
+    if (!model_get_string(sidecar, "general.name", &sidecar_name) ||
+        !model_get_string(primary, "general.name", &primary_name) ||
+        !ds4_str_eq(sidecar_name, primary_name)) {
+        ds4_die("IQ1_S sidecar model identity metadata mismatch");
+    }
+
+    uint64_t fingerprint = 1469598103934665603ull;
+    uint64_t matched_bytes = 0;
+    uint32_t matched_tensors = 0;
+    char name[96];
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        snprintf(name, sizeof(name), "blk.%u.attn_norm.weight", il);
+        iq1_s_identity_compare_tensor(
+            sidecar, primary, name,
+            &fingerprint, &matched_bytes, &matched_tensors);
+        snprintf(name, sizeof(name), "blk.%u.ffn_norm.weight", il);
+        iq1_s_identity_compare_tensor(
+            sidecar, primary, name,
+            &fingerprint, &matched_bytes, &matched_tensors);
+        if (il >= 3) {
+            snprintf(name, sizeof(name), "blk.%u.exp_probs_b.bias", il);
+            iq1_s_identity_compare_tensor(
+                sidecar, primary, name,
+                &fingerprint, &matched_bytes, &matched_tensors);
+        }
+    }
+    fprintf(stderr,
+            "ds4: IQ1_S checkpoint identity validated: "
+            "controls=%u bytes=%llu fnv1a64=%016llx\n",
+            matched_tensors,
+            (unsigned long long)matched_bytes,
+            (unsigned long long)fingerprint);
+}
+
+static void iq1_s_sidecar_bind(
+        ds4_model *model,
+        const ds4_model *primary_model) {
+    if (!model || !primary_model) ds4_die("missing IQ1_S sidecar model");
+    memset(&g_iq1_s_sidecar, 0, sizeof(g_iq1_s_sidecar));
+    config_validate_model(model);
+    iq1_s_sidecar_validate_checkpoint_identity(model, primary_model);
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_tensor *gate = required_tensorf(
+            model, "blk.%u.ffn_gate_exps.weight", il);
+        ds4_tensor *up = required_tensorf(
+            model, "blk.%u.ffn_up_exps.weight", il);
+        ds4_tensor *down = required_tensorf(
+            model, "blk.%u.ffn_down_exps.weight", il);
+        tensor_expect_layout(gate, DS4_TENSOR_IQ1_S, 3,
+                             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(up, DS4_TENSOR_IQ1_S, 3,
+                             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(down,
+                             il < 3 ? DS4_TENSOR_Q2_K : DS4_TENSOR_IQ1_S,
+                             3,
+                             DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        g_iq1_s_sidecar.gate[il] = gate;
+        g_iq1_s_sidecar.up[il] = up;
+        g_iq1_s_sidecar.down[il] = down;
+    }
+
+    g_iq1_s_sidecar.model = model;
+    g_iq1_s_sidecar.primary_model = primary_model;
+    g_iq1_s_sidecar.ready = true;
+    fprintf(stderr,
+            "ds4: IQ1_S routed-expert sidecar validated: "
+            "layers=%u gate_up=iq1_s down=q2_k[0..2]+iq1_s[3..42]\n",
+            DS4_N_LAYER);
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -10473,10 +10862,12 @@ static bool metal_graph_encode_decode_layer(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = DS4_N_LORA_O;
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
+    const ds4_routed_expert_source route =
+        routed_expert_source(model, layer, il);
+    const uint64_t expert_in_dim = route.gate->dim[0];
+    const uint64_t expert_mid_dim = route.gate->dim[1];
+    const uint64_t down_in_dim = route.down->dim[0];
+    const uint64_t routed_out_dim = route.down->dim[1];
     const bool compressed = ds4_layer_compress_ratio(il) != 0;
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
@@ -11055,9 +11446,9 @@ static bool metal_graph_encode_decode_layer(
     }
     if (ok) metal_graph_spex_cpu_schedule(g, il);
     if (ok) metal_graph_spex_score_next(g, il);
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(route.gate);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_row_bytes = routed_expert_row_bytes(route.down);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->router_logits, model, layer->ffn_gate_inp,
                                                  DS4_N_EMBD, DS4_N_EXPERT, g->ffn_norm, 1);
@@ -11088,10 +11479,10 @@ static bool metal_graph_encode_decode_layer(
         overlap_shared_full_env && overlap_shared_full_env[0] &&
         strcmp(overlap_shared_full_env, "0") != 0;
     const bool overlap_shared = ok && ds4_gpu_routed_moe_prepare_selected(
-        model->map, model->size,
-        layer->ffn_gate_exps->abs_offset,
-        layer->ffn_up_exps->abs_offset,
-        layer->ffn_down_exps->abs_offset,
+        route.model->map, route.model->size,
+        route.gate->abs_offset,
+        route.up->abs_offset,
+        route.down->abs_offset,
         gate_expert_bytes, down_expert_bytes,
         g->router_selected, DS4_N_EXPERT_USED, 1) != 0;
     const bool overlap_shared_full = overlap_shared && overlap_shared_full_requested;
@@ -11137,13 +11528,14 @@ static bool metal_graph_encode_decode_layer(
                                                  g->routed_up,
                                                  g->routed_mid,
                                                   g->routed_down,
-                                                  model->map, model->size,
+                                                  route.model->map,
+                                                  route.model->size,
                                                   il,
-                                                  layer->ffn_gate_exps->abs_offset,
-                                                 layer->ffn_up_exps->abs_offset,
-                                                 layer->ffn_down_exps->abs_offset,
-                                                 layer->ffn_gate_exps->type,
-                                                 layer->ffn_down_exps->type,
+                                                  route.gate->abs_offset,
+                                                  route.up->abs_offset,
+                                                  route.down->abs_offset,
+                                                  route.gate->type,
+                                                  route.down->type,
                                                  gate_expert_bytes, gate_row_bytes,
                                                  down_expert_bytes, down_row_bytes,
                                                  (uint32_t)expert_in_dim,
@@ -11151,9 +11543,10 @@ static bool metal_graph_encode_decode_layer(
                                                  (uint32_t)routed_out_dim,
                                                  g->router_selected, g->router_weights,
                                                  DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
-                                                  g->spex_prefetch,
-                                                  g->spex_prefetch ? &spex_key : NULL) != 0;
-    if (ok) {
+                                                   route.sidecar ? NULL : g->spex_prefetch,
+                                                   !route.sidecar && g->spex_prefetch
+                                                       ? &spex_key : NULL) != 0;
+    if (ok && !route.sidecar) {
         metal_graph_spex_cpu_observe_exact(g, layer, il);
     }
     DS4_METAL_PROFILE_DECODE_STAGE(
@@ -13858,13 +14251,15 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t routed_out_dim = layer->ffn_down_exps->dim[1];
-    const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+    const ds4_routed_expert_source route =
+        routed_expert_source(model, layer, il);
+    const uint64_t expert_in_dim = route.gate->dim[0];
+    const uint64_t expert_mid_dim = route.gate->dim[1];
+    const uint64_t down_in_dim = route.down->dim[0];
+    const uint64_t routed_out_dim = route.down->dim[1];
+    const uint64_t gate_row_bytes = routed_expert_row_bytes(route.gate);
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
-    const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+    const uint64_t down_row_bytes = routed_expert_row_bytes(route.down);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
     const bool layer_stage_profile = getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL;
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
@@ -13985,14 +14380,14 @@ static bool metal_graph_encode_layer_ffn_batch(
                                                    g->batch_routed_up,
                                                    g->batch_routed_mid,
                                                    g->batch_routed_down,
-                                                    model->map,
-                                                    model->size,
+                                                    route.model->map,
+                                                    route.model->size,
                                                     il,
-                                                    layer->ffn_gate_exps->abs_offset,
-                                                   layer->ffn_up_exps->abs_offset,
-                                                   layer->ffn_down_exps->abs_offset,
-                                                   layer->ffn_gate_exps->type,
-                                                   layer->ffn_down_exps->type,
+                                                    route.gate->abs_offset,
+                                                    route.up->abs_offset,
+                                                    route.down->abs_offset,
+                                                    route.gate->type,
+                                                    route.down->type,
                                                    gate_expert_bytes,
                                                    gate_row_bytes,
                                                    down_expert_bytes,
@@ -15726,6 +16121,7 @@ struct ds4_vocab {
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
+    ds4_model iq1_s_sidecar_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -15739,6 +16135,7 @@ struct ds4_engine {
     bool quality;
     bool metal_ready;
     bool mtp_ready;
+    bool iq1_s_sidecar_ready;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -18600,6 +18997,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     ds4_engine *e = xcalloc(1, sizeof(*e));
     os_mmap_init(&e->model.mmap);
     os_mmap_init(&e->mtp_model.mmap);
+    os_mmap_init(&e->iq1_s_sidecar_model.mmap);
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
@@ -18631,6 +19029,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     ds4_reap_mask_install_bake(&e->model, &e->weights);
+    const char *iq1_s_sidecar_path = getenv("DS4_IQ1_S_EXPERT_SIDECAR");
+    if (iq1_s_sidecar_path && iq1_s_sidecar_path[0]) {
+        if (e->backend != DS4_BACKEND_CUDA || e->model.bake_embedded) {
+            fprintf(stderr,
+                    "ds4: IQ1_S expert sidecar requires CUDA and a non-baked primary model\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        model_open(&e->iq1_s_sidecar_model,
+                   iq1_s_sidecar_path,
+                   graph_backend,
+                   false);
+        iq1_s_sidecar_bind(&e->iq1_s_sidecar_model, &e->model);
+        e->iq1_s_sidecar_ready = true;
+        fprintf(stderr, "ds4: IQ1_S expert sidecar source: %s\n",
+                iq1_s_sidecar_path);
+    }
     if (e->backend == DS4_BACKEND_CPU && !cpu_load_directional_steering(e)) {
         ds4_engine_close(e);
         *out = NULL;
@@ -18710,6 +19126,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
         }
         (void)ds4_gpu_set_model_file(&e->model.mmap.file);
+        if (e->iq1_s_sidecar_ready &&
+            !ds4_gpu_set_iq1_s_sidecar(
+                &e->iq1_s_sidecar_model.mmap.file,
+                e->iq1_s_sidecar_model.map,
+                e->iq1_s_sidecar_model.size)) {
+            fprintf(stderr,
+                    "ds4: failed to install IQ1_S expert sidecar in CUDA\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,
@@ -18781,6 +19208,8 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_gpu_cleanup();
 #endif
     ds4_reap_mask_host_reset();
+    memset(&g_iq1_s_sidecar, 0, sizeof(g_iq1_s_sidecar));
+    if (e->iq1_s_sidecar_ready) model_close(&e->iq1_s_sidecar_model);
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
     ds4_release_instance_lock();

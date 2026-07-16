@@ -162,7 +162,17 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[CUDA_QK_K / 8];
+    uint16_t qh[CUDA_QK_K / 32];
+} cuda_block_iq1_s;
+
+static_assert(sizeof(cuda_block_iq1_s) == 50,
+              "IQ1_S must be 50 bytes per 256 weights");
+
 #include "ds4_iq2_tables_cuda.inc"
+#include "ds4_iq1_tables_cuda.inc"
 
 static const void *g_model_host_base;
 static const char *g_model_device_base;
@@ -180,6 +190,14 @@ static uint64_t g_model_evict_count = 0;      /* diagnostics: streamed ranges ev
 static int g_model_hmm_direct;
 static os_file_t g_model_file;
 static int g_model_file_valid;
+static os_file_t g_iq1_s_sidecar_file;
+static int g_iq1_s_sidecar_file_valid;
+static const void *g_iq1_s_sidecar_host_base;
+static uint64_t g_iq1_s_sidecar_size;
+static uint64_t g_iq1_s_route_calls;
+static uint64_t g_iq1_s_route_slots;
+static uint64_t g_iq1_s_selected_loads;
+static uint64_t g_iq1_s_selected_load_failures;
 static os_file_t g_model_file_sequential;
 static int g_model_file_sequential_valid;
 static int g_model_direct_fd = -1;
@@ -1433,6 +1451,30 @@ static void cuda_model_file_clear(void) {
     g_model_file_size = 0;
 }
 
+static void cuda_iq1_s_sidecar_clear(void) {
+    if (g_iq1_s_sidecar_file_valid || g_iq1_s_route_calls != 0) {
+        fprintf(stderr,
+                "ds4: [iq1-s-sidecar] result=summary calls=%llu slots=%llu "
+                "selected_loads=%llu failures=%llu\n",
+                (unsigned long long)g_iq1_s_route_calls,
+                (unsigned long long)g_iq1_s_route_slots,
+                (unsigned long long)g_iq1_s_selected_loads,
+                (unsigned long long)g_iq1_s_selected_load_failures);
+    }
+    if (g_iq1_s_sidecar_file_valid) {
+        os_file_close(&g_iq1_s_sidecar_file);
+        g_iq1_s_sidecar_file_valid = 0;
+    } else {
+        os_file_init(&g_iq1_s_sidecar_file);
+    }
+    g_iq1_s_sidecar_host_base = NULL;
+    g_iq1_s_sidecar_size = 0;
+    g_iq1_s_route_calls = 0;
+    g_iq1_s_route_slots = 0;
+    g_iq1_s_selected_loads = 0;
+    g_iq1_s_selected_load_failures = 0;
+}
+
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
     if (align <= 1) return v;
     return (v / align) * align;
@@ -2102,6 +2144,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
     cuda_model_file_clear();
+    cuda_iq1_s_sidecar_clear();
     g_model_cache_full = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
@@ -7958,6 +8001,39 @@ extern "C" int ds4_gpu_sparse_bake_set_retained_mask(
     return 1;
 }
 
+extern "C" int ds4_gpu_set_iq1_s_sidecar(
+        const os_file_t *file,
+        const void *model_map,
+        uint64_t model_size) {
+    cuda_iq1_s_sidecar_clear();
+    if (!file && !model_map && model_size == 0) return 1;
+    if (!file || !os_file_valid(file) || !model_map || model_size == 0) {
+        fprintf(stderr, "ds4: CUDA IQ1_S sidecar rejected incomplete source\n");
+        return 0;
+    }
+    if (os_file_dup(&g_iq1_s_sidecar_file, file) != 0) {
+        fprintf(stderr, "ds4: CUDA IQ1_S sidecar file duplicate failed: %s\n",
+                strerror(errno));
+        return 0;
+    }
+    g_iq1_s_sidecar_file_valid = 1;
+    const uint64_t file_size = os_file_size(&g_iq1_s_sidecar_file);
+    if (file_size == UINT64_MAX || file_size != model_size) {
+        fprintf(stderr,
+                "ds4: CUDA IQ1_S sidecar size mismatch: file=%llu map=%llu\n",
+                (unsigned long long)file_size,
+                (unsigned long long)model_size);
+        cuda_iq1_s_sidecar_clear();
+        return 0;
+    }
+    g_iq1_s_sidecar_host_base = model_map;
+    g_iq1_s_sidecar_size = model_size;
+    fprintf(stderr,
+            "ds4: CUDA IQ1_S routed-expert sidecar installed: %.2f GiB\n",
+            (double)model_size / 1073741824.0);
+    return 1;
+}
+
 extern "C" void ds4_gpu_sparse_bake_reset(void) {
     cuda_sparse_bake_reset_state();
 }
@@ -13810,6 +13886,36 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, 
     return 0.125f * d * (float)bsum;
 }
 
+__device__ static float dev_dot_iq1_s_q8_K_block(
+        const cuda_block_iq1_s *x,
+        const cuda_block_q8_K *y) {
+    const float d = dev_f16_to_f32(x->d) * y->d;
+    float sum = 0.0f;
+    for (uint32_t iqs = 0; iqs < CUDA_QK_K / 32; iqs++) {
+        const uint32_t qh = x->qh[iqs];
+        int32_t sumi = 0;
+        for (uint32_t g = 0; g < 4u; g++) {
+            const uint32_t index =
+                (uint32_t)x->qs[iqs * 4u + g] |
+                (((qh >> (3u * g)) & 7u) << 8u);
+            const uint32_t grid = ds4_cuda_iq1s_grid_gpu[index];
+            const int8_t *q8 = y->qs + iqs * 32u + g * 8u;
+            for (uint32_t lane = 0; lane < 8u; lane++) {
+                sumi += (int32_t)((grid >> (4u * lane)) & 0x0fu) *
+                    (int32_t)q8[lane];
+            }
+        }
+        const int32_t sumq =
+            (int32_t)y->bsums[iqs * 2u] +
+            (int32_t)y->bsums[iqs * 2u + 1u];
+        const float scale = (float)(((qh >> 11) & 0x0eu) + 1u);
+        const float delta = -1.0f + DS4_IQ1S_DELTA -
+            (qh & 0x8000u) * (2.0f * DS4_IQ1S_DELTA / 32768.0f);
+        sum += scale * ((float)sumi + delta * (float)sumq);
+    }
+    return d * sum;
+}
+
 __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y0,
@@ -14178,6 +14284,275 @@ __global__ static void q8_K_quantize_kernel(
         yb->bsums[tid] = (int16_t)sum;
     }
     if (tid == 0) yb->d = 1.0f / iscale_s;
+}
+
+__global__ static void moe_gate_up_mid_iq1_s_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const uint64_t *route_ptrs,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t route_ptr_slots,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const char *gate_ptr = NULL;
+    const char *up_ptr = NULL;
+    if (route_ptrs) {
+        gate_ptr = (const char *)(uintptr_t)route_ptrs[pair];
+        up_ptr = (const char *)(uintptr_t)route_ptrs[route_ptr_slots + pair];
+    } else {
+        int32_t expert_i = selected[pair];
+        if (expert_i < 0) expert_i = 0;
+        const uint64_t expert_byte =
+            (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+        gate_ptr = gate_base + expert_byte;
+        up_ptr = up_base + expert_byte;
+    }
+    if (!gate_ptr || !up_ptr) return;
+    const cuda_block_iq1_s *gr = (const cuda_block_iq1_s *)(
+        gate_ptr + (uint64_t)row * gate_row_bytes);
+    const cuda_block_iq1_s *ur = (const cuda_block_iq1_s *)(
+        up_ptr + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+        gate += dev_dot_iq1_s_q8_K_block(gr + b, xqb + b);
+        up += dev_dot_iq1_s_q8_K_block(ur + b, xqb + b);
+    }
+    gate = warp_sum_f32(gate);
+    up = warp_sum_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate_out[off] = gate;
+        up_out[off] = up;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+    }
+}
+
+__global__ static void moe_down_iq1_s_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const uint64_t *route_ptrs,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t route_ptr_slots) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const char *down_ptr = NULL;
+    if (route_ptrs) {
+        down_ptr = (const char *)(uintptr_t)route_ptrs[2u * route_ptr_slots + pair];
+    } else {
+        int32_t expert_i = selected[pair];
+        if (expert_i < 0) expert_i = 0;
+        down_ptr = down_base +
+            (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+    }
+    if (!down_ptr) return;
+    const cuda_block_iq1_s *wr = (const cuda_block_iq1_s *)(
+        down_ptr + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 32u) {
+        acc += dev_dot_iq1_s_q8_K_block(wr + b, xq + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) {
+        down_out[(uint64_t)pair * out_dim + row] = acc;
+    }
+}
+
+__global__ static void moe_down_q2_K_route_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const uint64_t *route_ptrs,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t route_ptr_slots) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const char *down_ptr = NULL;
+    if (route_ptrs) {
+        down_ptr = (const char *)(uintptr_t)route_ptrs[2u * route_ptr_slots + pair];
+    } else {
+        int32_t expert_i = selected[pair];
+        if (expert_i < 0) expert_i = 0;
+        down_ptr = down_base +
+            (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+    }
+    if (!down_ptr) return;
+    const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(
+        down_ptr + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 32u) {
+        acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) {
+        down_out[(uint64_t)pair * out_dim + row] = acc;
+    }
+}
+
+__global__ static void moe_gate_up_mid_iq1_s_sorted_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const cuda_block_q8_K *xq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= expert_mid_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const uint64_t expert_byte =
+        (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+    const cuda_block_iq1_s *gr = (const cuda_block_iq1_s *)(
+        gate_base + expert_byte + (uint64_t)row * gate_row_bytes);
+    const cuda_block_iq1_s *ur = (const cuda_block_iq1_s *)(
+        up_base + expert_byte + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+        gate += dev_dot_iq1_s_q8_K_block(gr + b, xqb + b);
+        up += dev_dot_iq1_s_q8_K_block(ur + b, xqb + b);
+    }
+    gate = warp_sum_f32(gate);
+    up = warp_sum_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate_out[off] = gate;
+        up_out[off] = up;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+    }
+}
+
+__global__ static void moe_down_iq1_s_sorted_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= out_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_iq1_s *wr = (const cuda_block_iq1_s *)(
+        down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+        (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 32u) {
+        acc += dev_dot_iq1_s_q8_K_block(wr + b, xq + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) {
+        down_out[(uint64_t)pair * out_dim + row] = acc;
+    }
+}
+
+__global__ static void moe_down_q2_K_route_sorted_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const cuda_block_q8_K *midq,
+        const uint32_t *sorted_pairs,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = sorted_pairs[blockIdx.y];
+    if (row >= out_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+    if (expert_i < 0) expert_i = 0;
+    const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(
+        down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes +
+        (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 32u) {
+        acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) {
+        down_out[(uint64_t)pair * out_dim + row] = acc;
+    }
 }
 
 __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
@@ -19067,6 +19442,21 @@ static int cuda_model_range_in_window(const void *model_map, uint64_t offset, ui
            offset + bytes <= g_model_window_bytes;
 }
 
+static const os_file_t *cuda_model_route_source_file(
+        const void *model_map,
+        int *is_main_file) {
+    if (is_main_file) *is_main_file = 0;
+    if (g_iq1_s_sidecar_file_valid &&
+        model_map == g_iq1_s_sidecar_host_base) {
+        return &g_iq1_s_sidecar_file;
+    }
+    if (g_model_file_valid && model_map == g_model_host_base) {
+        if (is_main_file) *is_main_file = 1;
+        return &g_model_file;
+    }
+    return NULL;
+}
+
 /* Persistent staging rotation so consecutive span uploads pipeline (pread of the
  * next tensor overlaps the H2D copy of the previous one). */
 static uint64_t g_stream_span_idx = 0;
@@ -19079,10 +19469,14 @@ static uint64_t g_stream_span_idx = 0;
  * cudaStreamSynchronize(g_model_upload_stream) before the data is read elsewhere. */
 static int cuda_model_stream_span_into(
         char *dst,
+        const void *model_map,
         uint64_t offset,
         uint64_t bytes,
         char *mirror) {
-    if (!g_model_file_valid || bytes == 0 || !dst) return 0;
+    int is_main_file = 0;
+    const os_file_t *source = cuda_model_route_source_file(
+        model_map, &is_main_file);
+    if (!source || bytes == 0 || !dst) return 0;
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
     const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes)) return 0;
@@ -19094,7 +19488,14 @@ static int cuda_model_stream_span_into(
             if (cudaEventSynchronize(g_model_stage_event[bi]) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
         }
         const char *payload = NULL;
-        if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes, offset + copied, n, &payload)) return 0;
+        if (is_main_file) {
+            if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+                                       offset + copied, n, &payload)) return 0;
+        } else {
+            if (!cuda_pread_full(source, g_model_stage[bi], n,
+                                 offset + copied)) return 0;
+            payload = (const char *)g_model_stage[bi];
+        }
         if (mirror) {
             memcpy(mirror + copied, payload, (size_t)n);
             if (memcmp(mirror + copied, payload, (size_t)n) != 0) return 0;
@@ -19104,7 +19505,7 @@ static int cuda_model_stream_span_into(
             return 0;
         }
         if (cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream) != cudaSuccess) { (void)cudaGetLastError(); return 0; }
-        cuda_model_drop_file_pages(offset + copied, n);
+        if (is_main_file) cuda_model_drop_file_pages(offset + copied, n);
         copied += n;
         g_stream_span_idx++;
     }
@@ -19137,14 +19538,18 @@ static int cuda_moe_io_events_ensure(void) {
     return 1;
 }
 
-static void cuda_moe_io_cancel_pending(const int pending[4], uint32_t count) {
+static void cuda_moe_io_cancel_pending(
+        const os_file_t *source,
+        const int pending[4],
+        uint32_t count) {
+    if (!source) return;
     for (uint32_t i = 0; i < count; i++) {
-        if (pending[i]) (void)CancelIoEx(g_model_file.h, &g_moe_io_ov[i]);
+        if (pending[i]) (void)CancelIoEx(source->h, &g_moe_io_ov[i]);
     }
     for (uint32_t i = 0; i < count; i++) {
         if (!pending[i]) continue;
         DWORD ignored = 0;
-        (void)GetOverlappedResult(g_model_file.h, &g_moe_io_ov[i], &ignored, TRUE);
+        (void)GetOverlappedResult(source->h, &g_moe_io_ov[i], &ignored, TRUE);
     }
 }
 
@@ -19156,7 +19561,10 @@ static int cuda_moe_fill_spans_overlapped(
         const void *model_map,
         const std::vector<cuda_moe_gather::span> &spans,
         uint32_t qd) {
-    if (qd < 2u || qd > 4u || !g_model_file_valid) return 0;
+    int is_main_file = 0;
+    const os_file_t *source = cuda_model_route_source_file(
+        model_map, &is_main_file);
+    if (qd < 2u || qd > 4u || !source) return 0;
     const uint64_t stage_bytes = cuda_model_copy_chunk_bytes() +
         (g_model_direct_align > 1 ? g_model_direct_align : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes) || !cuda_moe_io_events_ensure()) return 0;
@@ -19178,7 +19586,7 @@ static int cuda_moe_fill_spans_overlapped(
                     if (memcmp(s.mirror,
                                (const char *)model_map + s.offset,
                                (size_t)s.bytes) != 0) {
-                        cuda_moe_io_cancel_pending(pending, count);
+                        cuda_moe_io_cancel_pending(source, pending, count);
                         return 0;
                     }
                     cuda_dynamic_arena_observer_mirror_done(
@@ -19187,13 +19595,13 @@ static int cuda_moe_fill_spans_overlapped(
                 if (cudaMemcpyAsync(s.dst, src, (size_t)s.bytes, cudaMemcpyDefault,
                                     g_model_upload_stream) != cudaSuccess) {
                     (void)cudaGetLastError();
-                    cuda_moe_io_cancel_pending(pending, count);
+                    cuda_moe_io_cancel_pending(source, pending, count);
                     return 0;
                 }
                 continue;
             }
             if (s.bytes == 0 || s.bytes > g_model_stage_bytes || s.bytes > 0xffffffffull) {
-                cuda_moe_io_cancel_pending(pending, count);
+                cuda_moe_io_cancel_pending(source, pending, count);
                 return 0;
             }
             /* The serial and overlapped readers share this pinned staging
@@ -19201,7 +19609,7 @@ static int cuda_moe_fill_spans_overlapped(
              * when a buffer may be overwritten by the next ReadFile. */
             if (cudaEventSynchronize(g_model_stage_event[i]) != cudaSuccess) {
                 (void)cudaGetLastError();
-                cuda_moe_io_cancel_pending(pending, count);
+                cuda_moe_io_cancel_pending(source, pending, count);
                 return 0;
             }
 
@@ -19211,12 +19619,12 @@ static int cuda_moe_fill_spans_overlapped(
             ov.OffsetHigh = (DWORD)(s.offset >> 32);
             ov.hEvent = g_moe_io_event[i];
             (void)ResetEvent(ov.hEvent);
-            const BOOL started = ReadFile(g_model_file.h, g_model_stage[i],
+            const BOOL started = ReadFile(source->h, g_model_stage[i],
                                           (DWORD)s.bytes, NULL, &ov);
             if (!started && GetLastError() != ERROR_IO_PENDING) {
                 fprintf(stderr, "ds4: CUDA MoE overlapped read submit failed at %llu: %lu\n",
                         (unsigned long long)s.offset, (unsigned long)GetLastError());
-                cuda_moe_io_cancel_pending(pending, count);
+                cuda_moe_io_cancel_pending(source, pending, count);
                 return 0;
             }
             pending[i] = 1;
@@ -19226,12 +19634,12 @@ static int cuda_moe_fill_spans_overlapped(
             if (!pending[i]) continue;
             const cuda_moe_gather::span &s = spans[base + i];
             DWORD got = 0;
-            if (!GetOverlappedResult(g_model_file.h, &g_moe_io_ov[i], &got, TRUE) ||
+            if (!GetOverlappedResult(source->h, &g_moe_io_ov[i], &got, TRUE) ||
                 got != (DWORD)s.bytes) {
                 fprintf(stderr, "ds4: CUDA MoE overlapped read completion failed at %llu: %lu (%lu/%llu bytes)\n",
                         (unsigned long long)s.offset, (unsigned long)GetLastError(),
                         (unsigned long)got, (unsigned long long)s.bytes);
-                cuda_moe_io_cancel_pending(pending, count);
+                cuda_moe_io_cancel_pending(source, pending, count);
                 return 0;
             }
             pending[i] = 0;
@@ -19239,7 +19647,7 @@ static int cuda_moe_fill_spans_overlapped(
                 memcpy(s.mirror, g_model_stage[i], (size_t)s.bytes);
                 if (memcmp(s.mirror, g_model_stage[i],
                            (size_t)s.bytes) != 0) {
-                    cuda_moe_io_cancel_pending(pending, count);
+                    cuda_moe_io_cancel_pending(source, pending, count);
                     return 0;
                 }
                 cuda_dynamic_arena_observer_mirror_done(
@@ -19249,11 +19657,11 @@ static int cuda_moe_fill_spans_overlapped(
                                 cudaMemcpyHostToDevice, g_model_upload_stream) != cudaSuccess ||
                 cudaEventRecord(g_model_stage_event[i], g_model_upload_stream) != cudaSuccess) {
                 (void)cudaGetLastError();
-                cuda_moe_io_cancel_pending(pending, count);
+                cuda_moe_io_cancel_pending(source, pending, count);
                 return 0;
             }
             g_moe_io_stage_used[i] = 1;
-            cuda_model_drop_file_pages(s.offset, s.bytes);
+            if (is_main_file) cuda_model_drop_file_pages(s.offset, s.bytes);
         }
         base += count;
     }
@@ -19290,7 +19698,7 @@ static int cuda_moe_fill_span(
         }
         return 1;
     }
-    return cuda_model_stream_span_into(dst, offset, bytes, mirror);
+    return cuda_model_stream_span_into(dst, model_map, offset, bytes, mirror);
 }
 
 static int cuda_moe_gather_ensure(char **ptr, uint64_t *cap, uint64_t bytes, const char *what) {
@@ -19796,7 +20204,8 @@ static int cuda_moe_selected_load(
         const ds4_gpu_tensor *weights_arg,
         const ds4_gpu_tensor *probs_arg,
         ds4_gpu_spex_queue *spex_queue,
-        const ds4_gpu_spex_key *spex_key) {
+        const ds4_gpu_spex_key *spex_key,
+        int allow_prefill_mixed_route_ptrs) {
     g_moe_last_selected.valid = 0;
     g_moe_gather.direct_cache_active = 0;
     g_moe_gather.mixed_direct_active = 0;
@@ -20164,7 +20573,7 @@ static int cuda_moe_selected_load(
      * compact slot map are unchanged. */
     const int prof = getenv("DS4_CUDA_SEL_PROFILE") != NULL;
     const double t_fetch0 = prof ? cuda_wall_sec() : 0.0;
-    cuda_moe_expert_cache *cache =
+    cuda_moe_expert_cache *cache = allow_prefill_mixed_route_ptrs ? NULL :
         cuda_moe_expert_cache_prepare(gate_expert_bytes, down_expert_bytes);
     /* P3 owns persistent residency. The generic selected-load path still
      * serves prefill exactly through compact buffers, but must not smuggle a
@@ -20417,7 +20826,8 @@ static int cuda_moe_selected_load(
 
     const int mixed_direct_active =
         getenv("DS4_CUDA_MOE_MIXED_DIRECT") != NULL &&
-        n_tokens == 1u && n_expert == 6u && cache &&
+        (n_tokens == 1u || allow_prefill_mixed_route_ptrs) &&
+        n_expert == 6u && cache &&
         expert_in_dim / CUDA_QK_K <= 16u &&
         spex_prefetch_slot < 0 &&
         getenv("DS4_CUDA_MOE_NO_DECODE_LUT_GATE") == NULL &&
@@ -20971,7 +21381,21 @@ static int routed_moe_launch(
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
         return 0;
     }
-    if (gate_type != 16u || down_type != 10u) return 0;
+    const uint32_t route_iq2_q2 = gate_type == 16u && down_type == 10u;
+    const uint32_t route_iq1_s =
+        gate_type == 19u && (down_type == 19u || down_type == 10u);
+    if (!route_iq2_q2 && !route_iq1_s) return 0;
+    if (route_iq1_s) {
+        g_iq1_s_route_calls++;
+        g_iq1_s_route_slots += (uint64_t)n_tokens * n_expert;
+        if (getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") != NULL) {
+            g_iq1_s_selected_load_failures++;
+            fprintf(stderr,
+                    "ds4: IQ1_S sidecar requires selected expert loading at layer=%u\n",
+                    layer_index);
+            return 0;
+        }
+    }
     const uint32_t n_total_expert = 256u;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
@@ -21007,19 +21431,21 @@ static int routed_moe_launch(
      * MoE kernels then touch top-6 of 256 (~42x less streamed per layer). Falls
      * back to the whole-block path on failure or when fully in-window (zero-copy). */
     const int whole_in_window =
-        !sparse_bake_layer &&
+        !route_iq1_s && !sparse_bake_layer &&
         cuda_model_range_in_window(model_map, gate_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, down_offset, down_bytes);
     cuda_moe_expert_cache *gpu_route_cache = NULL;
-    const int split_hit_miss_requested = cuda_moe_split_hit_miss_requested();
-    const int split_fused_requested = cuda_moe_split_fused_requested();
+    const int split_hit_miss_requested =
+        route_iq1_s ? 0 : cuda_moe_split_hit_miss_requested();
+    const int split_fused_requested =
+        route_iq1_s ? 0 : cuda_moe_split_fused_requested();
     if (split_hit_miss_requested && split_fused_requested) {
         fprintf(stderr,
                 "ds4: split hit/miss and fused split are mutually exclusive\n");
         return 0;
     }
-    if (!whole_in_window &&
+    if (!route_iq1_s && !whole_in_window &&
         getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL) {
         if (!sparse_bake_layer &&
             (split_hit_miss_requested || split_fused_requested) &&
@@ -21061,10 +21487,14 @@ static int routed_moe_launch(
             cuda_moe_selected_load(model_map, model_size, layer_index,
                                    gate_offset, up_offset, down_offset,
                                    gate_expert_bytes, down_expert_bytes,
-                                   expert_in_dim,
-                                   n_total_expert, n_expert, n_tokens,
-                                   selected, weights, probs,
-                                   spex_queue, spex_key);
+                                    expert_in_dim,
+                                    n_total_expert, n_expert, n_tokens,
+                                    selected, weights, probs,
+                                     spex_queue, spex_key, route_iq1_s);
+        if (route_iq1_s) {
+            if (selected_loaded) g_iq1_s_selected_loads++;
+            else g_iq1_s_selected_load_failures++;
+        }
         if (!selected_loaded && g_moe_gather.wave_fail_closed) {
             ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
             return 0;
@@ -21090,6 +21520,12 @@ static int routed_moe_launch(
             selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
         } else {
             ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
+            if (route_iq1_s) {
+                fprintf(stderr,
+                        "ds4: IQ1_S sidecar selected load failed closed at layer=%u\n",
+                        layer_index);
+                return 0;
+            }
             if (sparse_bake_layer) {
                 fprintf(stderr,
                         "ds4: sparse bake selected load failed closed at layer=%u\n",
@@ -21204,6 +21640,289 @@ static int routed_moe_launch(
             NULL, 0u, 0u);
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
+        if (route_iq1_s) {
+            if (ok && g_moe_gather.wave_active) {
+                if (!wave_pairs_dev) ok = 0;
+                const int wave_double_buffer =
+                    g_moe_gather.wave_double_buffer != 0;
+                for (uint32_t wave = 0; ok && wave < g_moe_gather.wave_count; wave++) {
+                    const uint32_t parity = wave & 1u;
+                    int wave_work_enqueued = 0;
+                    const char *wave_gate_w = gate_w;
+                    const char *wave_up_w = up_w;
+                    const char *wave_down_w = down_w;
+                    const int32_t *wave_selected =
+                        (const int32_t *)selected->ptr;
+                    uint32_t *wave_pairs_current = wave_pairs_dev;
+                    cudaEvent_t wave_upload_ready =
+                        g_moe_gather.wave_upload_ready;
+                    std::vector<uint32_t> *wave_pairs_host =
+                        &g_moe_gather.h_wave_pairs;
+                    uint32_t wave_pair_count =
+                        g_moe_gather.wave_active_pairs;
+                    if (wave_double_buffer) {
+                        wave_gate_w = g_moe_gather.wave_gate[parity];
+                        wave_up_w = g_moe_gather.wave_up[parity];
+                        wave_down_w = g_moe_gather.wave_down[parity];
+                        wave_selected = g_moe_gather.wave_slot[parity];
+                        wave_pairs_current = g_moe_gather.wave_pair[parity];
+                        wave_upload_ready =
+                            g_moe_gather.wave_upload_ready_db[parity];
+                        wave_pairs_host =
+                            &g_moe_gather.h_wave_pairs_db[parity];
+                        wave_pair_count =
+                            g_moe_gather.wave_active_pairs_db[parity];
+                    }
+                    if (!wave_double_buffer && wave != 0u) {
+                        ok = cuda_ok(cudaStreamSynchronize(0),
+                                     "moe IQ1_S wave execution sync");
+                    }
+                    if (ok && !wave_double_buffer && wave != 0u) {
+                        ok = cuda_moe_selected_stage_wave(
+                            model_map, layer_index,
+                            gate_offset, up_offset, down_offset,
+                            gate_expert_bytes, down_expert_bytes,
+                            n_total_expert, n_expert, n_tokens, wave);
+                        wave_pair_count = g_moe_gather.wave_active_pairs;
+                    }
+                    if (ok) {
+                        ok = cuda_ok(cudaStreamWaitEvent(
+                                         0, wave_upload_ready, 0),
+                                     "moe IQ1_S wave upload wait");
+                    }
+                    if (!ok) break;
+                    if (wave_pair_count == 0 ||
+                        wave_pair_count > pair_count ||
+                        wave_pairs_host->size() != wave_pair_count) {
+                        ok = 0;
+                        break;
+                    }
+                    if (!wave_double_buffer) {
+                        ok = cuda_ok(cudaMemcpyAsync(
+                                         wave_pairs_dev,
+                                         wave_pairs_host->data(),
+                                         (size_t)wave_pair_count * sizeof(uint32_t),
+                                         cudaMemcpyHostToDevice, 0),
+                                     "routed_moe IQ1_S wave pairs upload");
+                    }
+                    if (!ok) break;
+
+                    dim3 mgrid((expert_mid_dim + 7u) / 8u,
+                               wave_pair_count, 1);
+                    moe_gate_up_mid_iq1_s_sorted_qwarp32_kernel<<<mgrid, 256>>>(
+                        (float *)gate->ptr,
+                        (float *)up->ptr,
+                        (float *)mid->ptr,
+                        wave_gate_w,
+                        wave_up_w,
+                        xq,
+                        wave_pairs_current,
+                        wave_selected,
+                        (const float *)weights->ptr,
+                        gate_expert_bytes,
+                        gate_row_bytes,
+                        xq_blocks,
+                        expert_mid_dim,
+                        n_expert,
+                        clamp);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe IQ1_S wave gate/up launch");
+                    if (!ok) break;
+                    wave_work_enqueued = 1;
+
+                    dim3 midq_grid(midq_blocks, pair_count, 1);
+                    q8_K_quantize_kernel<<<midq_grid, 256>>>(
+                        midq, (const float *)mid->ptr, expert_mid_dim,
+                        pair_count, NULL, 0u, 0u);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe IQ1_S wave mid quantize launch");
+                    if (!ok) {
+                        if (wave_double_buffer && wave_work_enqueued) {
+                            (void)cuda_moe_wave_compute_seal(parity);
+                        }
+                        break;
+                    }
+
+                    dim3 dgrid((out_dim + 7u) / 8u, wave_pair_count, 1);
+                    if (down_type == 19u) {
+                        moe_down_iq1_s_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                            (float *)down->ptr,
+                            wave_down_w,
+                            midq,
+                            wave_pairs_current,
+                            wave_selected,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    } else {
+                        moe_down_q2_K_route_sorted_qwarp32_kernel<<<dgrid, 256>>>(
+                            (float *)down->ptr,
+                            wave_down_w,
+                            midq,
+                            wave_pairs_current,
+                            wave_selected,
+                            down_expert_bytes,
+                            down_row_bytes,
+                            midq_blocks,
+                            out_dim,
+                            n_expert);
+                    }
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe IQ1_S wave down launch");
+                    if (!ok) {
+                        if (wave_double_buffer && wave_work_enqueued) {
+                            (void)cuda_moe_wave_compute_seal(parity);
+                        }
+                        break;
+                    }
+                    if (wave_double_buffer) {
+                        ok = cuda_moe_wave_compute_seal(parity);
+                        if (!ok) break;
+                    }
+                    if (wave_double_buffer) {
+                        const uint32_t next_wave = wave + 1u;
+                        if (next_wave < g_moe_gather.wave_count) {
+                            ok = cuda_moe_selected_stage_wave(
+                                model_map, layer_index,
+                                gate_offset, up_offset, down_offset,
+                                gate_expert_bytes, down_expert_bytes,
+                                n_total_expert, n_expert, n_tokens, next_wave);
+                            if (!ok) break;
+                        }
+                    }
+                }
+                if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
+                if (ok) {
+                    const uint64_t n = (uint64_t)n_tokens * out_dim;
+                    const uint32_t blocks = (uint32_t)((n + 255u) / 256u);
+                    moe_sum_kernel<<<blocks, 256>>>(
+                        (float *)out->ptr, (const float *)down->ptr,
+                        out_dim, n_expert, n_tokens);
+                    ok = cuda_ok(cudaGetLastError(),
+                                 "routed_moe IQ1_S wave sum launch");
+                }
+                if (prof_ev[6]) {
+                    (void)cudaEventRecord(prof_ev[6], 0);
+                    if (cudaEventSynchronize(prof_ev[6]) == cudaSuccess) {
+                        float ms_xq = 0.0f, ms_waves = 0.0f;
+                        float ms_sum = 0.0f, ms_total = 0.0f;
+                        (void)cudaEventElapsedTime(&ms_xq, prof_ev[0], prof_ev[1]);
+                        (void)cudaEventElapsedTime(&ms_waves, prof_ev[1], prof_ev[5]);
+                        (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
+                        (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
+                        fprintf(stderr,
+                                "ds4: CUDA IQ1_S MoE wave profile tokens=%u pairs=%u waves=%u max_wave=%u xq=%.3f waves_ms=%.3f sum=%.3f total=%.3f ms\n",
+                                n_tokens, pair_count, g_moe_gather.wave_count,
+                                g_moe_gather.wave_max_experts, ms_xq,
+                                ms_waves, ms_sum, ms_total);
+                    }
+                    for (uint32_t i = 0; i < 7u; i++) {
+                        (void)cudaEventDestroy(prof_ev[i]);
+                    }
+                }
+                return ok;
+            }
+            if (prof_ev[2]) (void)cudaEventRecord(prof_ev[2], 0);
+            if (ok) {
+                dim3 mgrid((expert_mid_dim + 7u) / 8u,
+                           pair_count, 1);
+                moe_gate_up_mid_iq1_s_qwarp32_kernel<<<mgrid, 256>>>(
+                    (float *)gate->ptr,
+                    (float *)up->ptr,
+                    (float *)mid->ptr,
+                    gate_w,
+                    up_w,
+                    use_mixed_route_ptrs ? mixed_route_ptrs : NULL,
+                    xq,
+                    (const int32_t *)selected->ptr,
+                    (const float *)weights->ptr,
+                    gate_expert_bytes,
+                    gate_row_bytes,
+                    xq_blocks,
+                    expert_mid_dim,
+                    n_expert,
+                    pair_count,
+                    clamp);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe IQ1_S gate/up launch");
+            }
+            if (prof_ev[3]) (void)cudaEventRecord(prof_ev[3], 0);
+            if (ok) {
+                dim3 midq_grid(midq_blocks, pair_count, 1);
+                q8_K_quantize_kernel<<<midq_grid, 256>>>(
+                    midq, (const float *)mid->ptr, expert_mid_dim,
+                    pair_count, NULL, 0u, 0u);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe IQ1_S mid quantize launch");
+            }
+            if (prof_ev[4]) (void)cudaEventRecord(prof_ev[4], 0);
+            if (ok) {
+                dim3 dgrid((out_dim + 7u) / 8u, pair_count, 1);
+                if (down_type == 19u) {
+                    moe_down_iq1_s_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        use_mixed_route_ptrs ? mixed_route_ptrs : NULL,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert,
+                        pair_count);
+                } else {
+                    moe_down_q2_K_route_qwarp32_kernel<<<dgrid, 256>>>(
+                        (float *)down->ptr,
+                        down_w,
+                        use_mixed_route_ptrs ? mixed_route_ptrs : NULL,
+                        midq,
+                        (const int32_t *)selected->ptr,
+                        down_expert_bytes,
+                        down_row_bytes,
+                        midq_blocks,
+                        out_dim,
+                        n_expert,
+                        pair_count);
+                }
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe IQ1_S down launch");
+            }
+            if (prof_ev[5]) (void)cudaEventRecord(prof_ev[5], 0);
+            if (ok) {
+                const uint64_t n = (uint64_t)n_tokens * out_dim;
+                const uint32_t blocks = (uint32_t)((n + 255u) / 256u);
+                moe_sum_kernel<<<blocks, 256>>>(
+                    (float *)out->ptr, (const float *)down->ptr,
+                    out_dim, n_expert, n_tokens);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe IQ1_S sum launch");
+            }
+            if (prof_ev[6]) {
+                (void)cudaEventRecord(prof_ev[6], 0);
+                if (cudaEventSynchronize(prof_ev[6]) == cudaSuccess) {
+                    float ms_xq = 0.0f, ms_gate = 0.0f;
+                    float ms_midq = 0.0f, ms_down = 0.0f;
+                    float ms_sum = 0.0f, ms_total = 0.0f;
+                    (void)cudaEventElapsedTime(&ms_xq, prof_ev[0], prof_ev[1]);
+                    (void)cudaEventElapsedTime(&ms_gate, prof_ev[2], prof_ev[3]);
+                    (void)cudaEventElapsedTime(&ms_midq, prof_ev[3], prof_ev[4]);
+                    (void)cudaEventElapsedTime(&ms_down, prof_ev[4], prof_ev[5]);
+                    (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
+                    (void)cudaEventElapsedTime(&ms_total, prof_ev[0], prof_ev[6]);
+                    fprintf(stderr,
+                            "ds4: CUDA IQ1_S MoE profile tokens=%u pairs=%u xq=%.3f gateup=%.3f midq=%.3f down=%.3f sum=%.3f total=%.3f ms\n",
+                            n_tokens, pair_count, ms_xq, ms_gate, ms_midq,
+                            ms_down, ms_sum, ms_total);
+                }
+                for (uint32_t i = 0; i < 7u; i++) {
+                    (void)cudaEventDestroy(prof_ev[i]);
+                }
+            }
+            return ok;
+        }
         if (ok && g_moe_gather.wave_active) {
             if (!wave_pairs_dev) ok = 0;
             const int wave_double_buffer =

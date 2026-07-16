@@ -1,0 +1,45 @@
+﻿{
+    "schema":  "g7_system_quiescence_preflight_v1",
+    "checked_utc":  "2026-07-16T16:29:12.7538681Z",
+    "sample_window_started_utc":  "2026-07-16T16:29:12.7424414Z",
+    "tag":  "g75b_iq1_runtime_postaudit_g73_regression_contaminated",
+    "command_line":  "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File .\\g7_measure.ps1 -MaxTokens 64 -Repeats 1 -GateKind structural-safety -Tag g75b_iq1_runtime_postaudit_g73_regression_contaminated -Prompt \"Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.\" -Context 256 -BudgetGB 2 -ReserveMB 1024 -DynamicArenaGiB 30 -ArenaWrapTrustWorkerChecksum -ArenaWrapSourceParts -ArenaWrapUnlockSourceRanges -ArenaWrapUnlockWaveGiB 4 -DisableQ8F16Cache -EmbedRowStaging -ReapPrefetchThreads 8 -ExpectedContentSHA256 31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8 -ModelPath C:\\ds4-models\\ds4-2bit.gguf -TimeoutSec 1800 -PrefillMassWrap -ComposePrefillMassTiering -ExpertCacheN 320 -ExpertCacheReserveGB 0.125 -ExpertCachePolicy lru -GpuResidentRoutes -RouteNoDefaultSync -ExpertTiering enforce -ExpertTierPolicy mass-lfru -ExpertTierClockCalls 430 -ExpertTierReplacementBudget 32 -ExpertTierMinFrequency 3 -ExpertTierHysteresis 1.25 -SplitFused -SkipSystemQuiescencePreflight",
+    "harness_sha256":  "6251f1af24f9bf3d09fce2caed576beb3ff26920ac158424fca2f3333f1de226",
+    "git_head":  "69faac418b8d0445c747344600c892f2ba9b329c",
+    "worktree_dirty":  true,
+    "executable_sha256":  "2b5939d8243dee61de6906791c6734493e45faad38486f8ff11f1f62052cf105",
+    "build_manifest_sha256":  "14f57ba810de199cd199e8edd95d81314044f4a6a421bdc15e56d64605f7bd2e",
+    "model_path":  "C:\\ds4-models\\ds4-2bit.gguf",
+    "model_size_bytes":  86720111488,
+    "iq1_s_sidecar_path":  "",
+    "iq1_s_sidecar_size_bytes":  0,
+    "iq1_s_sidecar_expected_sha256":  "",
+    "prompt_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+    "context":  256,
+    "max_tokens":  64,
+    "probe_only":  false,
+    "skipped":  true,
+    "requested_samples":  5,
+    "completed_samples":  0,
+    "requested_sleep_interval_ms":  1000,
+    "observed_interval_median_ms":  null,
+    "observed_window_ms":  0.678,
+    "gpu_scope":  "maximum-utilization-across-visible-gpus",
+    "thresholds":  {
+                       "maximum_cpu_median_percent":  60,
+                       "maximum_disk_median_percent":  30,
+                       "maximum_disk_io_median_mib_per_second":  64,
+                       "maximum_gpu_median_percent":  85
+                   },
+    "cpu_median_percent":  null,
+    "disk_median_percent":  null,
+    "disk_io_median_mib_per_second":  null,
+    "gpu_median_percent":  null,
+    "failures":  [
+
+                 ],
+    "samples":  [
+
+                ],
+    "ready_to_launch":  true
+}

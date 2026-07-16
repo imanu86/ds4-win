@@ -94,6 +94,11 @@ param(
     [string]$ExpectedContentSHA256 = "",
     [string]$ExpectedWarmupContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
+    [string]$ExpectedModelSHA256 = "",
+    [string]$Iq1SExpertSidecar = "",
+    [string]$ExpectedIq1SExpertSidecarSHA256 = "",
+    [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
+    [ValidateSet("benchmark", "structural-safety", "quality")][string]$GateKind = "benchmark",
     [int]$Port = 8000,
     [ValidateRange(64, 131072)][int]$Context = 256,
     [ValidateRange(-1, 65536)][int]$PrefillChunk = -1,
@@ -148,6 +153,9 @@ if ($ExpectedSpexSHA256 -and $ExpectedSpexSHA256 -notmatch '^[0-9a-fA-F]{64}$') 
 }
 if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedWarmupContentSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($ExpectedModelSHA256 -and $ExpectedModelSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedModelSHA256 must be a 64-character hexadecimal SHA-256"
 }
 if ($AllowEmbeddedBakeMask -and
     $ExpectedEmbeddedBakeMaskSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
@@ -252,6 +260,42 @@ $effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $buildManifestPath = Join-Path $PSScriptRoot "build\Release\g7_build_manifest.json"
 $model = $ModelPath
+$iq1SSidecarInfoAtStart = $null
+$iq1SSidecarReceiptAtStart = $null
+$iq1SSidecarReceiptPath = ""
+if ($Iq1SExpertSidecar) {
+    if (-not (Test-Path -LiteralPath $Iq1SExpertSidecar -PathType Leaf)) {
+        throw "IQ1_S sidecar missing: $Iq1SExpertSidecar"
+    }
+    if (-not $ExpectedIq1SExpertSidecarSHA256 -or
+        $ExpectedIq1SExpertSidecarSHA256 -notmatch '^[0-9a-fA-F]{64}$' -or
+        $ExpectedIq1SExpertSidecarBytes -eq 0) {
+        throw "IQ1_S sidecar requires expected SHA256 and byte count provenance"
+    }
+    $iq1SSidecarInfoAtStart = Get-Item -LiteralPath $Iq1SExpertSidecar
+    if ([UInt64]$iq1SSidecarInfoAtStart.Length -ne $ExpectedIq1SExpertSidecarBytes) {
+        throw "IQ1_S sidecar byte count differs from verified provenance"
+    }
+    $Iq1SExpertSidecar = $iq1SSidecarInfoAtStart.FullName
+    $iq1SSidecarReceiptPath = "$Iq1SExpertSidecar.receipt.json"
+    if (-not (Test-Path -LiteralPath $iq1SSidecarReceiptPath -PathType Leaf)) {
+        throw "IQ1_S sidecar verified receipt missing: $iq1SSidecarReceiptPath"
+    }
+    try {
+        $iq1SSidecarReceiptAtStart = Get-Content -LiteralPath $iq1SSidecarReceiptPath -Raw | ConvertFrom-Json
+    } catch {
+        throw "IQ1_S sidecar receipt is invalid JSON"
+    }
+    if ($iq1SSidecarReceiptAtStart.status -ne "verified" -or
+        [IO.Path]::GetFullPath([string]$iq1SSidecarReceiptAtStart.path) -ne $Iq1SExpertSidecar -or
+        [UInt64]$iq1SSidecarReceiptAtStart.bytes -ne $ExpectedIq1SExpertSidecarBytes -or
+        [string]$iq1SSidecarReceiptAtStart.sha256 -ine $ExpectedIq1SExpertSidecarSHA256 -or
+        [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.source) -or
+        [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.quantization_layout) -or
+        [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.imatrix_provenance)) {
+        throw "IQ1_S sidecar receipt does not match requested path/bytes/SHA-256"
+    }
+}
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 $processIsolationLog = Join-Path $outdir ("g7_" + $Tag + "_process_isolation_preflight.json")
@@ -362,6 +406,11 @@ foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | 
 }
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
+if ($Iq1SExpertSidecar) {
+    $env:DS4_IQ1_S_EXPERT_SIDECAR = $Iq1SExpertSidecar
+} else {
+    Remove-Item Env:\DS4_IQ1_S_EXPERT_SIDECAR -ErrorAction SilentlyContinue
+}
 if ($RuntimeReserveMB -gt 0) {
     $env:DS4_CUDA_STREAM_RUNTIME_RESERVE_MB = "$RuntimeReserveMB"
 } else {
@@ -789,6 +838,13 @@ if ($SpexCpuProbeK -gt 0 -and (-not $SpexDryRun -or $SpexStage -ne "full" -or $e
 if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap policy" }
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
+if ($Iq1SExpertSidecar -and
+    ($NoSelectedLoad -or $ExpertCacheN -gt 0 -or $ExpertTiering -ne "off" -or
+     $DynamicArenaGiB -gt 0.0 -or $GpuResidentRoutes -or
+     $SplitHitMiss -or $SplitFused -or $DirectCacheHits -or
+     $MixedDirectCache -or $SpexPrefetchK -gt 0)) {
+    throw "IQ1_S first-stage sidecar requires cache/tiering/arena/resident routes/SPEX prefetch off"
+}
 $effectiveDs4Environment = [ordered]@{}
 $_processEnvironment = [System.Environment]::GetEnvironmentVariables()
 foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | Where-Object { $_ -like "DS4_*" } | Sort-Object)) {
@@ -832,6 +888,22 @@ if ($ExpectedSpexSHA256 -and $spexHashAtStart -ine $ExpectedSpexSHA256) {
     throw "SPEX provenance failed: expected $($ExpectedSpexSHA256.ToLowerInvariant()), observed $spexHashAtStart"
 }
 $modelInfoAtStart = Get-Item -LiteralPath $model
+$modelHashAtStart = if ($ExpectedModelSHA256) {
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $model).Hash.ToLowerInvariant()
+} else { "" }
+if ($ExpectedModelSHA256 -and $modelHashAtStart -ine $ExpectedModelSHA256) {
+    throw "Model provenance failed: expected $($ExpectedModelSHA256.ToLowerInvariant()), observed $modelHashAtStart"
+}
+$iq1SSidecarHashAtStart = if ($iq1SSidecarInfoAtStart) {
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $Iq1SExpertSidecar).Hash.ToLowerInvariant()
+} else { "" }
+if ($iq1SSidecarInfoAtStart -and
+    $iq1SSidecarHashAtStart -ine $ExpectedIq1SExpertSidecarSHA256) {
+    throw "IQ1_S sidecar provenance failed: expected $($ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()), observed $iq1SSidecarHashAtStart"
+}
+$iq1SSidecarReceiptHashAtStart = if ($iq1SSidecarReceiptPath) {
+    (Get-FileHash -Algorithm SHA256 -LiteralPath $iq1SSidecarReceiptPath).Hash.ToLowerInvariant()
+} else { "" }
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
 $systemPromptBytes = [Text.Encoding]::UTF8.GetBytes($SystemPrompt)
@@ -993,6 +1065,9 @@ $systemQuiescencePreflight = [pscustomobject][ordered]@{
     build_manifest_sha256 = $buildManifestHashAtStart
     model_path = $modelInfoAtStart.FullName
     model_size_bytes = [Int64]$modelInfoAtStart.Length
+    iq1_s_sidecar_path = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
+    iq1_s_sidecar_size_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
+    iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
     prompt_sha256 = $promptHash
     context = $Context
     max_tokens = $MaxTokens
@@ -2543,6 +2618,50 @@ if ($spexCpuProbeLineCount -gt 0) {
     }
 }
 
+$iq1SSidecarCalls = [UInt64]0
+$iq1SSidecarSlots = [UInt64]0
+$iq1SSidecarSelectedLoads = [UInt64]0
+$iq1SSidecarFailures = [UInt64]0
+$iq1SSidecarRuntimeObserved = $false
+$iq1SSidecarLogText = ""
+if (Test-Path -LiteralPath $stderrLog) {
+    $iq1SSidecarLogText += (Get-Content -LiteralPath $stderrLog -Raw)
+}
+if (Test-Path -LiteralPath $stdoutLog) {
+    $iq1SSidecarLogText += "`n" + (Get-Content -LiteralPath $stdoutLog -Raw)
+}
+$iq1SSidecarSummaryMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-s-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)')
+if ($Iq1SExpertSidecar) {
+    foreach ($marker in @(
+            "validated concatenated split GGUF",
+            "IQ1_S checkpoint identity validated",
+            "IQ1_S routed-expert sidecar validated",
+            "CUDA IQ1_S routed-expert sidecar installed")) {
+        if ($iq1SSidecarLogText -notmatch [regex]::Escape($marker)) {
+            throw "IQ1_S sidecar runtime marker missing: $marker"
+        }
+    }
+    if ($iq1SSidecarSummaryMatches.Count -ne 1) {
+        throw "IQ1_S sidecar requires exactly one runtime summary; observed $($iq1SSidecarSummaryMatches.Count)"
+    }
+    $iq1SSidecarSummary = $iq1SSidecarSummaryMatches[0]
+    $iq1SSidecarCalls = [UInt64]$iq1SSidecarSummary.Groups[1].Value
+    $iq1SSidecarSlots = [UInt64]$iq1SSidecarSummary.Groups[2].Value
+    $iq1SSidecarSelectedLoads = [UInt64]$iq1SSidecarSummary.Groups[3].Value
+    $iq1SSidecarFailures = [UInt64]$iq1SSidecarSummary.Groups[4].Value
+    if ($iq1SSidecarCalls -eq 0 -or
+        $iq1SSidecarSlots -lt $iq1SSidecarCalls -or
+        $iq1SSidecarSelectedLoads -ne $iq1SSidecarCalls -or
+        $iq1SSidecarFailures -ne 0) {
+        throw "IQ1_S sidecar runtime counters are inconsistent"
+    }
+    $iq1SSidecarRuntimeObserved = $true
+} elseif ($iq1SSidecarSummaryMatches.Count -ne 0) {
+    throw "IQ1_S sidecar runtime summary appeared while sidecar was disabled"
+}
+
 if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
 if ($serverExitCode -ne 0) {
     throw "Measurement failed: ds4_server exited with code $serverExitCode"
@@ -3256,18 +3375,38 @@ $expertTieringResult = [pscustomobject]@{
     mass_sum = $expertTieringMassSum
     lfru_top = $expertTieringLfruTop
 }
+$qualityEligible = [bool]($GateKind -ne "structural-safety" -and $Repeats -ge 3)
+$sotaEligible = [bool]($qualityEligible -and -not $SkipSystemQuiescencePreflight)
 $rawOutputs = [pscustomobject]@{
     schema = "g7_raw_outputs_v1"
     tag = $Tag
+    gate_kind = $GateKind
+    quality_eligible = $qualityEligible
+    sota_eligible = $sotaEligible
     head = $headAtStart
     executable_sha256 = $exeHashAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
+    model_path = $modelInfoAtStart.FullName
+    model_size_bytes = [UInt64]$modelInfoAtStart.Length
+    model_expected_sha256 = $ExpectedModelSHA256.ToLowerInvariant()
+    model_sha256 = $modelHashAtStart
     prompt_sha256 = $promptHash
     system_prompt = $SystemPrompt
     system_prompt_sha256 = $systemPromptHash
     warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     expected_content_sha256 = if ($ExpectedContentSHA256) { $ExpectedContentSHA256.ToLowerInvariant() } else { "" }
     expected_warmup_content_sha256 = if ($ExpectedWarmupContentSHA256) { $ExpectedWarmupContentSHA256.ToLowerInvariant() } else { "" }
+    iq1_s_sidecar_path = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
+    iq1_s_sidecar_size_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
+    iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
+    iq1_s_sidecar_sha256 = $iq1SSidecarHashAtStart
+    iq1_s_sidecar_receipt_path = $iq1SSidecarReceiptPath
+    iq1_s_sidecar_receipt_sha256 = $iq1SSidecarReceiptHashAtStart
+    iq1_s_sidecar_runtime_observed = $iq1SSidecarRuntimeObserved
+    iq1_s_sidecar_route_calls = $iq1SSidecarCalls
+    iq1_s_sidecar_route_slots = $iq1SSidecarSlots
+    iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
+    iq1_s_sidecar_failures = $iq1SSidecarFailures
     warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
@@ -3291,6 +3430,9 @@ $arenaReportedResident = if ($PrefillMassWrap -and $prefillMassWrapResult -eq "p
 }
 $summary = [pscustomobject]@{
     tag = $Tag
+    gate_kind = $GateKind
+    quality_eligible = $qualityEligible
+    sota_eligible = $sotaEligible
     head = $headAtStart
     worktree_dirty = $worktreeDirtyAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
@@ -3315,6 +3457,23 @@ $summary = [pscustomobject]@{
     model = $model
     model_bytes = [long]$modelInfoAtStart.Length
     model_last_write_utc = $modelInfoAtStart.LastWriteTimeUtc.ToString("o")
+    model_expected_sha256 = $ExpectedModelSHA256.ToLowerInvariant()
+    model_sha256 = $modelHashAtStart
+    iq1_s_sidecar = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
+    iq1_s_sidecar_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
+    iq1_s_sidecar_last_write_utc = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.LastWriteTimeUtc.ToString("o") } else { "" })
+    iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
+    iq1_s_sidecar_sha256 = $iq1SSidecarHashAtStart
+    iq1_s_sidecar_receipt_path = $iq1SSidecarReceiptPath
+    iq1_s_sidecar_receipt_sha256 = $iq1SSidecarReceiptHashAtStart
+    iq1_s_sidecar_source = $(if ($iq1SSidecarReceiptAtStart) { [string]$iq1SSidecarReceiptAtStart.source } else { "" })
+    iq1_s_sidecar_quantization_layout = $(if ($iq1SSidecarReceiptAtStart) { [string]$iq1SSidecarReceiptAtStart.quantization_layout } else { "" })
+    iq1_s_sidecar_imatrix_provenance = $(if ($iq1SSidecarReceiptAtStart) { [string]$iq1SSidecarReceiptAtStart.imatrix_provenance } else { "" })
+    iq1_s_sidecar_runtime_observed = $iq1SSidecarRuntimeObserved
+    iq1_s_sidecar_route_calls = $iq1SSidecarCalls
+    iq1_s_sidecar_route_slots = $iq1SSidecarSlots
+    iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
+    iq1_s_sidecar_failures = $iq1SSidecarFailures
     prompt = $Prompt
     prompt_file = $PromptFile
     prompt_sha256 = $promptHash
