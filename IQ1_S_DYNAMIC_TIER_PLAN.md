@@ -20,16 +20,36 @@ The router, selected expert ids, and gate weights remain unchanged.
 
 ## Current Measured Status
 
-As of 2026-07-16, the first decode-only mixed-format fixture is operational.
-On layer 3 it executed five primary 2-bit contributions plus the router's
-lowest-weight contribution in IQ1_S and produced `Hello!`, with exact `5:1`
-telemetry and zero runtime failures. This is a structural `n=1` result, not a
-quality or speed verdict.
+As of 2026-07-17, the decode-only mixed-format path physically separates five
+primary IQ2 routes from one IQ1_S route and performs one final join. A
+persistent pageable-RAM IQ1_S cache and bounded transient VRAM cache are also
+operational. G86 is the only clean `n=3` transport comparison so far: the IQ1_S
+arm reached a 87.71 percent RAM-cache hit rate and avoided 41.112 GiB of SSD
+traffic, but measured 2.194 total t/s versus 3.460 t/s for the primary control.
+These short outputs have no recorded L0-L3 grade, so this is transport and
+performance evidence only, not a quality verdict.
 
-The fixture still invokes the six-slot primary path with the cold weight set to
-zero before adding the IQ1_S contribution. It therefore does not yet reduce
-primary transport. The immediate next step is physical work-list separation:
-five primary ids/weights, one IQ1_S id/weight, and one final join.
+G89 and G90 showed that retaining one or two transient IQ1_S experts per layer
+in VRAM produced only 53/640 and 78/640 hits respectively. The second slot
+recovered only 25 additional calls while reducing the primary IQ2 cache. A
+larger transient IQ1_S VRAM cache is therefore not the next optimization.
+
+Commits `9ff7bc4` and `c8f8678` add an opt-in GPU cold-route planner. It selects
+the same first minimum-weight route on-device, queues the five hot routes first,
+and stages the cold IQ1_S route on the nonblocking upload stream without a
+second router readback. G93 reproduced the exact G87/G91 output hash across
+640/640 calls, with zero planner/runtime failures. Router readback time fell
+from 2518 ms to 6.302 ms and metadata transfer from 30.7 ms to 3.624 ms in the
+structural profile. However, Windows `ScheduledDefrag` was concurrently keeping
+the IQ1_S source disk above 90 percent busy, so all G92/G93 timing and throughput
+values other than exactness/counter reconciliation are contaminated and cannot
+enter the SOTA ledger.
+
+The environment-off frozen G74 control has reproduced its historical output
+hash at the earlier checkpoint. It must be repeated on the current planner
+build. Deferred authoritative 2-bit promotion, next-token publication, and the
+`forbidden_cold_ssd_to_vram=0` end-to-end gate are still unimplemented. The
+required `n>=3` cyberpunk L0-L3 quality A/B is also still pending.
 
 ## Required Residency Contract
 

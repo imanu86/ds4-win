@@ -186,6 +186,30 @@ Measured result: output `Hello!`; mixed calls `2`; primary hot contributions
 last active layer `3`. This is a structural `n=1` PASS only. It is explicitly
 not quality-eligible or SOTA-eligible.
 
+### G77 mixed all-layer smoke
+
+The same fixture was then enabled for the complete inclusive `0..42` range.
+The run produced `Hello! How can I assist you today?`, with `387` mixed calls,
+`1935` primary hot contributions, `387` IQ1_S cold contributions, `387`
+sidecar selected loads, and zero mixed or sidecar failures. Result JSON SHA-256:
+`9de63ea52caf541b1868bbe20f53e2f0bd610ddc0d020facd4a8f582c6d0f00e`.
+This remains an `n=1` structural result and makes no generalized quality claim.
+
+### Environment-off G74 control
+
+After the mixed implementation was committed, the frozen G74 control arm was
+run with no sidecar and no mixed environment variable. It reproduced the exact
+historical content SHA-256
+`31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8`.
+No IQ1_S or mixed telemetry appeared. The observed decode rate was `4.89 t/s`,
+but this was one exactness run and is not a statistical SOTA claim. Result JSON
+SHA-256: `42a57333dbce70cf20df8651fe1de81e7da9109e0e90b5459289d53682aef4f5`.
+
+The G74 packed-copy candidate still refuses the existing unequal primary
+gate/down expert sizes (`2162688/2752512`). That guard predates the IQ1_S mixed
+change, and the historical G74 summary was already stopped at its candidate
+safety gate. It is not evidence of an IQ1_S regression.
+
 ## G75 measured gate
 
 The real-weight gate sampled only the required byte ranges from
@@ -212,3 +236,42 @@ Safety rule:
 
 - Build is allowed while other work is active.
 - Do not launch the benchmark if a DS4 server, DS4 benchmark, or G74 orchestrator/run process is active.
+
+## G76-G93 measured checkpoint
+
+Only G86 contains clean repeated performance measurements. All other entries
+below are structural evidence unless explicitly stated otherwise.
+
+| Gate | Scope | Evidence | Allowed conclusion |
+|---|---|---|---|
+| G76-G83 | Sidecar, split routing, RAM cache | IQ1_S runtime observed; physical `5:1` split and join; cache hits appear; zero mixed failures in retained smokes | Structural and transport plumbing only |
+| G86 control | Clean benchmark, `n=3` | 3.460 total t/s; 5.417 server decode t/s; TTFT 6.965 s | Baseline for this prompt and host state |
+| G86 IQ1_S | Clean benchmark, `n=3`, RAM cache 8 GiB | 2.194 total t/s; 3.430 server decode t/s; TTFT 10.505 s; 87.71% cache hits; 41.112 GiB SSD avoided | IQ1_S cache reduces SSD traffic but is slower than control in this configuration |
+| G89 | Structural profile, transient VRAM cache 1/layer | 53/640 hits, 587 misses, zero failures | Cache is functional; no speed claim |
+| G90 | Structural profile, transient VRAM cache 2/layer | 78/640 hits, 562 misses, zero failures | Second slot adds only 25 hits and consumes primary-cache VRAM |
+| G91 | Structural no-main-sync profile | Exact output; explicit main sync approximately zero; cost moved into cold submission | Removing one sync alone does not prove overlap |
+| G93 | Structural GPU-planner profile | Exact shared output SHA-256 `c7c8e02137fd31de53dc88a5645b3c6a92ab98d844e42ddcc00c52257d63823d`; planner 640/640; wait 0.085 ms total; zero failures; router D2H 6.302 ms; metadata 3.624 ms | Planner preserves the deterministic output and removes most router/metadata readback |
+
+G92 and G93 ran while Windows `ScheduledDefrag` kept the IQ1_S source disk
+above 90 percent busy. Their SSD, H2D, cold-submit, TTFT, throughput, and total
+latency values are invalid for performance comparison. They must not enter the
+SOTA ledger.
+
+The G86 outputs were only 64 tokens and have no recorded human L0-L3 grades.
+Consequently neither G86 nor the structural gates establish quality
+equivalence or lossless behavior.
+
+### Next clean A/B
+
+After system quiescence is restored, compare the current mixed IQ1_S baseline
+against the GPU-planner candidate with identical binary, model, sidecar,
+8-GiB RAM cache, 20-GiB primary arena, prompt, warmup, token budget and request
+order. Use at least three repetitions per arm, compute the full sidecar hash,
+retain every raw output, require identical deterministic output hashes, and do
+not enable profiling in the performance arms. A separate clean `n=1` profile
+may explain the winner but cannot determine it.
+
+Then repeat the current-build environment-off G74 exactness gate and run the
+long cyberpunk prompt at `n>=3` per arm with recorded L0-L3 grades. Promotion
+into authoritative 2-bit pinned RAM and next-token 2-bit VRAM eligibility are
+separate later gates; the current IQ1_S cold path does not prove them.
