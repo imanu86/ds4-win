@@ -1731,7 +1731,7 @@ if (Test-Path $stderrLog) {
         $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
         if ($expertTieringFinalLine -match " adaptive_budget=") {
             $expertTieringFields = @{}
-            foreach ($fieldMatch in [regex]::Matches($expertTieringFinalLine, " ([a-z_]+)=([^ ]+)")) {
+            foreach ($fieldMatch in [regex]::Matches($expertTieringFinalLine, " ([a-z0-9_]+)=([^ ]+)")) {
                 $expertTieringFields[$fieldMatch.Groups[1].Value] = $fieldMatch.Groups[2].Value
             }
             $requiredExpertTieringFields = @(
