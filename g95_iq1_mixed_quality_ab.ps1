@@ -22,9 +22,10 @@ $sidecarSourceRepository = "https://huggingface.co/persadian/DeepSeek-V4-Flash-I
 $prompt = "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document."
 $promptSha256 = "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6"
 $repeatsPerArm = 3
-$maxTokens = 2048
-$context = 4096
+$maxTokens = 768
+$context = 1024
 $warmupMaxTokens = 64
+$stopSequence = "</html>"
 $timeoutSec = 7200
 $cacheLabel = $Iq1CacheGiB.ToString(
     "0.###", [Globalization.CultureInfo]::InvariantCulture).Replace(".", "p")
@@ -78,7 +79,8 @@ function Assert-G95StaticContract {
     if ($repeatsPerArm -lt 3) {
         throw "G95 requires n>=3 per arm"
     }
-    if ($maxTokens -ne 2048 -or $context -ne 4096 -or $warmupMaxTokens -ne 64) {
+    if ($maxTokens -ne 768 -or $context -ne 1024 -or
+        $warmupMaxTokens -ne 64 -or $stopSequence -ne "</html>") {
         throw "G95 token/context/warmup contract mismatch"
     }
 
@@ -86,6 +88,7 @@ function Assert-G95StaticContract {
     foreach ($needle in @(
             '[ValidateSet("benchmark", "structural-safety", "quality")]',
             '[switch]$AllowNonIdenticalRepeatOutputs',
+            '[string]$StopSequence = ""',
             '[switch]$PrefillMassObserve',
             '[switch]$PrefillMassWrap',
             '[switch]$ComposePrefillMassTiering',
@@ -112,6 +115,7 @@ function New-G95BaseMeasureArgs([string]$Tag) {
         "-ModelPath", $model,
         "-ExpectedModelSHA256", $modelSha256,
         "-Prompt", $prompt,
+        "-StopSequence", $stopSequence,
         "-Warmup",
         "-WarmupPrompt", $prompt,
         "-WarmupMaxTokens", "$warmupMaxTokens",
@@ -205,6 +209,7 @@ function Assert-G95ArmResult {
         [string]$Result.model_sha256 -ine $modelSha256 -or
         [string]$Result.model_expected_sha256 -ine $modelSha256 -or
         [string]$Result.prompt_sha256 -ine $promptSha256 -or
+        [string]$Result.requested_stop_sequence -ne $stopSequence -or
         [int]$Result.requested_max_tokens -ne $maxTokens -or
         [int]$Result.requested_warmup_max_tokens -ne $warmupMaxTokens -or
         [int]$Result.context_requested -ne $context -or
@@ -322,6 +327,7 @@ function Assert-G95MatchedPair([object]$Control, [object]$Candidate) {
             "runtime_monitor_harness_sha256", "model_sha256",
             "model_expected_sha256", "prompt_sha256", "system_prompt_sha256",
             "warmup_prompt_sha256", "requested_max_tokens",
+            "requested_stop_sequence",
             "requested_warmup_max_tokens", "context_requested", "budget_gb",
             "reserve_mb", "dynamic_arena_gib_requested",
             "arena_wrap_trust_worker_checksum_requested",
@@ -478,6 +484,7 @@ $summary = [ordered]@{
     prompt_sha256 = $promptSha256
     max_tokens = $maxTokens
     context = $context
+    stop_sequence = $stopSequence
     warmup_max_tokens = $warmupMaxTokens
     warmup_prompt = "same-as-measurement-prompt"
     non_identical_repeat_outputs_allowed = $true
@@ -561,7 +568,7 @@ $summary = [ordered]@{
     grading_sha256 = Get-G95Sha256 $gradingPath
     repetition_flags_policy = "Integrity/determinism diagnostic only; never a quality grade or verdict."
     performance_policy = "Metrics are preserved descriptively; this runner declares no performance or quality winner."
-    claim_scope = "One preregistered cyberpunk HTML prompt; no broad lossless/equivalence claim."
+    claim_scope = "One preregistered cyberpunk HTML prompt, capped at 768 tokens and stopped on </html>; no broad lossless/equivalence claim."
     runner_sha256 = Get-G95Sha256 $runnerPath
 }
 $summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $summaryPath -Encoding UTF8

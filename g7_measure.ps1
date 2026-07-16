@@ -10,6 +10,7 @@ param(
     [string]$Prompt = "Hi",
     [string]$PromptFile = "",
     [string]$SystemPrompt = "",
+    [string]$StopSequence = "",
     [string]$WarmupPrompt = "",
     [switch]$NoSelectedLoad,
     [switch]$Warmup,
@@ -1286,20 +1287,26 @@ $messages += @{ role = "user"; content = $Prompt }
 $warmupMessages = @()
 if ($SystemPrompt) { $warmupMessages += @{ role = "system"; content = $SystemPrompt } }
 $warmupMessages += @{ role = "user"; content = $effectiveWarmupPrompt }
-$body = @{
+$bodySpec = @{
     model = "deepseek-chat"
     messages = $messages
     max_tokens = $MaxTokens
     temperature = 0
     think = $false
-} | ConvertTo-Json -Depth 5
-$warmupBody = @{
+}
+$warmupBodySpec = @{
     model = "deepseek-chat"
     messages = $warmupMessages
     max_tokens = $effectiveWarmupMaxTokens
     temperature = 0
     think = $false
-} | ConvertTo-Json -Depth 5
+}
+if (-not [string]::IsNullOrEmpty($StopSequence)) {
+    $bodySpec.stop = $StopSequence
+    $warmupBodySpec.stop = $StopSequence
+}
+$body = $bodySpec | ConvertTo-Json -Depth 5
+$warmupBody = $warmupBodySpec | ConvertTo-Json -Depth 5
 $bodyBytes = [Text.Encoding]::UTF8.GetBytes($body)
 $warmupBodyBytes = [Text.Encoding]::UTF8.GetBytes($warmupBody)
 
@@ -4208,6 +4215,7 @@ $summary = [pscustomobject]@{
     expected_warmup_content_sha256 = $ExpectedWarmupContentSHA256.ToLowerInvariant()
     warmup_result = $warmupResult
     non_identical_repeat_outputs_allowed = [bool]$AllowNonIdenticalRepeatOutputs
+    requested_stop_sequence = $StopSequence
     requested_max_tokens = $MaxTokens
     requested_warmup_max_tokens = $(if ($Warmup) { $effectiveWarmupMaxTokens } else { 0 })
     context_requested = $Context
