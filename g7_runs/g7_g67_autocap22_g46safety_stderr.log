@@ -1,0 +1,43 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 5.097s
+ds4: cuda backend initialized for graph diagnostics
+0716 11:59:26 ds4-server: context buffers 333.21 MiB (ctx=8192, backend=cuda, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=2050)
+ds4: [arena-cap] requested_gib=29.999 min_available_gib=22.000 available_before_gib=38.285 requested_bytes=32211468288 requested_slots=4551 chosen_bytes=17482383360 chosen_slots=2470 capped=1 result=ready reason=ok
+ds4: CUDA dynamic arena ready 16.28 GiB, 2470 slots, 6.75 MiB/slot, available_ram=21.99 GiB bytes=17482383360 slot_bytes=7077888
+0716 11:59:28 ds4-server: listening on http://127.0.0.1:8000
+0716 11:59:29 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [prefill-mass] armed slots=2470 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: CUDA loading model tensors 6.22 GiB cached
+ds4: CUDA loading model tensors 5.77 GiB cached
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=1702 total_candidate=2470 capacity=2470 candidate_fnv1a64=b48ac78676d23f71 sparse_skipped_ranked=0 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=2470 capacity=2470 mass_total=1720.000000 mass_candidate=604.781019 mass_coverage=0.3516 cutoff=0.223796 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=0 target=1 resident=2470 loads=2470 slots=2470
+ds4: [arena] publish generation=1 loads=2470
+ds4: [arena-wrap-profile] result=published schedule=source-parts source=mmap checksum=fnv1a64-worker-only loads=2470 workers=8 begin=0.006 copy_checksum=10.617 finish=0.000 publish=0.005 total=10.628 source_parts_copy=10.617 source_parts_checksum=0.000 parts=7410 copy_workers=8 checksum_workers=0 file_qd=1 file_qd_observed=1 file_submits=0 file_completions=0 file_failures=0
+ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=40 kept=1702 pruned=8538 semantics=request-scoped-closed base=none existing_layers=0
+ds4: [prefill-mass-wrap] result=published reason=ok candidate=2470 loads=2470 workers=8 seconds=10.628 snapshot_before=0 snapshot_after=1 resident_before=0 resident_after=2470 generation=1 preloaded=0 router=unbiased mask=request-scoped-closed
+0716 12:00:03 ds4-server: chat ctx=0..43:43 prompt done 34.649s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: CUDA loading model tensors 6.06 GiB cached
+ds4: expert tiering active mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 snapshot_generation=1 snapshot_backing_entries=2470 clock_calls=430 replacement_budget=16 min_frequency=3 hysteresis=1.25 entries=11008 ram_slots=2470
+ds4: CUDA resident expert cache ready: 139/320 experts, 6.75 MiB/expert, 0.92 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 139 slots
+ds4: [gpu-route-debug] request seq=1 layer=0 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=0
+ds4: [gpu-route-debug] request seq=2 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=1
+ds4: CUDA loading model tensors 5.24 GiB cached
+ds4: CUDA loading model tensors 5.26 GiB cached
+ds4: CUDA loading model tensors 4.80 GiB cached
+ds4: CUDA loading model tensors 5.24 GiB cached
+ds4: CUDA loading model tensors 5.24 GiB cached
+ds4: CUDA loading model tensors 5.24 GiB cached
+0716 12:01:04 ds4-server: chat ctx=0..43:43 gen=8 decoding chunk=0.13 t/s avg=0.13 t/s 60.117s
+0716 12:01:04 ds4-server: chat ctx=0..43:43 gen=8 finish=length 94.782s
+0716 12:01:04 ds4-server: benchmark request target reached; shutting down cleanly
+0716 12:01:04 ds4-server: shutdown requested, draining requests
+ds4: [gpu-resident-routes] final calls=344 split_calls=0 all_hit=0 worker_jobs=344 miss_experts=1628 errors=0 worker=7.370ms/job resolve=0.000ms/call wait=8.958ms/call queries=0 default_sync=0 no_default_sync=344 cache_count=139 cache_calls=344 cache_hits=436 cache_misses=1628 cache_admissions=155 cache_evictions=16 direct_loads=0
+ds4: [expert-tiering] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 snapshot_generation=1 snapshot_backing_entries=2470 snapshot_backing_hits=1628 snapshot_backing_misses=0 snapshot_to_vram_bytes=11522801664 forbidden_cold_ssd_to_vram=0 clock_calls=430 replacement_budget=16 min_frequency=3 hysteresis=1.25 calls=344 selected=2064 cold=0 ram_hits=1628 vram_hits=436 cold_to_ram=0 cold_to_vram=0 ram_to_warm=155 vram_promotions=155 vram_demotions=16 ram_evictions=0 ram_admit_skips=0 transient=1473 failures=0 ssd_bytes=0 ram_h2d_bytes=11522801664 policy_epochs=1 policy_free_promotions=139 policy_replacements=16 policy_min_frequency_skips=1255 policy_budget_skips=215 policy_score_skips=3 states_ssd=8538 states_probation=2331 states_warm=0 states_vram=139 mass_sum=471.565522 lfru_top=8.63138141
