@@ -21,8 +21,8 @@ $sidecarSourceRepository = "https://huggingface.co/persadian/DeepSeek-V4-Flash-I
 $prompt = "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document."
 $promptSha256 = "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6"
 $repeatsPerArm = 3
-$maxTokens = 2048
-$context = 4096
+$maxTokens = 4000
+$context = 8192
 $baselineTag = "g77_main_2bit_quality_n3"
 $sidecarTag = "g77_iq1_s_quality_n3"
 $summaryPath = Join-Path $outdir "g77_iq1_s_quality_ab_result.json"
@@ -77,6 +77,9 @@ function Assert-G77StaticContract {
             '$GateKind = "benchmark"',
             'quality_eligible = $qualityEligible',
             'sota_eligible = $sotaEligible',
+            'contamination_reason = $contaminationReason',
+            '[switch]$AllowNonIdenticalRepeatOutputs',
+            'non_identical_repeat_outputs_allowed = [bool]$AllowNonIdenticalRepeatOutputs',
             'iq1_s_sidecar_sha256 = $iq1SSidecarHashAtStart',
             'temperature = 0',
             'think = $false')) {
@@ -123,6 +126,7 @@ function Invoke-G77Arm {
             "-Prompt", $prompt,
             "-MaxTokens", "$maxTokens",
             "-Repeats", "$repeatsPerArm",
+            "-AllowNonIdenticalRepeatOutputs",
             "-Context", "$context",
             "-BudgetGB", "28",
             "-ReserveMB", "1024",
@@ -175,6 +179,8 @@ function Assert-G77ArmResult {
         [string]$Result.prompt_sha256 -ine $promptSha256 -or
         [int]$Result.requested_max_tokens -ne $maxTokens -or
         [int]$Result.context_requested -ne $context -or
+        -not [bool]$Result.non_identical_repeat_outputs_allowed -or
+        [string]$Result.contamination_reason -ne "" -or
         [int]$Result.budget_gb -ne 28 -or
         [int]$Result.reserve_mb -ne 1024 -or
         -not [bool]$Result.q8_f16_cache_disabled -or
@@ -322,6 +328,8 @@ $summary = [ordered]@{
     prompt_sha256 = $promptSha256
     max_tokens = $maxTokens
     context = $context
+    non_identical_repeat_outputs_allowed = $true
+    contamination_reason = ""
     main_model = [ordered]@{
         path = $model
         expected_sha256 = $modelSha256

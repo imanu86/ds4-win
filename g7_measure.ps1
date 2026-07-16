@@ -4,6 +4,7 @@ param(
     [int]$MaxTokens = 8,
     [ValidateRange(0, 131072)][int]$WarmupMaxTokens = 0,
     [int]$Repeats = 1,
+    [switch]$AllowNonIdenticalRepeatOutputs,
     [int]$TimeoutSec = 900,
     [string]$Tag = "run",
     [string]$Prompt = "Hi",
@@ -3377,12 +3378,25 @@ $expertTieringResult = [pscustomobject]@{
 }
 $qualityEligible = [bool]($GateKind -ne "structural-safety" -and $Repeats -ge 3)
 $sotaEligible = [bool]($qualityEligible -and -not $SkipSystemQuiescencePreflight)
+$contaminationReason = ""
+if (-not $qualityEligible) {
+    if ($GateKind -eq "structural-safety") {
+        $contaminationReason = "structural-safety-gate-not-quality-eligible"
+    } elseif ($Repeats -lt 3) {
+        $contaminationReason = "repeats-less-than-3-not-quality-eligible"
+    } else {
+        $contaminationReason = "not-quality-eligible"
+    }
+} elseif (-not $sotaEligible) {
+    $contaminationReason = "system-quiescence-preflight-skipped-not-sota-eligible"
+}
 $rawOutputs = [pscustomobject]@{
     schema = "g7_raw_outputs_v1"
     tag = $Tag
     gate_kind = $GateKind
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
+    contamination_reason = $contaminationReason
     head = $headAtStart
     executable_sha256 = $exeHashAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
@@ -3410,11 +3424,12 @@ $rawOutputs = [pscustomobject]@{
     warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
+    non_identical_repeat_outputs_allowed = [bool]$AllowNonIdenticalRepeatOutputs
     expert_tiering = $expertTieringResult
     results = $results
 }
 $rawOutputs | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $rawOutputsPath
-if ($Repeats -gt 1 -and $hashes.Count -ne 1) {
+if ($Repeats -gt 1 -and $hashes.Count -ne 1 -and -not $AllowNonIdenticalRepeatOutputs) {
     throw "Measurement failed: repeated outputs were not identical"
 }
 if ($ExpectedContentSHA256) {
@@ -3433,6 +3448,7 @@ $summary = [pscustomobject]@{
     gate_kind = $GateKind
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
+    contamination_reason = $contaminationReason
     head = $headAtStart
     worktree_dirty = $worktreeDirtyAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
@@ -3485,6 +3501,7 @@ $summary = [pscustomobject]@{
     expected_content_sha256 = $ExpectedContentSHA256.ToLowerInvariant()
     expected_warmup_content_sha256 = $ExpectedWarmupContentSHA256.ToLowerInvariant()
     warmup_result = $warmupResult
+    non_identical_repeat_outputs_allowed = [bool]$AllowNonIdenticalRepeatOutputs
     requested_max_tokens = $MaxTokens
     requested_warmup_max_tokens = $(if ($Warmup) { $effectiveWarmupMaxTokens } else { 0 })
     context_requested = $Context
