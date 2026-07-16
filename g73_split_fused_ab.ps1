@@ -70,7 +70,10 @@ function Assert-G73StaticContract {
     }
     $harnessText = Get-Content -LiteralPath $harness -Raw
     foreach ($needle in @(
-            "SplitFused",
+            '[switch]$SplitFused',
+            '$env:DS4_CUDA_MOE_SPLIT_FUSED = "1"',
+            'split_fused_miss_scratch_bytes_avoided',
+            'SplitFused was requested but fused calls were not observed',
             "ArenaWrapUnlockSourceRanges",
             "ComposePrefillMassTiering",
             "RouteNoDefaultSync",

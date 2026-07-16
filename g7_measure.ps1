@@ -1991,19 +1991,6 @@ if (Test-Path $stderrLog) {
     if ($SplitHitMiss -and (-not $gpuRoutesObserved -or $gpuRoutesSplitCalls -le 0)) {
         throw "SplitHitMiss was requested but the runtime did not report any split calls"
     }
-    if ($SplitFused) {
-        if (-not $gpuRoutesObserved -or $gpuRoutesCalls -le 0 -or
-            -not $splitFusedObserved -or $splitFusedCalls -ne $gpuRoutesCalls) {
-            throw "SplitFused was requested but fused calls were not observed on every GPU route call"
-        }
-        if (($splitFusedHits + $splitFusedMisses) -ne ($gpuRoutesCalls * 6)) {
-            throw "SplitFused route accounting does not match selected route population"
-        }
-        if ($splitFusedMissScratchBytesAvoided -le 0 -or
-            $splitFusedSumReadBytesAvoided -le 0) {
-            throw "SplitFused was requested but avoided byte counters were not positive"
-        }
-    }
     if ($gpuRoutesObserved -and
         ($gpuRoutesDefaultSyncCalls + $gpuRoutesNoDefaultSyncCalls) -ne $gpuRoutesCalls) {
         throw "GPU-resident route sync accounting does not match route calls"
@@ -2470,6 +2457,19 @@ if (Test-Path $stderrLog) {
         $arenaFinalHits = [long]$Matches[1]; $arenaFinalMisses = [long]$Matches[2]
         $arenaFinalFatal = [long]$Matches[3]
         $arenaFinalUploadedGiB = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
+    }
+}
+if ($SplitFused) {
+    if (-not $gpuRoutesObserved -or $gpuRoutesCalls -le 0 -or
+        -not $splitFusedObserved -or $splitFusedCalls -ne $gpuRoutesCalls) {
+        throw "SplitFused was requested but fused calls were not observed on every GPU route call"
+    }
+    if (($splitFusedHits + $splitFusedMisses) -ne ($gpuRoutesCalls * 6)) {
+        throw "SplitFused route accounting does not match selected route population"
+    }
+    if ($splitFusedMissScratchBytesAvoided -le 0 -or
+        $splitFusedSumReadBytesAvoided -le 0) {
+        throw "SplitFused was requested but avoided byte counters were not positive"
     }
 }
 if ($runtimeTelemetry.contamination_abort_observed) {
