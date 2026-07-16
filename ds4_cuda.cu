@@ -16294,7 +16294,13 @@ struct cuda_moe_tiering {
     int compose_prefill_mass_tiering;
     uint32_t policy_clock_calls;
     uint32_t policy_replacement_budget;
+    uint32_t policy_replacement_budget_base;
     uint32_t policy_budget_remaining;
+    int policy_adaptive_budget;
+    uint32_t policy_adaptive_budget_min;
+    uint32_t policy_adaptive_budget_max;
+    uint32_t policy_adaptive_budget_step;
+    uint32_t policy_adaptive_pressure_threshold;
     uint32_t policy_min_frequency;
     uint32_t snapshot_backing_entries;
     uint64_t policy_epoch;
@@ -16323,6 +16329,14 @@ struct cuda_moe_tiering {
     uint64_t policy_min_frequency_skips;
     uint64_t policy_budget_skips;
     uint64_t policy_score_skips;
+    uint64_t policy_adaptive_last_budget_skips;
+    uint64_t policy_adaptive_last_replacements;
+    uint64_t policy_adaptive_last_budget_skips_delta;
+    uint64_t policy_adaptive_last_replacements_delta;
+    uint64_t policy_adaptive_budget_ups;
+    uint64_t policy_adaptive_budget_downs;
+    uint64_t policy_adaptive_pressure_epochs;
+    uint64_t policy_adaptive_quiet_epochs;
     uint64_t snapshot_backing_hits;
     uint64_t snapshot_backing_misses;
     uint64_t snapshot_to_vram_bytes;
@@ -16537,6 +16551,21 @@ static int cuda_moe_tiering_u32_env(
     return 1;
 }
 
+static int cuda_moe_tiering_adaptive_budget_requested(int *value) {
+    const char *env = getenv("DS4_EXPERT_TIER_ADAPTIVE_BUDGET");
+    if (!value) return 0;
+    *value = 0;
+    if (!env || !env[0] || strcmp(env, "0") == 0) return 1;
+    if (strcmp(env, "1") == 0) {
+        *value = 1;
+        return 1;
+    }
+    fprintf(stderr,
+            "ds4: invalid DS4_EXPERT_TIER_ADAPTIVE_BUDGET=%s; adaptive budget disabled\n",
+            env);
+    return 0;
+}
+
 static int cuda_moe_tiering_double_env(
         const char *name, double fallback,
         double min_value, double max_value, double *value) {
@@ -16605,7 +16634,7 @@ static void cuda_moe_tiering_report_and_reset(void) {
         }
         if (g_moe_tiering.compose_prefill_mass_tiering) {
             fprintf(stderr,
-                "ds4: [expert-tiering] final mode=%s policy=%s compose_prefill_mass_tiering=%u snapshot_generation=%llu snapshot_backing_entries=%u snapshot_backing_hits=%llu snapshot_backing_misses=%llu snapshot_to_vram_bytes=%llu forbidden_cold_ssd_to_vram=%llu clock_calls=%u replacement_budget=%u min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
+                "ds4: [expert-tiering] final mode=%s policy=%s compose_prefill_mass_tiering=%u snapshot_generation=%llu snapshot_backing_entries=%u snapshot_backing_hits=%llu snapshot_backing_misses=%llu snapshot_to_vram_bytes=%llu forbidden_cold_ssd_to_vram=%llu clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
                 cuda_moe_tiering_mode_name(g_moe_tiering.mode),
                 cuda_moe_tiering_policy_name(g_moe_tiering.policy),
                 g_moe_tiering.compose_prefill_mass_tiering ? 1u : 0u,
@@ -16617,6 +16646,19 @@ static void cuda_moe_tiering_report_and_reset(void) {
                 (unsigned long long)g_moe_tiering.forbidden_cold_ssd_to_vram,
                 g_moe_tiering.policy_clock_calls,
                 g_moe_tiering.policy_replacement_budget,
+                g_moe_tiering.policy_replacement_budget_base,
+                g_moe_tiering.policy_adaptive_budget ? 1u : 0u,
+                g_moe_tiering.policy_replacement_budget,
+                g_moe_tiering.policy_adaptive_budget_min,
+                g_moe_tiering.policy_adaptive_budget_max,
+                g_moe_tiering.policy_adaptive_budget_step,
+                g_moe_tiering.policy_adaptive_pressure_threshold,
+                (unsigned long long)g_moe_tiering.policy_adaptive_budget_ups,
+                (unsigned long long)g_moe_tiering.policy_adaptive_budget_downs,
+                (unsigned long long)g_moe_tiering.policy_adaptive_pressure_epochs,
+                (unsigned long long)g_moe_tiering.policy_adaptive_quiet_epochs,
+                (unsigned long long)g_moe_tiering.policy_adaptive_last_budget_skips_delta,
+                (unsigned long long)g_moe_tiering.policy_adaptive_last_replacements_delta,
                 g_moe_tiering.policy_min_frequency,
                 g_moe_tiering.policy_hysteresis,
                 (unsigned long long)g_moe_tiering.calls,
@@ -16648,11 +16690,24 @@ static void cuda_moe_tiering_report_and_reset(void) {
                 mass_sum, lfru_top);
         } else {
             fprintf(stderr,
-                "ds4: [expert-tiering] final mode=%s policy=%s clock_calls=%u replacement_budget=%u min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
+                "ds4: [expert-tiering] final mode=%s policy=%s clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
                 cuda_moe_tiering_mode_name(g_moe_tiering.mode),
                 cuda_moe_tiering_policy_name(g_moe_tiering.policy),
                 g_moe_tiering.policy_clock_calls,
                 g_moe_tiering.policy_replacement_budget,
+                g_moe_tiering.policy_replacement_budget_base,
+                g_moe_tiering.policy_adaptive_budget ? 1u : 0u,
+                g_moe_tiering.policy_replacement_budget,
+                g_moe_tiering.policy_adaptive_budget_min,
+                g_moe_tiering.policy_adaptive_budget_max,
+                g_moe_tiering.policy_adaptive_budget_step,
+                g_moe_tiering.policy_adaptive_pressure_threshold,
+                (unsigned long long)g_moe_tiering.policy_adaptive_budget_ups,
+                (unsigned long long)g_moe_tiering.policy_adaptive_budget_downs,
+                (unsigned long long)g_moe_tiering.policy_adaptive_pressure_epochs,
+                (unsigned long long)g_moe_tiering.policy_adaptive_quiet_epochs,
+                (unsigned long long)g_moe_tiering.policy_adaptive_last_budget_skips_delta,
+                (unsigned long long)g_moe_tiering.policy_adaptive_last_replacements_delta,
                 g_moe_tiering.policy_min_frequency,
                 g_moe_tiering.policy_hysteresis,
                 (unsigned long long)g_moe_tiering.calls,
@@ -16708,6 +16763,11 @@ static int cuda_moe_tiering_prepare(void) {
     const int policy_requested = cuda_moe_tiering_policy_requested();
     uint32_t clock_calls = 430u;
     uint32_t replacement_budget = 16u;
+    int adaptive_budget = 0;
+    uint32_t adaptive_budget_min = 16u;
+    uint32_t adaptive_budget_max = 32u;
+    uint32_t adaptive_budget_step = 8u;
+    uint32_t adaptive_pressure_threshold = 64u;
     uint32_t min_frequency = 3u;
     double hysteresis = 1.25;
     if (policy_requested < 0 ||
@@ -16725,16 +16785,59 @@ static int cuda_moe_tiering_prepare(void) {
             &hysteresis)) {
         return 0;
     }
+    if (!cuda_moe_tiering_adaptive_budget_requested(&adaptive_budget)) {
+        adaptive_budget = 0;
+    }
+    if (adaptive_budget) {
+        int adaptive_config_ok = 1;
+        adaptive_config_ok = adaptive_config_ok &&
+            cuda_moe_tiering_u32_env(
+                "DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MIN", 16u, 1u, 512u,
+                &adaptive_budget_min);
+        adaptive_config_ok = adaptive_config_ok &&
+            cuda_moe_tiering_u32_env(
+                "DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MAX", 32u, 1u, 512u,
+                &adaptive_budget_max);
+        adaptive_config_ok = adaptive_config_ok &&
+            cuda_moe_tiering_u32_env(
+                "DS4_EXPERT_TIER_ADAPTIVE_BUDGET_STEP", 8u, 1u, 512u,
+                &adaptive_budget_step);
+        adaptive_config_ok = adaptive_config_ok &&
+            cuda_moe_tiering_u32_env(
+                "DS4_EXPERT_TIER_ADAPTIVE_PRESSURE_THRESHOLD", 64u, 1u,
+                1000000u, &adaptive_pressure_threshold);
+        if (!adaptive_config_ok ||
+            adaptive_budget_min > adaptive_budget_max ||
+            adaptive_budget_step >
+                adaptive_budget_max - adaptive_budget_min + 1u ||
+            replacement_budget < adaptive_budget_min ||
+            replacement_budget > adaptive_budget_max) {
+            fprintf(stderr,
+                    "ds4: invalid adaptive expert tier budget config; adaptive budget disabled\n");
+            adaptive_budget = 0;
+            adaptive_budget_min = 16u;
+            adaptive_budget_max = 32u;
+            adaptive_budget_step = 8u;
+            adaptive_pressure_threshold = 64u;
+        }
+    }
     if (policy_requested == CUDA_MOE_TIER_POLICY_SECOND_TOUCH) {
         clock_calls = 0u;
         replacement_budget = 0u;
+        adaptive_budget = 0;
         min_frequency = 2u;
         hysteresis = 1.0;
     }
     if (g_moe_tiering.mode == (cuda_moe_tier_mode)requested &&
         g_moe_tiering.policy == (cuda_moe_tier_policy)policy_requested &&
         g_moe_tiering.policy_clock_calls == clock_calls &&
-        g_moe_tiering.policy_replacement_budget == replacement_budget &&
+        g_moe_tiering.policy_replacement_budget_base == replacement_budget &&
+        g_moe_tiering.policy_adaptive_budget == adaptive_budget &&
+        g_moe_tiering.policy_adaptive_budget_min == adaptive_budget_min &&
+        g_moe_tiering.policy_adaptive_budget_max == adaptive_budget_max &&
+        g_moe_tiering.policy_adaptive_budget_step == adaptive_budget_step &&
+        g_moe_tiering.policy_adaptive_pressure_threshold ==
+            adaptive_pressure_threshold &&
         g_moe_tiering.policy_min_frequency == min_frequency &&
         g_moe_tiering.policy_hysteresis == hysteresis &&
         g_moe_tiering.compose_prefill_mass_tiering == compose_requested &&
@@ -16798,6 +16901,13 @@ static int cuda_moe_tiering_prepare(void) {
     g_moe_tiering.compose_prefill_mass_tiering = compose_requested;
     g_moe_tiering.policy_clock_calls = clock_calls;
     g_moe_tiering.policy_replacement_budget = replacement_budget;
+    g_moe_tiering.policy_replacement_budget_base = replacement_budget;
+    g_moe_tiering.policy_adaptive_budget = adaptive_budget;
+    g_moe_tiering.policy_adaptive_budget_min = adaptive_budget_min;
+    g_moe_tiering.policy_adaptive_budget_max = adaptive_budget_max;
+    g_moe_tiering.policy_adaptive_budget_step = adaptive_budget_step;
+    g_moe_tiering.policy_adaptive_pressure_threshold =
+        adaptive_pressure_threshold;
     g_moe_tiering.policy_min_frequency = min_frequency;
     g_moe_tiering.policy_hysteresis = hysteresis;
     g_moe_tiering.policy_epoch = UINT64_MAX;
@@ -16833,7 +16943,7 @@ static int cuda_moe_tiering_prepare(void) {
     if (g_moe_tiering.mode == CUDA_MOE_TIER_ENFORCE) {
         g_dynamic_arena.tiering_exclusive = 1;
     }
-    fprintf(stderr, "ds4: expert tiering active mode=%s policy=%s compose_prefill_mass_tiering=%u snapshot_generation=%llu snapshot_backing_entries=%u clock_calls=%u replacement_budget=%u min_frequency=%u hysteresis=%.9g entries=%u ram_slots=%u\n",
+    fprintf(stderr, "ds4: expert tiering active mode=%s policy=%s compose_prefill_mass_tiering=%u snapshot_generation=%llu snapshot_backing_entries=%u clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g entries=%u ram_slots=%u\n",
             cuda_moe_tiering_mode_name(g_moe_tiering.mode),
             cuda_moe_tiering_policy_name(g_moe_tiering.policy),
             g_moe_tiering.compose_prefill_mass_tiering ? 1u : 0u,
@@ -16841,6 +16951,19 @@ static int cuda_moe_tiering_prepare(void) {
             g_moe_tiering.snapshot_backing_entries,
             g_moe_tiering.policy_clock_calls,
             g_moe_tiering.policy_replacement_budget,
+            g_moe_tiering.policy_replacement_budget_base,
+            g_moe_tiering.policy_adaptive_budget ? 1u : 0u,
+            g_moe_tiering.policy_replacement_budget,
+            g_moe_tiering.policy_adaptive_budget_min,
+            g_moe_tiering.policy_adaptive_budget_max,
+            g_moe_tiering.policy_adaptive_budget_step,
+            g_moe_tiering.policy_adaptive_pressure_threshold,
+            (unsigned long long)g_moe_tiering.policy_adaptive_budget_ups,
+            (unsigned long long)g_moe_tiering.policy_adaptive_budget_downs,
+            (unsigned long long)g_moe_tiering.policy_adaptive_pressure_epochs,
+            (unsigned long long)g_moe_tiering.policy_adaptive_quiet_epochs,
+            (unsigned long long)g_moe_tiering.policy_adaptive_last_budget_skips_delta,
+            (unsigned long long)g_moe_tiering.policy_adaptive_last_replacements_delta,
             g_moe_tiering.policy_min_frequency,
             g_moe_tiering.policy_hysteresis,
             (uint32_t)g_moe_tiering.entries.size(),
@@ -17962,6 +18085,70 @@ static int cuda_moe_tiering_pick_vram_slot(
     const uint64_t epoch = g_moe_tiering.call_tick /
         (uint64_t)g_moe_tiering.policy_clock_calls;
     if (epoch != g_moe_tiering.policy_epoch) {
+        const int completed_epoch =
+            g_moe_tiering.policy_epoch != UINT64_MAX;
+        if (g_moe_tiering.policy_adaptive_budget && completed_epoch) {
+            const uint64_t budget_skips_delta =
+                g_moe_tiering.policy_budget_skips >=
+                    g_moe_tiering.policy_adaptive_last_budget_skips ?
+                g_moe_tiering.policy_budget_skips -
+                    g_moe_tiering.policy_adaptive_last_budget_skips : 0ull;
+            const uint64_t replacements_delta =
+                g_moe_tiering.policy_replacements >=
+                    g_moe_tiering.policy_adaptive_last_replacements ?
+                g_moe_tiering.policy_replacements -
+                    g_moe_tiering.policy_adaptive_last_replacements : 0ull;
+            g_moe_tiering.policy_adaptive_last_budget_skips =
+                g_moe_tiering.policy_budget_skips;
+            g_moe_tiering.policy_adaptive_last_replacements =
+                g_moe_tiering.policy_replacements;
+            g_moe_tiering.policy_adaptive_last_budget_skips_delta =
+                budget_skips_delta;
+            g_moe_tiering.policy_adaptive_last_replacements_delta =
+                replacements_delta;
+            if (budget_skips_delta >=
+                    (uint64_t)g_moe_tiering.policy_adaptive_pressure_threshold &&
+                replacements_delta >=
+                    (uint64_t)g_moe_tiering.policy_replacement_budget) {
+                g_moe_tiering.policy_adaptive_pressure_epochs++;
+                g_moe_tiering.policy_adaptive_quiet_epochs = 0ull;
+                if (g_moe_tiering.policy_replacement_budget <
+                        g_moe_tiering.policy_adaptive_budget_max) {
+                    uint32_t next_budget =
+                        g_moe_tiering.policy_replacement_budget +
+                        g_moe_tiering.policy_adaptive_budget_step;
+                    if (next_budget <
+                            g_moe_tiering.policy_replacement_budget ||
+                        next_budget >
+                            g_moe_tiering.policy_adaptive_budget_max) {
+                        next_budget =
+                            g_moe_tiering.policy_adaptive_budget_max;
+                    }
+                    if (next_budget !=
+                            g_moe_tiering.policy_replacement_budget) {
+                        g_moe_tiering.policy_replacement_budget = next_budget;
+                        g_moe_tiering.policy_adaptive_budget_ups++;
+                    }
+                }
+            } else if (budget_skips_delta == 0ull) {
+                g_moe_tiering.policy_adaptive_quiet_epochs++;
+                if (g_moe_tiering.policy_adaptive_quiet_epochs >= 2ull &&
+                    g_moe_tiering.policy_replacement_budget >
+                        g_moe_tiering.policy_adaptive_budget_min) {
+                    const uint32_t step =
+                        g_moe_tiering.policy_adaptive_budget_step;
+                    g_moe_tiering.policy_replacement_budget =
+                        g_moe_tiering.policy_replacement_budget >
+                            g_moe_tiering.policy_adaptive_budget_min + step ?
+                        g_moe_tiering.policy_replacement_budget - step :
+                        g_moe_tiering.policy_adaptive_budget_min;
+                    g_moe_tiering.policy_adaptive_budget_downs++;
+                    g_moe_tiering.policy_adaptive_quiet_epochs = 0ull;
+                }
+            } else {
+                g_moe_tiering.policy_adaptive_quiet_epochs = 0ull;
+            }
+        }
         g_moe_tiering.policy_epoch = epoch;
         g_moe_tiering.policy_budget_remaining =
             g_moe_tiering.policy_replacement_budget;

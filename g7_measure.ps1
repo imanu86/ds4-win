@@ -61,6 +61,11 @@ param(
     [ValidateSet("second-touch", "mass-lfru")][string]$ExpertTierPolicy = "second-touch",
     [ValidateRange(1, 1000000)][int]$ExpertTierClockCalls = 430,
     [ValidateRange(1, 512)][int]$ExpertTierReplacementBudget = 16,
+    [switch]$ExpertTierAdaptiveBudget,
+    [ValidateRange(1, 512)][int]$ExpertTierAdaptiveMin = 16,
+    [ValidateRange(1, 512)][int]$ExpertTierAdaptiveMax = 32,
+    [ValidateRange(1, 512)][int]$ExpertTierAdaptiveStep = 8,
+    [ValidateRange(1, 1000000)][int]$ExpertTierAdaptivePressureThreshold = 64,
     [ValidateRange(2, 1000000)][int]$ExpertTierMinFrequency = 3,
     [ValidateRange(1.0, 100.0)][double]$ExpertTierHysteresis = 1.25,
     [switch]$DirectCacheHits,
@@ -555,6 +560,11 @@ if ($ExpertTiering -eq "off") {
     Remove-Item Env:\DS4_EXPERT_TIER_POLICY -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_EXPERT_TIER_CLOCK_CALLS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_EXPERT_TIER_REPLACEMENT_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MIN -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MAX -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET_STEP -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_PRESSURE_THRESHOLD -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_EXPERT_TIER_MIN_FREQUENCY -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_EXPERT_TIER_HYSTERESIS -ErrorAction SilentlyContinue
 } else {
@@ -562,6 +572,19 @@ if ($ExpertTiering -eq "off") {
     $env:DS4_EXPERT_TIER_POLICY = $ExpertTierPolicy
     $env:DS4_EXPERT_TIER_CLOCK_CALLS = "$ExpertTierClockCalls"
     $env:DS4_EXPERT_TIER_REPLACEMENT_BUDGET = "$ExpertTierReplacementBudget"
+    if ($ExpertTierAdaptiveBudget) {
+        $env:DS4_EXPERT_TIER_ADAPTIVE_BUDGET = "1"
+        $env:DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MIN = "$ExpertTierAdaptiveMin"
+        $env:DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MAX = "$ExpertTierAdaptiveMax"
+        $env:DS4_EXPERT_TIER_ADAPTIVE_BUDGET_STEP = "$ExpertTierAdaptiveStep"
+        $env:DS4_EXPERT_TIER_ADAPTIVE_PRESSURE_THRESHOLD = "$ExpertTierAdaptivePressureThreshold"
+    } else {
+        Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET -ErrorAction SilentlyContinue
+        Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MIN -ErrorAction SilentlyContinue
+        Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET_MAX -ErrorAction SilentlyContinue
+        Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_BUDGET_STEP -ErrorAction SilentlyContinue
+        Remove-Item Env:\DS4_EXPERT_TIER_ADAPTIVE_PRESSURE_THRESHOLD -ErrorAction SilentlyContinue
+    }
     $env:DS4_EXPERT_TIER_MIN_FREQUENCY = "$ExpertTierMinFrequency"
     $env:DS4_EXPERT_TIER_HYSTERESIS = $ExpertTierHysteresis.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
 }
@@ -696,6 +719,19 @@ if ($ExpertTiering -ne "off") {
     if ($ReapMaskFile) { throw "ExpertTiering must be isolated from ReapMaskFile" }
     if ($OverlapShared -or $OverlapSharedFull) { throw "ExpertTiering must be isolated from overlap" }
     if ($ExpertTiering -eq "enforce" -and $DynamicArenaGiB -le 0.0) { throw "ExpertTiering enforce requires DynamicArenaGiB > 0" }
+    if ($ExpertTierAdaptiveBudget) {
+        if ($ExpertTierPolicy -ne "mass-lfru") { throw "ExpertTierAdaptiveBudget requires ExpertTierPolicy mass-lfru" }
+        if ($ExpertTierAdaptiveMin -gt $ExpertTierAdaptiveMax) { throw "ExpertTierAdaptiveMin must be <= ExpertTierAdaptiveMax" }
+        if ($ExpertTierReplacementBudget -lt $ExpertTierAdaptiveMin -or
+            $ExpertTierReplacementBudget -gt $ExpertTierAdaptiveMax) {
+            throw "ExpertTierReplacementBudget must be within adaptive min/max"
+        }
+        if ($ExpertTierAdaptiveStep -gt ($ExpertTierAdaptiveMax - $ExpertTierAdaptiveMin + 1)) {
+            throw "ExpertTierAdaptiveStep must fit within adaptive min/max"
+        }
+    }
+} elseif ($ExpertTierAdaptiveBudget) {
+    throw "ExpertTierAdaptiveBudget requires ExpertTiering"
 }
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
 if ($DynamicArenaMinAvailableGiB -gt 0.0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaMinAvailableGiB requires DynamicArenaGiB > 0" }
@@ -1260,7 +1296,14 @@ $cacheAdmissions = 0; $cacheEvictions = 0; $cacheDirect = 0
 $expertTieringFinalObserved = $false; $expertTieringFinalLineCount = 0; $expertTieringControlLineCount = 0
 $expertTieringModeObserved = ""; $expertTieringCalls = 0; $expertTieringSelected = 0
 $expertTieringPolicyObserved = ""; $expertTieringClockCalls = 0; $expertTieringReplacementBudget = 0
+$expertTieringReplacementBudgetBase = 0
 $expertTieringMinFrequency = 0; $expertTieringHysteresis = 0.0
+$expertTieringAdaptiveEnabled = $false; $expertTieringAdaptiveCurrent = 0
+$expertTieringAdaptiveMin = 0; $expertTieringAdaptiveMax = 0
+$expertTieringAdaptiveStep = 0; $expertTieringAdaptivePressureThreshold = 0
+$expertTieringAdaptiveUps = 0; $expertTieringAdaptiveDowns = 0
+$expertTieringAdaptivePressureEpochs = 0; $expertTieringAdaptiveQuietEpochs = 0
+$expertTieringAdaptiveLastSkipDelta = 0; $expertTieringAdaptiveLastReplacementDelta = 0
 $expertTieringCold = 0; $expertTieringRamHits = 0; $expertTieringVramHits = 0
 $expertTieringColdToRam = 0; $expertTieringColdToVram = 0; $expertTieringRamToWarm = 0
 $expertTieringVramPromotions = 0; $expertTieringVramDemotions = 0; $expertTieringRamEvictions = 0
@@ -1686,7 +1729,90 @@ if (Test-Path $stderrLog) {
         $numberPattern = "([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
         $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
         $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
-        if ($expertTieringFinalLine -match $expertTieringComposeFinalPattern) {
+        if ($expertTieringFinalLine -match " adaptive_budget=") {
+            $expertTieringFields = @{}
+            foreach ($fieldMatch in [regex]::Matches($expertTieringFinalLine, " ([a-z_]+)=([^ ]+)")) {
+                $expertTieringFields[$fieldMatch.Groups[1].Value] = $fieldMatch.Groups[2].Value
+            }
+            $requiredExpertTieringFields = @(
+                "mode", "policy", "clock_calls", "replacement_budget",
+                "replacement_budget_base", "adaptive_budget", "adaptive_current_budget", "adaptive_min",
+                "adaptive_max", "adaptive_step", "adaptive_pressure_threshold",
+                "adaptive_ups", "adaptive_downs", "adaptive_pressure_epochs",
+                "adaptive_quiet_epochs", "adaptive_last_budget_skips_delta",
+                "adaptive_last_replacements_delta", "min_frequency", "hysteresis",
+                "calls", "selected", "cold", "ram_hits", "vram_hits",
+                "cold_to_ram", "cold_to_vram", "ram_to_warm", "vram_promotions",
+                "vram_demotions", "ram_evictions", "ram_admit_skips",
+                "transient", "failures", "ssd_bytes", "ram_h2d_bytes",
+                "policy_epochs", "policy_free_promotions", "policy_replacements",
+                "policy_min_frequency_skips", "policy_budget_skips",
+                "policy_score_skips", "states_ssd", "states_probation",
+                "states_warm", "states_vram", "mass_sum", "lfru_top"
+            )
+            foreach ($requiredExpertTieringField in $requiredExpertTieringFields) {
+                if (-not $expertTieringFields.ContainsKey($requiredExpertTieringField)) {
+                    throw "Expert tiering measurement failed: adaptive final line missing $requiredExpertTieringField"
+                }
+            }
+            if ($expertTieringFields.ContainsKey("compose_prefill_mass_tiering")) {
+                foreach ($requiredExpertTieringField in @(
+                    "snapshot_generation", "snapshot_backing_entries",
+                    "snapshot_backing_hits", "snapshot_backing_misses",
+                    "snapshot_to_vram_bytes", "forbidden_cold_ssd_to_vram"
+                )) {
+                    if (-not $expertTieringFields.ContainsKey($requiredExpertTieringField)) {
+                        throw "Expert tiering measurement failed: adaptive compose final line missing $requiredExpertTieringField"
+                    }
+                }
+                $expertTieringComposeObserved = $true
+                $expertTieringComposeFlag = [uint32]$expertTieringFields["compose_prefill_mass_tiering"]
+                $expertTieringSnapshotGeneration = [uint64]$expertTieringFields["snapshot_generation"]
+                $expertTieringSnapshotBackingEntries = [uint32]$expertTieringFields["snapshot_backing_entries"]
+                $expertTieringSnapshotBackingHits = [uint64]$expertTieringFields["snapshot_backing_hits"]
+                $expertTieringSnapshotBackingMisses = [uint64]$expertTieringFields["snapshot_backing_misses"]
+                $expertTieringSnapshotToVramBytes = [uint64]$expertTieringFields["snapshot_to_vram_bytes"]
+                $expertTieringForbiddenColdSsdToVram = [uint64]$expertTieringFields["forbidden_cold_ssd_to_vram"]
+            }
+            $expertTieringFinalObserved = $true
+            $expertTieringModeObserved = $expertTieringFields["mode"]
+            $expertTieringPolicyObserved = $expertTieringFields["policy"]
+            $expertTieringClockCalls = [uint32]$expertTieringFields["clock_calls"]
+            $expertTieringReplacementBudget = [uint32]$expertTieringFields["replacement_budget"]
+            $expertTieringReplacementBudgetBase = [uint32]$expertTieringFields["replacement_budget_base"]
+            $expertTieringAdaptiveEnabled = ([uint32]$expertTieringFields["adaptive_budget"] -ne 0)
+            $expertTieringAdaptiveCurrent = [uint32]$expertTieringFields["adaptive_current_budget"]
+            $expertTieringAdaptiveMin = [uint32]$expertTieringFields["adaptive_min"]
+            $expertTieringAdaptiveMax = [uint32]$expertTieringFields["adaptive_max"]
+            $expertTieringAdaptiveStep = [uint32]$expertTieringFields["adaptive_step"]
+            $expertTieringAdaptivePressureThreshold = [uint32]$expertTieringFields["adaptive_pressure_threshold"]
+            $expertTieringAdaptiveUps = [uint64]$expertTieringFields["adaptive_ups"]
+            $expertTieringAdaptiveDowns = [uint64]$expertTieringFields["adaptive_downs"]
+            $expertTieringAdaptivePressureEpochs = [uint64]$expertTieringFields["adaptive_pressure_epochs"]
+            $expertTieringAdaptiveQuietEpochs = [uint64]$expertTieringFields["adaptive_quiet_epochs"]
+            $expertTieringAdaptiveLastSkipDelta = [uint64]$expertTieringFields["adaptive_last_budget_skips_delta"]
+            $expertTieringAdaptiveLastReplacementDelta = [uint64]$expertTieringFields["adaptive_last_replacements_delta"]
+            $expertTieringMinFrequency = [uint32]$expertTieringFields["min_frequency"]
+            $expertTieringHysteresis = [double]::Parse($expertTieringFields["hysteresis"], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringCalls = [uint64]$expertTieringFields["calls"]; $expertTieringSelected = [uint64]$expertTieringFields["selected"]
+            $expertTieringCold = [uint64]$expertTieringFields["cold"]; $expertTieringRamHits = [uint64]$expertTieringFields["ram_hits"]
+            $expertTieringVramHits = [uint64]$expertTieringFields["vram_hits"]; $expertTieringColdToRam = [uint64]$expertTieringFields["cold_to_ram"]
+            $expertTieringColdToVram = [uint64]$expertTieringFields["cold_to_vram"]; $expertTieringRamToWarm = [uint64]$expertTieringFields["ram_to_warm"]
+            $expertTieringVramPromotions = [uint64]$expertTieringFields["vram_promotions"]; $expertTieringVramDemotions = [uint64]$expertTieringFields["vram_demotions"]
+            $expertTieringRamEvictions = [uint64]$expertTieringFields["ram_evictions"]; $expertTieringRamAdmitSkips = [uint64]$expertTieringFields["ram_admit_skips"]
+            $expertTieringTransient = [uint64]$expertTieringFields["transient"]; $expertTieringFailures = [uint64]$expertTieringFields["failures"]
+            $expertTieringSsdBytes = [uint64]$expertTieringFields["ssd_bytes"]; $expertTieringRamH2DBytes = [uint64]$expertTieringFields["ram_h2d_bytes"]
+            $expertTieringPolicyEpochs = [uint64]$expertTieringFields["policy_epochs"]
+            $expertTieringPolicyFreePromotions = [uint64]$expertTieringFields["policy_free_promotions"]
+            $expertTieringPolicyReplacements = [uint64]$expertTieringFields["policy_replacements"]
+            $expertTieringPolicyMinFrequencySkips = [uint64]$expertTieringFields["policy_min_frequency_skips"]
+            $expertTieringPolicyBudgetSkips = [uint64]$expertTieringFields["policy_budget_skips"]
+            $expertTieringPolicyScoreSkips = [uint64]$expertTieringFields["policy_score_skips"]
+            $expertTieringStatesSsd = [uint32]$expertTieringFields["states_ssd"]; $expertTieringStatesProbation = [uint32]$expertTieringFields["states_probation"]
+            $expertTieringStatesWarm = [uint32]$expertTieringFields["states_warm"]; $expertTieringStatesVram = [uint32]$expertTieringFields["states_vram"]
+            $expertTieringMassSum = [double]::Parse($expertTieringFields["mass_sum"], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringLfruTop = [double]::Parse($expertTieringFields["lfru_top"], [Globalization.CultureInfo]::InvariantCulture)
+        } elseif ($expertTieringFinalLine -match $expertTieringComposeFinalPattern) {
             $expertTieringFinalObserved = $true
             $expertTieringComposeObserved = $true
             $expertTieringModeObserved = $Matches[1]
@@ -2369,10 +2495,26 @@ if ($ExpertTiering -eq "off") {
     if ($expertTieringPolicyObserved -ne $ExpertTierPolicy) { throw "Expert tiering measurement failed: observed policy mismatch" }
     if ($ExpertTierPolicy -eq "mass-lfru") {
         if ($expertTieringClockCalls -ne $ExpertTierClockCalls -or
-            $expertTieringReplacementBudget -ne $ExpertTierReplacementBudget -or
             $expertTieringMinFrequency -ne $ExpertTierMinFrequency -or
             [math]::Abs($expertTieringHysteresis - $ExpertTierHysteresis) -gt 1.0e-9) {
             throw "Expert tiering measurement failed: mass-lfru policy parameters mismatch"
+        }
+        if ($ExpertTierAdaptiveBudget) {
+            if (-not $expertTieringAdaptiveEnabled -or
+                $expertTieringReplacementBudgetBase -ne $ExpertTierReplacementBudget -or
+                $expertTieringReplacementBudget -ne $expertTieringAdaptiveCurrent -or
+                $expertTieringAdaptiveCurrent -lt $ExpertTierAdaptiveMin -or
+                $expertTieringAdaptiveCurrent -gt $ExpertTierAdaptiveMax -or
+                $expertTieringAdaptiveMin -ne $ExpertTierAdaptiveMin -or
+                $expertTieringAdaptiveMax -ne $ExpertTierAdaptiveMax -or
+                $expertTieringAdaptiveStep -ne $ExpertTierAdaptiveStep -or
+                $expertTieringAdaptivePressureThreshold -ne $ExpertTierAdaptivePressureThreshold) {
+                throw "Expert tiering measurement failed: adaptive observed config differs from requested"
+            }
+        } elseif ($expertTieringAdaptiveEnabled -or
+                  $expertTieringReplacementBudget -ne $ExpertTierReplacementBudget -or
+                  $expertTieringReplacementBudgetBase -ne $ExpertTierReplacementBudget) {
+            throw "Expert tiering measurement failed: fixed replacement budget mismatch"
         }
     } elseif ($expertTieringClockCalls -ne 0 -or
               $expertTieringReplacementBudget -ne 0 -or
@@ -2407,9 +2549,16 @@ if ($ExpertTiering -eq "off") {
             throw "Expert tiering measurement failed: policy replacement accounting mismatch"
         }
         if ($ExpertTierPolicy -eq "mass-lfru" -and
+            -not $ExpertTierAdaptiveBudget -and
             $expertTieringPolicyReplacements -gt
                 ($expertTieringPolicyEpochs * $ExpertTierReplacementBudget)) {
             throw "Expert tiering measurement failed: mass-lfru replacement budget exceeded"
+        }
+        if ($ExpertTierPolicy -eq "mass-lfru" -and
+            $ExpertTierAdaptiveBudget -and
+            $expertTieringPolicyReplacements -gt
+                ($expertTieringPolicyEpochs * $ExpertTierAdaptiveMax)) {
+            throw "Expert tiering measurement failed: adaptive mass-lfru replacement budget exceeded"
         }
     }
     if ($expertTieringStatesVram -gt $ExpertCacheN) {
@@ -2970,6 +3119,24 @@ $expertTieringResult = [pscustomobject]@{
     policy = $expertTieringPolicyObserved
     clock_calls = $expertTieringClockCalls
     replacement_budget = $expertTieringReplacementBudget
+    replacement_budget_base = $expertTieringReplacementBudgetBase
+    adaptive_requested = [bool]$ExpertTierAdaptiveBudget
+    adaptive_enabled = $expertTieringAdaptiveEnabled
+    adaptive_current = $expertTieringAdaptiveCurrent
+    adaptive_min_requested = $ExpertTierAdaptiveMin
+    adaptive_min = $expertTieringAdaptiveMin
+    adaptive_max_requested = $ExpertTierAdaptiveMax
+    adaptive_max = $expertTieringAdaptiveMax
+    adaptive_step_requested = $ExpertTierAdaptiveStep
+    adaptive_step = $expertTieringAdaptiveStep
+    adaptive_pressure_threshold_requested = $ExpertTierAdaptivePressureThreshold
+    adaptive_pressure_threshold = $expertTieringAdaptivePressureThreshold
+    adaptive_ups = $expertTieringAdaptiveUps
+    adaptive_downs = $expertTieringAdaptiveDowns
+    adaptive_pressure_epochs = $expertTieringAdaptivePressureEpochs
+    adaptive_quiet_epochs = $expertTieringAdaptiveQuietEpochs
+    adaptive_last_skip_delta = $expertTieringAdaptiveLastSkipDelta
+    adaptive_last_replacement_delta = $expertTieringAdaptiveLastReplacementDelta
     min_frequency = $expertTieringMinFrequency
     hysteresis = $expertTieringHysteresis
     calls = $expertTieringCalls
@@ -3443,6 +3610,23 @@ $summary = [pscustomobject]@{
     expert_tier_policy_requested = $ExpertTierPolicy
     expert_tier_clock_calls_requested = $ExpertTierClockCalls
     expert_tier_replacement_budget_requested = $ExpertTierReplacementBudget
+    expert_tier_adaptive_budget_requested = [bool]$ExpertTierAdaptiveBudget
+    expert_tier_adaptive_min_requested = $ExpertTierAdaptiveMin
+    expert_tier_adaptive_max_requested = $ExpertTierAdaptiveMax
+    expert_tier_adaptive_step_requested = $ExpertTierAdaptiveStep
+    expert_tier_adaptive_pressure_threshold_requested = $ExpertTierAdaptivePressureThreshold
+    expert_tier_adaptive_enabled = $expertTieringAdaptiveEnabled
+    expert_tier_adaptive_current = $expertTieringAdaptiveCurrent
+    expert_tier_adaptive_min = $expertTieringAdaptiveMin
+    expert_tier_adaptive_max = $expertTieringAdaptiveMax
+    expert_tier_adaptive_step = $expertTieringAdaptiveStep
+    expert_tier_adaptive_pressure_threshold = $expertTieringAdaptivePressureThreshold
+    expert_tier_adaptive_ups = $expertTieringAdaptiveUps
+    expert_tier_adaptive_downs = $expertTieringAdaptiveDowns
+    expert_tier_adaptive_pressure_epochs = $expertTieringAdaptivePressureEpochs
+    expert_tier_adaptive_quiet_epochs = $expertTieringAdaptiveQuietEpochs
+    expert_tier_adaptive_last_skip_delta = $expertTieringAdaptiveLastSkipDelta
+    expert_tier_adaptive_last_replacement_delta = $expertTieringAdaptiveLastReplacementDelta
     expert_tier_min_frequency_requested = $ExpertTierMinFrequency
     expert_tier_hysteresis_requested = $ExpertTierHysteresis
     expert_tiering = $expertTieringResult
@@ -3656,6 +3840,7 @@ Write-Host ("moe_io_fallbacks: " + $overlappedIoFallbacks)
 Write-Host ("expert_cache req/cap/count: " + $ExpertCacheN + " / " + $cacheCapacity + " / " + $cacheCount)
 Write-Host ("expert_cache hits/misses/evictions/direct: " + $cacheHits + " / " + $cacheMisses + " / " + $cacheEvictions + " / " + $cacheDirect)
 Write-Host ("expert_tiering requested/observed/calls/selected/failures/states vram/mass/lfru: " + $ExpertTiering + " / " + $expertTieringModeObserved + " / " + $expertTieringCalls + " / " + $expertTieringSelected + " / " + $expertTieringFailures + " / " + $expertTieringStatesVram + " / " + $expertTieringMassSum + " / " + $expertTieringLfruTop)
+Write-Host ("expert_tiering adaptive req/enabled/current/min/max/step/threshold ups/downs pressure/quiet last skip/repl: " + [bool]$ExpertTierAdaptiveBudget + " / " + $expertTieringAdaptiveEnabled + " / " + $expertTieringAdaptiveCurrent + " / " + $expertTieringAdaptiveMin + " / " + $expertTieringAdaptiveMax + " / " + $expertTieringAdaptiveStep + " / " + $expertTieringAdaptivePressureThreshold + " / " + $expertTieringAdaptiveUps + " / " + $expertTieringAdaptiveDowns + " / " + $expertTieringAdaptivePressureEpochs + " / " + $expertTieringAdaptiveQuietEpochs + " / " + $expertTieringAdaptiveLastSkipDelta + " / " + $expertTieringAdaptiveLastReplacementDelta)
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
 Write-Host ("gpu resident routes requested/no-sync/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms/queries/default-sync/no-sync-calls: " + [bool]$GpuResidentRoutes + " / " + [bool]$RouteNoDefaultSync + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs + " / " + $gpuRoutesQueries + " / " + $gpuRoutesDefaultSyncCalls + " / " + $gpuRoutesNoDefaultSyncCalls)
