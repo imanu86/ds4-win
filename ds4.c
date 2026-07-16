@@ -11527,7 +11527,11 @@ static bool metal_graph_encode_decode_layer(
     const bool overlap_shared_full_requested =
         overlap_shared_full_env && overlap_shared_full_env[0] &&
         strcmp(overlap_shared_full_env, "0") != 0;
-    const bool overlap_shared = ok && ds4_gpu_routed_moe_prepare_selected(
+    /* Mixed IQ1 routing builds a physical five-route primary work list in
+     * the CUDA wrapper. Preparing all six routes here would fetch the cold
+     * primary expert before that split and erase the transport saving. */
+    const bool overlap_shared = ok && !iq1_mixed_cold_one &&
+        ds4_gpu_routed_moe_prepare_selected(
         route.model->map, route.model->size,
         route.gate->abs_offset,
         route.up->abs_offset,
