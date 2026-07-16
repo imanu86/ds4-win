@@ -72,6 +72,7 @@ param(
     [switch]$MixedDirectCache,
     [switch]$GpuResidentRoutes,
     [switch]$RouteNoDefaultSync,
+    [switch]$RoutePackedCopy,
     [switch]$SplitHitMiss,
     [switch]$SplitFused,
     [switch]$RouteProfile,
@@ -229,6 +230,9 @@ if ($SplitFused -and -not $GpuResidentRoutes) {
 }
 if ($RouteNoDefaultSync -and -not $GpuResidentRoutes) {
     throw "RouteNoDefaultSync requires -GpuResidentRoutes"
+}
+if ($RoutePackedCopy -and -not $GpuResidentRoutes) {
+    throw "RoutePackedCopy requires -GpuResidentRoutes"
 }
 if ($RouteNoDefaultSync -and $SplitHitMiss) {
     throw "RouteNoDefaultSync must be isolated from SplitHitMiss"
@@ -626,6 +630,11 @@ if ($RouteNoDefaultSync) {
     $env:DS4_CUDA_MOE_ROUTE_NO_DEFAULT_SYNC = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_MOE_ROUTE_NO_DEFAULT_SYNC -ErrorAction SilentlyContinue
+}
+if ($RoutePackedCopy) {
+    $env:DS4_CUDA_MOE_ROUTE_PACKED_COPY = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_MOE_ROUTE_PACKED_COPY -ErrorAction SilentlyContinue
 }
 if ($RequestPhaseTrace) {
     $env:DS4_REQUEST_PHASE_TRACE = "1"
@@ -1341,6 +1350,9 @@ $gpuRoutesObserved = $false; $gpuRoutesCalls = 0; $gpuRoutesSplitCalls = 0; $gpu
 $gpuRoutesWorkerJobs = 0; $gpuRoutesMissExperts = 0; $gpuRoutesErrors = 0
 $gpuRoutesWorkerMs = 0.0; $gpuRoutesResolveMs = 0.0; $gpuRoutesWaitMs = 0.0
 $gpuRoutesQueries = 0; $gpuRoutesDefaultSyncCalls = 0; $gpuRoutesNoDefaultSyncCalls = 0
+$gpuRoutesPackedCopyRequested = 0; $gpuRoutesPackedCopyExperts = 0
+$gpuRoutesPackedCopySubmissions = 0; $gpuRoutesPackedCopyBytes = 0
+$gpuRoutesLegacyCopySubmissions = 0
 $splitFusedObserved = $false; $splitFusedCalls = 0; $splitFusedHits = 0
 $splitFusedMisses = 0; $splitFusedMissScratchBytesAvoided = 0
 $splitFusedSumReadBytesAvoided = 0
@@ -1971,6 +1983,22 @@ if (Test-Path $stderrLog) {
         $gpuRoutesCacheEvictions = [long]$Matches[6]
         $gpuRoutesCacheDirectLoads = [long]$Matches[7]
     }
+    foreach ($packedCopyField in @(
+        "packed_copy_requested",
+        "packed_copy_experts",
+        "packed_copy_submissions",
+        "packed_copy_bytes",
+        "legacy_copy_submissions")) {
+        if ($gpuRoutesLine -and $gpuRoutesLine -match ($packedCopyField + "=(\d+)")) {
+            switch ($packedCopyField) {
+                "packed_copy_requested" { $gpuRoutesPackedCopyRequested = [long]$Matches[1] }
+                "packed_copy_experts" { $gpuRoutesPackedCopyExperts = [long]$Matches[1] }
+                "packed_copy_submissions" { $gpuRoutesPackedCopySubmissions = [long]$Matches[1] }
+                "packed_copy_bytes" { $gpuRoutesPackedCopyBytes = [long]$Matches[1] }
+                "legacy_copy_submissions" { $gpuRoutesLegacyCopySubmissions = [long]$Matches[1] }
+            }
+        }
+    }
     foreach ($splitFusedField in @(
         "split_fused_calls",
         "split_fused_hits",
@@ -2471,6 +2499,21 @@ if ($SplitFused) {
         $splitFusedSumReadBytesAvoided -le 0) {
         throw "SplitFused was requested but avoided byte counters were not positive"
     }
+}
+if ($RoutePackedCopy) {
+    if (-not $gpuRoutesObserved -or
+        $gpuRoutesPackedCopyRequested -ne 1 -or
+        $gpuRoutesPackedCopyExperts -le 0 -or
+        $gpuRoutesPackedCopySubmissions -ne $gpuRoutesPackedCopyExperts -or
+        $gpuRoutesPackedCopyBytes -le 0 -or
+        $gpuRoutesLegacyCopySubmissions -ne 0) {
+        throw "RoutePackedCopy was requested but packed route copy accounting did not prove exclusive packed copies"
+    }
+} elseif ($gpuRoutesPackedCopyRequested -ne 0 -or
+    $gpuRoutesPackedCopyExperts -ne 0 -or
+    $gpuRoutesPackedCopySubmissions -ne 0 -or
+    $gpuRoutesPackedCopyBytes -ne 0) {
+    throw "RoutePackedCopy activated while not requested"
 }
 if ($runtimeTelemetry.contamination_abort_observed) {
     throw "Runtime telemetry aborted a contaminated measurement (low RAM plus deep disk queue)"
@@ -3691,6 +3734,13 @@ $summary = [pscustomobject]@{
     route_profile_publish_ms_per_call = $routeProfilePublishMs
     gpu_resident_routes_requested = [bool]$GpuResidentRoutes
     route_no_default_sync_requested = [bool]$RouteNoDefaultSync
+    route_packed_copy_requested = [bool]$RoutePackedCopy
+    route_packed_copy_observed = ($gpuRoutesPackedCopyRequested -eq 1)
+    route_packed_copy_runtime_requested = $gpuRoutesPackedCopyRequested
+    route_packed_copy_experts = $gpuRoutesPackedCopyExperts
+    route_packed_copy_submissions = $gpuRoutesPackedCopySubmissions
+    route_packed_copy_bytes = $gpuRoutesPackedCopyBytes
+    route_packed_copy_legacy_submissions = $gpuRoutesLegacyCopySubmissions
     split_hit_miss_requested = [bool]$SplitHitMiss
     split_fused_requested = [bool]$SplitFused
     split_fused_observed = $splitFusedObserved
@@ -3895,7 +3945,8 @@ Write-Host ("expert_tiering requested/observed/calls/selected/failures/states vr
 Write-Host ("expert_tiering adaptive req/enabled/current/min/max/step/threshold ups/downs pressure/quiet last skip/repl: " + [bool]$ExpertTierAdaptiveBudget + " / " + $expertTieringAdaptiveEnabled + " / " + $expertTieringAdaptiveCurrent + " / " + $expertTieringAdaptiveMin + " / " + $expertTieringAdaptiveMax + " / " + $expertTieringAdaptiveStep + " / " + $expertTieringAdaptivePressureThreshold + " / " + $expertTieringAdaptiveUps + " / " + $expertTieringAdaptiveDowns + " / " + $expertTieringAdaptivePressureEpochs + " / " + $expertTieringAdaptiveQuietEpochs + " / " + $expertTieringAdaptiveLastSkipDelta + " / " + $expertTieringAdaptiveLastReplacementDelta)
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
-Write-Host ("gpu resident routes requested/no-sync/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms/queries/default-sync/no-sync-calls: " + [bool]$GpuResidentRoutes + " / " + [bool]$RouteNoDefaultSync + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs + " / " + $gpuRoutesQueries + " / " + $gpuRoutesDefaultSyncCalls + " / " + $gpuRoutesNoDefaultSyncCalls)
+Write-Host ("gpu resident routes requested/no-sync/packed/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms/queries/default-sync/no-sync-calls: " + [bool]$GpuResidentRoutes + " / " + [bool]$RouteNoDefaultSync + " / " + [bool]$RoutePackedCopy + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs + " / " + $gpuRoutesQueries + " / " + $gpuRoutesDefaultSyncCalls + " / " + $gpuRoutesNoDefaultSyncCalls)
+Write-Host ("route packed copy requested/observed/runtime-requested/experts/submissions/bytes/legacy-submissions: " + [bool]$RoutePackedCopy + " / " + ($gpuRoutesPackedCopyRequested -eq 1) + " / " + $gpuRoutesPackedCopyRequested + " / " + $gpuRoutesPackedCopyExperts + " / " + $gpuRoutesPackedCopySubmissions + " / " + $gpuRoutesPackedCopyBytes + " / " + $gpuRoutesLegacyCopySubmissions)
 Write-Host ("split fused requested/observed/calls/hits/misses/miss-scratch-avoided/sum-read-avoided: " + [bool]$SplitFused + " / " + $splitFusedObserved + " / " + $splitFusedCalls + " / " + $splitFusedHits + " / " + $splitFusedMisses + " / " + $splitFusedMissScratchBytesAvoided + " / " + $splitFusedSumReadBytesAvoided)
 Write-Host ("gpu resident route cache count/calls/hits/misses/admissions/evictions/direct: " + $gpuRoutesCacheCount + " / " + $gpuRoutesCacheCalls + " / " + $gpuRoutesCacheHits + " / " + $gpuRoutesCacheMisses + " / " + $gpuRoutesCacheAdmissions + " / " + $gpuRoutesCacheEvictions + " / " + $gpuRoutesCacheDirectLoads)
 Write-Host ("request phase trace requested/observed/lines prefill/wrap/copy/post-wrap/sync-tail/decode-gap/sample/eval/decode-first/prompt-first sec: " + [bool]$RequestPhaseTrace + " / " + $requestPhaseObserved + " / " + $requestPhaseLineCount + " / " + $requestPhasePrefillComputeSeconds + " / " + $requestPhaseWrapSeconds + " / " + $requestPhaseWrapCopySeconds + " / " + $requestPhasePostWrapSeconds + " / " + $requestPhaseSyncTailSeconds + " / " + $requestPhaseDecodeGapSeconds + " / " + $requestPhaseFirstSampleSeconds + " / " + $requestPhaseFirstEvalSeconds + " / " + $requestPhaseDecodeToFirstSeconds + " / " + $requestPhasePromptToFirstSeconds)
