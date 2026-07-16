@@ -2,7 +2,8 @@
 param(
     [switch]$StaticCheckOnly,
     [switch]$SkipBuild,
-    [switch]$Resume
+    [switch]$Resume,
+    [ValidateRange(1.0, 8.0)][double]$Iq1CacheGiB = 4.0
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,10 +26,14 @@ $maxTokens = 2048
 $context = 4096
 $warmupMaxTokens = 64
 $timeoutSec = 7200
+$cacheLabel = $Iq1CacheGiB.ToString(
+    "0.###", [Globalization.CultureInfo]::InvariantCulture).Replace(".", "p")
+$cacheArgument = $Iq1CacheGiB.ToString(
+    "0.###", [Globalization.CultureInfo]::InvariantCulture)
 $controlTag = "g95_control_main_iq2_quality_n3"
-$candidateTag = "g95_candidate_iq1_mixed_gpu_plan_quality_n3"
-$summaryPath = Join-Path $outdir "g95_iq1_mixed_quality_ab_result.json"
-$gradingPath = Join-Path $outdir "g95_iq1_mixed_quality_ab_grading.json"
+$candidateTag = "g95_candidate_iq1_cache${cacheLabel}_mixed_gpu_plan_quality_n3"
+$summaryPath = Join-Path $outdir "g95_iq1_cache${cacheLabel}_mixed_quality_ab_result.json"
+$gradingPath = Join-Path $outdir "g95_iq1_cache${cacheLabel}_mixed_quality_ab_grading.json"
 
 function Get-G95ResultPath([string]$Tag) {
     Join-Path $outdir ("g7_" + $Tag + "_result.json")
@@ -166,7 +171,7 @@ function Invoke-G95Arm {
                 "-Iq1SLayerLast", "42",
                 "-Iq1SMixedColdOne",
                 "-Iq1SMixedGpuPlan",
-                "-Iq1SRamCacheGiB", "8"
+                "-Iq1SRamCacheGiB", $cacheArgument
             )
         }
         Write-Host ("[g95] start arm=" + $Arm + " tag=" + $Tag)
@@ -277,7 +282,7 @@ function Assert-G95ArmResult {
             [UInt64]$Result.iq1_s_sidecar_route_calls -ne [UInt64]$Result.iq1_s_sidecar_selected_loads -or
             [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_FIRST -ne 3 -or
             [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_LAST -ne 42 -or
-            [double]$Result.iq1_s_ram_cache_requested_gib -ne 8.0 -or
+            [double]$Result.iq1_s_ram_cache_requested_gib -ne $Iq1CacheGiB -or
             -not [bool]$Result.iq1_s_ram_cache_runtime_observed -or
             [UInt64]$Result.iq1_s_ram_cache_failures -ne 0 -or
             -not [bool]$Result.iq1_s_mixed_cold_one -or
@@ -520,6 +525,7 @@ $summary = [ordered]@{
         route_no_default_sync = $true
         split_fused = $true
         reap_prefetch_threads = 8
+        iq1_s_ram_cache_gib = $Iq1CacheGiB
         system_quiescence_required = $true
     }
     arms = @(
@@ -544,7 +550,7 @@ $summary = [ordered]@{
             output_sha256 = @($candidate.result.results | ForEach-Object { $_.content_sha256 })
             iq1_s_layer_first = 3
             iq1_s_layer_last = 42
-            iq1_s_ram_cache_gib = 8
+            iq1_s_ram_cache_gib = $Iq1CacheGiB
             mixed_ratio = "5:1 hot-main-to-cold-IQ1"
             mixed_calls = [UInt64]$candidate.result.iq1_s_mixed_calls
             planner_calls = [UInt64]$candidate.result.iq1_s_mixed_gpu_plan_calls
