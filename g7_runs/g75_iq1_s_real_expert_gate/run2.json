@@ -1,0 +1,11 @@
+﻿{
+  "benchmark": "ds4_iq1_s_bench",
+  "weight_source": "real_gguf_range",
+  "provenance": {"repo":"ggml-org/llama.cpp","commit":"b15ca938ad00aa6b3ee6c2edda7363fd02826b18","files":["ggml/src/ggml-common.h","ggml/src/ggml-cuda/vecdotq.cuh"]},
+  "device": {"index":0,"name":"NVIDIA GeForce RTX 3060","sm":86},
+  "ds4_geometry": {"n_embd":4096,"n_ff_exp":2048,"n_expert":256,"current_bytes_per_3x256":216,"iq1_s_bytes_per_3x256":150,
+    "current_expert_bytes":7077888,"iq1_s_expert_bytes":4915200,"current_gate_or_up_expert_bytes":2162688,"current_down_expert_bytes":2752512,"iq1_s_gate_or_up_expert_bytes":1638400,"iq1_s_down_expert_bytes":1638400},
+  "validation": {"checked_blocks":256,"dot_q8_1_max_abs":1.1920929e-07,"dot_q8_K_max_abs":6.55651093e-07,"dot_q8_K_packed_cpu_max_abs":6.55651093e-07,"dot_q8_K_worst_block":68,"dot_q8_K_worst_gpu":0.937664866,"dot_q8_K_worst_ref":0.937664211,"dot_tol_abs":1e-4,"dequant_max_abs":0,"dequant_tol_abs":1e-6,"pass":true},
+  "measurements": {"iters":200,"iq1_blocks":98304,"h2d_pinned_current_ms":0.270879,"h2d_pinned_iq1_s_ms":0.188881,"dot_q8_1_kernel_ms":0.746329,"dot_q8_K_kernel_ms":0.685204,"dequant_kernel_ms":0.721109,
+    "h2d_current_gib_s":24.334865,"h2d_iq1_s_gib_s":24.235584,"dot_q8_1_blocks_per_s":131716769.559,"dot_q8_K_blocks_per_s":143466761.087,"dequant_values_per_s":34898756939.505}
+}

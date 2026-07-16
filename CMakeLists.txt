@@ -63,6 +63,14 @@ target_link_libraries(ds4_moe_gate_bench PRIVATE
     CUDA::cudart
     CUDA::cublas
 )
+
+add_executable(ds4_iq1_s_bench ds4_iq1_s_bench.cu)
+target_compile_features(ds4_iq1_s_bench PRIVATE cxx_std_17)
+target_link_libraries(ds4_iq1_s_bench PRIVATE CUDA::cudart)
+set_target_properties(ds4_iq1_s_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
+)
 if(WIN32)
     target_link_libraries(ds4_server PRIVATE ws2_32 bcrypt)
 endif()
@@ -74,6 +82,7 @@ if(MSVC)
     target_compile_options(ds4_server PRIVATE /W3)
     target_compile_options(ds4_moe_gate_bench PRIVATE /W3)
     target_compile_options(ds4_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>)
+    target_compile_options(ds4_iq1_s_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>)
 endif()
 
 if(NOT WIN32)

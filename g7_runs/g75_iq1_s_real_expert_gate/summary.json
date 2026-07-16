@@ -1,0 +1,30 @@
+﻿{
+    "benchmark":  "g75_iq1_s_real_expert_gate",
+    "source_model":  "persadian/DeepSeek-V4-Flash-IQ1_S-XL",
+    "source_revision":  "7e641d4869031039314f0ae48c79a4f2a7862230",
+    "source_file_sha256":  "b049d1eb34c068f19ab007b33c22a7d758b578bf2b10d9276e79654f85d35047",
+    "sampled_tensor":  "blk.3 routed expert 0 gate+up+down",
+    "sampled_bytes":  4915200,
+    "sampled_sha256":  "0F5B7B4505E4E3B83517D4881463DDD5414F1F21F30BFD3F440981BB70E8F2C0",
+    "n":  3,
+    "validation_pass":  true,
+    "dot_q8_K_max_abs":  6.55651093E-07,
+    "h2d_current_ms":  [
+                           0.270886,
+                           0.270879,
+                           0.270865
+                       ],
+    "h2d_iq1_s_ms":  [
+                         0.188786,
+                         0.188881,
+                         0.188796
+                     ],
+    "dot_q8_K_ms":  [
+                        0.695035,
+                        0.685204,
+                        0.687396
+                    ],
+    "h2d_current_mean_ms":  0.27087666666666671,
+    "h2d_iq1_s_mean_ms":  0.188821,
+    "dot_q8_K_mean_ms":  0.68921166666666667
+}
