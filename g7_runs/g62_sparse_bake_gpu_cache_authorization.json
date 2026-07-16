@@ -1,6 +1,6 @@
 ﻿{
     "schema":  "g62_sparse_bake_gpu_cache_authorization_v1",
-    "created_utc":  "2026-07-16T07:05:20.2480030Z",
+    "created_utc":  "2026-07-16T07:08:39.3697920Z",
     "purpose":  "verify K60 payload/hash/manifest/embedded-mask once before GPU cache candidate runs",
     "prompt":  "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
     "max_tokens":  64,
@@ -23,7 +23,7 @@
     "bakes":  [
                   {
                       "bake_id":  "K60",
-                      "authorized_utc":  "2026-07-16T07:05:20.2318800Z",
+                      "authorized_utc":  "2026-07-16T07:08:39.3617375Z",
                       "model_path":  "C:\\ds4-models\\ds4-2bit-k60-mass-full-decode.gguf",
                       "model_sha256_not_verified":  true,
                       "expected_pack_sha256":  "3b464ee43514c8caa841be61da70190a4a7ba3c760c22849d2d723e5da5b7d71",
@@ -34,7 +34,7 @@
                       "expected_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                       "observed_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                       "payload_verify_method":  "python-hashlib-extents",
-                      "payload_verify_elapsed_seconds":  70.105689100004383,
+                      "payload_verify_elapsed_seconds":  55.505823200001032,
                       "payload_verify_extent_count":  7155,
                       "payload_verifier_path":  "C:\\Users\\imanu\\source\\repos\\reap-loop\\scripts\\ds4_windows_sparse_bake.py",
                       "payload_verifier_sha256":  "cf9cf279fe2a41eb7b924ae0c90ad383ca5a9271368c9fa2ad4205dc2f44a38a",
