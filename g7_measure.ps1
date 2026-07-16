@@ -103,6 +103,7 @@ param(
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [switch]$Iq1SMixedColdOne,
+    [switch]$Iq1SMixedGpuPlan,
     [ValidateRange(0.0, 48.0)][double]$Iq1SRamCacheGiB = 0.0,
     [switch]$Iq1SMixedDebug,
     [switch]$Iq1SProfile,
@@ -316,6 +317,9 @@ if ($ReuseVerifiedIq1SReceipt -and -not $Iq1SExpertSidecar) {
 if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar) {
     throw "Iq1SMixedColdOne requires Iq1SExpertSidecar"
 }
+if ($Iq1SMixedGpuPlan -and -not $Iq1SMixedColdOne) {
+    throw "Iq1SMixedGpuPlan requires Iq1SMixedColdOne"
+}
 if ($Iq1SRamCacheGiB -gt 0.0 -and -not $Iq1SExpertSidecar) {
     throw "Iq1SRamCacheGiB requires Iq1SExpertSidecar"
 }
@@ -461,6 +465,11 @@ if ($Iq1SMixedColdOne) {
     $env:DS4_IQ1_S_MIXED_COLD_K = "1"
 } else {
     Remove-Item Env:\DS4_IQ1_S_MIXED_COLD_K -ErrorAction SilentlyContinue
+}
+if ($Iq1SMixedGpuPlan) {
+    $env:DS4_IQ1_MIXED_GPU_PLAN = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_MIXED_GPU_PLAN -ErrorAction SilentlyContinue
 }
 if ($Iq1SRamCacheGiB -gt 0.0) {
     $env:DS4_IQ1_S_RAM_CACHE_GB = $Iq1SRamCacheGiB.ToString(
@@ -2945,9 +2954,19 @@ $iq1MixedLastLayer = [UInt32]::MaxValue
 $iq1MixedLastSlot = [UInt32]::MaxValue
 $iq1MixedLastExpert = -1
 $iq1MixedRuntimeObserved = $false
+$iq1MixedGpuPlanRuntimeObserved = $false
+$iq1MixedGpuPlanCalls = [UInt64]0
+$iq1MixedGpuPlanWaitMs = 0.0
+$iq1MixedGpuPlanFailures = [UInt64]0
 $iq1MixedSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
     '\[iq1-mixed\] result=summary calls=(\d+) hot_main=(\d+) cold_iq1=(\d+) primary_cold_avoided=(\d+) joins=(\d+) failures=(\d+) last_layer=(\d+) last_slot=(\d+) last_expert=(-?\d+)')
+$iq1MixedGpuPlanReadyMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-mixed-gpu-plan\] result=ready mode=cold-one-upload-overlap')
+$iq1MixedGpuPlanSummaryMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-mixed-gpu-plan\] result=summary calls=(\d+) wait_ms=([0-9.]+) failures=(\d+)')
 if ($Iq1SMixedColdOne) {
     if ($iq1MixedSummaryMatches.Count -ne 1) {
         throw "IQ1_S mixed decode requires exactly one runtime summary; observed $($iq1MixedSummaryMatches.Count)"
@@ -2975,6 +2994,24 @@ if ($Iq1SMixedColdOne) {
     $iq1MixedRuntimeObserved = $true
 } elseif ($iq1MixedSummaryMatches.Count -ne 0) {
     throw "IQ1_S mixed decode summary appeared while mixed mode was disabled"
+}
+if ($Iq1SMixedGpuPlan) {
+    if ($iq1MixedGpuPlanReadyMatches.Count -ne 1 -or
+        $iq1MixedGpuPlanSummaryMatches.Count -ne 1) {
+        throw "IQ1_S mixed GPU plan requires exactly one ready marker and one summary; observed ready=$($iq1MixedGpuPlanReadyMatches.Count) summary=$($iq1MixedGpuPlanSummaryMatches.Count)"
+    }
+    $iq1MixedGpuPlanSummary = $iq1MixedGpuPlanSummaryMatches[0]
+    $iq1MixedGpuPlanCalls = [UInt64]$iq1MixedGpuPlanSummary.Groups[1].Value
+    $iq1MixedGpuPlanWaitMs = [double]::Parse($iq1MixedGpuPlanSummary.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1MixedGpuPlanFailures = [UInt64]$iq1MixedGpuPlanSummary.Groups[3].Value
+    if ($iq1MixedGpuPlanCalls -ne $iq1MixedCalls -or
+        $iq1MixedGpuPlanFailures -ne 0) {
+        throw "IQ1_S mixed GPU plan runtime counters are inconsistent"
+    }
+    $iq1MixedGpuPlanRuntimeObserved = $true
+} elseif ($iq1MixedGpuPlanReadyMatches.Count -ne 0 -or
+          $iq1MixedGpuPlanSummaryMatches.Count -ne 0) {
+    throw "IQ1_S mixed GPU plan telemetry appeared while GPU plan was disabled"
 }
 
 $iq1ProfileSsdReadCalls = [UInt64]0
@@ -4009,6 +4046,11 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_mixed_last_layer = $iq1MixedLastLayer
     iq1_s_mixed_last_slot = $iq1MixedLastSlot
     iq1_s_mixed_last_expert = $iq1MixedLastExpert
+    iq1_s_mixed_gpu_plan_requested = [bool]$Iq1SMixedGpuPlan
+    iq1_s_mixed_gpu_plan_runtime_observed = $iq1MixedGpuPlanRuntimeObserved
+    iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls
+    iq1_s_mixed_gpu_plan_wait_ms = $iq1MixedGpuPlanWaitMs
+    iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
     iq1_s_profile_requested = [bool]$Iq1SProfile
     iq1_s_no_main_sync_requested = [bool]$Iq1SNoMainSync
     iq1_s_packed_h2d_requested = [bool]$Iq1SPackedH2D
@@ -4132,6 +4174,11 @@ $summary = [pscustomobject]@{
     iq1_s_mixed_last_layer = $iq1MixedLastLayer
     iq1_s_mixed_last_slot = $iq1MixedLastSlot
     iq1_s_mixed_last_expert = $iq1MixedLastExpert
+    iq1_s_mixed_gpu_plan_requested = [bool]$Iq1SMixedGpuPlan
+    iq1_s_mixed_gpu_plan_runtime_observed = $iq1MixedGpuPlanRuntimeObserved
+    iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls
+    iq1_s_mixed_gpu_plan_wait_ms = $iq1MixedGpuPlanWaitMs
+    iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
     iq1_s_profile_requested = [bool]$Iq1SProfile
     iq1_s_no_main_sync_requested = [bool]$Iq1SNoMainSync
     iq1_s_packed_h2d_requested = [bool]$Iq1SPackedH2D
@@ -4805,6 +4852,7 @@ Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math
 Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SVramCachePerLayer + " / " + $iq1SVramCacheRuntimeObserved + " / " + $iq1SVramCacheCapacity + " / " + $iq1SVramCacheCount + " / " + $iq1SVramCacheHits + " / " + $iq1SVramCacheMisses + " / " + $iq1SVramCacheEvictions + " / " + $iq1SVramCacheFailures)
 Write-Host ("IQ1_S VRAM cache hit-rate/H2D GiB: " + $(if (($iq1SVramCacheHits + $iq1SVramCacheMisses) -gt 0) { [math]::Round([double]$iq1SVramCacheHits / [double]($iq1SVramCacheHits + $iq1SVramCacheMisses), 4) } else { 0 }) + " / " + [math]::Round($iq1SVramCacheH2dBytes / 1GB, 3))
 Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures: " + $iq1MixedCalls + " / " + $iq1MixedHotMain + " / " + $iq1MixedColdIq1 + " / " + $iq1MixedPrimaryColdAvoided + " / " + $iq1MixedJoins + " / " + $iq1MixedFailures)
+Write-Host ("IQ1_S mixed GPU plan requested/observed/calls/wait-ms/failures: " + [bool]$Iq1SMixedGpuPlan + " / " + $iq1MixedGpuPlanRuntimeObserved + " / " + $iq1MixedGpuPlanCalls + " / " + $iq1MixedGpuPlanWaitMs + " / " + $iq1MixedGpuPlanFailures)
 Write-Host ("IQ1_S profile/no-main-sync/packed-H2D: " + [bool]$Iq1SProfile + " / " + [bool]$Iq1SNoMainSync + " / " + [bool]$Iq1SPackedH2D)
 Write-Host ("IQ1_S profile SSD reads/ms H2D batches/copies/enqueue-ms/syncs/sync-ms: " + $iq1ProfileSsdReadCalls + " / " + $iq1ProfileSsdReadMs + " / " + $iq1ProfileH2dBatches + " / " + $iq1ProfileH2dCopies + " / " + $iq1ProfileH2dEnqueueMs + " / " + $iq1ProfileH2dSyncs + " / " + $iq1ProfileH2dSyncMs)
 Write-Host ("IQ1_S mixed profile calls/router-D2H/meta-H2D/main-submit/main-sync/cold-submit/join ms: " + $iq1MixedProfileCalls + " / " + $iq1MixedProfileRouterD2hMs + " / " + $iq1MixedProfileMetadataH2dMs + " / " + $iq1MixedProfileMainSubmitMs + " / " + $iq1MixedProfileMainSyncMs + " / " + $iq1MixedProfileColdSubmitMs + " / " + $iq1MixedProfileJoinSubmitMs)
