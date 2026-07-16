@@ -3046,6 +3046,8 @@ struct cuda_dynamic_arena_part_copy_context {
     uint32_t load_count;
     const cuda_dynamic_arena_wrap_part *parts;
     uint32_t part_count;
+    uint32_t cursor_begin;
+    uint32_t cursor_end;
     std::atomic<uint32_t> next;
     uint64_t *checksums;
     uint8_t *success;
@@ -3079,11 +3081,13 @@ struct cuda_dynamic_arena_source_unlock_phase_stats {
     uint64_t parts;
     uint64_t ranges;
     uint64_t bytes_requested;
+    uint64_t max_wave_bytes;
     uint32_t calls;
     uint32_t true_count;
     uint32_t error_not_locked;
     uint32_t failed;
     uint32_t last_error;
+    uint32_t waves;
     double seconds;
     cuda_dynamic_arena_source_unlock_snapshot before;
     cuda_dynamic_arena_source_unlock_snapshot after;
@@ -3091,6 +3095,7 @@ struct cuda_dynamic_arena_source_unlock_phase_stats {
 
 struct cuda_dynamic_arena_source_unlock_summary {
     uint32_t phases;
+    uint32_t waves;
     uint32_t calls;
     uint32_t true_count;
     uint32_t error_not_locked;
@@ -3098,6 +3103,7 @@ struct cuda_dynamic_arena_source_unlock_summary {
     uint64_t parts;
     uint64_t ranges;
     uint64_t bytes_requested;
+    uint64_t max_wave_bytes;
     double seconds;
 };
 
@@ -3415,7 +3421,11 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
         for (;;) {
             const uint32_t cursor =
                 context->next.fetch_add(1, std::memory_order_relaxed);
-            if (cursor >= context->part_count) break;
+            if (cursor >= context->cursor_end) break;
+            if (cursor < context->cursor_begin ||
+                cursor >= context->part_count) {
+                continue;
+            }
             const cuda_dynamic_arena_wrap_part &part = context->parts[cursor];
             if (context->phase_part && part.part != context->phase_part) {
                 continue;
@@ -3461,7 +3471,11 @@ static void *cuda_dynamic_arena_part_copy_worker(void *arg) {
     for (;;) {
         const uint32_t cursor =
             context->next.fetch_add(1, std::memory_order_relaxed);
-        if (cursor >= context->part_count) break;
+        if (cursor >= context->cursor_end) break;
+        if (cursor < context->cursor_begin ||
+            cursor >= context->part_count) {
+            continue;
+        }
         const cuda_dynamic_arena_wrap_part &part = context->parts[cursor];
         if (context->phase_part && part.part != context->phase_part) {
             continue;
@@ -3583,11 +3597,16 @@ static int cuda_dynamic_arena_copy_phase_file_qd(
     }
 
     int ok = 1;
-    uint32_t cursor = 0;
-    while (cursor < context->part_count && ok) {
+    uint32_t cursor = context->cursor_begin;
+    while (cursor < context->cursor_end && ok) {
         uint32_t submitted = 0;
-        while (cursor < context->part_count && submitted < qd) {
+        while (cursor < context->cursor_end && submitted < qd) {
             const uint32_t part_cursor = cursor++;
+            if (part_cursor >= context->part_count) {
+                profile->failures++;
+                ok = 0;
+                break;
+            }
             const cuda_dynamic_arena_wrap_part &part =
                 context->parts[part_cursor];
             if (context->phase_part && part.part != context->phase_part) {
@@ -3927,52 +3946,138 @@ static int cuda_dynamic_arena_source_unlock_emit_phase(
         const cuda_dynamic_arena_source_unlock_phase_stats *stats) {
     if (!stats) return 0;
     const char *result = stats->failed ? "failed" : "ok";
-    fprintf(stderr,
-            "ds4: [arena-wrap-source-unlock] result=%s phase=%s parts=%llu ranges=%llu bytes_requested=%llu calls=%u true=%u error_not_locked=%u failed=%u seconds=%.6f available_before=%llu available_after=%llu working_set_before=%llu working_set_after=%llu page_fault_before=%llu page_fault_after=%llu read_transfer_before=%llu read_transfer_after=%llu last_error=%u\n",
-            result,
-            stats->phase ? stats->phase : "unknown",
-            (unsigned long long)stats->parts,
-            (unsigned long long)stats->ranges,
-            (unsigned long long)stats->bytes_requested,
-            stats->calls,
-            stats->true_count,
-            stats->error_not_locked,
-            stats->failed,
-            stats->seconds,
-            (unsigned long long)stats->before.available_bytes,
-            (unsigned long long)stats->after.available_bytes,
-            (unsigned long long)stats->before.working_set_bytes,
-            (unsigned long long)stats->after.working_set_bytes,
-            (unsigned long long)stats->before.page_fault_count,
-            (unsigned long long)stats->after.page_fault_count,
-            (unsigned long long)stats->before.read_transfer_bytes,
-            (unsigned long long)stats->after.read_transfer_bytes,
-            stats->last_error);
+    if (stats->waves) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-source-unlock] result=%s phase=%s waves=%u max_wave_bytes=%llu parts=%llu ranges=%llu bytes_requested=%llu calls=%u true=%u error_not_locked=%u failed=%u seconds=%.6f available_before=%llu available_after=%llu working_set_before=%llu working_set_after=%llu page_fault_before=%llu page_fault_after=%llu read_transfer_before=%llu read_transfer_after=%llu last_error=%u\n",
+                result,
+                stats->phase ? stats->phase : "unknown",
+                stats->waves,
+                (unsigned long long)stats->max_wave_bytes,
+                (unsigned long long)stats->parts,
+                (unsigned long long)stats->ranges,
+                (unsigned long long)stats->bytes_requested,
+                stats->calls,
+                stats->true_count,
+                stats->error_not_locked,
+                stats->failed,
+                stats->seconds,
+                (unsigned long long)stats->before.available_bytes,
+                (unsigned long long)stats->after.available_bytes,
+                (unsigned long long)stats->before.working_set_bytes,
+                (unsigned long long)stats->after.working_set_bytes,
+                (unsigned long long)stats->before.page_fault_count,
+                (unsigned long long)stats->after.page_fault_count,
+                (unsigned long long)stats->before.read_transfer_bytes,
+                (unsigned long long)stats->after.read_transfer_bytes,
+                stats->last_error);
+    } else {
+        fprintf(stderr,
+                "ds4: [arena-wrap-source-unlock] result=%s phase=%s parts=%llu ranges=%llu bytes_requested=%llu calls=%u true=%u error_not_locked=%u failed=%u seconds=%.6f available_before=%llu available_after=%llu working_set_before=%llu working_set_after=%llu page_fault_before=%llu page_fault_after=%llu read_transfer_before=%llu read_transfer_after=%llu last_error=%u\n",
+                result,
+                stats->phase ? stats->phase : "unknown",
+                (unsigned long long)stats->parts,
+                (unsigned long long)stats->ranges,
+                (unsigned long long)stats->bytes_requested,
+                stats->calls,
+                stats->true_count,
+                stats->error_not_locked,
+                stats->failed,
+                stats->seconds,
+                (unsigned long long)stats->before.available_bytes,
+                (unsigned long long)stats->after.available_bytes,
+                (unsigned long long)stats->before.working_set_bytes,
+                (unsigned long long)stats->after.working_set_bytes,
+                (unsigned long long)stats->before.page_fault_count,
+                (unsigned long long)stats->after.page_fault_count,
+                (unsigned long long)stats->before.read_transfer_bytes,
+                (unsigned long long)stats->after.read_transfer_bytes,
+                stats->last_error);
+    }
     return stats->failed == 0;
 }
 
-static int cuda_dynamic_arena_source_unlock_phase(
+static int cuda_dynamic_arena_source_unlock_aligned_range(
+        const cuda_dynamic_arena_wrap_part &part,
+        uint64_t page_size,
+        uint64_t *aligned_start,
+        uint64_t *aligned_end) {
+    if (!aligned_start || !aligned_end || page_size == 0 ||
+        (page_size & (page_size - 1u)) != 0 ||
+        part.bytes == 0 ||
+        part.source_offset > g_dynamic_arena.model_size ||
+        part.bytes > g_dynamic_arena.model_size - part.source_offset) {
+        return 0;
+    }
+    const uint64_t end = part.source_offset + part.bytes;
+    uint64_t range_start = part.source_offset & ~(page_size - 1u);
+    uint64_t range_end = end;
+    const uint64_t remainder = range_end & (page_size - 1u);
+    if (remainder) {
+        const uint64_t add = page_size - remainder;
+        if (range_end > UINT64_MAX - add) return 0;
+        range_end += add;
+    }
+    if (range_end > g_dynamic_arena.model_size) {
+        range_end = g_dynamic_arena.model_size;
+    }
+    if (range_end <= range_start) return 0;
+    *aligned_start = range_start;
+    *aligned_end = range_end;
+    return 1;
+}
+
+static uint64_t cuda_dynamic_arena_source_unlock_page_size(void) {
+#ifdef _WIN32
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    uint64_t page_size = (uint64_t)system_info.dwPageSize;
+    if (page_size == 0 || (page_size & (page_size - 1u)) != 0) {
+        page_size = 4096;
+    }
+    return page_size;
+#else
+    const long observed_page_size = sysconf(_SC_PAGESIZE);
+    uint64_t page_size = observed_page_size > 0 ?
+        (uint64_t)observed_page_size : 4096u;
+    if (page_size == 0 || (page_size & (page_size - 1u)) != 0) {
+        page_size = 4096;
+    }
+    return page_size;
+#endif
+}
+
+static int cuda_dynamic_arena_source_unlock_phase_range(
         const std::vector<cuda_dynamic_arena_wrap_part> &parts,
-        const std::vector<uint8_t> &part_success,
+        std::vector<uint8_t> &part_success,
         uint8_t phase_part,
-        cuda_dynamic_arena_source_unlock_phase_stats *stats) {
+        uint32_t cursor_begin,
+        uint32_t cursor_end,
+        cuda_dynamic_arena_source_unlock_phase_stats *stats,
+        int emit) {
     if (!stats) return 0;
-    memset(stats, 0, sizeof(*stats));
-    stats->phase = cuda_dynamic_arena_wrap_part_name(phase_part);
+    cuda_dynamic_arena_source_unlock_phase_stats local = {};
+    local.phase = cuda_dynamic_arena_wrap_part_name(phase_part);
 #ifndef _WIN32
-    stats->failed = 1;
-    stats->last_error = (uint32_t)ENOTSUP;
+    local.failed = 1;
+    local.last_error = (uint32_t)ENOTSUP;
     (void)parts;
     (void)part_success;
-    return cuda_dynamic_arena_source_unlock_emit_phase(stats);
+    (void)cursor_begin;
+    (void)cursor_end;
+    *stats = local;
+    return emit ? cuda_dynamic_arena_source_unlock_emit_phase(stats) : 0;
 #else
     if (!g_dynamic_arena.model_map ||
         parts.size() != part_success.size() ||
+        cursor_begin > cursor_end ||
+        cursor_end > parts.size() ||
         (phase_part != CUDA_DYNAMIC_ARENA_MIRROR_GATE &&
-         phase_part != CUDA_DYNAMIC_ARENA_MIRROR_UP)) {
-        stats->failed = 1;
-        stats->last_error = ERROR_INVALID_PARAMETER;
-        return cuda_dynamic_arena_source_unlock_emit_phase(stats);
+         phase_part != CUDA_DYNAMIC_ARENA_MIRROR_UP &&
+         phase_part != CUDA_DYNAMIC_ARENA_MIRROR_DOWN)) {
+        local.failed = 1;
+        local.last_error = ERROR_INVALID_PARAMETER;
+        *stats = local;
+        return emit ? cuda_dynamic_arena_source_unlock_emit_phase(stats) : 0;
     }
 
     SYSTEM_INFO system_info;
@@ -3987,37 +4092,20 @@ static int cuda_dynamic_arena_source_unlock_phase(
     };
     std::vector<range_t> ranges;
     try {
-        ranges.reserve(parts.size());
-        for (size_t i = 0; i < parts.size(); i++) {
+        ranges.reserve(cursor_end - cursor_begin);
+        for (size_t i = cursor_begin; i < cursor_end; i++) {
             const cuda_dynamic_arena_wrap_part &part = parts[i];
-            if (part.part != phase_part || !part_success[i]) continue;
-            if (part.bytes == 0 ||
-                part.source_offset > g_dynamic_arena.model_size ||
-                part.bytes > g_dynamic_arena.model_size - part.source_offset) {
+            if (part.part != phase_part || part_success[i] != 1u) continue;
+            uint64_t aligned_start = 0;
+            uint64_t aligned_end = 0;
+            if (!cuda_dynamic_arena_source_unlock_aligned_range(
+                    part, page_size, &aligned_start, &aligned_end)) {
                 continue;
             }
-            const uint64_t end = part.source_offset + part.bytes;
-            const uint64_t aligned_start =
-                part.source_offset & ~(page_size - 1u);
-            uint64_t aligned_end = end;
-            const uint64_t remainder = aligned_end & (page_size - 1u);
-            if (remainder) {
-                const uint64_t add = page_size - remainder;
-                if (aligned_end > UINT64_MAX - add) {
-                    stats->failed = 1;
-                    stats->last_error = ERROR_ARITHMETIC_OVERFLOW;
-                    break;
-                }
-                aligned_end += add;
-            }
-            if (aligned_end > g_dynamic_arena.model_size) {
-                aligned_end = g_dynamic_arena.model_size;
-            }
-            if (aligned_end <= aligned_start) continue;
             ranges.push_back({aligned_start, aligned_end});
-            stats->parts++;
+            local.parts++;
         }
-        if (!stats->failed) {
+        if (!local.failed) {
             std::sort(ranges.begin(), ranges.end(),
                 [](const range_t &a, const range_t &b) {
                     if (a.start != b.start) return a.start < b.start;
@@ -4034,44 +4122,84 @@ static int cuda_dynamic_arena_source_unlock_phase(
             ranges.resize(out);
         }
     } catch (...) {
-        stats->failed = 1;
-        stats->last_error = ERROR_OUTOFMEMORY;
+        local.failed = 1;
+        local.last_error = ERROR_OUTOFMEMORY;
     }
 
     const double started_at = cuda_wall_sec();
-    cuda_dynamic_arena_source_unlock_snapshot_read(&stats->before);
+    cuda_dynamic_arena_source_unlock_snapshot_read(&local.before);
     const uint8_t *base = (const uint8_t *)g_dynamic_arena.model_map;
-    if (!stats->failed) {
-        stats->ranges = (uint64_t)ranges.size();
+    if (!local.failed) {
+        local.ranges = (uint64_t)ranges.size();
         for (size_t i = 0; i < ranges.size(); i++) {
             const uint64_t len = ranges[i].end - ranges[i].start;
             if (len == 0 || len > (uint64_t)SIZE_MAX) {
-                stats->failed++;
-                stats->last_error = ERROR_INVALID_PARAMETER;
+                local.failed++;
+                local.last_error = ERROR_INVALID_PARAMETER;
                 continue;
             }
-            stats->bytes_requested += len;
-            stats->calls++;
+            local.bytes_requested += len;
+            local.calls++;
             SetLastError(ERROR_SUCCESS);
             const BOOL ok = VirtualUnlock(
                 (LPVOID)(base + ranges[i].start), (SIZE_T)len);
             if (ok) {
-                stats->true_count++;
+                local.true_count++;
             } else {
                 const DWORD error = GetLastError();
                 if (error == ERROR_NOT_LOCKED) {
-                    stats->error_not_locked++;
+                    local.error_not_locked++;
                 } else {
-                    stats->failed++;
-                    stats->last_error = (uint32_t)error;
+                    local.failed++;
+                    local.last_error = (uint32_t)error;
                 }
             }
         }
     }
-    cuda_dynamic_arena_source_unlock_snapshot_read(&stats->after);
-    stats->seconds = cuda_wall_sec() - started_at;
-    return cuda_dynamic_arena_source_unlock_emit_phase(stats);
+    if (!local.failed) {
+        for (size_t i = cursor_begin; i < cursor_end; i++) {
+            if (parts[i].part == phase_part && part_success[i] == 1u) {
+                part_success[i] = 2u;
+            }
+        }
+    }
+    cuda_dynamic_arena_source_unlock_snapshot_read(&local.after);
+    local.seconds = cuda_wall_sec() - started_at;
+    local.max_wave_bytes = local.bytes_requested;
+    *stats = local;
+    return emit ? cuda_dynamic_arena_source_unlock_emit_phase(stats) :
+        (stats->failed == 0);
 #endif
+}
+
+static int cuda_dynamic_arena_source_unlock_phase(
+        const std::vector<cuda_dynamic_arena_wrap_part> &parts,
+        std::vector<uint8_t> &part_success,
+        uint8_t phase_part,
+        cuda_dynamic_arena_source_unlock_phase_stats *stats) {
+    return cuda_dynamic_arena_source_unlock_phase_range(
+        parts, part_success, phase_part, 0u, (uint32_t)parts.size(),
+        stats, 1);
+}
+
+static double cuda_dynamic_arena_wrap_unlock_wave_gib(void) {
+    const char *value = getenv("DS4_CUDA_ARENA_WRAP_UNLOCK_WAVE_GIB");
+    if (!value || !value[0]) return 0.0;
+    char *end = NULL;
+    errno = 0;
+    const double gib = strtod(value, &end);
+    if (errno == 0 && end && *end == '\0' &&
+        isfinite(gib) && gib >= 0.0 && gib <= 64.0) {
+        return gib;
+    }
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-wrap-source-unlock] invalid wave GiB '%s'; disabled\n",
+                value);
+        warned = 1;
+    }
+    return 0.0;
 }
 
 static double cuda_dynamic_arena_wrap_slow_part_seconds(void) {
@@ -4118,6 +4246,9 @@ static int cuda_dynamic_arena_wrap_publish_target(
         cuda_dynamic_arena_wrap_trim_between_phases();
     const int unlock_source_ranges_requested =
         cuda_dynamic_arena_wrap_unlock_source_ranges();
+    const double unlock_wave_gib =
+        cuda_dynamic_arena_wrap_unlock_wave_gib();
+    const int unlock_wave_requested = unlock_wave_gib > 0.0;
     const double slow_part_threshold_seconds =
         part_profile ? cuda_dynamic_arena_wrap_slow_part_seconds() : 0.025;
     const cuda_dynamic_arena_wrap_schedule schedule =
@@ -4154,6 +4285,18 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 87u);
         fprintf(stderr,
                 "ds4: [arena-wrap-source-unlock-summary] result=failed phases=0 parts=0 ranges=0 bytes_requested=0 calls=0 true=0 error_not_locked=0 failed=1 seconds=0.000000\n");
+        if (result) *result = local;
+        return 0;
+    }
+    if (unlock_wave_requested && !unlock_source_ranges_requested) {
+        local.reason = "source-unlock-wave-contract";
+        local.seconds = cuda_wall_sec() - started_at;
+        fprintf(stderr,
+                "ds4: [arena-wrap-source-unlock] result=failed phase=contract waves=0 parts=0 ranges=0 bytes_requested=0 calls=0 true=0 error_not_locked=0 failed=1 seconds=0.000000 available_before=0 available_after=0 working_set_before=0 working_set_after=0 page_fault_before=0 page_fault_after=0 read_transfer_before=0 read_transfer_after=0 last_error=%u\n",
+                87u);
+        fprintf(stderr,
+                "ds4: [arena-wrap-source-unlock-summary] result=failed phases=0 waves=0 wave_gib=%.6f max_wave_bytes=0 parts=0 ranges=0 bytes_requested=0 calls=0 true=0 error_not_locked=0 failed=1 seconds=0.000000\n",
+                unlock_wave_gib);
         if (result) *result = local;
         return 0;
     }
@@ -4308,6 +4451,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
             context.load_count = load_count;
             context.parts = parts.data();
             context.part_count = (uint32_t)parts.size();
+            context.cursor_begin = 0;
+            context.cursor_end = context.part_count;
             context.checksums = checksums.data();
             context.success = part_success.data();
             context.source_file = sequential_file_requested ?
@@ -4325,125 +4470,277 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 CUDA_DYNAMIC_ARENA_MIRROR_DOWN,
             };
             const uint32_t phase_count = trust_worker_checksum ? 3u : 1u;
+            const uint64_t unlock_wave_target_bytes = unlock_wave_requested ?
+                (uint64_t)(unlock_wave_gib * 1073741824.0) : 0u;
+            const uint64_t unlock_wave_page_size =
+                cuda_dynamic_arena_source_unlock_page_size();
             for (uint32_t phase = 0; phase < phase_count; phase++) {
                 context.phase_part = trust_worker_checksum ?
                     phases[phase] : 0;
-                context.next.store(0, std::memory_order_relaxed);
-                if (part_profile) {
-                    std::fill(part_worker_profiles.begin(),
-                              part_worker_profiles.end(),
-                              cuda_dynamic_arena_part_worker_profile{});
-                    context.profile_workers = part_worker_profiles.data();
-                    context.profile_worker_capacity =
-                        (uint32_t)part_worker_profiles.size();
-                    context.profile_worker_next.store(0,
-                        std::memory_order_relaxed);
-                }
-                started_threads.clear();
-                if (file_qd_requested == 1u) {
-                    for (uint32_t i = 0; i < threads.size(); i++) {
-                        if (os_thread_create(
-                                &threads[i],
-                                cuda_dynamic_arena_part_copy_worker,
-                                &context) == 0) {
-                            started_threads.push_back(threads[i]);
+                cuda_dynamic_arena_source_unlock_phase_stats phase_unlock = {};
+                phase_unlock.phase =
+                    cuda_dynamic_arena_wrap_part_name(context.phase_part);
+                uint32_t wave_cursor = 0;
+                int phase_has_work = 1;
+                while (phase_has_work && all_succeeded) {
+                    uint32_t cursor_begin = 0;
+                    uint32_t cursor_end = context.part_count;
+                    if (unlock_wave_requested) {
+                        phase_has_work = 0;
+                        uint64_t wave_union_bytes = 0;
+                        uint64_t wave_union_end = 0;
+                        for (uint32_t cursor = wave_cursor;
+                             cursor < context.part_count; cursor++) {
+                            const cuda_dynamic_arena_wrap_part &part =
+                                parts[cursor];
+                            if (part.part != context.phase_part ||
+                                part_success[cursor] != 0u) {
+                                continue;
+                            }
+                            uint64_t aligned_start = 0;
+                            uint64_t aligned_end = 0;
+                            if (!cuda_dynamic_arena_source_unlock_aligned_range(
+                                    part, unlock_wave_page_size,
+                                    &aligned_start, &aligned_end)) {
+                                local.reason = "source-unlock-wave-range";
+                                source_parts_copy_failed = 1;
+                                all_succeeded = 0;
+                                break;
+                            }
+                            uint64_t increment = aligned_end - aligned_start;
+                            if (phase_has_work) {
+                                if (aligned_start > wave_union_end) {
+                                    increment = aligned_end - aligned_start;
+                                } else if (aligned_end > wave_union_end) {
+                                    increment = aligned_end - wave_union_end;
+                                } else {
+                                    increment = 0;
+                                }
+                            }
+                            if (!phase_has_work) {
+                                if (increment > unlock_wave_target_bytes) {
+                                    local.reason =
+                                        "source-unlock-wave-part-exceeds-target";
+                                    source_parts_copy_failed = 1;
+                                    all_succeeded = 0;
+                                    break;
+                                }
+                                cursor_begin = cursor;
+                                cursor_end = cursor + 1u;
+                                wave_union_bytes = increment;
+                                wave_union_end = aligned_end;
+                                phase_has_work = 1;
+                            } else if (increment > 0u &&
+                                       (wave_union_bytes >
+                                            UINT64_MAX - increment ||
+                                        wave_union_bytes + increment >
+                                            unlock_wave_target_bytes)) {
+                                break;
+                            } else {
+                                cursor_end = cursor + 1u;
+                                wave_union_bytes += increment;
+                                if (aligned_end > wave_union_end) {
+                                    wave_union_end = aligned_end;
+                                }
+                            }
+                        }
+                        if (!all_succeeded || !phase_has_work) break;
+                        wave_cursor = cursor_end;
+                    } else {
+                        phase_has_work = 0;
+                    }
+                    context.cursor_begin = cursor_begin;
+                    context.cursor_end = cursor_end;
+                    context.next.store(cursor_begin,
+                                       std::memory_order_relaxed);
+                    if (part_profile) {
+                        std::fill(part_worker_profiles.begin(),
+                                  part_worker_profiles.end(),
+                                  cuda_dynamic_arena_part_worker_profile{});
+                        context.profile_workers = part_worker_profiles.data();
+                        context.profile_worker_capacity =
+                            (uint32_t)part_worker_profiles.size();
+                        context.profile_worker_next.store(0,
+                            std::memory_order_relaxed);
+                    }
+                    started_threads.clear();
+                    if (file_qd_requested == 1u) {
+                        for (uint32_t i = 0; i < threads.size(); i++) {
+                            if (os_thread_create(
+                                    &threads[i],
+                                    cuda_dynamic_arena_part_copy_worker,
+                                    &context) == 0) {
+                                started_threads.push_back(threads[i]);
+                            }
                         }
                     }
-                }
-                const uint32_t phase_workers = file_qd_requested > 1u ? 1u :
-                    1u + (uint32_t)started_threads.size();
-                if (phase_workers > local.workers) {
-                    local.workers = phase_workers;
-                }
-                if ((sequential_file_requested || random_file_requested) &&
-                    phase_workers != requested_copy_workers) {
-                    local.reason = "copy-workers";
-                    source_parts_copy_failed = 1;
-                    all_succeeded = 0;
-                }
-                const double main_worker_started_at = cuda_wall_sec();
-                if (file_qd_requested > 1u) {
-                    if (!cuda_dynamic_arena_copy_phase_file_qd(
-                            &context, file_qd_requested, &file_qd_profile)) {
-                        local.reason = "file-qd-copy";
+                    const uint32_t phase_workers =
+                        file_qd_requested > 1u ? 1u :
+                        1u + (uint32_t)started_threads.size();
+                    if (phase_workers > local.workers) {
+                        local.workers = phase_workers;
+                    }
+                    if ((sequential_file_requested || random_file_requested) &&
+                        phase_workers != requested_copy_workers) {
+                        local.reason = "copy-workers";
                         source_parts_copy_failed = 1;
                         all_succeeded = 0;
                     }
-                } else {
-                    (void)cuda_dynamic_arena_part_copy_worker(&context);
-                }
-                source_parts_main_worker_seconds +=
-                    cuda_wall_sec() - main_worker_started_at;
-                const double join_started_at = cuda_wall_sec();
-                for (uint32_t i = 0; i < started_threads.size(); i++) {
-                    os_thread_join(started_threads[i]);
-                }
-                source_parts_join_seconds += cuda_wall_sec() - join_started_at;
-                if (part_profile) {
-                    const uint32_t profiled_workers =
-                        context.profile_worker_next.load(std::memory_order_relaxed);
-                    if (profiled_workers > source_parts_profile_workers) {
-                        source_parts_profile_workers = profiled_workers;
-                    }
-                    const uint32_t worker_limit = std::min(
-                        profiled_workers, context.profile_worker_capacity);
-                    for (uint32_t i = 0; i < worker_limit; i++) {
-                        const cuda_dynamic_arena_part_worker_profile &profile =
-                            part_worker_profiles[i];
-                        source_parts_profile_parts += profile.parts;
-                        source_parts_profile_bytes += profile.bytes;
-                        source_parts_memcpy_seconds += profile.memcpy_seconds;
-                        source_parts_slow_parts += profile.slow_parts;
-                        source_parts_worker_parts_min = std::min(
-                            source_parts_worker_parts_min, profile.parts);
-                        source_parts_worker_parts_max = std::max(
-                            source_parts_worker_parts_max, profile.parts);
-                        if (source_parts_worker_active_min_seconds < 0 ||
-                            profile.active_seconds <
-                                source_parts_worker_active_min_seconds) {
-                            source_parts_worker_active_min_seconds =
-                                profile.active_seconds;
+                    const double main_worker_started_at = cuda_wall_sec();
+                    if (file_qd_requested > 1u) {
+                        if (!cuda_dynamic_arena_copy_phase_file_qd(
+                                &context, file_qd_requested,
+                                &file_qd_profile)) {
+                            local.reason = "file-qd-copy";
+                            source_parts_copy_failed = 1;
+                            all_succeeded = 0;
                         }
-                        source_parts_worker_active_max_seconds = std::max(
-                            source_parts_worker_active_max_seconds,
-                            profile.active_seconds);
-                        if (profile.max_part_seconds >
-                                source_parts_max_part_seconds) {
-                            source_parts_max_part_seconds =
-                                profile.max_part_seconds;
-                            source_parts_max_part_bytes = profile.max_part_bytes;
-                            source_parts_max_part_source_offset =
-                                profile.max_part_source_offset;
-                            source_parts_max_part_load_index =
-                                profile.max_part_load_index;
-                            source_parts_max_part_cursor =
-                                profile.max_part_cursor;
-                            source_parts_max_part_kind = profile.max_part_kind;
+                    } else {
+                        (void)cuda_dynamic_arena_part_copy_worker(&context);
+                    }
+                    source_parts_main_worker_seconds +=
+                        cuda_wall_sec() - main_worker_started_at;
+                    const double join_started_at = cuda_wall_sec();
+                    for (uint32_t i = 0; i < started_threads.size(); i++) {
+                        os_thread_join(started_threads[i]);
+                    }
+                    source_parts_join_seconds +=
+                        cuda_wall_sec() - join_started_at;
+                    if (part_profile) {
+                        const uint32_t profiled_workers =
+                            context.profile_worker_next.load(
+                                std::memory_order_relaxed);
+                        if (profiled_workers > source_parts_profile_workers) {
+                            source_parts_profile_workers = profiled_workers;
+                        }
+                        const uint32_t worker_limit = std::min(
+                            profiled_workers, context.profile_worker_capacity);
+                        for (uint32_t i = 0; i < worker_limit; i++) {
+                            const cuda_dynamic_arena_part_worker_profile
+                                &profile = part_worker_profiles[i];
+                            source_parts_profile_parts += profile.parts;
+                            source_parts_profile_bytes += profile.bytes;
+                            source_parts_memcpy_seconds +=
+                                profile.memcpy_seconds;
+                            source_parts_slow_parts += profile.slow_parts;
+                            source_parts_worker_parts_min = std::min(
+                                source_parts_worker_parts_min, profile.parts);
+                            source_parts_worker_parts_max = std::max(
+                                source_parts_worker_parts_max, profile.parts);
+                            if (source_parts_worker_active_min_seconds < 0 ||
+                                profile.active_seconds <
+                                    source_parts_worker_active_min_seconds) {
+                                source_parts_worker_active_min_seconds =
+                                    profile.active_seconds;
+                            }
+                            source_parts_worker_active_max_seconds = std::max(
+                                source_parts_worker_active_max_seconds,
+                                profile.active_seconds);
+                            if (profile.max_part_seconds >
+                                    source_parts_max_part_seconds) {
+                                source_parts_max_part_seconds =
+                                    profile.max_part_seconds;
+                                source_parts_max_part_bytes =
+                                    profile.max_part_bytes;
+                                source_parts_max_part_source_offset =
+                                    profile.max_part_source_offset;
+                                source_parts_max_part_load_index =
+                                    profile.max_part_load_index;
+                                source_parts_max_part_cursor =
+                                    profile.max_part_cursor;
+                                source_parts_max_part_kind =
+                                    profile.max_part_kind;
+                            }
+                        }
+                    }
+                    if (unlock_source_ranges_requested &&
+                        (unlock_wave_requested ||
+                         context.phase_part == CUDA_DYNAMIC_ARENA_MIRROR_GATE ||
+                         context.phase_part == CUDA_DYNAMIC_ARENA_MIRROR_UP)) {
+                        cuda_dynamic_arena_source_unlock_phase_stats
+                            unlock_stats;
+                        const int unlock_ok = unlock_wave_requested ?
+                            cuda_dynamic_arena_source_unlock_phase_range(
+                                parts, part_success, context.phase_part,
+                                cursor_begin, cursor_end, &unlock_stats, 0) :
+                            cuda_dynamic_arena_source_unlock_phase(
+                                parts, part_success, context.phase_part,
+                                &unlock_stats);
+                        if (unlock_wave_requested) {
+                            if (phase_unlock.waves == 0u) {
+                                phase_unlock.before = unlock_stats.before;
+                            }
+                            phase_unlock.after = unlock_stats.after;
+                            phase_unlock.waves++;
+                            phase_unlock.calls += unlock_stats.calls;
+                            phase_unlock.true_count +=
+                                unlock_stats.true_count;
+                            phase_unlock.error_not_locked +=
+                                unlock_stats.error_not_locked;
+                            phase_unlock.failed += unlock_stats.failed;
+                            phase_unlock.parts += unlock_stats.parts;
+                            phase_unlock.ranges += unlock_stats.ranges;
+                            phase_unlock.bytes_requested +=
+                                unlock_stats.bytes_requested;
+                            if (unlock_stats.bytes_requested >
+                                    phase_unlock.max_wave_bytes) {
+                                phase_unlock.max_wave_bytes =
+                                    unlock_stats.bytes_requested;
+                            }
+                            phase_unlock.seconds += unlock_stats.seconds;
+                            if (unlock_stats.last_error) {
+                                phase_unlock.last_error =
+                                    unlock_stats.last_error;
+                            }
+                        } else {
+                            source_unlock_summary.phases++;
+                            source_unlock_summary.calls += unlock_stats.calls;
+                            source_unlock_summary.true_count +=
+                                unlock_stats.true_count;
+                            source_unlock_summary.error_not_locked +=
+                                unlock_stats.error_not_locked;
+                            source_unlock_summary.failed +=
+                                unlock_stats.failed;
+                            source_unlock_summary.parts += unlock_stats.parts;
+                            source_unlock_summary.ranges += unlock_stats.ranges;
+                            source_unlock_summary.bytes_requested +=
+                                unlock_stats.bytes_requested;
+                            source_unlock_summary.seconds +=
+                                unlock_stats.seconds;
+                        }
+                        if (!unlock_ok) {
+                            local.reason = "source-unlock";
+                            source_parts_copy_failed = 1;
+                            all_succeeded = 0;
                         }
                     }
                 }
-                if (unlock_source_ranges_requested &&
-                    (context.phase_part == CUDA_DYNAMIC_ARENA_MIRROR_GATE ||
-                     context.phase_part == CUDA_DYNAMIC_ARENA_MIRROR_UP)) {
-                    cuda_dynamic_arena_source_unlock_phase_stats unlock_stats;
+                if (unlock_wave_requested) {
                     const int unlock_ok =
-                        cuda_dynamic_arena_source_unlock_phase(
-                            parts, part_success, context.phase_part,
-                            &unlock_stats);
+                        cuda_dynamic_arena_source_unlock_emit_phase(
+                            &phase_unlock);
                     source_unlock_summary.phases++;
-                    source_unlock_summary.calls += unlock_stats.calls;
+                    source_unlock_summary.waves += phase_unlock.waves;
+                    source_unlock_summary.calls += phase_unlock.calls;
                     source_unlock_summary.true_count +=
-                        unlock_stats.true_count;
+                        phase_unlock.true_count;
                     source_unlock_summary.error_not_locked +=
-                        unlock_stats.error_not_locked;
-                    source_unlock_summary.failed += unlock_stats.failed;
-                    source_unlock_summary.parts += unlock_stats.parts;
-                    source_unlock_summary.ranges += unlock_stats.ranges;
+                        phase_unlock.error_not_locked;
+                    source_unlock_summary.failed += phase_unlock.failed;
+                    source_unlock_summary.parts += phase_unlock.parts;
+                    source_unlock_summary.ranges += phase_unlock.ranges;
                     source_unlock_summary.bytes_requested +=
-                        unlock_stats.bytes_requested;
-                    source_unlock_summary.seconds += unlock_stats.seconds;
-                    if (!unlock_ok) {
-                        local.reason = "source-unlock";
+                        phase_unlock.bytes_requested;
+                    if (phase_unlock.max_wave_bytes >
+                            source_unlock_summary.max_wave_bytes) {
+                        source_unlock_summary.max_wave_bytes =
+                            phase_unlock.max_wave_bytes;
+                    }
+                    source_unlock_summary.seconds += phase_unlock.seconds;
+                    if (!unlock_ok || phase_unlock.waves == 0u) {
+                        if (!local.reason || strcmp(local.reason, "begin") == 0) {
+                            local.reason = "source-unlock";
+                        }
                         source_parts_copy_failed = 1;
                         all_succeeded = 0;
                     }
@@ -4466,22 +4763,44 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 }
             }
             if (unlock_source_ranges_requested) {
+                const uint32_t expected_unlock_phases =
+                    unlock_wave_requested ? 3u : 2u;
                 const int unlock_complete =
-                    source_unlock_summary.phases == 2u &&
+                    source_unlock_summary.phases == expected_unlock_phases &&
                     source_unlock_summary.failed == 0u;
-                fprintf(stderr,
-                        "ds4: [arena-wrap-source-unlock-summary] result=%s phases=%u parts=%llu ranges=%llu bytes_requested=%llu calls=%u true=%u error_not_locked=%u failed=%u seconds=%.6f\n",
-                        unlock_complete ? "complete" : "failed",
-                        source_unlock_summary.phases,
-                        (unsigned long long)source_unlock_summary.parts,
-                        (unsigned long long)source_unlock_summary.ranges,
-                        (unsigned long long)
-                            source_unlock_summary.bytes_requested,
-                        source_unlock_summary.calls,
-                        source_unlock_summary.true_count,
-                        source_unlock_summary.error_not_locked,
-                        source_unlock_summary.failed,
-                        source_unlock_summary.seconds);
+                if (unlock_wave_requested) {
+                    fprintf(stderr,
+                            "ds4: [arena-wrap-source-unlock-summary] result=%s phases=%u waves=%u wave_gib=%.6f max_wave_bytes=%llu parts=%llu ranges=%llu bytes_requested=%llu calls=%u true=%u error_not_locked=%u failed=%u seconds=%.6f\n",
+                            unlock_complete ? "complete" : "failed",
+                            source_unlock_summary.phases,
+                            source_unlock_summary.waves,
+                            unlock_wave_gib,
+                            (unsigned long long)
+                                source_unlock_summary.max_wave_bytes,
+                            (unsigned long long)source_unlock_summary.parts,
+                            (unsigned long long)source_unlock_summary.ranges,
+                            (unsigned long long)
+                                source_unlock_summary.bytes_requested,
+                            source_unlock_summary.calls,
+                            source_unlock_summary.true_count,
+                            source_unlock_summary.error_not_locked,
+                            source_unlock_summary.failed,
+                            source_unlock_summary.seconds);
+                } else {
+                    fprintf(stderr,
+                            "ds4: [arena-wrap-source-unlock-summary] result=%s phases=%u parts=%llu ranges=%llu bytes_requested=%llu calls=%u true=%u error_not_locked=%u failed=%u seconds=%.6f\n",
+                            unlock_complete ? "complete" : "failed",
+                            source_unlock_summary.phases,
+                            (unsigned long long)source_unlock_summary.parts,
+                            (unsigned long long)source_unlock_summary.ranges,
+                            (unsigned long long)
+                                source_unlock_summary.bytes_requested,
+                            source_unlock_summary.calls,
+                            source_unlock_summary.true_count,
+                            source_unlock_summary.error_not_locked,
+                            source_unlock_summary.failed,
+                            source_unlock_summary.seconds);
+                }
                 if (!unlock_complete) {
                     local.reason = "source-unlock";
                     source_parts_copy_failed = 1;
