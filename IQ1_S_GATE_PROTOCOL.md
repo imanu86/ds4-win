@@ -261,17 +261,27 @@ The G86 outputs were only 64 tokens and have no recorded human L0-L3 grades.
 Consequently neither G86 nor the structural gates establish quality
 equivalence or lossless behavior.
 
-### Next clean A/B
+### G94 clean GPU-planner A/B
 
-After system quiescence is restored, compare the current mixed IQ1_S baseline
-against the GPU-planner candidate with identical binary, model, sidecar,
-8-GiB RAM cache, 20-GiB primary arena, prompt, warmup, token budget and request
-order. Use at least three repetitions per arm, compute the full sidecar hash,
-retain every raw output, require identical deterministic output hashes, and do
-not enable profiling in the performance arms. A separate clean `n=1` profile
-may explain the winner but cannot determine it.
+The clean cache-4 gate used identical binary, model, sidecar, 20-GiB primary
+arena, prompt, warmup, and three measured repeats per arm. All six measured
+outputs had the same SHA-256. Planner-on raised server decode from 2.073 to
+2.223 t/s (`+7.23%`) and harness throughput from 1.543 to 1.630 t/s (`+5.68%`).
+Mean TTFT changed from 10.588 to 10.458 seconds. The planner reconciled
+10240/10240 calls, accumulated 1.363 ms wait, and reported zero failures. This
+is a short performance/exactness gate and carries no L0-L3 quality claim.
 
-Then repeat the current-build environment-off G74 exactness gate and run the
-long cyberpunk prompt at `n>=3` per arm with recorded L0-L3 grades. Promotion
+The cache-8 attempt is not a result: the fail-closed runtime monitor aborted it
+after available Windows memory fell below 0.5 GiB. The 2048-token/context-4096
+G95 control was also stopped as an impractical protocol probe after generation
+100 measured 0.47 t/s with only 276/320 resident expert-cache slots. No timing
+or quality verdict may be derived from either aborted run.
+
+### Next gates
+
+Repeat the current-build environment-off G74 exactness gate when at least 32
+GiB of host memory are available. Run G95 at 768 max tokens, context 1024,
+`stop="</html>"`, and `n>=3` per arm, preserving every raw output and recording
+human L0-L3 grades. Promotion
 into authoritative 2-bit pinned RAM and next-token 2-bit VRAM eligibility are
 separate later gates; the current IQ1_S cold path does not prove them.

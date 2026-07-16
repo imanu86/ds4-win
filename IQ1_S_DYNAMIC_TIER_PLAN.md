@@ -45,11 +45,30 @@ the IQ1_S source disk above 90 percent busy, so all G92/G93 timing and throughpu
 values other than exactness/counter reconciliation are contaminated and cannot
 enter the SOTA ledger.
 
+G94 then compared planner-off and planner-on with a stable 4-GiB IQ1_S RAM
+cache, 20-GiB primary arena, identical prompt/warmup, and three measured repeats
+per arm on a quiescent host. The planner preserved the same output SHA-256 on
+every repeat and raised server decode from 2.073 to 2.223 t/s (`+7.23%`);
+harness throughput rose from 1.543 to 1.630 t/s (`+5.68%`) and mean TTFT changed
+from 10.588 to 10.458 seconds. Planner calls reconciled at 10240/10240 with
+1.363 ms total planner wait and zero failures. This is clean
+performance/exactness evidence for the short 64-token gate, not a quality
+verdict. An 8-GiB G94 attempt was aborted by the runtime contamination guard
+when available Windows memory fell below 0.5 GiB; it supplies no timing result.
+
 The environment-off frozen G74 control has reproduced its historical output
 hash at the earlier checkpoint. It must be repeated on the current planner
 build. Deferred authoritative 2-bit promotion, next-token publication, and the
 `forbidden_cold_ssd_to_vram=0` end-to-end gate are still unimplemented. The
 required `n>=3` cyberpunk L0-L3 quality A/B is also still pending.
+
+The first 2048-token, context-4096 quality protocol was stopped during its
+control arm: at generation 100 it measured only 0.47 t/s and exposed 276 rather
+than the requested 320 resident expert-cache slots. That run is an invalid,
+incomplete protocol probe, not a quality or performance result. The replacement
+gate keeps `n=3` per arm but caps generation at 768 tokens, context at 1024, and
+stops on `</html>` so it evaluates a complete page without measuring a long
+post-completion tail. It remains pending host cleanup.
 
 A source audit identified the exact promotion gap. The five hot IQ2 routes are
 observed by the GPU route worker, but the separated cold IQ1_S route bypasses
@@ -59,6 +78,17 @@ expert into pinned RAM and publish it to VRAM during the same request. The
 promotion patch must both feed the cold IQ1_S observation into the authoritative
 mass/LFRU state and add an explicit `vram_eligible_epoch` guard. Merely passing
 through RAM is not sufficient to prove next-token eligibility.
+
+## Capacity Arithmetic
+
+For the currently eligible layers 3-42, `40 * 256 = 10240` routed experts.
+At the measured IQ1_S expert footprint of 4,915,200 bytes, that pool occupies
+50,331,648,000 bytes, or 46.875 GiB. If all 43 expert layers used exactly that
+footprint, the hypothetical pool would be 54,106,521,600 bytes, or 50.391 GiB.
+The real complete IQ1_S sidecar is 61,540,805,344 bytes (57.310 GiB) because it
+also contains non-routed tensors, metadata, and the validated layer-specific
+layout. The currently eligible IQ1_S pool saves 20.625 GiB (`30.56%`) against
+the corresponding 67.5-GiB IQ2 pool.
 
 ## Required Residency Contract
 
