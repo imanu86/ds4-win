@@ -99,6 +99,8 @@ param(
     [string]$Iq1SExpertSidecar = "",
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
+    [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
+    [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [ValidateSet("benchmark", "structural-safety", "quality")][string]$GateKind = "benchmark",
     [int]$Port = 8000,
     [ValidateRange(64, 131072)][int]$Context = 256,
@@ -265,6 +267,9 @@ $iq1SSidecarInfoAtStart = $null
 $iq1SSidecarReceiptAtStart = $null
 $iq1SSidecarReceiptPath = ""
 if ($Iq1SExpertSidecar) {
+    if ($Iq1SLayerFirst -gt $Iq1SLayerLast) {
+        throw "Iq1SLayerFirst must be less than or equal to Iq1SLayerLast"
+    }
     if (-not (Test-Path -LiteralPath $Iq1SExpertSidecar -PathType Leaf)) {
         throw "IQ1_S sidecar missing: $Iq1SExpertSidecar"
     }
@@ -409,8 +414,12 @@ $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
 if ($Iq1SExpertSidecar) {
     $env:DS4_IQ1_S_EXPERT_SIDECAR = $Iq1SExpertSidecar
+    $env:DS4_IQ1_S_LAYER_FIRST = [string]$Iq1SLayerFirst
+    $env:DS4_IQ1_S_LAYER_LAST = [string]$Iq1SLayerLast
 } else {
     Remove-Item Env:\DS4_IQ1_S_EXPERT_SIDECAR -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_S_LAYER_FIRST -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_S_LAYER_LAST -ErrorAction SilentlyContinue
 }
 if ($RuntimeReserveMB -gt 0) {
     $env:DS4_CUDA_STREAM_RUNTIME_RESERVE_MB = "$RuntimeReserveMB"

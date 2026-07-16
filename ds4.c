@@ -2415,6 +2415,8 @@ typedef struct {
     ds4_tensor *gate[DS4_N_LAYER];
     ds4_tensor *up[DS4_N_LAYER];
     ds4_tensor *down[DS4_N_LAYER];
+    uint32_t first_layer;
+    uint32_t last_layer;
     bool ready;
 } ds4_iq1_s_sidecar;
 
@@ -2441,6 +2443,8 @@ static ds4_routed_expert_source routed_expert_source(
     };
     if (g_iq1_s_sidecar.ready &&
         model == g_iq1_s_sidecar.primary_model &&
+        layer_index >= g_iq1_s_sidecar.first_layer &&
+        layer_index <= g_iq1_s_sidecar.last_layer &&
         layer_index < DS4_N_LAYER) {
         source.model = g_iq1_s_sidecar.model;
         source.gate = g_iq1_s_sidecar.gate[layer_index];
@@ -3168,6 +3172,33 @@ static void iq1_s_sidecar_bind(
     config_validate_model(model);
     iq1_s_sidecar_validate_checkpoint_identity(model, primary_model);
 
+    uint32_t first_layer = 0;
+    uint32_t last_layer = DS4_N_LAYER - 1;
+    const char *first_env = getenv("DS4_IQ1_S_LAYER_FIRST");
+    const char *last_env = getenv("DS4_IQ1_S_LAYER_LAST");
+    if ((first_env && first_env[0]) || (last_env && last_env[0])) {
+        char *first_end = NULL;
+        char *last_end = NULL;
+        errno = 0;
+        const unsigned long first = first_env && first_env[0]
+            ? strtoul(first_env, &first_end, 10) : 0ul;
+        const int first_errno = errno;
+        errno = 0;
+        const unsigned long last = last_env && last_env[0]
+            ? strtoul(last_env, &last_end, 10) : (unsigned long)(DS4_N_LAYER - 1);
+        const int last_errno = errno;
+        if (first_errno != 0 || last_errno != 0 ||
+            (first_env && first_env[0] &&
+             (first_end == first_env || *first_end != '\0')) ||
+            (last_env && last_env[0] &&
+             (last_end == last_env || *last_end != '\0')) ||
+            first >= DS4_N_LAYER || last >= DS4_N_LAYER || first > last) {
+            ds4_die("invalid IQ1_S sidecar layer range");
+        }
+        first_layer = (uint32_t)first;
+        last_layer = (uint32_t)last;
+    }
+
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_tensor *gate = required_tensorf(
             model, "blk.%u.ffn_gate_exps.weight", il);
@@ -3190,11 +3221,14 @@ static void iq1_s_sidecar_bind(
 
     g_iq1_s_sidecar.model = model;
     g_iq1_s_sidecar.primary_model = primary_model;
+    g_iq1_s_sidecar.first_layer = first_layer;
+    g_iq1_s_sidecar.last_layer = last_layer;
     g_iq1_s_sidecar.ready = true;
     fprintf(stderr,
             "ds4: IQ1_S routed-expert sidecar validated: "
-            "layers=%u gate_up=iq1_s down=q2_k[0..2]+iq1_s[3..42]\n",
-            DS4_N_LAYER);
+            "layers=%u active=%u..%u gate_up=iq1_s "
+            "down=q2_k[0..2]+iq1_s[3..42]\n",
+            DS4_N_LAYER, first_layer, last_layer);
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
