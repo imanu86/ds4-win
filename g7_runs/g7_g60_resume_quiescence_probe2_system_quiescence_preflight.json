@@ -1,0 +1,126 @@
+﻿{
+    "schema":  "g7_system_quiescence_preflight_v1",
+    "checked_utc":  "2026-07-16T05:44:44.4000154Z",
+    "sample_window_started_utc":  "2026-07-16T05:44:37.4071081Z",
+    "tag":  "g60_resume_quiescence_probe2",
+    "command_line":  "\"C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -ExecutionPolicy Bypass -File .\\g7_measure.ps1 -Tag g60_resume_quiescence_probe2 -ModelPath C:\\ds4-models\\ds4-2bit.gguf -MaxTokens 64 -QuiescenceProbeOnly",
+    "harness_sha256":  "c112b79a8c15ed2e21ff28058eafbae37a7eb3bbd3ba4621ab1a34d6c8971626",
+    "git_head":  "8acaf32e9d49f4f91a6f4ac7374902eb2bd3c660",
+    "worktree_dirty":  true,
+    "executable_sha256":  "0ab9fade181c675a6d83c03efa89d10829098640607f5a7cdcad208c25d99f19",
+    "build_manifest_sha256":  "b6ee516d8977227cc446e47cf9e686ccea1baa5f481b5b9c4cc58606acbe0505",
+    "model_path":  "C:\\ds4-models\\ds4-2bit.gguf",
+    "model_size_bytes":  86720111488,
+    "prompt_sha256":  "3639efcd08abb273b1619e82e78c29a7df02c1051b1820e99fc395dcaa3326b8",
+    "context":  256,
+    "max_tokens":  64,
+    "probe_only":  true,
+    "skipped":  false,
+    "requested_samples":  5,
+    "completed_samples":  5,
+    "requested_sleep_interval_ms":  1000,
+    "observed_interval_median_ms":  1585.8905,
+    "observed_window_ms":  6971.468,
+    "gpu_scope":  "maximum-utilization-across-visible-gpus",
+    "thresholds":  {
+                       "maximum_cpu_median_percent":  60,
+                       "maximum_disk_median_percent":  30,
+                       "maximum_disk_io_median_mib_per_second":  64,
+                       "maximum_gpu_median_percent":  85
+                   },
+    "cpu_median_percent":  13,
+    "disk_median_percent":  192,
+    "disk_io_median_mib_per_second":  3.9587831497192383,
+    "gpu_median_percent":  0,
+    "failures":  [
+                     "disk-median-above-threshold"
+                 ],
+    "samples":  [
+                    {
+                        "sample":  1,
+                        "timestamp_utc":  "2026-07-16T05:44:38.0117964Z",
+                        "elapsed_ms":  592.462,
+                        "cpu_percent":  26,
+                        "disk_percent":  197,
+                        "disk_read_mib_per_second":  4.1205425262451172,
+                        "disk_write_mib_per_second":  0,
+                        "disk_io_mib_per_second":  4.1205425262451172,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  2,
+                        "timestamp_utc":  "2026-07-16T05:44:39.5918420Z",
+                        "elapsed_ms":  2178.088,
+                        "cpu_percent":  13,
+                        "disk_percent":  174,
+                        "disk_read_mib_per_second":  3.8374414443969727,
+                        "disk_write_mib_per_second":  0.12134170532226563,
+                        "disk_io_mib_per_second":  3.9587831497192383,
+                        "gpu_percent":  1,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  1
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  3,
+                        "timestamp_utc":  "2026-07-16T05:44:41.1711290Z",
+                        "elapsed_ms":  3757.633,
+                        "cpu_percent":  13,
+                        "disk_percent":  192,
+                        "disk_read_mib_per_second":  3.8674392700195313,
+                        "disk_write_mib_per_second":  0.18972301483154297,
+                        "disk_io_mib_per_second":  4.0571622848510742,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  4,
+                        "timestamp_utc":  "2026-07-16T05:44:42.7635810Z",
+                        "elapsed_ms":  5343.788,
+                        "cpu_percent":  13,
+                        "disk_percent":  190,
+                        "disk_read_mib_per_second":  3.7724800109863281,
+                        "disk_write_mib_per_second":  0.13159751892089844,
+                        "disk_io_mib_per_second":  3.9040775299072266,
+                        "gpu_percent":  0,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  0
+                                                                 }
+                                                             ]
+                    },
+                    {
+                        "sample":  5,
+                        "timestamp_utc":  "2026-07-16T05:44:44.3840065Z",
+                        "elapsed_ms":  6970.492,
+                        "cpu_percent":  8,
+                        "disk_percent":  193,
+                        "disk_read_mib_per_second":  3.903411865234375,
+                        "disk_write_mib_per_second":  0,
+                        "disk_io_mib_per_second":  3.903411865234375,
+                        "gpu_percent":  1,
+                        "gpu_utilization_percent_by_index":  [
+                                                                 {
+                                                                     "index":  0,
+                                                                     "utilization_percent":  1
+                                                                 }
+                                                             ]
+                    }
+                ],
+    "ready_to_launch":  false
+}
