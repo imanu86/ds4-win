@@ -13,6 +13,7 @@
     "think":  false,
     "quality_claims":  "none",
     "baseline_g58_k60_content_sha256":  "ceced6c1b481bb2c6f68bd116c06e554502017a44b40b4e5e6bc9fc5d710edc7",
+    "expected_g63_k60_content_sha256":  "4aaf0f0813f4cb15ac21a88f195f4f7d2c2af797e81524935e22eea60603c6b1",
     "expert_cache_n":  320,
     "expert_cache_reserve_gb":  0.125,
     "expert_cache_policy":  "lru",
@@ -68,7 +69,7 @@
     "expected_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
     "authorization":  {
                           "bake_id":  "K60",
-                          "authorized_utc":  "2026-07-16T08:19:30.5519751Z",
+                          "authorized_utc":  "2026-07-16T08:25:39.9369518Z",
                           "model_path":  "C:\\ds4-models\\ds4-2bit-k60-mass-full-decode.gguf",
                           "model_sha256_not_verified":  true,
                           "expected_pack_sha256":  "3b464ee43514c8caa841be61da70190a4a7ba3c760c22849d2d723e5da5b7d71",
@@ -79,7 +80,7 @@
                           "expected_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                           "observed_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                           "payload_verify_method":  "python-hashlib-extents",
-                          "payload_verify_elapsed_seconds":  56.541546599997673,
+                          "payload_verify_elapsed_seconds":  57.115223399989191,
                           "payload_verify_extent_count":  7155,
                           "payload_verifier_path":  "C:\\Users\\imanu\\source\\repos\\reap-loop\\scripts\\ds4_windows_sparse_bake.py",
                           "payload_verifier_sha256":  "cf9cf279fe2a41eb7b924ae0c90ad383ca5a9271368c9fa2ad4205dc2f44a38a",
@@ -100,9 +101,9 @@
                           "ds4_server_c_sha256":  "3358c8e053439306838763e5cac4774d40277a96e73e1f757a4a7cbffeb5c8c4",
                           "ds4_bake_c_sha256":  "e68cdf03b70a396bbbcac15e68f7faf5fa8bc0d2e29db6ec0ceda4f348d9df53",
                           "ds4_bake_h_sha256":  "b6445472a997665d773a77eff0b8936eacfc4360167754ba8c20cb5a8a23f456",
-                          "build_manifest_sha256":  "d1c153c4605dbf5ebf276189448a7cbb1c74c914c456787b9ea989b32d4b4916"
+                          "build_manifest_sha256":  "c164f8b1c96eef6aba74f59d6747b5d0c55f92500c18192b9dc2ff7115f059c9"
                       },
-    "execution_runner_sha256":  "42a873d172d8b09a0b5beee585d8396f1c01826b7b2fc21df3701afbe0444832",
+    "execution_runner_sha256":  "53152be15d5913962dc197eb03fe2f9f5a27aa5f08a8d326cb4c5a36a0c19a61",
     "executable_sha256":  "63f1a24285bac089df1db6ecd2024f812b6905b7e7d31a49d95e7b2dcd983399",
     "harness_sha256":  "e95b0f827f63efefa195e839943a60b4578ffe6ca6886dcc6a92c7d8fd3bc7cb",
     "runtime_monitor_harness_sha256":  "94b7d3c7df52764696073d4a4f9651b349e471ba0b252d88d7f76102da67e3e6",
@@ -111,6 +112,6 @@
     "ds4_server_c_sha256":  "3358c8e053439306838763e5cac4774d40277a96e73e1f757a4a7cbffeb5c8c4",
     "ds4_bake_c_sha256":  "e68cdf03b70a396bbbcac15e68f7faf5fa8bc0d2e29db6ec0ceda4f348d9df53",
     "ds4_bake_h_sha256":  "b6445472a997665d773a77eff0b8936eacfc4360167754ba8c20cb5a8a23f456",
-    "build_manifest_sha256":  "d1c153c4605dbf5ebf276189448a7cbb1c74c914c456787b9ea989b32d4b4916",
-    "created_utc":  "2026-07-16T08:19:30.6056811Z"
+    "build_manifest_sha256":  "c164f8b1c96eef6aba74f59d6747b5d0c55f92500c18192b9dc2ff7115f059c9",
+    "created_utc":  "2026-07-16T08:25:40.0010227Z"
 }

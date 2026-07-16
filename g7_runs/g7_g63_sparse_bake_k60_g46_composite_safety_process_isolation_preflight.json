@@ -1,12 +1,12 @@
 ﻿{
     "schema":  "g7_process_isolation_preflight_v1",
-    "checked_utc":  "2026-07-16T08:19:31.3036493Z",
+    "checked_utc":  "2026-07-16T08:25:40.5309025Z",
     "mutex_name":  "Local\\DS4_G7_MEASUREMENT_LOCK",
     "mutex_acquired":  true,
-    "current_harness_pid":  17656,
+    "current_harness_pid":  3924,
     "ancestor_process_ids":  [
-                                 5020,
-                                 13136,
+                                 25204,
+                                 26144,
                                  18156,
                                  21076,
                                  19968

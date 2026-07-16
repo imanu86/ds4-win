@@ -1,14 +1,14 @@
 ﻿{
     "schema":  "g7_raw_outputs_v1",
     "tag":  "g63_sparse_bake_k60_g46_composite_safety",
-    "head":  "9ed1a00e87c47ea816de616f251e4b24bfbf6cd2",
+    "head":  "c0739e0bdb4a2e8ed56ea89288a32f79cf968c63",
     "executable_sha256":  "63f1a24285bac089df1db6ecd2024f812b6905b7e7d31a49d95e7b2dcd983399",
     "ds4_cuda_sha256":  "ed601dadbc8dbb9e43a682b2854d03625f6c5131b3c18633a7044a417d2231b7",
     "prompt_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
     "system_prompt":  "",
     "system_prompt_sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
     "warmup_prompt_sha256":  "",
-    "expected_content_sha256":  "ceced6c1b481bb2c6f68bd116c06e554502017a44b40b4e5e6bc9fc5d710edc7",
+    "expected_content_sha256":  "4aaf0f0813f4cb15ac21a88f195f4f7d2c2af797e81524935e22eea60603c6b1",
     "expected_warmup_content_sha256":  "",
     "warmup_result":  null,
     "output_hashes":  [
@@ -81,9 +81,9 @@
     "results":  [
                     {
                         "repeat":  1,
-                        "seconds":  54.876149,
+                        "seconds":  57.223193,
                         "completion_tokens":  64,
-                        "tokens_per_second":  1.166263,
+                        "tokens_per_second":  1.118428,
                         "content_sha256":  "4aaf0f0813f4cb15ac21a88f195f4f7d2c2af797e81524935e22eea60603c6b1",
                         "content":  "Here is the complete single-file HTML landing page for a cyberpunk AI programming shop. It includes all CSS, navigation, hero section, request form, and a JavaScript confirmation popup.\n```html\n\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n    \u003cmeta charset=\"UTF-8\"\u003e\n    \u003cmeta name"
                     }
