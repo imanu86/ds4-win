@@ -2321,6 +2321,8 @@ static void cuda_dynamic_arena_storage_release(void) {
     g_dynamic_arena.preloaded_parts.clear();
 }
 
+static double cuda_dynamic_arena_min_available_gib(void);
+
 extern "C" void ds4_gpu_dynamic_arena_release(void) {
     if (g_dynamic_arena.host_base &&
         (g_dynamic_arena.hits || g_dynamic_arena.misses ||
@@ -2435,7 +2437,64 @@ extern "C" int ds4_gpu_dynamic_arena_prepare(
         (uint64_t)g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
     if (slots64 > max_entries) slots64 = max_entries;
     if (slots64 == 0 || slots64 > UINT32_MAX) return 0;
+    const uint64_t requested_slots64 = slots64;
+    const uint64_t requested_capped_bytes =
+        requested_slots64 * g_dynamic_arena.slot_bytes;
+    const double min_available_gib = cuda_dynamic_arena_min_available_gib();
+    double available_before_gib = -1.0;
+    int memory_status_ok = 0;
+    const char *cap_reason = "ok";
+#ifdef _WIN32
+    MEMORYSTATUSEX ms_before;
+    memset(&ms_before, 0, sizeof(ms_before));
+    ms_before.dwLength = sizeof(ms_before);
+    if (GlobalMemoryStatusEx(&ms_before)) {
+        memory_status_ok = 1;
+        available_before_gib =
+            (double)ms_before.ullAvailPhys / 1073741824.0;
+    }
+#endif
+    if (min_available_gib < 0.0) {
+        slots64 = 0;
+        cap_reason = "invalid-min-available";
+    } else if (min_available_gib > 0.0) {
+        if (!memory_status_ok) {
+            slots64 = 0;
+            cap_reason = "memory-status-unavailable";
+        } else {
+            const double budget_gib = available_before_gib - min_available_gib;
+            if (budget_gib <= 0.0) {
+                slots64 = 0;
+            } else {
+                const long double budget_bytes_ld =
+                    (long double)budget_gib * 1073741824.0L;
+                uint64_t budget_slots = 0;
+                if (budget_bytes_ld >=
+                    (long double)g_dynamic_arena.slot_bytes) {
+                    budget_slots =
+                        (uint64_t)(budget_bytes_ld /
+                                   (long double)g_dynamic_arena.slot_bytes);
+                }
+                if (budget_slots < slots64) slots64 = budget_slots;
+            }
+            if (slots64 == 0) cap_reason = "insufficient-available";
+        }
+    }
     const uint64_t bytes = slots64 * g_dynamic_arena.slot_bytes;
+    const int cap_capped = slots64 < requested_slots64 ? 1 : 0;
+    fprintf(stderr,
+            "ds4: [arena-cap] requested_gib=%.3f min_available_gib=%.3f available_before_gib=%.3f requested_bytes=%llu requested_slots=%llu chosen_bytes=%llu chosen_slots=%llu capped=%d result=%s reason=%s\n",
+            (double)requested_capped_bytes / 1073741824.0,
+            min_available_gib,
+            available_before_gib,
+            (unsigned long long)requested_capped_bytes,
+            (unsigned long long)requested_slots64,
+            (unsigned long long)bytes,
+            (unsigned long long)slots64,
+            cap_capped,
+            slots64 == 0 ? "disabled" : "ready",
+            cap_reason);
+    if (slots64 == 0) return 0;
     if (bytes > (uint64_t)SIZE_MAX) return 0;
     if (g_dynamic_arena.host_base && g_dynamic_arena.allocated_bytes == bytes) {
         if (allocated_bytes) *allocated_bytes = bytes;
@@ -3646,6 +3705,26 @@ static int cuda_dynamic_arena_wrap_sequential_file(void) {
 static int cuda_dynamic_arena_wrap_random_file(void) {
     const char *value = getenv("DS4_CUDA_ARENA_WRAP_RANDOM_FILE");
     return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static double cuda_dynamic_arena_min_available_gib(void) {
+    const char *value = getenv("DS4_CUDA_DYNAMIC_ARENA_MIN_AVAILABLE_GIB");
+    if (!value || !value[0]) return 0.0;
+    char *end = NULL;
+    errno = 0;
+    const double parsed = strtod(value, &end);
+    if (errno == 0 && end && *end == '\0' &&
+        isfinite(parsed) && parsed >= 0.0 && parsed <= 64.0) {
+        return parsed;
+    }
+    static int warned = 0;
+    if (!warned) {
+        fprintf(stderr,
+                "ds4: [arena-cap] invalid min_available_gib '%s'; dynamic arena disabled\n",
+                value);
+        warned = 1;
+    }
+    return -1.0;
 }
 
 static uint32_t cuda_dynamic_arena_wrap_sequential_workers(

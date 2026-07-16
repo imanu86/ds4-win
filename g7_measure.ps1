@@ -21,6 +21,7 @@ param(
     [switch]$DisableQ8F16Cache,
     [switch]$EmbedRowStaging,
     [ValidateRange(0.0, 1024.0)][double]$DynamicArenaGiB = 0.0,
+    [ValidateRange(0.0, 64.0)][double]$DynamicArenaMinAvailableGiB = 0.0,
     [switch]$ArenaWrapTrustWorkerChecksum,
     [switch]$ArenaWrapSourceParts,
     [switch]$ArenaWrapSequentialFile,
@@ -356,6 +357,12 @@ if ($DynamicArenaGiB -gt 0.0) {
 } else {
     Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_GB -ErrorAction SilentlyContinue
 }
+if ($DynamicArenaMinAvailableGiB -gt 0.0) {
+    $env:DS4_CUDA_DYNAMIC_ARENA_MIN_AVAILABLE_GIB =
+        $DynamicArenaMinAvailableGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+    Remove-Item Env:\DS4_CUDA_DYNAMIC_ARENA_MIN_AVAILABLE_GIB -ErrorAction SilentlyContinue
+}
 if ($PrefillMassObserve -or $PrefillMassWrap) {
     $env:DS4_CUDA_PREFILL_MASS_OBSERVE = "1"
 } else {
@@ -665,6 +672,7 @@ if ($ExpertTiering -ne "off") {
     if ($ExpertTiering -eq "enforce" -and $DynamicArenaGiB -le 0.0) { throw "ExpertTiering enforce requires DynamicArenaGiB > 0" }
 }
 if ($DynamicArenaObservedWindow -gt 0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaObservedWindow requires DynamicArenaGiB > 0" }
+if ($DynamicArenaMinAvailableGiB -gt 0.0 -and $DynamicArenaGiB -le 0.0) { throw "DynamicArenaMinAvailableGiB requires DynamicArenaGiB > 0" }
 if ($PrefillMassObserve -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassObserve requires DynamicArenaGiB > 0" }
 if ($PrefillMassWrap -and $DynamicArenaGiB -le 0.0) { throw "PrefillMassWrap requires DynamicArenaGiB > 0" }
 if ($ReapMassObserve -and $DynamicArenaGiB -le 0.0) { throw "ReapMassObserve requires DynamicArenaGiB > 0" }
@@ -1396,6 +1404,12 @@ $prefillWaveOverlapFailures = 0
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
 $arenaAllocatedBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
+$arenaCapObserved = $false; $arenaCapRequestedGiB = 0.0
+$arenaCapMinAvailableGiB = 0.0; $arenaCapAvailableBeforeGiB = 0.0
+$arenaCapRequestedBytes = 0; $arenaCapRequestedSlots = 0
+$arenaCapChosenBytes = 0; $arenaCapChosenSlots = 0
+$arenaCapCapped = $false; $arenaCapResult = "not_observed"
+$arenaCapReason = "not_observed"
 $requestPhaseObserved = $false; $requestPhaseLineCount = 0
 $requestPhaseEvents = @{}
 $requestPhasePrefillComputeSeconds = 0.0; $requestPhaseWrapSeconds = 0.0
@@ -1817,6 +1831,24 @@ if (Test-Path $stderrLog) {
         $reapMaskRangesUpdated = [int]$Matches[5]
         $reapMaskRangesCreated = [int]$Matches[6]
         $reapMaskRangesFailed = [int]$Matches[7]
+    }
+    $arenaCapLine = $lines | Where-Object { $_ -match "^\s*ds4: \[arena-cap\] " } | Select-Object -Last 1
+    if ($arenaCapLine) {
+        $arenaCapPattern = "^ds4: \[arena-cap\] requested_gib=([0-9.]+) min_available_gib=([0-9.]+) available_before_gib=(-?[0-9.]+) requested_bytes=(\d+) requested_slots=(\d+) chosen_bytes=(\d+) chosen_slots=(\d+) capped=(0|1) result=(ready|disabled) reason=([a-z-]+)$"
+        if ($arenaCapLine -notmatch $arenaCapPattern) {
+            throw "Dynamic arena cap line format mismatch: $arenaCapLine"
+        }
+        $arenaCapObserved = $true
+        $arenaCapRequestedGiB = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaCapMinAvailableGiB = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaCapAvailableBeforeGiB = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaCapRequestedBytes = [long]$Matches[4]
+        $arenaCapRequestedSlots = [long]$Matches[5]
+        $arenaCapChosenBytes = [long]$Matches[6]
+        $arenaCapChosenSlots = [long]$Matches[7]
+        $arenaCapCapped = ($Matches[8] -eq "1")
+        $arenaCapResult = $Matches[9]
+        $arenaCapReason = $Matches[10]
     }
     $arenaReadyLine = $lines | Where-Object { $_ -match "CUDA dynamic arena ready" } | Select-Object -Last 1
     if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready [0-9.]+ GiB, (\d+) slots.*bytes=(\d+) slot_bytes=(\d+)") {
@@ -2499,6 +2531,42 @@ if ($DynamicArenaObservedWindow -gt 0) {
         throw "Dynamic arena measurement failed: initial publication result was not observed"
     }
 }
+if ($DynamicArenaGiB -gt 0.0) {
+    if (-not $arenaCapObserved) { throw "Dynamic arena cap telemetry was not observed" }
+    if ([math]::Abs($arenaCapMinAvailableGiB - $DynamicArenaMinAvailableGiB) -gt 0.0015) {
+        throw "Dynamic arena cap measurement failed: observed min-available differs from requested value"
+    }
+    if ($arenaCapChosenBytes -gt $arenaCapRequestedBytes -or
+        $arenaCapChosenSlots -gt $arenaCapRequestedSlots) {
+        throw "Dynamic arena cap measurement failed: chosen arena exceeds requested arena"
+    }
+    if (-not $arenaCapCapped -and
+        ($arenaCapChosenBytes -ne $arenaCapRequestedBytes -or
+         $arenaCapChosenSlots -ne $arenaCapRequestedSlots)) {
+        throw "Dynamic arena cap measurement failed: uncapped telemetry changed the requested arena"
+    }
+    if ($arenaCapChosenSlots -lt 1) {
+        if ($arenaCapResult -ne "disabled" -or $arenaAllocatedBytes -ne 0 -or
+            $arenaAllocatedSlots -ne 0) {
+            throw "Dynamic arena cap measurement failed: zero-slot arena was not disabled"
+        }
+    } else {
+        if ($arenaCapResult -ne "ready" -or
+            $arenaAllocatedBytes -ne $arenaCapChosenBytes -or
+            $arenaAllocatedSlots -ne $arenaCapChosenSlots) {
+            throw "Dynamic arena cap measurement failed: ready allocation differs from chosen cap"
+        }
+    }
+    if ($DynamicArenaMinAvailableGiB -gt 0.0 -and
+        $arenaCapAvailableBeforeGiB -ge 0.0 -and
+        $arenaCapChosenBytes -gt 0) {
+        $arenaCapChosenGiB = [double]$arenaCapChosenBytes / 1GB
+        if (($arenaCapAvailableBeforeGiB - $arenaCapChosenGiB + 0.000001) -lt
+            $DynamicArenaMinAvailableGiB) {
+            throw "Dynamic arena cap measurement failed: chosen arena violates min-available request"
+        }
+    }
+}
 if ($DynamicArenaCarry -ne "default") {
     $expectedCarryLookup = if ($DynamicArenaCarry -eq "keep") { "enabled" } else { "disabled" }
     if (-not $arenaCarryObserved) { throw "Dynamic arena carry measurement failed: telemetry was not observed" }
@@ -3090,6 +3158,18 @@ $summary = [pscustomobject]@{
     dynamic_arena_wrap_publication_count = $arenaWrapPublicationCount
     reap_prefetch_threads_requested = $ReapPrefetchThreads
     minimum_available_gib_effective = $effectiveMinimumAvailableGiB
+    dynamic_arena_min_available_gib_requested = $DynamicArenaMinAvailableGiB
+    dynamic_arena_cap_observed = $arenaCapObserved
+    dynamic_arena_cap_requested_gib = $arenaCapRequestedGiB
+    dynamic_arena_cap_min_available_gib = $arenaCapMinAvailableGiB
+    dynamic_arena_cap_available_before_gib = $arenaCapAvailableBeforeGiB
+    dynamic_arena_cap_requested_bytes = $arenaCapRequestedBytes
+    dynamic_arena_cap_requested_slots = $arenaCapRequestedSlots
+    dynamic_arena_cap_chosen_bytes = $arenaCapChosenBytes
+    dynamic_arena_cap_chosen_slots = $arenaCapChosenSlots
+    dynamic_arena_cap_capped = $arenaCapCapped
+    dynamic_arena_cap_result = $arenaCapResult
+    dynamic_arena_cap_reason = $arenaCapReason
     dynamic_arena_allocated_bytes = $arenaAllocatedBytes
     dynamic_arena_allocated_slots = $arenaAllocatedSlots
     dynamic_arena_slot_bytes = $arenaSlotBytes
@@ -3326,6 +3406,7 @@ Write-Host ("REAP mass WRAP requested/armed/grow/hysteresis/capacity/router/mask
 Write-Host ("REAP mass WRAP events/published/skipped/failed/entrants/victims/loads/sec: " + $reapMassWrapEventCount + " / " + $reapMassWrapPublicationCount + " / " + $reapMassWrapSkippedCount + " / " + $reapMassWrapFailureCount + " / " + $reapMassWrapEntrants + " / " + $reapMassWrapVictims + " / " + $reapMassWrapLoads + " / " + $reapMassWrapSeconds)
 Write-Host ("REAP mass WRAP last result/reason/resident before/after/generation: " + $reapMassWrapLastResult + " / " + $reapMassWrapLastReason + " / " + $reapMassWrapLastResidentBefore + " / " + $reapMassWrapLastResidentAfter + " / " + $reapMassWrapLastGeneration)
 Write-Host ("arena observer armed/window/minhits/grow/tokens/resident: " + $arenaObserverArmed + " / " + $arenaObserverWindowObserved + " / " + $arenaObserverMinHitsObserved + " / " + $arenaObserverGrowIntervalObserved + " / " + $arenaObserverTokens + " / " + $arenaObserverResident)
+Write-Host ("arena cap req/min/available-before/chosen slots/bytes/capped/result/reason: " + $summary.dynamic_arena_cap_requested_gib + " / " + $summary.dynamic_arena_cap_min_available_gib + " / " + $summary.dynamic_arena_cap_available_before_gib + " / " + $summary.dynamic_arena_cap_chosen_slots + " / " + $summary.dynamic_arena_cap_chosen_bytes + " / " + $summary.dynamic_arena_cap_capped + " / " + $summary.dynamic_arena_cap_result + " / " + $summary.dynamic_arena_cap_reason)
 Write-Host ("arena carry requested: " + $DynamicArenaCarry)
 Write-Host ("arena carry observed/request/mode/snapshot/resident/lookup/observer: " + $arenaCarryObserved + " / " + $arenaCarryRequest + " / " + $arenaCarryModeObserved + " / " + $arenaCarrySnapshot + " / " + $arenaCarryResident + " / " + $arenaCarryLookupObserved + " / " + $arenaCarryObserverObserved)
 Write-Host ("arena publication/window+WRAP counts: " + $arenaObserverPublicationCount + " / " + $arenaWrapPublicationCount)
