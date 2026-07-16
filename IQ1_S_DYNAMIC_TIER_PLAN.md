@@ -51,6 +51,15 @@ build. Deferred authoritative 2-bit promotion, next-token publication, and the
 `forbidden_cold_ssd_to_vram=0` end-to-end gate are still unimplemented. The
 required `n>=3` cyberpunk L0-L3 quality A/B is also still pending.
 
+A source audit identified the exact promotion gap. The five hot IQ2 routes are
+observed by the GPU route worker, but the separated cold IQ1_S route bypasses
+that worker and therefore does not contribute to tiering mass, frequency, or
+recency. In addition, the existing main-route enforce path can read a cold IQ2
+expert into pinned RAM and publish it to VRAM during the same request. The
+promotion patch must both feed the cold IQ1_S observation into the authoritative
+mass/LFRU state and add an explicit `vram_eligible_epoch` guard. Merely passing
+through RAM is not sufficient to prove next-token eligibility.
+
 ## Required Residency Contract
 
 ### SSD Cold Tier
@@ -200,11 +209,17 @@ expected, and output remains structurally valid.
 ### Phase 2: Deferred 2-bit Promotion
 
 1. Add separate IQ1_S cache binding fields to tiering state.
-2. Generate promotion candidates from measured mass/frequency policy.
-3. Load candidates from the main GGUF into the existing pinned 2-bit arena.
-4. Publish the 2-bit binding atomically after validation.
-5. Enforce a token epoch: an expert promoted during token `T` cannot become a
+2. Observe the separated cold IQ1_S route in the same authoritative
+   mass/frequency policy used by the five hot IQ2 routes, with one thread owner
+   and reconciled call counters.
+3. Generate promotion candidates from measured mass/frequency policy.
+4. Load candidates from the main GGUF into the existing pinned 2-bit arena.
+5. Publish the 2-bit RAM binding atomically after validation.
+6. Enforce a token epoch: an expert promoted during token `T` cannot become a
    2-bit VRAM candidate before token `T+1`.
+7. Reject same-request RAM-to-VRAM publication even if the IQ2 load completes
+   early; increment a fail-closed counter rather than silently relaxing the
+   epoch.
 
 Exit gate: every promoted expert has an auditable IQ1_S-cold event followed by
 a 2-bit pinned-ready event, with no direct cold-to-VRAM transition.
