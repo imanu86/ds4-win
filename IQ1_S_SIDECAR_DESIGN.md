@@ -156,6 +156,18 @@ For each routed expert lookup:
 The sidecar must never influence routing decisions directly. It is an expert
 payload source after routing, not a router replacement.
 
+## Checkpoint Identity
+
+Geometry and tensor names do not prove that two GGUF files came from the same
+checkpoint. Before enabling the sidecar, the runtime therefore compares 126
+quantization-invariant F32 control tensors byte-for-byte across the main model
+and sidecar: `attn_norm` and `ffn_norm` for every layer, plus expert probability
+biases where present. The current set covers `1,449,984` bytes and emits a
+diagnostic FNV-1a fingerprint only after every exact comparison succeeds.
+
+This runtime identity gate complements, rather than replaces, the full-file
+SHA-256 provenance checks in the measurement harness.
+
 ## Gate Safety and Quality Gates
 
 Validation is split into a safety gate and a quality gate.
@@ -309,10 +321,19 @@ or quality claims.
 
 ### Environment-Off Regression
 
-Run `g75_iq1_runtime_g73_regression_contaminated_retry` completed with server
+Run `g75b_iq1_runtime_postaudit_g73_regression_contaminated` completed with server
 exit code zero and reproduced the expected G73 output SHA-256 exactly:
 `31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8`.
 The IQ1_S sidecar was disabled. System quiescence was intentionally skipped
 while the sidecar download used another physical disk, so all timing from this
 run is excluded from SOTA and A/B claims. This gate proves only that the new
 runtime leaves the established path unchanged when disabled.
+
+### Fail-Closed Negative Gate
+
+The main IQ2_XXS GGUF was deliberately supplied as the IQ1_S sidecar. The
+runtime exited with code 1 before inference and reported
+`blk.0.ffn_gate_exps.weight has type iq2_xxs, expected iq1_s`. In addition, an
+IQ1_S route now requires selected expert loading: loader failure or an attempt
+to disable the selected loader returns failure immediately and cannot fall
+through to main-model offsets.
