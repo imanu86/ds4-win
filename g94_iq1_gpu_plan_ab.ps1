@@ -171,7 +171,6 @@ function New-G94Args {
         "-ArenaWrapUnlockWaveGiB", "4",
         "-DisableQ8F16Cache",
         "-EmbedRowStaging",
-        "-PrefillMassObserve",
         "-PrefillMassWrap",
         "-ComposePrefillMassTiering",
         "-ExpertCacheN", "320",
@@ -287,7 +286,7 @@ function Assert-G94RunContract {
         [bool]$Result.arena_wrap_unlock_source_ranges_requested -ne $true -or
         [double]$Result.arena_wrap_unlock_wave_gib_requested -ne 4.0 -or
         [bool]$Result.arena_wrap_unlock_source_ranges_observed -ne $true -or
-        [bool]$Result.prefill_mass_observe_requested -ne $true -or
+        [bool]$Result.prefill_mass_observe_requested -ne $false -or
         [bool]$Result.prefill_mass_wrap_requested -ne $true -or
         [bool]$Result.prefill_mass_wrap_observed -ne $true -or
         [string]$Result.prefill_mass_wrap_result -ne "published" -or
@@ -666,7 +665,7 @@ $summary = [pscustomobject]@{
         unlock_wave_gib = 4
     }
     prefill_mass = [pscustomobject]@{
-        observe = $true
+        explicit_observe = $false
         wrap = $true
         compose_tiering = $true
     }

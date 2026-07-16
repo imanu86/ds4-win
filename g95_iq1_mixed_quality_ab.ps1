@@ -124,7 +124,6 @@ function New-G95BaseMeasureArgs([string]$Tag) {
         "-DisableQ8F16Cache",
         "-EmbedRowStaging",
         "-ReapPrefetchThreads", "8",
-        "-PrefillMassObserve",
         "-PrefillMassWrap",
         "-ComposePrefillMassTiering",
         "-ExpertCacheN", "320",
@@ -214,7 +213,7 @@ function Assert-G95ArmResult {
         -not [bool]$Result.q8_f16_cache_disabled -or
         -not [bool]$Result.embed_row_staging_requested -or
         [int]$Result.reap_prefetch_threads_requested -ne 8 -or
-        -not [bool]$Result.prefill_mass_observe_requested -or
+        [bool]$Result.prefill_mass_observe_requested -or
         -not [bool]$Result.prefill_mass_wrap_requested -or
         -not [bool]$Result.compose_prefill_mass_tiering_requested -or
         [int]$Result.expert_cache_requested -ne 320 -or
@@ -505,7 +504,7 @@ $summary = [ordered]@{
         arena_wrap_unlock_wave_gib = 4
         q8_f16_cache = "disabled"
         embed_row_staging = $true
-        prefill_mass_observe = $true
+        prefill_mass_explicit_observe = $false
         prefill_mass_wrap = $true
         compose_prefill_mass_tiering = $true
         expert_cache_n = 320
