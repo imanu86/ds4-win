@@ -1,0 +1,20 @@
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 3.246s
+ds4: cuda backend initialized for graph diagnostics
+0716 12:20:12 ds4-server: context buffers 333.21 MiB (ctx=8192, backend=cuda, prefill_chunk=2048, raw_kv_rows=2304, compressed_kv_rows=2050)
+ds4: [arena-cap] requested_gib=29.999 min_available_gib=0.000 available_before_gib=38.043 requested_bytes=32211468288 requested_slots=4551 chosen_bytes=32211468288 chosen_slots=4551 capped=0 result=ready reason=ok
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=8.66 GiB bytes=32211468288 slot_bytes=7077888
+0716 12:20:17 ds4-server: listening on http://127.0.0.1:8000
+0716 12:20:18 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: CUDA loading model tensors 6.22 GiB cached
+ds4: CUDA loading model tensors 6.12 GiB cached
+ds4: CUDA loading model tensors 6.02 GiB cached
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 candidate_fnv1a64=c59a437fe9c6c376 sparse_skipped_ranked=0 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=4551 capacity=4551 mass_total=1720.000000 mass_candidate=1010.291848 mass_coverage=0.5874 cutoff=0.170601 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=0 target=1 resident=4551 loads=4551 slots=4551
+ds4: [arena-wrap-source-unlock] result=ok phase=gate parts=4551 ranges=2395 bytes_requested=9852203008 calls=2395 true=0 error_not_locked=2395 failed=0 seconds=1.392817 available_before=68747264 available_after=9432907776 working_set_before=30274732032 working_set_after=20422537216 page_fault_before=10504293 page_fault_after=10504295 read_transfer_before=36265359097 read_transfer_after=36265359097 last_error=0
+ds4: [arena-wrap-source-unlock] result=ok phase=up parts=4551 ranges=2395 bytes_requested=9852203008 calls=2395 true=0 error_not_locked=2395 failed=0 seconds=1.138859 available_before=873553920 available_after=10421305344 working_set_before=34879746048 working_set_after=25027543040 page_fault_before=14253766 page_fault_after=14253766 read_transfer_before=36265359097 read_transfer_after=36265359097 last_error=0
