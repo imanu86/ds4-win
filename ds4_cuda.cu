@@ -5290,10 +5290,67 @@ static void cuda_prefill_mass_observer_report_decode(const char *reason) {
                 (double)observer.decode_slots, policy);
 }
 
+static int cuda_sparse_bake_router_bias_topology_matches(void) {
+    if (!g_sparse_bake_active || g_dynamic_arena.n_expert != 256u) return 0;
+    const size_t layers = std::max(
+        (size_t)g_dynamic_arena.n_layer, g_reap_router_bias.size());
+    for (size_t layer = 0; layer < layers; layer++) {
+        const int expected = layer < g_dynamic_arena.n_layer &&
+            cuda_sparse_bake_layer_is_sparse((uint32_t)layer);
+        const int actual = layer < g_reap_router_bias.size() &&
+            g_reap_router_bias[layer] != NULL;
+        if (expected != actual) return 0;
+    }
+    return 1;
+}
+
+static int cuda_sparse_bake_restore_router_bias(const char *where) {
+    if (!g_sparse_bake_active || g_dynamic_arena.n_expert != 256u) return 0;
+    float bias[256];
+    uint32_t layers = 0;
+    uint32_t kept = 0;
+    uint32_t pruned = 0;
+    for (uint32_t layer = 0; layer < g_dynamic_arena.n_layer; layer++) {
+        if (!cuda_sparse_bake_layer_is_sparse(layer)) continue;
+        uint32_t layer_kept = 0;
+        for (uint32_t expert = 0; expert < 256u; expert++) {
+            const int retained =
+                cuda_sparse_bake_expert_retained(layer, expert);
+            bias[expert] = retained ? 0.0f : -1.0e9f;
+            layer_kept += retained;
+        }
+        if (!ds4_gpu_reap_router_bias_update(layer, bias, 256u)) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-compose-mask] result=restore-failed reason=upload where=%s layer=%u layers=%u kept=%u pruned=%u base=embedded-sparse-bake\n",
+                    where ? where : "unknown", layer, layers, kept, pruned);
+            return 0;
+        }
+        layers++;
+        kept += layer_kept;
+        pruned += 256u - layer_kept;
+    }
+    fprintf(stderr,
+            "ds4: [prefill-mass-compose-mask] result=restored reason=ok where=%s layers=%u kept=%u pruned=%u base=embedded-sparse-bake\n",
+            where ? where : "unknown", layers, kept, pruned);
+    return layers > 0;
+}
+
+static void cuda_prefill_mass_compose_release_router_mask(const char *where) {
+    if (!g_sparse_bake_active) {
+        ds4_gpu_reap_router_bias_reset();
+        return;
+    }
+    if (cuda_sparse_bake_restore_router_bias(where)) return;
+    ds4_gpu_reap_router_bias_reset();
+    g_dynamic_arena.submissions_blocked = 1;
+    g_dynamic_arena.hits_disabled = 1;
+    g_dynamic_arena.fatal_errors++;
+}
+
 static void cuda_prefill_mass_observer_release(int report) {
     if (report) cuda_prefill_mass_observer_report_decode("request-end");
     if (g_prefill_mass_observer.compose_mask_applied) {
-        ds4_gpu_reap_router_bias_reset();
+        cuda_prefill_mass_compose_release_router_mask("request-end");
     }
     g_prefill_mass_observer.mass.clear();
     g_prefill_mass_observer.counts.clear();
@@ -5320,7 +5377,7 @@ static void cuda_prefill_mass_observer_release(int report) {
 static void cuda_prefill_mass_compose_fail_closed(void) {
     if (cuda_moe_prefill_tier_compose_requested() <= 0) return;
     if (g_prefill_mass_observer.compose_mask_applied) {
-        ds4_gpu_reap_router_bias_reset();
+        cuda_prefill_mass_compose_release_router_mask("fail-closed");
         g_prefill_mass_observer.compose_mask_applied = 0;
     }
     /* A composed snapshot without its complete request mask is unsafe. Keep
@@ -5333,12 +5390,20 @@ static void cuda_prefill_mass_compose_fail_closed(void) {
 static int cuda_prefill_mass_compose_apply_router_mask(void) {
     cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
     if (cuda_moe_prefill_tier_compose_requested() <= 0) return 1;
+    uint32_t existing_bias_layers = 0;
     for (float *device_bias : g_reap_router_bias) {
-        if (device_bias) {
+        existing_bias_layers += device_bias != NULL;
+    }
+    const char *mask_base = "none";
+    if (existing_bias_layers > 0) {
+        if (!g_sparse_bake_active ||
+            !cuda_sparse_bake_router_bias_topology_matches()) {
             fprintf(stderr,
-                    "ds4: [prefill-mass-compose-mask] result=failed reason=existing-router-bias layers=0 kept=0 pruned=0\n");
+                    "ds4: [prefill-mass-compose-mask] result=failed reason=existing-router-bias layers=%u kept=0 pruned=0 base=unknown\n",
+                    existing_bias_layers);
             return 0;
         }
+        mask_base = "embedded-sparse-bake";
     }
     std::vector<float> bias;
     try {
@@ -5353,21 +5418,32 @@ static int cuda_prefill_mass_compose_apply_router_mask(void) {
     uint32_t pruned = 0;
     for (uint32_t layer = 3; layer < g_dynamic_arena.n_layer; layer++) {
         uint32_t layer_kept = 0;
-        const uint32_t base = layer * g_dynamic_arena.n_expert;
+        const uint32_t layer_base = layer * g_dynamic_arena.n_expert;
         for (uint32_t expert = 0;
              expert < g_dynamic_arena.n_expert; expert++) {
-            const int resident = observer.candidate[base + expert] != 0;
+            const int resident =
+                observer.candidate[layer_base + expert] != 0;
+            if (resident &&
+                !cuda_sparse_bake_expert_retained(layer, expert)) {
+                cuda_prefill_mass_compose_release_router_mask(
+                    "candidate-not-retained");
+                fprintf(stderr,
+                        "ds4: [prefill-mass-compose-mask] result=failed reason=candidate-not-retained layer=%u kept=%u pruned=%u base=%s\n",
+                        layer, layer_kept,
+                        g_dynamic_arena.n_expert - layer_kept, mask_base);
+                return 0;
+            }
             bias[expert] = resident ? 0.0f : -1.0e9f;
             layer_kept += resident;
         }
         if (layer_kept < 6u ||
             !ds4_gpu_reap_router_bias_update(
                 layer, bias.data(), g_dynamic_arena.n_expert)) {
-            ds4_gpu_reap_router_bias_reset();
+            cuda_prefill_mass_compose_release_router_mask("apply-failure");
             fprintf(stderr,
-                    "ds4: [prefill-mass-compose-mask] result=failed reason=layer-mask layer=%u kept=%u pruned=%u\n",
+                    "ds4: [prefill-mass-compose-mask] result=failed reason=layer-mask layer=%u kept=%u pruned=%u base=%s\n",
                     layer, layer_kept,
-                    g_dynamic_arena.n_expert - layer_kept);
+                    g_dynamic_arena.n_expert - layer_kept, mask_base);
             return 0;
         }
         layers++;
@@ -5376,8 +5452,8 @@ static int cuda_prefill_mass_compose_apply_router_mask(void) {
     }
     observer.compose_mask_applied = 1;
     fprintf(stderr,
-            "ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=%u kept=%u pruned=%u semantics=request-scoped-closed\n",
-            layers, kept, pruned);
+            "ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=%u kept=%u pruned=%u semantics=request-scoped-closed base=%s existing_layers=%u\n",
+            layers, kept, pruned, mask_base, existing_bias_layers);
     return 1;
 }
 

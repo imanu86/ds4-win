@@ -1293,6 +1293,9 @@ $prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
 $prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
 $prefillMassComposeCapacity = 0; $prefillMassComposeCandidateFNV1A64 = "not_observed"
 $prefillMassComposeSparseSkippedRanked = 0
+$prefillMassComposeMaskObserved = $false; $prefillMassComposeMaskEventCount = 0
+$prefillMassComposeMaskFailedCount = 0; $prefillMassComposeMaskBase = "not_observed"
+$prefillMassComposeMaskExistingLayers = 0; $prefillMassComposeMaskRestoreCount = 0
 $prefillMassLayerStripeObserved = $false; $prefillMassLayerStripeEventCount = 0
 $prefillMassLayerStripeFailedCount = 0; $prefillMassLayerStripeResult = "not_observed"
 $prefillMassLayerStripeReason = "not_observed"; $prefillMassLayerStripeStride = 0
@@ -1854,6 +1857,16 @@ if (Test-Path $stderrLog) {
     if ($prefillMassComposeLine -and $prefillMassComposeLine -match "sparse_skipped_ranked=(\d+)") {
         $prefillMassComposeSparseSkippedRanked = [long]$Matches[1]
     }
+    $prefillMassComposeMaskLines = @($lines | Where-Object { $_ -match "\[prefill-mass-compose-mask\] result=" })
+    $prefillMassComposeMaskEventCount = $prefillMassComposeMaskLines.Count
+    $prefillMassComposeMaskFailedCount = @($prefillMassComposeMaskLines | Where-Object { $_ -match "result=(failed|restore-failed)" }).Count
+    $prefillMassComposeMaskAppliedLine = $prefillMassComposeMaskLines | Where-Object { $_ -match "result=applied" } | Select-Object -Last 1
+    if ($prefillMassComposeMaskAppliedLine -and $prefillMassComposeMaskAppliedLine -match "base=([a-z-]+) existing_layers=(\d+)") {
+        $prefillMassComposeMaskObserved = $true
+        $prefillMassComposeMaskBase = $Matches[1]
+        $prefillMassComposeMaskExistingLayers = [int]$Matches[2]
+    }
+    $prefillMassComposeMaskRestoreCount = @($prefillMassComposeMaskLines | Where-Object { $_ -match "result=restored" }).Count
     $prefillMassLayerStripeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-layer-stripe\] result=" })
     $prefillMassLayerStripeEventCount = $prefillMassLayerStripeLines.Count
     $prefillMassLayerStripeFailedCount = @($prefillMassLayerStripeLines | Where-Object { $_ -match "result=failed" }).Count
@@ -3021,6 +3034,12 @@ $summary = [pscustomobject]@{
     prefill_mass_compose_capacity = $prefillMassComposeCapacity
     prefill_mass_compose_candidate_fnv1a64 = $prefillMassComposeCandidateFNV1A64
     prefill_mass_compose_sparse_skipped_ranked = $prefillMassComposeSparseSkippedRanked
+    prefill_mass_compose_mask_observed = $prefillMassComposeMaskObserved
+    prefill_mass_compose_mask_event_count = $prefillMassComposeMaskEventCount
+    prefill_mass_compose_mask_failed_count = $prefillMassComposeMaskFailedCount
+    prefill_mass_compose_mask_base = $prefillMassComposeMaskBase
+    prefill_mass_compose_mask_existing_layers = $prefillMassComposeMaskExistingLayers
+    prefill_mass_compose_mask_restore_count = $prefillMassComposeMaskRestoreCount
     prefill_mass_layer_stripe_observed = $prefillMassLayerStripeObserved
     prefill_mass_layer_stripe_event_count = $prefillMassLayerStripeEventCount
     prefill_mass_layer_stripe_failed_count = $prefillMassLayerStripeFailedCount
