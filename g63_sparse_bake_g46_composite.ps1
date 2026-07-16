@@ -690,6 +690,7 @@ function Invoke-G63Run {
         [int]$r.prefill_mass_wrap_event_count -le 0 -or
         [bool]$r.prefill_mass_compose_observed -ne $true -or
         [int]$r.prefill_mass_compose_event_count -le 0 -or
+        [int64]$r.prefill_mass_compose_sparse_skipped_ranked -le 0 -or
         $null -eq $tier -or
         [bool]$tier.compose_prefill_mass_tiering_observed -ne $true -or
         [int]$tier.compose_prefill_mass_tiering_flag -ne 1 -or
@@ -887,6 +888,7 @@ function Invoke-G63Run {
         prefill_mass_compose_total_candidate = [int]$r.prefill_mass_compose_total_candidate
         prefill_mass_compose_ranked_entries = [int]$r.prefill_mass_compose_ranked_entries
         prefill_mass_compose_hash_seed_entries = [int]$r.prefill_mass_compose_hash_seed_entries
+        prefill_mass_compose_sparse_skipped_ranked = [int64]$r.prefill_mass_compose_sparse_skipped_ranked
         expert_cache_requested = [int]$r.expert_cache_requested
         expert_cache_reserve_gb = [double]$r.expert_cache_reserve_gb
         expert_cache_policy = [string]$r.expert_cache_policy
@@ -1118,6 +1120,7 @@ foreach ($bakeId in @("K60")) {
         prefill_mass_wrap_loads_mean = Get-G63Mean $rows "prefill_mass_wrap_loads"
         prefill_mass_wrap_resident_after_mean = Get-G63Mean $rows "prefill_mass_wrap_resident_after"
         prefill_mass_wrap_seconds_mean = Get-G63Mean $rows "prefill_mass_wrap_seconds"
+        prefill_mass_compose_sparse_skipped_ranked_mean = Get-G63Mean $rows "prefill_mass_compose_sparse_skipped_ranked"
         tier_vram_hits_mean = Get-G63Mean $rows "tier_vram_hits"
         tier_ram_hits_mean = Get-G63Mean $rows "tier_ram_hits"
         tier_ram_h2d_gib_mean = Get-G63Mean $rows "tier_ram_h2d_gib"
@@ -1210,6 +1213,7 @@ $summary = [pscustomobject]@{
         "ArenaWrap source-parts profile published with worker checksum",
         "PrefillMassWrap published with request-scoped-closed mask",
         "ComposePrefillMassTiering observed",
+        "sparse compose skipped and replaced non-retained ranked experts",
         "ExpertTiering enforce/mass-lfru observed",
         "tier states_vram=320, failures=0, snapshot_backing_misses=0, forbidden_cold_ssd_to_vram=0",
         "RouteNoDefaultSync requested with default_sync_calls=0",
@@ -1270,7 +1274,7 @@ $runs | Select-Object tag,bake_id,order_index,content_sha256,output_hash_matches
     arena_wrap_file_qd_requested,prefill_mass_wrap_candidate_entries,
     prefill_mass_wrap_loads,prefill_mass_wrap_resident_after,
     prefill_mass_wrap_seconds,prefill_mass_wrap_mask,
-    prefill_mass_compose_total_candidate,
+    prefill_mass_compose_total_candidate,prefill_mass_compose_sparse_skipped_ranked,
     expert_cache_requested,expert_cache_capacity,expert_cache_count,
     expert_tiering_requested,expert_tier_policy_requested,
     expert_tier_clock_calls_requested,expert_tier_replacement_budget_requested,
