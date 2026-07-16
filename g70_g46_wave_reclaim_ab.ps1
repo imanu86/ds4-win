@@ -5,6 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$runnerPath = $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $harness = Join-Path $root "g7_measure.ps1"
 $outdir = Join-Path $root "g7_runs"
@@ -309,7 +310,9 @@ function Assert-G70SameProvenance {
 
 function Test-G70Outlier {
     param([object[]]$Rows)
-    foreach ($property in @("decode_tokens_per_second", "ttft_minus_wrap_seconds")) {
+    foreach ($property in @(
+            "decode_tokens_per_second", "wrap_seconds",
+            "ttft_minus_wrap_seconds")) {
         foreach ($arm in @("legacy", "candidate")) {
             $armRows = @($Rows | Where-Object { $_.arm -eq $arm -and -not $_.safety })
             if ($armRows.Count -eq 0) { continue }
@@ -370,7 +373,7 @@ function Write-G70Summary {
         capacity_asymmetry_recorded = $CapacityAsymmetry
         performance_claim_allowed = ($Status -eq "matrix_complete" -and -not $CapacityAsymmetry -and $matrix.Count -ge 6)
         outlier_extension_triggered = $OutlierExtensionTriggered
-        outlier_rule = "If either arm has >20% max/min spread in decode_tokens_per_second or ttft_minus_wrap_seconds after n=3, run exactly three additional independent processes per arm before any verdict."
+        outlier_rule = "If either arm has >20% max/min spread in decode_tokens_per_second, wrap_seconds or ttft_minus_wrap_seconds after n=3, run exactly three additional independent processes per measured arm before any verdict."
         prompt = $prompt
         expected_content_sha256 = $expected
         model = $model
@@ -406,7 +409,7 @@ function Write-G70Summary {
                 model = $successful[0].model
                 model_bytes = $successful[0].model_bytes
                 model_last_write_utc = $successful[0].model_last_write_utc
-                runner_sha256 = (Get-FileHash -LiteralPath $MyInvocation.MyCommand.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+                runner_sha256 = (Get-FileHash -LiteralPath $runnerPath -Algorithm SHA256).Hash.ToLowerInvariant()
             }
         } else { $null }
     }

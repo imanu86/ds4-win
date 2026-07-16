@@ -119,10 +119,12 @@ quiescence preflight artifacts.
 
 ## Outlier Rule
 
-After the first n=3 matrix, inspect each arm independently. If either
-`decode_tokens_per_second` or `ttft_minus_wrap_seconds` has a max/min spread
-greater than 20% within either arm, treat the matrix as outlier-contaminated and
-run exactly three additional independent processes per arm.
+After the first n=3 matrix, inspect each arm independently. If any of
+`decode_tokens_per_second`, `wrap_seconds`, or `ttft_minus_wrap_seconds` has a
+max/min spread greater than 20% within either arm, treat the matrix as
+outlier-contaminated and run exactly three additional independent processes
+per measured arm. `wrap_seconds` is explicit because source-page stalls may
+occur inside WRAP rather than after it.
 
 The final summary must report whether this extension was triggered. No result
 may be promoted from a single safety run.
