@@ -16256,7 +16256,7 @@ static void cuda_moe_expert_cache_release(void) {
     if (g_moe_expert_cache.route_calls != 0 ||
         g_moe_expert_cache.route_worker_jobs != 0) {
         fprintf(stderr,
-                "ds4: [gpu-resident-routes] final calls=%llu split_calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu default_sync=%llu no_default_sync=%llu\n",
+                "ds4: [gpu-resident-routes] final calls=%llu split_calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu default_sync=%llu no_default_sync=%llu cache_count=%u cache_calls=%llu cache_hits=%llu cache_misses=%llu cache_admissions=%llu cache_evictions=%llu direct_loads=%llu\n",
                 (unsigned long long)g_moe_expert_cache.route_calls,
                 (unsigned long long)g_moe_expert_cache.route_split_calls,
                 (unsigned long long)g_moe_expert_cache.route_all_hit_observed,
@@ -16274,7 +16274,14 @@ static void cuda_moe_expert_cache_release(void) {
                         (double)g_moe_expert_cache.route_calls : 0.0,
                 (unsigned long long)g_moe_expert_cache.route_stream_queries,
                 (unsigned long long)g_moe_expert_cache.route_default_sync_calls,
-                (unsigned long long)g_moe_expert_cache.route_no_default_sync_calls);
+                (unsigned long long)g_moe_expert_cache.route_no_default_sync_calls,
+                g_moe_expert_cache.count,
+                (unsigned long long)g_moe_expert_cache.calls,
+                (unsigned long long)g_moe_expert_cache.hits,
+                (unsigned long long)g_moe_expert_cache.misses,
+                (unsigned long long)g_moe_expert_cache.admissions,
+                (unsigned long long)g_moe_expert_cache.evictions,
+                (unsigned long long)g_moe_expert_cache.direct_loads);
     }
     cuda_moe_tiering_report_and_reset();
     if (g_moe_expert_cache.gate) (void)cudaFree(g_moe_expert_cache.gate);

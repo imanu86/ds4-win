@@ -1249,6 +1249,9 @@ $gpuRoutesObserved = $false; $gpuRoutesCalls = 0; $gpuRoutesSplitCalls = 0; $gpu
 $gpuRoutesWorkerJobs = 0; $gpuRoutesMissExperts = 0; $gpuRoutesErrors = 0
 $gpuRoutesWorkerMs = 0.0; $gpuRoutesResolveMs = 0.0; $gpuRoutesWaitMs = 0.0
 $gpuRoutesQueries = 0; $gpuRoutesDefaultSyncCalls = 0; $gpuRoutesNoDefaultSyncCalls = 0
+$gpuRoutesCacheCount = 0; $gpuRoutesCacheCalls = 0; $gpuRoutesCacheHits = 0
+$gpuRoutesCacheMisses = 0; $gpuRoutesCacheAdmissions = 0; $gpuRoutesCacheEvictions = 0
+$gpuRoutesCacheDirectLoads = 0
 $overlapSharedObserved = $false
 $overlapSharedFullObserved = $false
 $spexObserved = $false; $spexObservedStage = ""; $spexObservedCap = 0; $spexScheduled = 0; $spexReady = 0; $spexNotReady = 0
@@ -1760,6 +1763,15 @@ if (Test-Path $stderrLog) {
         $gpuRoutesQueries = [long]$Matches[10]
         $gpuRoutesDefaultSyncCalls = [long]$Matches[11]
         $gpuRoutesNoDefaultSyncCalls = [long]$Matches[12]
+    }
+    if ($gpuRoutesLine -and $gpuRoutesLine -match "cache_count=(\d+) cache_calls=(\d+) cache_hits=(\d+) cache_misses=(\d+) cache_admissions=(\d+) cache_evictions=(\d+) direct_loads=(\d+)") {
+        $gpuRoutesCacheCount = [long]$Matches[1]
+        $gpuRoutesCacheCalls = [long]$Matches[2]
+        $gpuRoutesCacheHits = [long]$Matches[3]
+        $gpuRoutesCacheMisses = [long]$Matches[4]
+        $gpuRoutesCacheAdmissions = [long]$Matches[5]
+        $gpuRoutesCacheEvictions = [long]$Matches[6]
+        $gpuRoutesCacheDirectLoads = [long]$Matches[7]
     }
     if ($SplitHitMiss -and (-not $gpuRoutesObserved -or $gpuRoutesSplitCalls -le 0)) {
         throw "SplitHitMiss was requested but the runtime did not report any split calls"
@@ -3143,6 +3155,13 @@ $summary = [pscustomobject]@{
     gpu_resident_routes_queries = $gpuRoutesQueries
     gpu_resident_routes_default_sync_calls = $gpuRoutesDefaultSyncCalls
     gpu_resident_routes_no_default_sync_calls = $gpuRoutesNoDefaultSyncCalls
+    gpu_resident_routes_cache_count = $gpuRoutesCacheCount
+    gpu_resident_routes_cache_calls = $gpuRoutesCacheCalls
+    gpu_resident_routes_cache_hits = $gpuRoutesCacheHits
+    gpu_resident_routes_cache_misses = $gpuRoutesCacheMisses
+    gpu_resident_routes_cache_admissions = $gpuRoutesCacheAdmissions
+    gpu_resident_routes_cache_evictions = $gpuRoutesCacheEvictions
+    gpu_resident_routes_cache_direct_loads = $gpuRoutesCacheDirectLoads
     request_phase_trace_requested = [bool]$RequestPhaseTrace
     request_phase_trace_observed = $requestPhaseObserved
     request_phase_trace_line_count = $requestPhaseLineCount
@@ -3317,6 +3336,7 @@ Write-Host ("expert_tiering requested/observed/calls/selected/failures/states vr
 Write-Host ("mixed direct requested/observed/calls/cache routes/compact routes: " + [bool]$MixedDirectCache + " / " + $mixedDirectObserved + " / " + $mixedDirectCalls + " / " + $mixedDirectCacheRoutes + " / " + $mixedDirectCompactRoutes)
 Write-Host ("route profile requested/observed/calls d2h/observe/map/transport/publish ms: " + [bool]$RouteProfile + " / " + $routeProfileObserved + " / " + $routeProfileCalls + " / " + $routeProfileD2HMs + " / " + $routeProfileObserveMs + " / " + $routeProfileMapMs + " / " + $routeProfileTransportMs + " / " + $routeProfilePublishMs)
 Write-Host ("gpu resident routes requested/no-sync/split/observed/calls/split-calls/all-hit/jobs/miss-experts/errors/worker-ms/resolve-ms/wait-ms/queries/default-sync/no-sync-calls: " + [bool]$GpuResidentRoutes + " / " + [bool]$RouteNoDefaultSync + " / " + [bool]$SplitHitMiss + " / " + $gpuRoutesObserved + " / " + $gpuRoutesCalls + " / " + $gpuRoutesSplitCalls + " / " + $gpuRoutesAllHit + " / " + $gpuRoutesWorkerJobs + " / " + $gpuRoutesMissExperts + " / " + $gpuRoutesErrors + " / " + $gpuRoutesWorkerMs + " / " + $gpuRoutesResolveMs + " / " + $gpuRoutesWaitMs + " / " + $gpuRoutesQueries + " / " + $gpuRoutesDefaultSyncCalls + " / " + $gpuRoutesNoDefaultSyncCalls)
+Write-Host ("gpu resident route cache count/calls/hits/misses/admissions/evictions/direct: " + $gpuRoutesCacheCount + " / " + $gpuRoutesCacheCalls + " / " + $gpuRoutesCacheHits + " / " + $gpuRoutesCacheMisses + " / " + $gpuRoutesCacheAdmissions + " / " + $gpuRoutesCacheEvictions + " / " + $gpuRoutesCacheDirectLoads)
 Write-Host ("request phase trace requested/observed/lines prefill/wrap/copy/post-wrap/sync-tail/decode-gap/sample/eval/decode-first/prompt-first sec: " + [bool]$RequestPhaseTrace + " / " + $requestPhaseObserved + " / " + $requestPhaseLineCount + " / " + $requestPhasePrefillComputeSeconds + " / " + $requestPhaseWrapSeconds + " / " + $requestPhaseWrapCopySeconds + " / " + $requestPhasePostWrapSeconds + " / " + $requestPhaseSyncTailSeconds + " / " + $requestPhaseDecodeGapSeconds + " / " + $requestPhaseFirstSampleSeconds + " / " + $requestPhaseFirstEvalSeconds + " / " + $requestPhaseDecodeToFirstSeconds + " / " + $requestPhasePromptToFirstSeconds)
 Write-Host ("overlap_shared requested/observed: " + [bool]$OverlapShared + " / " + $overlapSharedObserved)
 Write-Host ("overlap_shared_full requested/observed: " + [bool]$OverlapSharedFull + " / " + $overlapSharedFullObserved)
