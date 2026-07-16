@@ -1,0 +1,32 @@
+{
+  "schema": "g72_infrastructure_retry_incident_v1",
+  "tag": "g72_static32_c",
+  "classification": "infrastructure_invalid_no_performance_claim",
+  "first_attempt": {
+    "process_start_local": "2026-07-16T14:43:23+02:00",
+    "memory_preflight_completed_utc": "2026-07-16T12:43:16.0577026Z",
+    "memory_preflight_ready_to_launch": true,
+    "memory_preflight_available_gib": 38.52,
+    "last_preserved_first_attempt_log_local": "2026-07-16T14:47:13+02:00",
+    "last_observed_stage": "arena_wrap_source_unlock_phase_up",
+    "http_failure": "underlying connection closed during receive",
+    "runner_contract_failure": "RouteNoDefaultSync was requested but not observed on every route call",
+    "runner_contract_failure_is_secondary": true,
+    "decode_started": false,
+    "performance_claim_allowed": false,
+    "windows_event_match_found": false,
+    "root_cause": "unestablished"
+  },
+  "artifact_limitation": "The retry reused the same tag and overwrote the first-attempt stderr and invalid summary. This receipt preserves the measured runner outcome and explicitly records that the original raw stderr is no longer available.",
+  "retry": {
+    "completed": true,
+    "result_path": "g7_runs/g7_g72_static32_c_result.json",
+    "decode_tokens_per_second": 4.62,
+    "expected_content_sha256_matched": true,
+    "snapshot_backing_misses": 0,
+    "ssd_bytes": 0,
+    "tier_failures": 0,
+    "default_sync_calls": 0
+  },
+  "interpretation": "The first attempt is excluded. The successful retry is the preregistered static32_c matrix observation. No cause is assigned to the interrupted WRAP attempt without a preserved crash record."
+}
