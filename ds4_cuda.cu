@@ -261,6 +261,35 @@ struct cuda_iq1_s_vram_cache {
     std::vector<cuda_iq1_s_vram_cache_slot> slots;
 };
 static cuda_iq1_s_vram_cache g_iq1_s_vram_cache;
+struct cuda_iq1_mixed_gpu_plan_request {
+    uint32_t sequence;
+    uint32_t layer_index;
+    uint32_t cold_slot;
+    int32_t cold_expert;
+    float cold_weight;
+};
+struct cuda_iq1_mixed_gpu_plan {
+    cuda_iq1_mixed_gpu_plan_request *host_request;
+    cuda_iq1_mixed_gpu_plan_request *device_request;
+    uint32_t sequence;
+    uint64_t calls;
+    uint64_t failures;
+    double wait_seconds;
+};
+static cuda_iq1_mixed_gpu_plan g_iq1_mixed_gpu_plan;
+struct cuda_iq1_mixed_host_selected {
+    const void *model_map;
+    const void *selected_ptr;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    int32_t expert;
+    float weight;
+    uint8_t valid;
+};
+static cuda_iq1_mixed_host_selected g_iq1_mixed_host_selected;
 static uint64_t g_iq1_mixed_calls;
 static uint64_t g_iq1_mixed_hot_main;
 static uint64_t g_iq1_mixed_cold_iq1;
@@ -644,6 +673,7 @@ static void cuda_moe_expert_cache_invalidate(void);
 static void cuda_moe_expert_cache_release(void);
 static void cuda_iq1_s_ram_cache_release(void);
 static void cuda_iq1_s_vram_cache_release(void);
+static void cuda_iq1_mixed_gpu_plan_release(void);
 static int cuda_iq1_mixed_debug_output(
     const char *phase, const ds4_gpu_tensor *tensor, uint32_t count);
 static void cuda_moe_gather_release(void);
@@ -1576,8 +1606,18 @@ static void cuda_iq1_s_sidecar_clear(void) {
                 g_iq1_mixed_profile_main_submit_seconds * 1000.0,
                 g_iq1_mixed_profile_main_sync_seconds * 1000.0,
                 g_iq1_mixed_profile_cold_submit_seconds * 1000.0,
-                g_iq1_mixed_profile_join_submit_seconds * 1000.0);
+                 g_iq1_mixed_profile_join_submit_seconds * 1000.0);
     }
+    if (g_iq1_mixed_gpu_plan.calls != 0 ||
+        g_iq1_mixed_gpu_plan.failures != 0) {
+        fprintf(stderr,
+                "ds4: [iq1-mixed-gpu-plan] result=summary calls=%llu "
+                "wait_ms=%.3f failures=%llu\n",
+                (unsigned long long)g_iq1_mixed_gpu_plan.calls,
+                g_iq1_mixed_gpu_plan.wait_seconds * 1000.0,
+                (unsigned long long)g_iq1_mixed_gpu_plan.failures);
+    }
+    cuda_iq1_mixed_gpu_plan_release();
     if (g_iq1_s_sidecar_file_valid) {
         os_file_close(&g_iq1_s_sidecar_file);
         g_iq1_s_sidecar_file_valid = 0;
@@ -1606,6 +1646,8 @@ static void cuda_iq1_s_sidecar_clear(void) {
     g_iq1_mixed_last_layer = UINT32_MAX;
     g_iq1_mixed_last_slot = UINT32_MAX;
     g_iq1_mixed_last_expert = -1;
+    memset(&g_iq1_mixed_host_selected, 0,
+           sizeof(g_iq1_mixed_host_selected));
     if (g_iq1_mixed_scratch) {
         (void)cudaFree(g_iq1_mixed_scratch);
         g_iq1_mixed_scratch = NULL;
@@ -15372,6 +15414,43 @@ __global__ static void moe_resolve_resident_routes_kernel(
     request->sequence = sequence;
 }
 
+__global__ static void iq1_mixed_cold_one_plan_kernel(
+        int32_t *hot_selected,
+        float *hot_weights,
+        int32_t *cold_selected,
+        float *cold_weight,
+        cuda_iq1_mixed_gpu_plan_request *request,
+        const int32_t *selected,
+        const float *weights,
+        uint32_t layer_index,
+        uint32_t sequence) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    uint32_t cold_slot = 0;
+    float min_weight = weights[0];
+    for (uint32_t route = 1; route < 6u; route++) {
+        if (weights[route] < min_weight) {
+            min_weight = weights[route];
+            cold_slot = route;
+        }
+    }
+    uint32_t hot = 0;
+    for (uint32_t route = 0; route < 6u; route++) {
+        if (route == cold_slot) continue;
+        hot_selected[hot] = selected[route];
+        hot_weights[hot] = weights[route];
+        hot++;
+    }
+    const int32_t expert = selected[cold_slot];
+    *cold_selected = expert;
+    *cold_weight = min_weight;
+    request->layer_index = layer_index;
+    request->cold_slot = cold_slot;
+    request->cold_expert = expert;
+    request->cold_weight = min_weight;
+    __threadfence_system();
+    request->sequence = sequence;
+}
+
 __global__ static void moe_publish_transient_route_kernel(
         uint64_t *route_ptrs,
         uint32_t route_count,
@@ -20927,6 +21006,20 @@ static int cuda_moe_selected_load(
     const uint32_t slot_count = n_tokens * n_expert;
     if (slot_count == 0) return 0;
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
+    const int iq1_mixed_host_prepared =
+        g_iq1_mixed_host_selected.valid && slot_count == 1u &&
+        g_iq1_mixed_host_selected.model_map == model_map &&
+        g_iq1_mixed_host_selected.selected_ptr == selected_arg->ptr &&
+        g_iq1_mixed_host_selected.gate_offset == gate_offset &&
+        g_iq1_mixed_host_selected.up_offset == up_offset &&
+        g_iq1_mixed_host_selected.down_offset == down_offset &&
+        g_iq1_mixed_host_selected.gate_expert_bytes == gate_expert_bytes &&
+        g_iq1_mixed_host_selected.down_expert_bytes == down_expert_bytes;
+    const int32_t iq1_mixed_host_expert =
+        g_iq1_mixed_host_selected.expert;
+    const float iq1_mixed_host_weight =
+        g_iq1_mixed_host_selected.weight;
+    g_iq1_mixed_host_selected.valid = 0;
     const int prefill_mass_weights =
         cuda_prefill_mass_observer_needs_weights();
     const int compose_requested =
@@ -20962,7 +21055,8 @@ static int cuda_moe_selected_load(
         weights_available &&
         (layer_top1 || prefill_mass_weights ||
          (reap_mass_weights && !packed_reap_trace));
-    const int host_weights_available = copy_weights || packed_reap_trace;
+    const int host_weights_available =
+        copy_weights || packed_reap_trace || iq1_mixed_host_prepared;
     const uint64_t full_prob_count =
         (uint64_t)n_tokens * n_total_expert;
     if (prefill_mass_full_probs &&
@@ -21003,7 +21097,14 @@ static int cuda_moe_selected_load(
 
     /* 1. Router outputs -> host. Layer-top1 also consumes the selected weights
      * to choose residency; selection itself remains unchanged. */
-    if (prepared) {
+    if (iq1_mixed_host_prepared) {
+        if (iq1_mixed_host_expert < 0 ||
+            (uint32_t)iq1_mixed_host_expert >= n_total_expert) {
+            return 0;
+        }
+        g_moe_gather.h_sel.assign(1u, iq1_mixed_host_expert);
+        g_moe_gather.h_weights.assign(1u, iq1_mixed_host_weight);
+    } else if (prepared) {
         if (g_moe_gather.h_sel.size() != slot_count) return 0;
         if (packed_reap_trace) {
             g_moe_gather.h_weights.resize(slot_count);
@@ -23705,6 +23806,38 @@ static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
     return 1;
 }
 
+static int cuda_iq1_mixed_gpu_plan_prepare(void) {
+    cuda_iq1_mixed_gpu_plan &plan = g_iq1_mixed_gpu_plan;
+    if (plan.host_request && plan.device_request) return 1;
+    cuda_iq1_mixed_gpu_plan_release();
+    cudaError_t err = cudaHostAlloc(
+        (void **)&plan.host_request, sizeof(*plan.host_request),
+        cudaHostAllocMapped);
+    if (err == cudaSuccess) {
+        err = cudaHostGetDevicePointer(
+            (void **)&plan.device_request, plan.host_request, 0);
+    }
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: IQ1 mixed GPU planner allocation failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        cuda_iq1_mixed_gpu_plan_release();
+        return 0;
+    }
+    memset(plan.host_request, 0, sizeof(*plan.host_request));
+    fprintf(stderr,
+            "ds4: [iq1-mixed-gpu-plan] result=ready "
+            "mode=cold-one-upload-overlap\n");
+    return 1;
+}
+
+static void cuda_iq1_mixed_gpu_plan_release(void) {
+    cuda_iq1_mixed_gpu_plan &plan = g_iq1_mixed_gpu_plan;
+    if (plan.host_request) (void)cudaFreeHost(plan.host_request);
+    memset(&plan, 0, sizeof(plan));
+}
+
 static int cuda_iq1_mixed_debug_output(
         const char *phase,
         const ds4_gpu_tensor *tensor,
@@ -23790,6 +23923,8 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
     g_iq1_mixed_calls++;
     const int mixed_profile = getenv("DS4_IQ1_S_PROFILE") != NULL;
     const int no_main_sync = getenv("DS4_IQ1_MIXED_NO_MAIN_SYNC") != NULL;
+    const int gpu_plan_requested =
+        getenv("DS4_IQ1_MIXED_GPU_PLAN") != NULL;
     const double mixed_t0 = mixed_profile ? cuda_wall_sec() : 0.0;
     const uint32_t slot_count = 6u;
     int32_t h_selected[6];
@@ -23804,40 +23939,46 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         g_iq1_mixed_failures++;
         return 0;
     }
-    if (!cuda_ok(cudaMemcpy(h_selected, selected->ptr,
-                            sizeof(h_selected), cudaMemcpyDeviceToHost),
-                 "iq1 mixed selected D2H") ||
-        !cuda_ok(cudaMemcpy(h_weights, weights->ptr,
-                            sizeof(h_weights), cudaMemcpyDeviceToHost),
-                 "iq1 mixed weights D2H")) {
+    uint32_t cold_slot = 0;
+    float cold_weight = 0.0f;
+    int32_t cold_expert = -1;
+    int32_t h_hot_selected[5];
+    float h_hot_weights[5];
+    uint32_t hot_i = 0;
+    if (!gpu_plan_requested) {
+        if (!cuda_ok(cudaMemcpy(h_selected, selected->ptr,
+                                sizeof(h_selected), cudaMemcpyDeviceToHost),
+                     "iq1 mixed selected D2H") ||
+            !cuda_ok(cudaMemcpy(h_weights, weights->ptr,
+                                sizeof(h_weights), cudaMemcpyDeviceToHost),
+                     "iq1 mixed weights D2H")) {
+            g_iq1_mixed_failures++;
+            return 0;
+        }
+        cold_weight = h_weights[0];
+        for (uint32_t i = 1; i < slot_count; i++) {
+            if (h_weights[i] < cold_weight) {
+                cold_weight = h_weights[i];
+                cold_slot = i;
+            }
+        }
+        cold_expert = h_selected[cold_slot];
+        for (uint32_t i = 0; i < slot_count; i++) {
+            if (i == cold_slot) continue;
+            h_hot_selected[hot_i] = h_selected[i];
+            h_hot_weights[hot_i] = h_weights[i];
+            hot_i++;
+        }
+    } else if (!cuda_iq1_mixed_gpu_plan_prepare()) {
+        g_iq1_mixed_gpu_plan.failures++;
         g_iq1_mixed_failures++;
         return 0;
     }
     const double mixed_router_t = mixed_profile ? cuda_wall_sec() : 0.0;
 
-    uint32_t cold_slot = 0;
-    float cold_weight = h_weights[0];
-    for (uint32_t i = 1; i < slot_count; i++) {
-        if (h_weights[i] < cold_weight) {
-            cold_weight = h_weights[i];
-            cold_slot = i;
-        }
-    }
-    const int32_t cold_expert = h_selected[cold_slot];
     const uint32_t hot_count = slot_count - 1u;
-    int32_t h_hot_selected[5];
-    float h_hot_weights[5];
-    uint32_t hot_i = 0;
-    for (uint32_t i = 0; i < slot_count; i++) {
-        if (i == cold_slot) continue;
-        h_hot_selected[hot_i] = h_selected[i];
-        h_hot_weights[hot_i] = h_weights[i];
-        hot_i++;
-    }
-    g_iq1_mixed_last_layer = layer_index;
-    g_iq1_mixed_last_slot = cold_slot;
-    g_iq1_mixed_last_expert = cold_expert;
-    if (cold_expert < 0 || hot_i != hot_count) {
+    if (!gpu_plan_requested &&
+        (cold_expert < 0 || cold_expert >= 256 || hot_i != hot_count)) {
         g_iq1_mixed_failures++;
         return 0;
     }
@@ -23873,20 +24014,40 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
     float *d_cold_out = (float *)(scratch + off_cold_out);
     float *d_cold_down = (float *)(scratch + off_cold_down);
 
-    if (!cuda_ok(cudaMemcpy(d_hot_selected, h_hot_selected,
-                            sizeof(h_hot_selected), cudaMemcpyHostToDevice),
-                 "iq1 mixed hot selected H2D") ||
-        !cuda_ok(cudaMemcpy(d_hot_weights, h_hot_weights,
-                            sizeof(h_hot_weights), cudaMemcpyHostToDevice),
-                 "iq1 mixed hot weights H2D") ||
-        !cuda_ok(cudaMemcpy(d_cold_selected, &cold_expert,
-                            sizeof(cold_expert), cudaMemcpyHostToDevice),
-                 "iq1 mixed cold selected H2D") ||
-        !cuda_ok(cudaMemcpy(d_cold_weight, &cold_weight,
-                            sizeof(cold_weight), cudaMemcpyHostToDevice),
-                 "iq1 mixed cold weight H2D")) {
-        g_iq1_mixed_failures++;
-        return 0;
+    uint32_t gpu_plan_sequence = 0;
+    if (gpu_plan_requested) {
+        gpu_plan_sequence = ++g_iq1_mixed_gpu_plan.sequence;
+        if (gpu_plan_sequence == 0u) {
+            gpu_plan_sequence = ++g_iq1_mixed_gpu_plan.sequence;
+        }
+        iq1_mixed_cold_one_plan_kernel<<<1, 1>>>(
+            d_hot_selected, d_hot_weights,
+            d_cold_selected, d_cold_weight,
+            g_iq1_mixed_gpu_plan.device_request,
+            (const int32_t *)selected->ptr,
+            (const float *)weights->ptr,
+            layer_index, gpu_plan_sequence);
+        if (!cuda_ok(cudaGetLastError(), "iq1 mixed GPU planner launch")) {
+            g_iq1_mixed_gpu_plan.failures++;
+            g_iq1_mixed_failures++;
+            return 0;
+        }
+    } else {
+        if (!cuda_ok(cudaMemcpy(d_hot_selected, h_hot_selected,
+                                sizeof(h_hot_selected), cudaMemcpyHostToDevice),
+                     "iq1 mixed hot selected H2D") ||
+            !cuda_ok(cudaMemcpy(d_hot_weights, h_hot_weights,
+                                sizeof(h_hot_weights), cudaMemcpyHostToDevice),
+                     "iq1 mixed hot weights H2D") ||
+            !cuda_ok(cudaMemcpy(d_cold_selected, &cold_expert,
+                                sizeof(cold_expert), cudaMemcpyHostToDevice),
+                     "iq1 mixed cold selected H2D") ||
+            !cuda_ok(cudaMemcpy(d_cold_weight, &cold_weight,
+                                sizeof(cold_weight), cudaMemcpyHostToDevice),
+                     "iq1 mixed cold weight H2D")) {
+            g_iq1_mixed_failures++;
+            return 0;
+        }
     }
     const double mixed_metadata_t = mixed_profile ? cuda_wall_sec() : 0.0;
 
@@ -23906,7 +24067,71 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         return 0;
     }
     const double mixed_main_submit_t = mixed_profile ? cuda_wall_sec() : 0.0;
-    if (!no_main_sync &&
+    double gpu_plan_wait_seconds = 0.0;
+    if (gpu_plan_requested) {
+        const double wait_started = cuda_wall_sec();
+        const double wait_deadline = wait_started + 5.0;
+        while (*(volatile uint32_t *)&g_iq1_mixed_gpu_plan.host_request->sequence !=
+               gpu_plan_sequence) {
+            if (cuda_wall_sec() >= wait_deadline) {
+                fprintf(stderr,
+                        "ds4: IQ1 mixed GPU planner timed out seq=%u layer=%u\n",
+                        gpu_plan_sequence, layer_index);
+                g_iq1_mixed_gpu_plan.failures++;
+                g_iq1_mixed_failures++;
+                return 0;
+            }
+#ifdef _WIN32
+            (void)SwitchToThread();
+#else
+            usleep(0);
+#endif
+        }
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+        gpu_plan_wait_seconds = cuda_wall_sec() - wait_started;
+        g_iq1_mixed_gpu_plan.wait_seconds += gpu_plan_wait_seconds;
+        const cuda_iq1_mixed_gpu_plan_request *request =
+            g_iq1_mixed_gpu_plan.host_request;
+        cold_slot = request->cold_slot;
+        cold_expert = request->cold_expert;
+        cold_weight = request->cold_weight;
+        if (request->layer_index != layer_index || cold_slot >= slot_count ||
+            cold_expert < 0 || cold_expert >= 256) {
+            fprintf(stderr,
+                    "ds4: IQ1 mixed GPU planner returned invalid route "
+                    "seq=%u layer=%u request_layer=%u slot=%u expert=%d\n",
+                    gpu_plan_sequence, layer_index, request->layer_index,
+                    cold_slot, (int)cold_expert);
+            g_iq1_mixed_gpu_plan.failures++;
+            g_iq1_mixed_failures++;
+            return 0;
+        }
+        g_iq1_mixed_gpu_plan.calls++;
+
+        /* The hot kernels are already queued on stream 0. Publish the exact
+         * host-selected cold id so selected-load can stage IQ1_S on the
+         * nonblocking upload stream without repeating a router D2H. */
+        g_iq1_mixed_host_selected.model_map = iq1_model_map;
+        g_iq1_mixed_host_selected.selected_ptr = d_cold_selected;
+        g_iq1_mixed_host_selected.gate_offset = iq1_gate_offset;
+        g_iq1_mixed_host_selected.up_offset = iq1_up_offset;
+        g_iq1_mixed_host_selected.down_offset = iq1_down_offset;
+        g_iq1_mixed_host_selected.gate_expert_bytes =
+            iq1_gate_expert_bytes;
+        g_iq1_mixed_host_selected.down_expert_bytes =
+            iq1_down_expert_bytes;
+        g_iq1_mixed_host_selected.expert = cold_expert;
+        g_iq1_mixed_host_selected.weight = cold_weight;
+        g_iq1_mixed_host_selected.valid = 1;
+    }
+    g_iq1_mixed_last_layer = layer_index;
+    g_iq1_mixed_last_slot = cold_slot;
+    g_iq1_mixed_last_expert = cold_expert;
+    if (!no_main_sync && !gpu_plan_requested &&
         !cuda_ok(cudaStreamSynchronize(0), "iq1 mixed main preserve sync")) {
         g_iq1_mixed_failures++;
         return 0;
@@ -23958,8 +24183,10 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
             mixed_metadata_t - mixed_router_t;
         g_iq1_mixed_profile_main_submit_seconds +=
             mixed_main_submit_t - mixed_metadata_t;
-        g_iq1_mixed_profile_main_sync_seconds +=
-            mixed_main_sync_t - mixed_main_submit_t;
+        double main_sync_seconds =
+            mixed_main_sync_t - mixed_main_submit_t - gpu_plan_wait_seconds;
+        if (main_sync_seconds < 0.0) main_sync_seconds = 0.0;
+        g_iq1_mixed_profile_main_sync_seconds += main_sync_seconds;
         g_iq1_mixed_profile_cold_submit_seconds +=
             mixed_cold_submit_t - mixed_main_sync_t;
         g_iq1_mixed_profile_join_submit_seconds +=
