@@ -15413,6 +15413,44 @@ __global__ static void moe_down_ptrs_masked_qwarp32_kernel(
     if (lane == 0) down_out[(uint64_t)slot * out_dim + row] = acc;
 }
 
+__global__ static void moe_down_split_fused_finish_qwarp32_kernel(
+        float *out,
+        const float *hit_down,
+        const uint64_t *down_ptrs,
+        const cuda_block_q8_K *midq,
+        const uint32_t *route_hit_mask,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim) {
+    uint32_t lane = threadIdx.x & 7u;
+    uint32_t row = blockIdx.x * 32u + (threadIdx.x >> 3u);
+    if (row >= out_dim) return;
+    const uint32_t hit_mask = *route_hit_mask;
+    float total = 0.0f;
+    #pragma unroll
+    for (uint32_t slot = 0; slot < 6u; slot++) {
+        if ((hit_mask >> slot) & 1u) {
+            if (lane == 0) {
+                total += hit_down[(uint64_t)slot * out_dim + row];
+            }
+            continue;
+        }
+        const char *down_ptr =
+            (const char *)(uintptr_t)down_ptrs[slot];
+        const cuda_block_q2_K *wr = (const cuda_block_q2_K *)(
+            down_ptr + (uint64_t)row * down_row_bytes);
+        const cuda_block_q8_K *xq =
+            midq + (uint64_t)slot * midq_blocks;
+        float acc = 0.0f;
+        for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+            acc += dev_dot_q2_K_q8_K_block(wr + b, xq + b);
+        }
+        acc = quarter_warp_sum_f32(acc, lane);
+        if (lane == 0) total += acc;
+    }
+    if (lane == 0) out[row] = total;
+}
+
 __global__ static void moe_down_sorted_qwarp32_kernel(
         float *down_out,
         const char *down_base,
@@ -16397,6 +16435,11 @@ struct cuda_moe_expert_cache {
     uint64_t route_miss_experts;
     uint64_t route_worker_errors;
     uint64_t route_split_calls;
+    uint64_t route_split_fused_calls;
+    uint64_t route_split_fused_hits;
+    uint64_t route_split_fused_misses;
+    uint64_t route_split_fused_miss_scratch_bytes_avoided;
+    uint64_t route_split_fused_sum_read_bytes_avoided;
     uint64_t route_default_sync_calls;
     uint64_t route_no_default_sync_calls;
     double route_worker_seconds;
@@ -16414,6 +16457,11 @@ static int cuda_moe_gpu_routes_requested(void) {
 
 static int cuda_moe_split_hit_miss_requested(void) {
     const char *env = getenv("DS4_CUDA_MOE_SPLIT_HIT_MISS");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+static int cuda_moe_split_fused_requested(void) {
+    const char *env = getenv("DS4_CUDA_MOE_SPLIT_FUSED");
     return env && env[0] && strcmp(env, "0") != 0;
 }
 
@@ -17207,7 +17255,7 @@ static void cuda_moe_expert_cache_release(void) {
     if (g_moe_expert_cache.route_calls != 0 ||
         g_moe_expert_cache.route_worker_jobs != 0) {
         fprintf(stderr,
-                "ds4: [gpu-resident-routes] final calls=%llu split_calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu default_sync=%llu no_default_sync=%llu cache_count=%u cache_calls=%llu cache_hits=%llu cache_misses=%llu cache_admissions=%llu cache_evictions=%llu direct_loads=%llu\n",
+                "ds4: [gpu-resident-routes] final calls=%llu split_calls=%llu all_hit=%llu worker_jobs=%llu miss_experts=%llu errors=%llu worker=%.3fms/job resolve=%.3fms/call wait=%.3fms/call queries=%llu default_sync=%llu no_default_sync=%llu cache_count=%u cache_calls=%llu cache_hits=%llu cache_misses=%llu cache_admissions=%llu cache_evictions=%llu direct_loads=%llu split_fused_calls=%llu split_fused_hits=%llu split_fused_misses=%llu split_fused_miss_scratch_bytes_avoided=%llu split_fused_sum_read_bytes_avoided=%llu\n",
                 (unsigned long long)g_moe_expert_cache.route_calls,
                 (unsigned long long)g_moe_expert_cache.route_split_calls,
                 (unsigned long long)g_moe_expert_cache.route_all_hit_observed,
@@ -17232,7 +17280,12 @@ static void cuda_moe_expert_cache_release(void) {
                 (unsigned long long)g_moe_expert_cache.misses,
                 (unsigned long long)g_moe_expert_cache.admissions,
                 (unsigned long long)g_moe_expert_cache.evictions,
-                (unsigned long long)g_moe_expert_cache.direct_loads);
+                (unsigned long long)g_moe_expert_cache.direct_loads,
+                (unsigned long long)g_moe_expert_cache.route_split_fused_calls,
+                (unsigned long long)g_moe_expert_cache.route_split_fused_hits,
+                (unsigned long long)g_moe_expert_cache.route_split_fused_misses,
+                (unsigned long long)g_moe_expert_cache.route_split_fused_miss_scratch_bytes_avoided,
+                (unsigned long long)g_moe_expert_cache.route_split_fused_sum_read_bytes_avoided);
     }
     cuda_moe_tiering_report_and_reset();
     if (g_moe_expert_cache.gate) (void)cudaFree(g_moe_expert_cache.gate);
@@ -17322,6 +17375,11 @@ static void cuda_moe_expert_cache_release(void) {
     g_moe_expert_cache.route_miss_experts = 0;
     g_moe_expert_cache.route_worker_errors = 0;
     g_moe_expert_cache.route_split_calls = 0;
+    g_moe_expert_cache.route_split_fused_calls = 0;
+    g_moe_expert_cache.route_split_fused_hits = 0;
+    g_moe_expert_cache.route_split_fused_misses = 0;
+    g_moe_expert_cache.route_split_fused_miss_scratch_bytes_avoided = 0;
+    g_moe_expert_cache.route_split_fused_sum_read_bytes_avoided = 0;
     g_moe_expert_cache.route_default_sync_calls = 0;
     g_moe_expert_cache.route_no_default_sync_calls = 0;
     g_moe_expert_cache.route_worker_seconds = 0.0;
@@ -20527,7 +20585,8 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
         cuda_moe_expert_cache *cache,
         uint32_t sequence,
         uint32_t layer_index,
-        int split_hit_miss) {
+        int split_mode,
+        uint32_t split_out_dim) {
     if (!cache || sequence == 0u) return NULL;
     if (cuda_moe_route_no_default_sync_requested()) {
         cache->route_no_default_sync_calls++;
@@ -20593,7 +20652,28 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
                 sequence, layer_index);
     }
     cache->route_calls++;
-    if (split_hit_miss) cache->route_split_calls++;
+    if (split_mode == 1) {
+        cache->route_split_calls++;
+    } else if (split_mode == 2) {
+        cache->route_split_fused_calls++;
+        if (!request || request->sequence != sequence ||
+            request->route_count != CUDA_MOE_ROUTE_COUNT ||
+            request->miss_count > CUDA_MOE_ROUTE_COUNT ||
+            split_out_dim == 0u) {
+            fprintf(stderr,
+                    "ds4: CUDA fused split telemetry contract failed seq=%u\n",
+                    sequence);
+            abort();
+        }
+        const uint64_t misses = request->miss_count;
+        const uint64_t hits = CUDA_MOE_ROUTE_COUNT - misses;
+        cache->route_split_fused_hits += hits;
+        cache->route_split_fused_misses += misses;
+        cache->route_split_fused_miss_scratch_bytes_avoided +=
+            misses * split_out_dim * sizeof(float);
+        cache->route_split_fused_sum_read_bytes_avoided +=
+            misses * split_out_dim * sizeof(float);
+    }
     return cache;
 }
 
@@ -20616,7 +20696,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         gate_expert_bytes, down_expert_bytes, expert_in_dim,
         selected, weights, n_expert, n_tokens, spex_queue, 0u, &sequence);
     return cuda_moe_gpu_resident_routes_finish(
-        cache, sequence, layer_index, 0);
+        cache, sequence, layer_index, 0, 0u);
 }
 
 static int routed_moe_launch(
@@ -20703,6 +20783,7 @@ static int routed_moe_launch(
     const char *down_w = NULL;
     uint32_t use_mixed_route_ptrs = 0;
     uint32_t use_split_hit_miss = 0;
+    uint32_t use_split_fused = 0;
     uint32_t gpu_route_sequence = 0;
     const uint64_t *mixed_route_ptrs = NULL;
     /* Selected-expert load: when the whole 256-expert block is beyond the pinned
@@ -20716,10 +20797,17 @@ static int routed_moe_launch(
         cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, down_offset, down_bytes);
     cuda_moe_expert_cache *gpu_route_cache = NULL;
+    const int split_hit_miss_requested = cuda_moe_split_hit_miss_requested();
+    const int split_fused_requested = cuda_moe_split_fused_requested();
+    if (split_hit_miss_requested && split_fused_requested) {
+        fprintf(stderr,
+                "ds4: split hit/miss and fused split are mutually exclusive\n");
+        return 0;
+    }
     if (!whole_in_window &&
         getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL) {
         if (!sparse_bake_layer &&
-            cuda_moe_split_hit_miss_requested() &&
+            (split_hit_miss_requested || split_fused_requested) &&
             getenv("DS4_CUDA_MOE_PROFILE") == NULL) {
             gpu_route_cache = cuda_moe_gpu_resident_routes_begin(
                 layer_index,
@@ -20728,7 +20816,8 @@ static int routed_moe_launch(
                 expert_in_dim,
                 selected, weights, n_expert, n_tokens,
                 spex_queue, out_dim, &gpu_route_sequence);
-            use_split_hit_miss = gpu_route_cache != NULL;
+            use_split_fused = gpu_route_cache != NULL && split_fused_requested;
+            use_split_hit_miss = gpu_route_cache != NULL && split_hit_miss_requested;
         } else {
             gpu_route_cache = cuda_moe_gpu_resident_routes_submit(
                 layer_index,
@@ -21126,7 +21215,7 @@ static int routed_moe_launch(
             }
             return ok;
         }
-        if (ok && use_split_hit_miss) {
+        if (ok && (use_split_hit_miss || use_split_fused)) {
             dim3 qgrid((expert_mid_dim + 127u) / 128u, n_expert, 1);
             dim3 midq_grid(midq_blocks, n_expert, 1);
             dim3 dgrid((out_dim + 31u) / 32u, n_expert, 1);
@@ -21169,7 +21258,8 @@ static int routed_moe_launch(
             }
 
             gpu_route_cache = cuda_moe_gpu_resident_routes_finish(
-                gpu_route_cache, gpu_route_sequence, layer_index, 1);
+                gpu_route_cache, gpu_route_sequence, layer_index,
+                use_split_fused ? 2 : 1, out_dim);
             if (!gpu_route_cache) ok = 0;
 
             if (ok) {
@@ -21196,7 +21286,7 @@ static int routed_moe_launch(
                     hit_mask, n_expert, 0u);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split miss mid quantize launch");
             }
-            if (ok) {
+            if (ok && !use_split_fused) {
                 moe_down_ptrs_masked_qwarp32_kernel<<<dgrid, 256>>>(
                     split_down,
                     mixed_route_ptrs + 2u * n_expert,
@@ -21208,7 +21298,21 @@ static int routed_moe_launch(
                     out_dim);
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split miss down launch");
             }
-            if (ok) {
+            if (ok && use_split_fused) {
+                dim3 fgrid((out_dim + 31u) / 32u, 1, 1);
+                moe_down_split_fused_finish_qwarp32_kernel<<<fgrid, 256>>>(
+                    (float *)out->ptr,
+                    split_down,
+                    mixed_route_ptrs + 2u * n_expert,
+                    midq,
+                    hit_mask,
+                    down_row_bytes,
+                    midq_blocks,
+                    out_dim);
+                ok = cuda_ok(cudaGetLastError(),
+                             "routed_moe fused split finish launch");
+            }
+            if (ok && !use_split_fused) {
                 moe_sum_kernel<<<(out_dim + 255u) / 256u, 256>>>(
                     (float *)out->ptr,
                     split_down,
