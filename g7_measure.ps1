@@ -32,6 +32,7 @@ param(
     [switch]$ArenaWrapLayoutProfile,
     [ValidateRange(0.001, 600000.0)][double]$ArenaWrapSlowPartMs = 25.0,
     [switch]$ArenaWrapTrimBetweenPhases,
+    [switch]$ArenaWrapUnlockSourceRanges,
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
@@ -162,6 +163,16 @@ if ($RequestPhaseTrace -and -not $PrefillMassWrap) {
 if ($ArenaWrapTrimBetweenPhases -and
     (-not $ArenaWrapSourceParts -or -not $ArenaWrapTrustWorkerChecksum)) {
     throw "ArenaWrapTrimBetweenPhases requires -ArenaWrapSourceParts and -ArenaWrapTrustWorkerChecksum"
+}
+if ($ArenaWrapUnlockSourceRanges -and
+    (-not $ArenaWrapSourceParts -or -not $ArenaWrapTrustWorkerChecksum)) {
+    throw "ArenaWrapUnlockSourceRanges requires -ArenaWrapSourceParts and -ArenaWrapTrustWorkerChecksum"
+}
+if ($ArenaWrapUnlockSourceRanges -and $ArenaWrapTrimBetweenPhases) {
+    throw "ArenaWrapUnlockSourceRanges is incompatible with -ArenaWrapTrimBetweenPhases"
+}
+if ($ArenaWrapUnlockSourceRanges -and ($ArenaWrapSequentialFile -or $ArenaWrapRandomFile)) {
+    throw "ArenaWrapUnlockSourceRanges is incompatible with ArenaWrap file source modes"
 }
 if ($ArenaWrapSequentialFile -and -not $ArenaWrapSourceParts) {
     throw "ArenaWrapSequentialFile requires -ArenaWrapSourceParts"
@@ -417,6 +428,11 @@ if ($ArenaWrapTrimBetweenPhases) {
     $env:DS4_CUDA_ARENA_WRAP_TRIM_BETWEEN_PHASES = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_ARENA_WRAP_TRIM_BETWEEN_PHASES -ErrorAction SilentlyContinue
+}
+if ($ArenaWrapUnlockSourceRanges) {
+    $env:DS4_CUDA_ARENA_WRAP_UNLOCK_SOURCE_RANGES = "1"
+} else {
+    Remove-Item Env:\DS4_CUDA_ARENA_WRAP_UNLOCK_SOURCE_RANGES -ErrorAction SilentlyContinue
 }
 if ($ComposePrefillMassTiering) {
     $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
@@ -691,6 +707,8 @@ if ($PrefillMassWrap -and -not $ComposePrefillMassTiering -and ($ExpertCacheN -g
 if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
 if ($PrefillMassWrap -and ($Warmup -or $Repeats -ne 1)) { throw "PrefillMassWrap first-snapshot measurements require one request and no warmup" }
 if ($ArenaWrapPartProfile -and -not $ArenaWrapSourceParts) { throw "ArenaWrapPartProfile requires ArenaWrapSourceParts" }
+if ($ArenaWrapUnlockSourceRanges -and (-not $ArenaWrapSourceParts -or -not $ArenaWrapTrustWorkerChecksum)) { throw "ArenaWrapUnlockSourceRanges requires ArenaWrapSourceParts and ArenaWrapTrustWorkerChecksum" }
+if ($ArenaWrapUnlockSourceRanges -and ($ArenaWrapTrimBetweenPhases -or $ArenaWrapSequentialFile -or $ArenaWrapRandomFile)) { throw "ArenaWrapUnlockSourceRanges must be isolated from ArenaWrapTrimBetweenPhases and file source modes" }
 if ($DynamicArenaGrowInterval -gt 0 -and $DynamicArenaObservedWindow -le 0) { throw "DynamicArenaGrowInterval requires DynamicArenaObservedWindow > 0" }
 if ($DynamicArenaCarry -ne "default" -and (-not $Warmup -or $DynamicArenaObservedWindow -le 0)) { throw "DynamicArenaCarry requires Warmup and DynamicArenaObservedWindow > 0" }
 if ($SpexFusedTopK -and -not $SpexDryRun) { throw "SpexFusedTopK requires SpexDryRun" }
@@ -1375,6 +1393,14 @@ $arenaWrapLayoutProfileObserved = $false; $arenaWrapLayoutProfileRows = @()
 $arenaWrapTrimObserved = $false; $arenaWrapTrimResult = "not_observed"
 $arenaWrapTrimCalls = 0; $arenaWrapTrimSucceeded = 0; $arenaWrapTrimFailed = 0
 $arenaWrapTrimSeconds = 0.0; $arenaWrapTrimLastError = 0
+$arenaWrapUnlockObserved = $false; $arenaWrapUnlockRows = @()
+$arenaWrapUnlockSummaryObserved = $false
+$arenaWrapUnlockSummaryResult = "not_observed"
+$arenaWrapUnlockSummaryPhases = 0; $arenaWrapUnlockSummaryParts = 0
+$arenaWrapUnlockSummaryRanges = 0; $arenaWrapUnlockSummaryBytesRequested = 0
+$arenaWrapUnlockSummaryCalls = 0; $arenaWrapUnlockSummaryTrue = 0
+$arenaWrapUnlockSummaryErrorNotLocked = 0; $arenaWrapUnlockSummaryFailed = 0
+$arenaWrapUnlockSummarySeconds = 0.0
 $arenaVerifyWorkers = 0; $arenaVerifySeconds = 0.0
 $arenaObserverResultObserved = $false; $arenaObserverResult = "not_observed"
 $arenaObserverPublicationCount = 0; $arenaWrapPublicationCount = 0
@@ -2133,6 +2159,56 @@ if (Test-Path $stderrLog) {
         $arenaWrapTrimSeconds = [double]::Parse($Matches[5], [Globalization.CultureInfo]::InvariantCulture)
         $arenaWrapTrimLastError = [long]$Matches[6]
     }
+    $arenaWrapUnlockLines = @($lines | Where-Object {
+        $_ -match "^\s*ds4: \[arena-wrap-source-unlock\] "
+    })
+    $arenaWrapUnlockPattern = "^ds4: \[arena-wrap-source-unlock\] result=([^ ]+) phase=([^ ]+) parts=(\d+) ranges=(\d+) bytes_requested=(\d+) calls=(\d+) true=(\d+) error_not_locked=(\d+) failed=(\d+) seconds=([0-9.]+) available_before=(\d+) available_after=(\d+) working_set_before=(\d+) working_set_after=(\d+) page_fault_before=(\d+) page_fault_after=(\d+) read_transfer_before=(\d+) read_transfer_after=(\d+) last_error=(\d+)$"
+    foreach ($arenaWrapUnlockLine in $arenaWrapUnlockLines) {
+        if ($arenaWrapUnlockLine -notmatch $arenaWrapUnlockPattern) {
+            throw "Arena WRAP source unlock line format mismatch: $arenaWrapUnlockLine"
+        }
+        $arenaWrapUnlockRows += [pscustomobject]@{
+            result = $Matches[1]
+            phase = $Matches[2]
+            parts = [uint64]$Matches[3]
+            ranges = [uint64]$Matches[4]
+            bytes_requested = [uint64]$Matches[5]
+            calls = [uint32]$Matches[6]
+            true_count = [uint32]$Matches[7]
+            error_not_locked = [uint32]$Matches[8]
+            failed = [uint32]$Matches[9]
+            seconds = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+            available_before = [uint64]$Matches[11]
+            available_after = [uint64]$Matches[12]
+            working_set_before = [uint64]$Matches[13]
+            working_set_after = [uint64]$Matches[14]
+            page_fault_before = [uint64]$Matches[15]
+            page_fault_after = [uint64]$Matches[16]
+            read_transfer_before = [uint64]$Matches[17]
+            read_transfer_after = [uint64]$Matches[18]
+            last_error = [uint32]$Matches[19]
+        }
+    }
+    $arenaWrapUnlockObserved = ($arenaWrapUnlockRows.Count -gt 0)
+    $arenaWrapUnlockSummaryLine = $lines | Where-Object {
+        $_ -match "\[arena-wrap-source-unlock-summary\] result="
+    } | Select-Object -Last 1
+    if ($arenaWrapUnlockSummaryLine -and
+        $arenaWrapUnlockSummaryLine -match "result=([^ ]+) phases=(\d+) parts=(\d+) ranges=(\d+) bytes_requested=(\d+) calls=(\d+) true=(\d+) error_not_locked=(\d+) failed=(\d+) seconds=([0-9.]+)") {
+        $arenaWrapUnlockSummaryObserved = $true
+        $arenaWrapUnlockSummaryResult = $Matches[1]
+        $arenaWrapUnlockSummaryPhases = [uint32]$Matches[2]
+        $arenaWrapUnlockSummaryParts = [uint64]$Matches[3]
+        $arenaWrapUnlockSummaryRanges = [uint64]$Matches[4]
+        $arenaWrapUnlockSummaryBytesRequested = [uint64]$Matches[5]
+        $arenaWrapUnlockSummaryCalls = [uint32]$Matches[6]
+        $arenaWrapUnlockSummaryTrue = [uint32]$Matches[7]
+        $arenaWrapUnlockSummaryErrorNotLocked = [uint32]$Matches[8]
+        $arenaWrapUnlockSummaryFailed = [uint32]$Matches[9]
+        $arenaWrapUnlockSummarySeconds = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+    } elseif ($arenaWrapUnlockSummaryLine) {
+        throw "Arena WRAP source unlock summary format mismatch: $arenaWrapUnlockSummaryLine"
+    }
     $arenaResultLines = @($lines | Where-Object { $_ -match "\[arena-observe\] window complete" })
     $arenaObserverPublicationCount = $arenaResultLines.Count
     $arenaResultLine = $arenaResultLines | Select-Object -Last 1
@@ -2724,6 +2800,61 @@ if ($ArenaWrapTrimBetweenPhases) {
 } elseif ($arenaWrapTrimObserved) {
     throw "Arena WRAP trim measurement failed: unexpected trim telemetry while disabled"
 }
+if ($ArenaWrapUnlockSourceRanges) {
+    if (-not $arenaWrapUnlockObserved -or
+        -not $arenaWrapUnlockSummaryObserved -or
+        $arenaWrapUnlockSummaryResult -ne "complete" -or
+        $arenaWrapUnlockSummaryPhases -ne 2 -or
+        $arenaWrapUnlockRows.Count -ne 2 -or
+        $arenaWrapUnlockSummaryFailed -ne 0) {
+        throw "Arena WRAP source unlock measurement failed: telemetry/contract differs"
+    }
+    foreach ($requiredUnlockPhase in @("gate", "up")) {
+        $phaseRows = @($arenaWrapUnlockRows |
+            Where-Object { $_.phase -eq $requiredUnlockPhase })
+        if ($phaseRows.Count -ne 1) {
+            throw "Arena WRAP source unlock measurement failed: phase count differs for $requiredUnlockPhase"
+        }
+        $phaseRow = $phaseRows[0]
+        if ($phaseRow.result -ne "ok" -or
+            [uint64]$phaseRow.parts -le 0 -or
+            [uint64]$phaseRow.ranges -le 0 -or
+            [uint64]$phaseRow.bytes_requested -le 0 -or
+            [uint32]$phaseRow.calls -ne [uint32]$phaseRow.ranges -or
+            ([uint32]$phaseRow.true_count + [uint32]$phaseRow.error_not_locked) -ne [uint32]$phaseRow.calls -or
+            [uint32]$phaseRow.failed -ne 0 -or
+            [uint32]$phaseRow.last_error -ne 0) {
+            throw "Arena WRAP source unlock measurement failed: phase accounting differs"
+        }
+    }
+    $arenaWrapUnlockRowsParts = [uint64]0
+    $arenaWrapUnlockRowsRanges = [uint64]0
+    $arenaWrapUnlockRowsBytes = [uint64]0
+    $arenaWrapUnlockRowsCalls = [uint32]0
+    $arenaWrapUnlockRowsTrue = [uint32]0
+    $arenaWrapUnlockRowsErrorNotLocked = [uint32]0
+    $arenaWrapUnlockRowsFailed = [uint32]0
+    foreach ($unlockRow in $arenaWrapUnlockRows) {
+        $arenaWrapUnlockRowsParts += [uint64]$unlockRow.parts
+        $arenaWrapUnlockRowsRanges += [uint64]$unlockRow.ranges
+        $arenaWrapUnlockRowsBytes += [uint64]$unlockRow.bytes_requested
+        $arenaWrapUnlockRowsCalls += [uint32]$unlockRow.calls
+        $arenaWrapUnlockRowsTrue += [uint32]$unlockRow.true_count
+        $arenaWrapUnlockRowsErrorNotLocked += [uint32]$unlockRow.error_not_locked
+        $arenaWrapUnlockRowsFailed += [uint32]$unlockRow.failed
+    }
+    if ($arenaWrapUnlockSummaryParts -ne $arenaWrapUnlockRowsParts -or
+        $arenaWrapUnlockSummaryRanges -ne $arenaWrapUnlockRowsRanges -or
+        $arenaWrapUnlockSummaryBytesRequested -ne $arenaWrapUnlockRowsBytes -or
+        $arenaWrapUnlockSummaryCalls -ne $arenaWrapUnlockRowsCalls -or
+        $arenaWrapUnlockSummaryTrue -ne $arenaWrapUnlockRowsTrue -or
+        $arenaWrapUnlockSummaryErrorNotLocked -ne $arenaWrapUnlockRowsErrorNotLocked -or
+        $arenaWrapUnlockSummaryFailed -ne $arenaWrapUnlockRowsFailed) {
+        throw "Arena WRAP source unlock measurement failed: summary does not match phase rows"
+    }
+} elseif ($arenaWrapUnlockObserved -or $arenaWrapUnlockSummaryObserved) {
+    throw "Arena WRAP source unlock measurement failed: unexpected source unlock telemetry while disabled"
+}
 
 $serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
 $serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
@@ -2995,6 +3126,20 @@ $summary = [pscustomobject]@{
     arena_wrap_trim_failed = $arenaWrapTrimFailed
     arena_wrap_trim_seconds = $arenaWrapTrimSeconds
     arena_wrap_trim_last_error = $arenaWrapTrimLastError
+    arena_wrap_unlock_source_ranges_requested = [bool]$ArenaWrapUnlockSourceRanges
+    arena_wrap_unlock_source_ranges_observed = $arenaWrapUnlockObserved
+    arena_wrap_unlock_source_ranges = $arenaWrapUnlockRows
+    arena_wrap_unlock_source_ranges_summary_observed = $arenaWrapUnlockSummaryObserved
+    arena_wrap_unlock_source_ranges_summary_result = $arenaWrapUnlockSummaryResult
+    arena_wrap_unlock_source_ranges_summary_phases = $arenaWrapUnlockSummaryPhases
+    arena_wrap_unlock_source_ranges_summary_parts = $arenaWrapUnlockSummaryParts
+    arena_wrap_unlock_source_ranges_summary_ranges = $arenaWrapUnlockSummaryRanges
+    arena_wrap_unlock_source_ranges_summary_bytes_requested = $arenaWrapUnlockSummaryBytesRequested
+    arena_wrap_unlock_source_ranges_summary_calls = $arenaWrapUnlockSummaryCalls
+    arena_wrap_unlock_source_ranges_summary_true = $arenaWrapUnlockSummaryTrue
+    arena_wrap_unlock_source_ranges_summary_error_not_locked = $arenaWrapUnlockSummaryErrorNotLocked
+    arena_wrap_unlock_source_ranges_summary_failed = $arenaWrapUnlockSummaryFailed
+    arena_wrap_unlock_source_ranges_summary_seconds = $arenaWrapUnlockSummarySeconds
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
@@ -3417,6 +3562,7 @@ Write-Host ("arena WRAP file QD req/line/obs/submits/completions/failures: " + $
 Write-Host ("arena WRAP part profile req/obs/workers/parts/memcpy/main/join/max-part-ms/slow: " + [bool]$ArenaWrapPartProfile + " / " + $arenaWrapPartProfileObserved + " / " + $arenaWrapPartProfileWorkers + " / " + $arenaWrapPartProfileParts + " / " + $arenaWrapPartProfileMemcpySumSeconds + " / " + $arenaWrapPartProfileMainWorkerSeconds + " / " + $arenaWrapPartProfileJoinSeconds + " / " + $arenaWrapPartProfileMaxPartMs + " / " + $arenaWrapPartProfileSlowParts)
 Write-Host ("arena WRAP layout profile req/obs/lines: " + [bool]$ArenaWrapLayoutProfile + " / " + $arenaWrapLayoutProfileObserved + " / " + $arenaWrapLayoutProfileRows.Count)
 Write-Host ("arena WRAP trim req/obs/result/calls/ok/fail/sec/error: " + [bool]$ArenaWrapTrimBetweenPhases + " / " + $arenaWrapTrimObserved + " / " + $arenaWrapTrimResult + " / " + $arenaWrapTrimCalls + " / " + $arenaWrapTrimSucceeded + " / " + $arenaWrapTrimFailed + " / " + $arenaWrapTrimSeconds + " / " + $arenaWrapTrimLastError)
+Write-Host ("arena WRAP source unlock req/obs/result/phases/ranges/bytes/calls/true/not_locked/fail/sec: " + [bool]$ArenaWrapUnlockSourceRanges + " / " + $arenaWrapUnlockObserved + " / " + $arenaWrapUnlockSummaryResult + " / " + $arenaWrapUnlockSummaryPhases + " / " + $arenaWrapUnlockSummaryRanges + " / " + $arenaWrapUnlockSummaryBytesRequested + " / " + $arenaWrapUnlockSummaryCalls + " / " + $arenaWrapUnlockSummaryTrue + " / " + $arenaWrapUnlockSummaryErrorNotLocked + " / " + $arenaWrapUnlockSummaryFailed + " / " + $arenaWrapUnlockSummarySeconds)
 Write-Host ("arena verify workers/sec: " + $arenaVerifyWorkers + " / " + $arenaVerifySeconds)
 Write-Host ("arena result/final hits/misses/fatal/H2D GiB: " + $arenaObserverResult + " / " + $arenaFinalHits + " / " + $arenaFinalMisses + " / " + $arenaFinalFatal + " / " + $arenaFinalUploadedGiB)
 Write-Host ("arena allocated/resident bytes/occupancy: " + $arenaAllocatedBytes + " / " + ([long]$arenaReportedResident * [long]$arenaSlotBytes) + " / " + $summary.dynamic_arena_occupancy_ratio)
