@@ -312,6 +312,33 @@ static int cuda_sparse_bake_layer_is_sparse(uint32_t layer_index) {
         g_sparse_bake_retained_count[layer_index] < 256u;
 }
 
+static int cuda_sparse_bake_validate_selected(
+        uint32_t layer_index,
+        const int32_t *selected,
+        uint32_t count,
+        const char *where,
+        uint32_t sequence) {
+    if (!g_sparse_bake_active) return 1;
+    if (!selected) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const int32_t expert = selected[i];
+        if (expert < 0 || expert >= 256 ||
+            !cuda_sparse_bake_expert_retained(
+                layer_index, (uint32_t)expert)) {
+            g_sparse_bake_route_rejections++;
+            fprintf(stderr,
+                    "ds4: sparse bake rejected %s layer=%u seq=%u "
+                    "slot=%u expert=%d\n",
+                    where ? where : "route", layer_index, sequence,
+                    i, expert);
+            return 0;
+        }
+    }
+    g_sparse_bake_route_calls++;
+    g_sparse_bake_route_slots += count;
+    return 1;
+}
+
 static void cuda_sparse_bake_reset_state(void) {
     memset(g_sparse_bake_retained, 0, sizeof(g_sparse_bake_retained));
     memset(g_sparse_bake_retained_count, 0,
@@ -7098,7 +7125,7 @@ extern "C" int ds4_gpu_sparse_bake_set_retained_mask(
     g_sparse_bake_route_rejections = 0;
     fprintf(stderr,
             "ds4: [sparse-bake-runtime] result=guards-installed "
-            "layers=%u sparse_layers=%u retained=%u\n",
+            "layers=%u sparse_layers=%u retained=%u rejected=0\n",
             layers, sparse_layers, retained_total);
     return 1;
 }
@@ -17176,6 +17203,17 @@ static int cuda_moe_tiering_enforce_request(
             break;
         }
         const uint32_t expert = (uint32_t)expert_i;
+        if (g_sparse_bake_active &&
+            !cuda_sparse_bake_expert_retained(request.layer_index, expert)) {
+            g_sparse_bake_route_rejections++;
+            fprintf(stderr,
+                    "ds4: sparse bake rejected tiering route miss "
+                    "layer=%u seq=%u route=%u expert=%u\n",
+                    request.layer_index, request.sequence, route, expert);
+            g_moe_tiering.failures++;
+            ok = 0;
+            break;
+        }
         cuda_moe_tier_entry &tier = g_moe_tiering.entries[
             cuda_moe_tiering_entry_index(request.layer_index, expert)];
 
@@ -17449,6 +17487,13 @@ static void *cuda_moe_route_worker(void *arg) {
             request.gate_expert_bytes == cache->gate_expert_bytes &&
             request.down_expert_bytes == cache->down_expert_bytes;
         if (request_valid &&
+            !cuda_sparse_bake_validate_selected(
+                request.layer_index, request.selected,
+                CUDA_MOE_ROUTE_COUNT, "gpu resident route",
+                sequence)) {
+            request_valid = 0;
+        }
+        if (request_valid &&
             g_moe_tiering.compose_prefill_mass_tiering &&
             g_dynamic_arena.snapshot_generation !=
                 g_moe_tiering.snapshot_generation) {
@@ -17535,6 +17580,16 @@ static void *cuda_moe_route_worker(void *arg) {
                 break;
             }
             const uint32_t expert = (uint32_t)expert_i;
+            if (g_sparse_bake_active &&
+                !cuda_sparse_bake_expert_retained(request.layer_index, expert)) {
+                g_sparse_bake_route_rejections++;
+                fprintf(stderr,
+                        "ds4: sparse bake rejected route worker miss "
+                        "layer=%u seq=%u route=%u expert=%u\n",
+                        request.layer_index, sequence, route, expert);
+                ok = 0;
+                break;
+            }
             const int cache_slot_i = cuda_moe_route_worker_pick_slot(cache, claimed.data());
             if (cache_slot_i < 0) {
                 ok = 0;
@@ -18625,22 +18680,10 @@ static int cuda_moe_selected_load(
             return 0;
         }
     }
-    if (g_sparse_bake_active) {
-        for (uint32_t i = 0; i < slot_count; i++) {
-            const int32_t expert = g_moe_gather.h_sel[i];
-            if (expert < 0 || (uint32_t)expert >= n_total_expert ||
-                !cuda_sparse_bake_expert_retained(
-                    layer_index, (uint32_t)expert)) {
-                g_sparse_bake_route_rejections++;
-                fprintf(stderr,
-                        "ds4: sparse bake rejected routed selection "
-                        "layer=%u slot=%u expert=%d\n",
-                        layer_index, i, expert);
-                return 0;
-            }
-        }
-        g_sparse_bake_route_calls++;
-        g_sparse_bake_route_slots += slot_count;
+    if (!cuda_sparse_bake_validate_selected(
+            layer_index, g_moe_gather.h_sel.data(), slot_count,
+            "routed selection", 0u)) {
+        return 0;
     }
     if (route_prof) route_t_d2h = cuda_wall_sec();
 
@@ -19651,9 +19694,10 @@ static int routed_moe_launch(
         cuda_model_range_in_window(model_map, up_offset, gate_bytes) &&
         cuda_model_range_in_window(model_map, down_offset, down_bytes);
     cuda_moe_expert_cache *gpu_route_cache = NULL;
-    if (!sparse_bake_layer && !whole_in_window &&
+    if (!whole_in_window &&
         getenv("DS4_CUDA_MOE_NO_SELECTED_LOAD") == NULL) {
-        if (cuda_moe_split_hit_miss_requested() &&
+        if (!sparse_bake_layer &&
+            cuda_moe_split_hit_miss_requested() &&
             getenv("DS4_CUDA_MOE_PROFILE") == NULL) {
             gpu_route_cache = cuda_moe_gpu_resident_routes_begin(
                 layer_index,
