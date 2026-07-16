@@ -435,8 +435,6 @@ if ($ReapMassWrap) {
     Remove-Item Env:\DS4_CUDA_REAP_MASS_GROW_INTERVAL -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_CUDA_REAP_MASS_HYSTERESIS -ErrorAction SilentlyContinue
 }
-$embeddedBakeMaskObserved = $reapMaskAppliedObserved -and
-    $reapMaskPathObserved -like "embedded-bake:*"
 if ($ReapMaskFile) {
     if (-not (Test-Path -LiteralPath $ReapMaskFile -PathType Leaf)) {
         throw "ReapMaskFile does not exist: $ReapMaskFile"
@@ -2305,6 +2303,8 @@ if ($PrefillMassWrap) {
 } elseif ($prefillMassWrapEventCount -ne 0 -or $prefillMassWrapObserved) {
     throw "Prefill mass WRAP activated while not requested"
 }
+$embeddedBakeMaskObserved = $reapMaskAppliedObserved -and
+    $reapMaskPathObserved -like "embedded-bake:*"
 if ($ReapMaskFile) {
     $resolvedReapMaskFile = (Resolve-Path -LiteralPath $ReapMaskFile).Path
     if (-not $reapMaskReloadObserved -or -not $reapMaskAppliedObserved) {
