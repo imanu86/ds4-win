@@ -772,7 +772,7 @@ function Invoke-G63Run {
         -Pattern "CUDA dynamic arena ready 30\.00 GiB, [1-9][0-9]* slots" `
         -Label "dynamic arena allocation" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
-        -Pattern "\[prefill-mass-compose\] hash_layers=[1-9][0-9]* hash_seed_entries=[1-9][0-9]* ranked_entries=[1-9][0-9]* total_candidate=[1-9][0-9]* capacity=[1-9][0-9]* mass_source=full-probability-normalized-per-token" `
+        -Pattern "\[prefill-mass-compose\] hash_layers=[1-9][0-9]* hash_seed_entries=[1-9][0-9]* ranked_entries=[1-9][0-9]* total_candidate=[1-9][0-9]* capacity=[1-9][0-9]* candidate_fnv1a64=[0-9a-f]{16} sparse_skipped_ranked=[1-9][0-9]* mass_source=full-probability-normalized-per-token" `
         -Label "prefill mass compose" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
         -Pattern "\[arena\] begin base=0 target=1 resident=[1-9][0-9]* loads=[1-9][0-9]* slots=[1-9][0-9]*" `
@@ -781,8 +781,11 @@ function Invoke-G63Run {
         -Pattern "\[arena\] publish generation=1 loads=[1-9][0-9]*" `
         -Label "arena publish" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
-        -Pattern "\[prefill-mass-compose-mask\] result=applied reason=ok layers=[1-9][0-9]* kept=[1-9][0-9]* pruned=[1-9][0-9]* semantics=request-scoped-closed" `
+        -Pattern "\[prefill-mass-compose-mask\] result=applied reason=ok layers=40 kept=[1-9][0-9]* pruned=[1-9][0-9]* semantics=request-scoped-closed base=embedded-sparse-bake existing_layers=40" `
         -Label "prefill mass compose mask" -Tag $Tag
+    Assert-G63LogContains -Lines $logLines `
+        -Pattern "\[prefill-mass-compose-mask\] result=restored reason=ok where=request-end layers=40 kept=6160 pruned=4080 base=embedded-sparse-bake" `
+        -Label "prefill mass sparse base restore" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
         -Pattern "\[prefill-mass-wrap\] result=published reason=ok candidate=[1-9][0-9]* loads=[1-9][0-9]* .* resident_after=[1-9][0-9]*" `
         -Label "prefill mass WRAP publication" -Tag $Tag
