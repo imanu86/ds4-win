@@ -796,11 +796,11 @@ function Invoke-G63Run {
         -Pattern "\[expert-tiering\] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 .*snapshot_backing_misses=0 .*forbidden_cold_ssd_to_vram=0 .*clock_calls=430 replacement_budget=16 min_frequency=3 hysteresis=1\.25 .*failures=0 ssd_bytes=0 .*states_vram=320 " `
         -Label "expert tiering mass-lfru compose final counters" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
-        -Pattern "arena WRAP profile result/schedule/checksum/total/copy/parts/workers: published / source-parts / fnv1a64-worker-only /" `
+        -Pattern "arena WRAP profile result/schedule/source/checksum/total/copy/parts/workers: published / source-parts / mmap / fnv1a64-worker-only /" `
         -Label "arena wrap source-parts profile" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
-        -Pattern "arena WRAP file QD req/line/obs/submits/completions/failures: 1 / 0 / 0 / 0 / 0 / 0" `
-        -Label "no post-G46 ArenaWrapFileQD" -Tag $Tag
+        -Pattern "arena WRAP file QD req/line/obs/submits/completions/failures: 1 / 1 / 1 / 0 / 0 / 0" `
+        -Label "G46 source-parts default file QD1" -Tag $Tag
     Assert-G63LogContains -Lines $logLines `
         -Pattern "expert tiering requested/policy/observed/compose/failures/ssd GiB/ram_h2d GiB/states_vram: enforce / mass-lfru / True / True / 0 / 0 / .* / 320" `
         -Label "expert tiering summary line" -Tag $Tag
