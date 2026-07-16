@@ -1,6 +1,6 @@
 ﻿{
     "schema":  "g63_sparse_bake_g46_composite_authorization_v1",
-    "created_utc":  "2026-07-16T07:25:56.7109606Z",
+    "created_utc":  "2026-07-16T08:05:22.0500255Z",
     "purpose":  "verify K60 payload/hash/manifest/embedded-mask once before G46 composite candidate runs",
     "prompt":  "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
     "max_tokens":  64,
@@ -8,22 +8,22 @@
     "temperature":  0,
     "think":  false,
     "quality_claims":  "none",
-    "execution_runner_sha256":  "f0a3da52f1011c769031dc466f0800525431ed7ac7fc95f3ed569ce2e3c762cb",
+    "execution_runner_sha256":  "85d6b8a223bb93587e78850fe56f8ddebcfe40b404e81d362e8d30e9285f0d47",
     "provenance":  {
-                       "executable_sha256":  "107fc08720e4b2269eb6bb34e614bd130f36267415a24c2dfc794cf51dbca2e9",
-                       "harness_sha256":  "3df0e087273f93f2efd0238411861369c78b8c52346f37ed0230e02f9716541d",
+                       "executable_sha256":  "70acb8cf967bfb3373512e9ec721313d3da7e2e6dcdad6ecddab19256ff0f961",
+                       "harness_sha256":  "afd8ee746158afe83e942e6d79cd56d896d502dc42bee20d95ab46db43ace5e9",
                        "runtime_monitor_harness_sha256":  "94b7d3c7df52764696073d4a4f9651b349e471ba0b252d88d7f76102da67e3e6",
-                       "ds4_cuda_sha256":  "a066affa5375542bc26e6bfefdec49a3c68b41751ef436276cd8cee338b44a3d",
+                       "ds4_cuda_sha256":  "786430889cd1908142fb380a9f574621a67f88b49513bf30d52951cc8728ef88",
                        "ds4_c_sha256":  "9ad3a269b2e7a5557f8189668792af23461bb2d07255133092c1c288ca16b71b",
                        "ds4_server_c_sha256":  "3358c8e053439306838763e5cac4774d40277a96e73e1f757a4a7cbffeb5c8c4",
                        "ds4_bake_c_sha256":  "e68cdf03b70a396bbbcac15e68f7faf5fa8bc0d2e29db6ec0ceda4f348d9df53",
                        "ds4_bake_h_sha256":  "b6445472a997665d773a77eff0b8936eacfc4360167754ba8c20cb5a8a23f456",
-                       "build_manifest_sha256":  "e36a2e59dc3b6c6a4270dbb1e750ab82b59cf474c5d36041895e8870f5b52f1f"
+                       "build_manifest_sha256":  "cbc4117e1d6a2f332ddf0785b89cdce5b03b9bc613b3eda98f11499f0d06e692"
                    },
     "bakes":  [
                   {
                       "bake_id":  "K60",
-                      "authorized_utc":  "2026-07-16T07:25:56.6960887Z",
+                      "authorized_utc":  "2026-07-16T08:05:22.0419287Z",
                       "model_path":  "C:\\ds4-models\\ds4-2bit-k60-mass-full-decode.gguf",
                       "model_sha256_not_verified":  true,
                       "expected_pack_sha256":  "3b464ee43514c8caa841be61da70190a4a7ba3c760c22849d2d723e5da5b7d71",
@@ -34,7 +34,7 @@
                       "expected_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                       "observed_payload_sha256":  "5cb4bf69d7c6ef2aadfc8760069c3a7a89fc40504ce80b7b3735b10f9539e4b5",
                       "payload_verify_method":  "python-hashlib-extents",
-                      "payload_verify_elapsed_seconds":  56.068190200006939,
+                      "payload_verify_elapsed_seconds":  60.172749799996382,
                       "payload_verify_extent_count":  7155,
                       "payload_verifier_path":  "C:\\Users\\imanu\\source\\repos\\reap-loop\\scripts\\ds4_windows_sparse_bake.py",
                       "payload_verifier_sha256":  "cf9cf279fe2a41eb7b924ae0c90ad383ca5a9271368c9fa2ad4205dc2f44a38a",
@@ -47,15 +47,15 @@
                       "retained_layers":  40,
                       "safety_result_sha256":  "dc91bc21b36fc161a0d259ca7fb594e6dcc28575269b8dba014094a244f6f91f",
                       "safety_launch_sha256":  "7a7faeb0a635a1116e3f7da978d397748b9e8cf7842ca78c68f88d38d1ad657f",
-                      "executable_sha256":  "107fc08720e4b2269eb6bb34e614bd130f36267415a24c2dfc794cf51dbca2e9",
-                      "harness_sha256":  "3df0e087273f93f2efd0238411861369c78b8c52346f37ed0230e02f9716541d",
+                      "executable_sha256":  "70acb8cf967bfb3373512e9ec721313d3da7e2e6dcdad6ecddab19256ff0f961",
+                      "harness_sha256":  "afd8ee746158afe83e942e6d79cd56d896d502dc42bee20d95ab46db43ace5e9",
                       "runtime_monitor_harness_sha256":  "94b7d3c7df52764696073d4a4f9651b349e471ba0b252d88d7f76102da67e3e6",
-                      "ds4_cuda_sha256":  "a066affa5375542bc26e6bfefdec49a3c68b41751ef436276cd8cee338b44a3d",
+                      "ds4_cuda_sha256":  "786430889cd1908142fb380a9f574621a67f88b49513bf30d52951cc8728ef88",
                       "ds4_c_sha256":  "9ad3a269b2e7a5557f8189668792af23461bb2d07255133092c1c288ca16b71b",
                       "ds4_server_c_sha256":  "3358c8e053439306838763e5cac4774d40277a96e73e1f757a4a7cbffeb5c8c4",
                       "ds4_bake_c_sha256":  "e68cdf03b70a396bbbcac15e68f7faf5fa8bc0d2e29db6ec0ceda4f348d9df53",
                       "ds4_bake_h_sha256":  "b6445472a997665d773a77eff0b8936eacfc4360167754ba8c20cb5a8a23f456",
-                      "build_manifest_sha256":  "e36a2e59dc3b6c6a4270dbb1e750ab82b59cf474c5d36041895e8870f5b52f1f"
+                      "build_manifest_sha256":  "cbc4117e1d6a2f332ddf0785b89cdce5b03b9bc613b3eda98f11499f0d06e692"
                   }
               ]
 }
