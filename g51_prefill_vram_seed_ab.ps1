@@ -734,9 +734,19 @@ if (-not $SafetyOnly) {
     $seedSummary = @($armSummary | Where-Object {
         $_.arm -eq "prefill-vram-seed"
     })[0]
-    $routeH2DSavedGiB = [double]$controlSummary.route_h2d_gib_mean -
-        [double]$seedSummary.route_h2d_gib_mean
     $seedCostGiB = [double]$seedSummary.prefill_vram_seed_gib_mean
+    $routeH2DSource = "gpu-resident-route-counter"
+    $controlRouteH2DGiB = $controlSummary.route_h2d_gib_mean
+    $seedRouteH2DGiB = $seedSummary.route_h2d_gib_mean
+    if ($null -eq $controlRouteH2DGiB -or $null -eq $seedRouteH2DGiB) {
+        # Tier ram_h2d includes the explicit one-shot seed upload. Subtract it
+        # to recover decode-route H2D when route profiling is intentionally off.
+        $routeH2DSource = "tier-ram-h2d-minus-one-time-seed"
+        $controlRouteH2DGiB = [double]$controlSummary.ram_h2d_gib_mean
+        $seedRouteH2DGiB = [double]$seedSummary.ram_h2d_gib_mean - $seedCostGiB
+    }
+    $routeH2DSavedGiB = [double]$controlRouteH2DGiB -
+        [double]$seedRouteH2DGiB
     $netH2DSavedGiB = $routeH2DSavedGiB - $seedCostGiB
     $decodeDeltaPercent = if (
         [double]$controlSummary.decode_tokens_per_second_mean -ne 0.0) {
@@ -747,9 +757,15 @@ if (-not $SafetyOnly) {
     } else { $null }
     $observedEffect = [pscustomobject]@{
         window_generated_tokens = 64
+        route_h2d_source = $routeH2DSource
         control_route_h2d_gib_mean =
-            [double]$controlSummary.route_h2d_gib_mean
-        seed_route_h2d_gib_mean = [double]$seedSummary.route_h2d_gib_mean
+            [math]::Round([double]$controlRouteH2DGiB, 6)
+        seed_route_h2d_gib_mean =
+            [math]::Round([double]$seedRouteH2DGiB, 6)
+        control_total_ram_h2d_gib_mean =
+            [double]$controlSummary.ram_h2d_gib_mean
+        seed_total_ram_h2d_gib_mean =
+            [double]$seedSummary.ram_h2d_gib_mean
         route_h2d_saved_gib_mean = [math]::Round($routeH2DSavedGiB, 6)
         one_time_seed_h2d_gib_mean = [math]::Round($seedCostGiB, 6)
         net_h2d_saved_after_seed_gib_mean =
@@ -761,6 +777,12 @@ if (-not $SafetyOnly) {
         vram_routes_delta_mean = [math]::Round(
             [double]$seedSummary.route_vram_routes_mean -
             [double]$controlSummary.route_vram_routes_mean, 6)
+        vram_hits_delta_mean = [math]::Round(
+            [double]$seedSummary.vram_hits_mean -
+            [double]$controlSummary.vram_hits_mean, 6)
+        ram_hits_delta_mean = [math]::Round(
+            [double]$seedSummary.ram_hits_mean -
+            [double]$controlSummary.ram_hits_mean, 6)
         decode_tokens_per_second_delta_percent = if (
             $null -eq $decodeDeltaPercent) { $null } else {
             [math]::Round($decodeDeltaPercent, 6)
