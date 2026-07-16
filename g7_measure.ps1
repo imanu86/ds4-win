@@ -103,6 +103,12 @@ param(
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [switch]$Iq1SMixedColdOne,
+    [ValidateRange(0.0, 48.0)][double]$Iq1SRamCacheGiB = 0.0,
+    [switch]$Iq1SMixedDebug,
+    [switch]$Iq1SProfile,
+    [switch]$Iq1SNoMainSync,
+    [switch]$Iq1SPackedH2D,
+    [ValidateSet(0, 1, 2, 4)][int]$Iq1SVramCachePerLayer = 0,
     [ValidateSet("benchmark", "structural-safety", "quality")][string]$GateKind = "benchmark",
     [int]$Port = 8000,
     [ValidateRange(64, 131072)][int]$Context = 256,
@@ -310,6 +316,25 @@ if ($ReuseVerifiedIq1SReceipt -and -not $Iq1SExpertSidecar) {
 if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar) {
     throw "Iq1SMixedColdOne requires Iq1SExpertSidecar"
 }
+if ($Iq1SRamCacheGiB -gt 0.0 -and -not $Iq1SExpertSidecar) {
+    throw "Iq1SRamCacheGiB requires Iq1SExpertSidecar"
+}
+if ($Iq1SProfile -and -not $Iq1SExpertSidecar) {
+    throw "Iq1SProfile requires Iq1SExpertSidecar"
+}
+if ($Iq1SNoMainSync -and -not $Iq1SMixedColdOne) {
+    throw "Iq1SNoMainSync requires Iq1SMixedColdOne"
+}
+if ($Iq1SPackedH2D -and -not $Iq1SMixedColdOne) {
+    throw "Iq1SPackedH2D requires Iq1SMixedColdOne"
+}
+if ($Iq1SVramCachePerLayer -gt 0 -and
+    (-not $Iq1SMixedColdOne -or $Iq1SRamCacheGiB -le 0.0)) {
+    throw "Iq1SVramCachePerLayer requires Iq1SMixedColdOne and Iq1SRamCacheGiB > 0"
+}
+if ($Iq1SVramCachePerLayer -gt 0 -and $Iq1SPackedH2D) {
+    throw "Iq1SVramCachePerLayer and Iq1SPackedH2D are mutually exclusive"
+}
 if ($ReuseVerifiedIq1SReceipt -and $GateKind -ne "structural-safety") {
     throw "ReuseVerifiedIq1SReceipt is restricted to structural-safety diagnostics"
 }
@@ -436,6 +461,37 @@ if ($Iq1SMixedColdOne) {
     $env:DS4_IQ1_S_MIXED_COLD_K = "1"
 } else {
     Remove-Item Env:\DS4_IQ1_S_MIXED_COLD_K -ErrorAction SilentlyContinue
+}
+if ($Iq1SRamCacheGiB -gt 0.0) {
+    $env:DS4_IQ1_S_RAM_CACHE_GB = $Iq1SRamCacheGiB.ToString(
+        "0.###", [Globalization.CultureInfo]::InvariantCulture)
+} else {
+    Remove-Item Env:\DS4_IQ1_S_RAM_CACHE_GB -ErrorAction SilentlyContinue
+}
+if ($Iq1SMixedDebug) {
+    $env:DS4_IQ1_MIXED_DEBUG = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_MIXED_DEBUG -ErrorAction SilentlyContinue
+}
+if ($Iq1SProfile) {
+    $env:DS4_IQ1_S_PROFILE = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_PROFILE -ErrorAction SilentlyContinue
+}
+if ($Iq1SNoMainSync) {
+    $env:DS4_IQ1_MIXED_NO_MAIN_SYNC = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_MIXED_NO_MAIN_SYNC -ErrorAction SilentlyContinue
+}
+if ($Iq1SPackedH2D) {
+    $env:DS4_IQ1_S_PACKED_H2D = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_PACKED_H2D -ErrorAction SilentlyContinue
+}
+if ($Iq1SVramCachePerLayer -gt 0) {
+    $env:DS4_IQ1_S_VRAM_CACHE_PER_LAYER = "$Iq1SVramCachePerLayer"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_VRAM_CACHE_PER_LAYER -ErrorAction SilentlyContinue
 }
 if ($RuntimeReserveMB -gt 0) {
     $env:DS4_CUDA_STREAM_RUNTIME_RESERVE_MB = "$RuntimeReserveMB"
@@ -770,7 +826,8 @@ if ($SpexDryRun) {
 }
 
 if ($Repeats -lt 1) { throw "Repeats must be >= 1" }
-$env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$(if ($Warmup) { $Repeats + 1 } else { $Repeats })"
+$requestCountExpected = if ($Warmup) { $Repeats + 1 } else { $Repeats }
+$env:DS4_BENCH_EXIT_AFTER_REQUESTS = "$requestCountExpected"
 if ($ComposePrefillMassTiering) {
     if (-not $PrefillMassWrap) { throw "ComposePrefillMassTiering requires PrefillMassWrap" }
     if ($DynamicArenaGiB -le 0.0) { throw "ComposePrefillMassTiering requires DynamicArenaGiB > 0" }
@@ -779,7 +836,6 @@ if ($ComposePrefillMassTiering) {
     if ($ExpertCacheN -le 0) { throw "ComposePrefillMassTiering requires ExpertCacheN > 0" }
     if (-not $GpuResidentRoutes) { throw "ComposePrefillMassTiering requires GpuResidentRoutes" }
     if (-not $DisableQ8F16Cache -or $Q8F16CacheMB -ne 0) { throw "ComposePrefillMassTiering requires Q8-F16 cache disabled" }
-    if ($Warmup -or $Repeats -ne 1) { throw "ComposePrefillMassTiering requires one request and no warmup" }
     if ($PrefillMassObserve -or $ReapMassObserve -or $ReapMassWrap) { throw "ComposePrefillMassTiering must be isolated from observe-only prefill and REAP mass" }
     if ($DynamicArenaObservedWindow -gt 0 -or $DynamicArenaGrowInterval -gt 0 -or $DynamicArenaCarry -ne "default") { throw "ComposePrefillMassTiering must be isolated from dynamic arena observer/grow/carry" }
 }
@@ -847,7 +903,10 @@ if ($PrefillMassWrap -and $DynamicArenaGrowInterval -gt 0) { throw "PrefillMassW
 if ($PrefillMassWrap -and $DynamicArenaCarry -ne "default") { throw "PrefillMassWrap must be isolated from arena carry" }
 if ($PrefillMassWrap -and -not $ComposePrefillMassTiering -and ($ExpertCacheN -gt 0 -or $ExpertCacheStats)) { throw "PrefillMassWrap must be isolated from the expert cache" }
 if ($PrefillMassWrap -and ($SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0)) { throw "PrefillMassWrap must be isolated from SPEX" }
-if ($PrefillMassWrap -and ($Warmup -or $Repeats -ne 1)) { throw "PrefillMassWrap first-snapshot measurements require one request and no warmup" }
+if ($PrefillMassWrap -and -not $ComposePrefillMassTiering -and
+    ($Warmup -or $Repeats -ne 1)) {
+    throw "PrefillMassWrap without composed request-scoped masks requires one request and no warmup"
+}
 if ($ArenaWrapPartProfile -and -not $ArenaWrapSourceParts) { throw "ArenaWrapPartProfile requires ArenaWrapSourceParts" }
 if ($ArenaWrapUnlockSourceRanges -and (-not $ArenaWrapSourceParts -or -not $ArenaWrapTrustWorkerChecksum)) { throw "ArenaWrapUnlockSourceRanges requires ArenaWrapSourceParts and ArenaWrapTrustWorkerChecksum" }
 if ($ArenaWrapUnlockSourceRanges -and ($ArenaWrapTrimBetweenPhases -or $ArenaWrapSequentialFile -or $ArenaWrapRandomFile)) { throw "ArenaWrapUnlockSourceRanges must be isolated from ArenaWrapTrimBetweenPhases and file source modes" }
@@ -865,11 +924,12 @@ if ($OverlapShared -and $OverlapSharedFull) { throw "Select only one overlap pol
 if (($OverlapShared -or $OverlapSharedFull) -and $NoSelectedLoad) { throw "Overlap is incompatible with NoSelectedLoad" }
 if (($OverlapShared -or $OverlapSharedFull) -and $ExpertCacheN -gt 0) { throw "Overlap is incompatible with ExpertCacheN > 0" }
 if ($Iq1SExpertSidecar -and
-    ($NoSelectedLoad -or $ExpertCacheN -gt 0 -or $ExpertTiering -ne "off" -or
-     $DynamicArenaGiB -gt 0.0 -or $GpuResidentRoutes -or
-     $SplitHitMiss -or $SplitFused -or $DirectCacheHits -or
-     $MixedDirectCache -or $SpexPrefetchK -gt 0)) {
-    throw "IQ1_S first-stage sidecar requires cache/tiering/arena/resident routes/SPEX prefetch off"
+    ($NoSelectedLoad -or $SplitHitMiss -or
+     $DirectCacheHits -or $MixedDirectCache -or $SpexPrefetchK -gt 0 -or
+     (-not $Iq1SMixedColdOne -and
+      ($ExpertCacheN -gt 0 -or $ExpertTiering -ne "off" -or
+       $DynamicArenaGiB -gt 0.0 -or $GpuResidentRoutes)))) {
+    throw "IQ1_S sidecar composition is unsupported; standalone requires cache/tiering/arena/resident routes off, while mixed 5+1 still excludes selected-load bypass, split-hit-miss/direct-cache, and SPEX prefetch"
 }
 $effectiveDs4Environment = [ordered]@{}
 $_processEnvironment = [System.Environment]::GetEnvironmentVariables()
@@ -1492,7 +1552,8 @@ $spexCpuProbeD2HWaitMs = 0.0; $spexCpuProbeCpuMs = 0.0; $spexCpuProbeQueueMs = 0
 $spexCpuProbeChecksum = 0.0
 $arenaObserverArmed = $false; $arenaObserverWindowObserved = 0
 $arenaObserverMinHitsObserved = 0; $arenaObserverGrowIntervalObserved = 0
-$prefillMassArmed = $false; $prefillMassFinalized = $false
+$prefillMassArmed = $false; $prefillMassArmedEventCount = 0
+$prefillMassFinalized = $false; $prefillMassFinalizeEventCount = 0
 $prefillMassLayers = 0; $prefillMassRowsMin = 0; $prefillMassRowsMax = 0
 $prefillMassRoutedSlots = 0; $prefillMassUnique = 0
 $prefillMassCandidate = 0; $prefillMassCapacity = 0
@@ -1500,6 +1561,7 @@ $prefillMassTotal = 0.0; $prefillMassCandidateMass = 0.0
 $prefillMassCoverage = 0.0; $prefillMassCutoff = 0.0
 $prefillMassPolicy = "not_observed"; $prefillMassResidency = "not_observed"
 $prefillMassDecodeTokens = 0; $prefillMassDecodeSlots = 0; $prefillMassDecodeHits = 0; $prefillMassDecodeHitRate = 0.0
+$prefillMassDecodeEventCount = 0
 $prefillMassWrapObserved = $false; $prefillMassWrapEventCount = 0
 $prefillMassWrapResult = "not_observed"; $prefillMassWrapReason = "not_observed"
 $prefillMassWrapCandidate = 0; $prefillMassWrapLoads = 0; $prefillMassWrapWorkers = 0
@@ -1507,14 +1569,17 @@ $prefillMassWrapSeconds = 0.0; $prefillMassWrapSnapshotBefore = 0; $prefillMassW
 $prefillMassWrapResidentBefore = 0; $prefillMassWrapResidentAfter = 0
 $prefillMassWrapGeneration = 0; $prefillMassWrapPreloaded = -1
 $prefillMassWrapRouter = "not_observed"; $prefillMassWrapMask = "not_observed"
+$prefillMassWrapParsedEvents = @()
 $prefillMassComposeObserved = $false; $prefillMassComposeEventCount = 0
+$prefillMassComposeParsedCount = 0; $prefillMassComposeFingerprints = @()
 $prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
 $prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
 $prefillMassComposeCapacity = 0; $prefillMassComposeCandidateFNV1A64 = "not_observed"
 $prefillMassComposeSparseSkippedRanked = 0
 $prefillMassComposeMaskObserved = $false; $prefillMassComposeMaskEventCount = 0
 $prefillMassComposeMaskFailedCount = 0; $prefillMassComposeMaskBase = "not_observed"
-$prefillMassComposeMaskExistingLayers = 0; $prefillMassComposeMaskRestoreCount = 0
+$prefillMassComposeMaskExistingLayers = 0; $prefillMassComposeMaskAppliedCount = 0
+$prefillMassComposeMaskRestoreCount = 0
 $prefillMassLayerStripeObserved = $false; $prefillMassLayerStripeEventCount = 0
 $prefillMassLayerStripeFailedCount = 0; $prefillMassLayerStripeResult = "not_observed"
 $prefillMassLayerStripeReason = "not_observed"; $prefillMassLayerStripeStride = 0
@@ -2070,62 +2135,89 @@ if (Test-Path $stderrLog) {
         $routeProfileTransportMs = [double]$Matches[5]
         $routeProfilePublishMs = [double]$Matches[6]
     }
-    $gpuRoutesLine = $lines | Where-Object { $_ -match "\[gpu-resident-routes\] final" } | Select-Object -Last 1
-    if ($gpuRoutesLine -and $gpuRoutesLine -match "calls=(\d+) split_calls=(\d+) all_hit=(\d+) worker_jobs=(\d+) miss_experts=(\d+) errors=(\d+) worker=([0-9.]+)ms/job resolve=([0-9.]+)ms/call wait=([0-9.]+)ms/call queries=(\d+) default_sync=(\d+) no_default_sync=(\d+)") {
+    $gpuRoutesLines = @($lines | Where-Object { $_ -match "\[gpu-resident-routes\] final" })
+    $gpuRoutesLine = $gpuRoutesLines | Select-Object -Last 1
+    $gpuRoutesWorkerMsWeighted = 0.0
+    $gpuRoutesResolveMsWeighted = 0.0
+    $gpuRoutesWaitMsWeighted = 0.0
+    foreach ($currentGpuRoutesLine in $gpuRoutesLines) {
+        if ($currentGpuRoutesLine -notmatch "calls=(\d+) split_calls=(\d+) all_hit=(\d+) worker_jobs=(\d+) miss_experts=(\d+) errors=(\d+) worker=([0-9.]+)ms/job resolve=([0-9.]+)ms/call wait=([0-9.]+)ms/call queries=(\d+) default_sync=(\d+) no_default_sync=(\d+)") {
+            throw "GPU-resident route summary format mismatch: $currentGpuRoutesLine"
+        }
         $gpuRoutesObserved = $true
-        $gpuRoutesCalls = [long]$Matches[1]
-        $gpuRoutesSplitCalls = [long]$Matches[2]
-        $gpuRoutesAllHit = [long]$Matches[3]
-        $gpuRoutesWorkerJobs = [long]$Matches[4]
-        $gpuRoutesMissExperts = [long]$Matches[5]
-        $gpuRoutesErrors = [long]$Matches[6]
-        $gpuRoutesWorkerMs = [double]$Matches[7]
-        $gpuRoutesResolveMs = [double]$Matches[8]
-        $gpuRoutesWaitMs = [double]$Matches[9]
-        $gpuRoutesQueries = [long]$Matches[10]
-        $gpuRoutesDefaultSyncCalls = [long]$Matches[11]
-        $gpuRoutesNoDefaultSyncCalls = [long]$Matches[12]
-    }
-    if ($gpuRoutesLine -and $gpuRoutesLine -match "cache_count=(\d+) cache_calls=(\d+) cache_hits=(\d+) cache_misses=(\d+) cache_admissions=(\d+) cache_evictions=(\d+) direct_loads=(\d+)") {
-        $gpuRoutesCacheCount = [long]$Matches[1]
-        $gpuRoutesCacheCalls = [long]$Matches[2]
-        $gpuRoutesCacheHits = [long]$Matches[3]
-        $gpuRoutesCacheMisses = [long]$Matches[4]
-        $gpuRoutesCacheAdmissions = [long]$Matches[5]
-        $gpuRoutesCacheEvictions = [long]$Matches[6]
-        $gpuRoutesCacheDirectLoads = [long]$Matches[7]
-    }
-    foreach ($packedCopyField in @(
-        "packed_copy_requested",
-        "packed_copy_experts",
-        "packed_copy_submissions",
-        "packed_copy_bytes",
-        "legacy_copy_submissions")) {
-        if ($gpuRoutesLine -and $gpuRoutesLine -match ($packedCopyField + "=(\d+)")) {
-            switch ($packedCopyField) {
-                "packed_copy_requested" { $gpuRoutesPackedCopyRequested = [long]$Matches[1] }
-                "packed_copy_experts" { $gpuRoutesPackedCopyExperts = [long]$Matches[1] }
-                "packed_copy_submissions" { $gpuRoutesPackedCopySubmissions = [long]$Matches[1] }
-                "packed_copy_bytes" { $gpuRoutesPackedCopyBytes = [long]$Matches[1] }
-                "legacy_copy_submissions" { $gpuRoutesLegacyCopySubmissions = [long]$Matches[1] }
+        $currentCalls = [long]$Matches[1]
+        $currentWorkerJobs = [long]$Matches[4]
+        $gpuRoutesCalls += $currentCalls
+        $gpuRoutesSplitCalls += [long]$Matches[2]
+        $gpuRoutesAllHit += [long]$Matches[3]
+        $gpuRoutesWorkerJobs += $currentWorkerJobs
+        $gpuRoutesMissExperts += [long]$Matches[5]
+        $gpuRoutesErrors += [long]$Matches[6]
+        $gpuRoutesWorkerMsWeighted += [double]$Matches[7] * $currentWorkerJobs
+        $gpuRoutesResolveMsWeighted += [double]$Matches[8] * $currentCalls
+        $gpuRoutesWaitMsWeighted += [double]$Matches[9] * $currentCalls
+        $gpuRoutesQueries += [long]$Matches[10]
+        $gpuRoutesDefaultSyncCalls += [long]$Matches[11]
+        $gpuRoutesNoDefaultSyncCalls += [long]$Matches[12]
+
+        if ($currentGpuRoutesLine -match "cache_count=(\d+) cache_calls=(\d+) cache_hits=(\d+) cache_misses=(\d+) cache_admissions=(\d+) cache_evictions=(\d+) direct_loads=(\d+)") {
+            $gpuRoutesCacheCount = [long]$Matches[1]
+            $gpuRoutesCacheCalls += [long]$Matches[2]
+            $gpuRoutesCacheHits += [long]$Matches[3]
+            $gpuRoutesCacheMisses += [long]$Matches[4]
+            $gpuRoutesCacheAdmissions += [long]$Matches[5]
+            $gpuRoutesCacheEvictions += [long]$Matches[6]
+            $gpuRoutesCacheDirectLoads += [long]$Matches[7]
+        }
+        foreach ($packedCopyField in @(
+            "packed_copy_requested",
+            "packed_copy_experts",
+            "packed_copy_submissions",
+            "packed_copy_bytes",
+            "legacy_copy_submissions")) {
+            if ($currentGpuRoutesLine -match ($packedCopyField + "=(\d+)")) {
+                switch ($packedCopyField) {
+                    "packed_copy_requested" {
+                        $currentPackedRequested = [long]$Matches[1]
+                        if ($currentPackedRequested -ne $(if ($RoutePackedCopy) { 1 } else { 0 })) {
+                            throw "RoutePackedCopy runtime state changed across requests"
+                        }
+                        $gpuRoutesPackedCopyRequested = $currentPackedRequested
+                    }
+                    "packed_copy_experts" { $gpuRoutesPackedCopyExperts += [long]$Matches[1] }
+                    "packed_copy_submissions" { $gpuRoutesPackedCopySubmissions += [long]$Matches[1] }
+                    "packed_copy_bytes" { $gpuRoutesPackedCopyBytes += [long]$Matches[1] }
+                    "legacy_copy_submissions" { $gpuRoutesLegacyCopySubmissions += [long]$Matches[1] }
+                }
+            }
+        }
+        foreach ($splitFusedField in @(
+            "split_fused_calls",
+            "split_fused_hits",
+            "split_fused_misses",
+            "split_fused_miss_scratch_bytes_avoided",
+            "split_fused_sum_read_bytes_avoided")) {
+            if ($currentGpuRoutesLine -match ($splitFusedField + "=(\d+)")) {
+                switch ($splitFusedField) {
+                    "split_fused_calls" { $splitFusedCalls += [long]$Matches[1] }
+                    "split_fused_hits" { $splitFusedHits += [long]$Matches[1] }
+                    "split_fused_misses" { $splitFusedMisses += [long]$Matches[1] }
+                    "split_fused_miss_scratch_bytes_avoided" { $splitFusedMissScratchBytesAvoided += [long]$Matches[1] }
+                    "split_fused_sum_read_bytes_avoided" { $splitFusedSumReadBytesAvoided += [long]$Matches[1] }
+                }
             }
         }
     }
-    foreach ($splitFusedField in @(
-        "split_fused_calls",
-        "split_fused_hits",
-        "split_fused_misses",
-        "split_fused_miss_scratch_bytes_avoided",
-        "split_fused_sum_read_bytes_avoided")) {
-        if ($gpuRoutesLine -and $gpuRoutesLine -match ($splitFusedField + "=(\d+)")) {
-            switch ($splitFusedField) {
-                "split_fused_calls" { $splitFusedCalls = [long]$Matches[1] }
-                "split_fused_hits" { $splitFusedHits = [long]$Matches[1] }
-                "split_fused_misses" { $splitFusedMisses = [long]$Matches[1] }
-                "split_fused_miss_scratch_bytes_avoided" { $splitFusedMissScratchBytesAvoided = [long]$Matches[1] }
-                "split_fused_sum_read_bytes_avoided" { $splitFusedSumReadBytesAvoided = [long]$Matches[1] }
-            }
-        }
+    if ($gpuRoutesWorkerJobs -gt 0) {
+        $gpuRoutesWorkerMs = $gpuRoutesWorkerMsWeighted / $gpuRoutesWorkerJobs
+    }
+    if ($gpuRoutesCalls -gt 0) {
+        $gpuRoutesResolveMs = $gpuRoutesResolveMsWeighted / $gpuRoutesCalls
+        $gpuRoutesWaitMs = $gpuRoutesWaitMsWeighted / $gpuRoutesCalls
+    }
+    if ($ComposePrefillMassTiering -and
+        $gpuRoutesLines.Count -ne $requestCountExpected) {
+        throw "GPU-resident route summary count differs from request count"
     }
     $splitFusedObserved = ($splitFusedCalls -gt 0)
     if ($SplitHitMiss -and (-not $gpuRoutesObserved -or $gpuRoutesSplitCalls -le 0)) {
@@ -2193,12 +2285,16 @@ if (Test-Path $stderrLog) {
         $arenaAllocatedBytes = [long]$Matches[2]
         $arenaSlotBytes = [long]$Matches[3]
     }
-    $prefillMassArmedLine = $lines | Where-Object { $_ -match "\[prefill-mass\] armed" } | Select-Object -Last 1
+    $prefillMassArmedLines = @($lines | Where-Object { $_ -match "\[prefill-mass\] armed" })
+    $prefillMassArmedEventCount = $prefillMassArmedLines.Count
+    $prefillMassArmedLine = $prefillMassArmedLines | Select-Object -Last 1
     if ($prefillMassArmedLine -and $prefillMassArmedLine -match "armed slots=(\d+) layers=(\d+)\.\.(\d+).*residency=([a-z-]+) policy=([a-z-]+)") {
         $prefillMassArmed = $true
         $prefillMassResidency = $Matches[4]; $prefillMassPolicy = $Matches[5]
     }
-    $prefillMassFinalizeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] finalize layers=" } | Select-Object -Last 1
+    $prefillMassFinalizeLines = @($lines | Where-Object { $_ -match "\[prefill-mass\] finalize layers=" })
+    $prefillMassFinalizeEventCount = $prefillMassFinalizeLines.Count
+    $prefillMassFinalizeLine = $prefillMassFinalizeLines | Select-Object -Last 1
     if ($prefillMassFinalizeLine -and $prefillMassFinalizeLine -match "finalize layers=(\d+) rows_min=(\d+) rows_max=(\d+) routed_slots=(\d+) unique=(\d+) candidate=(\d+) capacity=(\d+) mass_total=([0-9.]+) mass_candidate=([0-9.]+) mass_coverage=([0-9.]+) cutoff=([0-9.]+).*residency=([a-z-]+) policy=([a-z-]+)") {
         $prefillMassFinalized = $true
         $prefillMassLayers = [int]$Matches[1]; $prefillMassRowsMin = [int]$Matches[2]
@@ -2213,23 +2309,28 @@ if (Test-Path $stderrLog) {
     }
     $prefillMassComposeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-compose\]" })
     $prefillMassComposeEventCount = $prefillMassComposeLines.Count
-    $prefillMassComposeLine = $prefillMassComposeLines | Select-Object -Last 1
-    if ($prefillMassComposeLine -and $prefillMassComposeLine -match "hash_layers=(\d+) hash_seed_entries=(\d+) ranked_entries=(\d+) total_candidate=(\d+) capacity=(\d+) candidate_fnv1a64=([0-9a-f]{16})") {
-        $prefillMassComposeObserved = $true
-        $prefillMassComposeHashLayers = [int]$Matches[1]
-        $prefillMassComposeHashSeedEntries = [long]$Matches[2]
-        $prefillMassComposeRankedEntries = [long]$Matches[3]
-        $prefillMassComposeTotalCandidate = [long]$Matches[4]
-        $prefillMassComposeCapacity = [long]$Matches[5]
-        $prefillMassComposeCandidateFNV1A64 = $Matches[6]
-    }
-    if ($prefillMassComposeLine -and $prefillMassComposeLine -match "sparse_skipped_ranked=(\d+)") {
-        $prefillMassComposeSparseSkippedRanked = [long]$Matches[1]
+    foreach ($prefillMassComposeLine in $prefillMassComposeLines) {
+        if ($prefillMassComposeLine -match "hash_layers=(\d+) hash_seed_entries=(\d+) ranked_entries=(\d+) total_candidate=(\d+) capacity=(\d+) candidate_fnv1a64=([0-9a-f]{16})") {
+            $prefillMassComposeObserved = $true
+            $prefillMassComposeParsedCount++
+            $prefillMassComposeHashLayers = [int]$Matches[1]
+            $prefillMassComposeHashSeedEntries = [long]$Matches[2]
+            $prefillMassComposeRankedEntries = [long]$Matches[3]
+            $prefillMassComposeTotalCandidate = [long]$Matches[4]
+            $prefillMassComposeCapacity = [long]$Matches[5]
+            $prefillMassComposeCandidateFNV1A64 = $Matches[6]
+            $prefillMassComposeFingerprints += $prefillMassComposeCandidateFNV1A64
+        }
+        if ($prefillMassComposeLine -match "sparse_skipped_ranked=(\d+)") {
+            $prefillMassComposeSparseSkippedRanked = [long]$Matches[1]
+        }
     }
     $prefillMassComposeMaskLines = @($lines | Where-Object { $_ -match "\[prefill-mass-compose-mask\] result=" })
     $prefillMassComposeMaskEventCount = $prefillMassComposeMaskLines.Count
     $prefillMassComposeMaskFailedCount = @($prefillMassComposeMaskLines | Where-Object { $_ -match "result=(failed|restore-failed)" }).Count
-    $prefillMassComposeMaskAppliedLine = $prefillMassComposeMaskLines | Where-Object { $_ -match "result=applied" } | Select-Object -Last 1
+    $prefillMassComposeMaskAppliedLines = @($prefillMassComposeMaskLines | Where-Object { $_ -match "result=applied" })
+    $prefillMassComposeMaskAppliedCount = $prefillMassComposeMaskAppliedLines.Count
+    $prefillMassComposeMaskAppliedLine = $prefillMassComposeMaskAppliedLines | Select-Object -Last 1
     if ($prefillMassComposeMaskAppliedLine -and $prefillMassComposeMaskAppliedLine -match "base=([a-z-]+) existing_layers=(\d+)") {
         $prefillMassComposeMaskObserved = $true
         $prefillMassComposeMaskBase = $Matches[1]
@@ -2262,7 +2363,9 @@ if (Test-Path $stderrLog) {
             $prefillMassLayerStripeReason = $Matches[1]
         }
     }
-    $prefillMassDecodeLine = $lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" } | Select-Object -Last 1
+    $prefillMassDecodeLines = @($lines | Where-Object { $_ -match "\[prefill-mass\] decode reason=request-end" })
+    $prefillMassDecodeEventCount = $prefillMassDecodeLines.Count
+    $prefillMassDecodeLine = $prefillMassDecodeLines | Select-Object -Last 1
     if ($prefillMassDecodeLine -and $prefillMassDecodeLine -match "tokens=(\d+) slots=(\d+) candidate_hits=(\d+) hit_rate=([0-9.]+) policy=([a-z-]+)") {
         $prefillMassDecodeTokens = [long]$Matches[1]
         $prefillMassDecodeSlots = [long]$Matches[2]
@@ -2271,17 +2374,29 @@ if (Test-Path $stderrLog) {
     }
     $prefillMassWrapLines = @($lines | Where-Object { $_ -match "\[prefill-mass-wrap\] result=" })
     $prefillMassWrapEventCount = $prefillMassWrapLines.Count
-    $prefillMassWrapLine = $prefillMassWrapLines | Select-Object -Last 1
-    if ($prefillMassWrapLine -and $prefillMassWrapLine -match "result=([a-z-]+) reason=([a-z-]+) candidate=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9.]+) snapshot_before=(\d+) snapshot_after=(\d+) resident_before=(\d+) resident_after=(\d+) generation=(\d+) preloaded=(\d+) router=([a-z-]+) mask=([a-z-]+)") {
-        $prefillMassWrapObserved = $true
-        $prefillMassWrapResult = $Matches[1]; $prefillMassWrapReason = $Matches[2]
-        $prefillMassWrapCandidate = [long]$Matches[3]; $prefillMassWrapLoads = [long]$Matches[4]
-        $prefillMassWrapWorkers = [int]$Matches[5]
-        $prefillMassWrapSeconds = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
-        $prefillMassWrapSnapshotBefore = [long]$Matches[7]; $prefillMassWrapSnapshotAfter = [long]$Matches[8]
-        $prefillMassWrapResidentBefore = [long]$Matches[9]; $prefillMassWrapResidentAfter = [long]$Matches[10]
-        $prefillMassWrapGeneration = [long]$Matches[11]; $prefillMassWrapPreloaded = [int]$Matches[12]
-        $prefillMassWrapRouter = $Matches[13]; $prefillMassWrapMask = $Matches[14]
+    foreach ($prefillMassWrapLine in $prefillMassWrapLines) {
+        if ($prefillMassWrapLine -match "result=([a-z-]+) reason=([a-z-]+) candidate=(\d+) loads=(\d+) workers=(\d+) seconds=([0-9.]+) snapshot_before=(\d+) snapshot_after=(\d+) resident_before=(\d+) resident_after=(\d+) generation=(\d+) preloaded=(\d+) router=([a-z-]+) mask=([a-z-]+)") {
+            $prefillMassWrapObserved = $true
+            $prefillMassWrapResult = $Matches[1]; $prefillMassWrapReason = $Matches[2]
+            $prefillMassWrapCandidate = [long]$Matches[3]; $prefillMassWrapLoads = [long]$Matches[4]
+            $prefillMassWrapWorkers = [int]$Matches[5]
+            $prefillMassWrapSeconds = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
+            $prefillMassWrapSnapshotBefore = [long]$Matches[7]; $prefillMassWrapSnapshotAfter = [long]$Matches[8]
+            $prefillMassWrapResidentBefore = [long]$Matches[9]; $prefillMassWrapResidentAfter = [long]$Matches[10]
+            $prefillMassWrapGeneration = [long]$Matches[11]; $prefillMassWrapPreloaded = [int]$Matches[12]
+            $prefillMassWrapRouter = $Matches[13]; $prefillMassWrapMask = $Matches[14]
+            $prefillMassWrapParsedEvents += [pscustomobject]@{
+                result = $prefillMassWrapResult; reason = $prefillMassWrapReason
+                candidate = $prefillMassWrapCandidate; loads = $prefillMassWrapLoads
+                snapshot_before = $prefillMassWrapSnapshotBefore
+                snapshot_after = $prefillMassWrapSnapshotAfter
+                resident_before = $prefillMassWrapResidentBefore
+                resident_after = $prefillMassWrapResidentAfter
+                generation = $prefillMassWrapGeneration
+                preloaded = $prefillMassWrapPreloaded
+                router = $prefillMassWrapRouter; mask = $prefillMassWrapMask
+            }
+        }
     }
     $reapMassArmedLine = $lines | Where-Object { $_ -match "\[reap-mass\] armed" } | Select-Object -Last 1
     if ($reapMassArmedLine -and $reapMassArmedLine -match "armed window=(\d+) top=(\d+) layers=(\d+)\.\.(\d+) semantics=selected_weight_normalized_per_token sliding_ring_observe_only transport=([a-z0-9-]+)") {
@@ -2372,33 +2487,47 @@ if (Test-Path $stderrLog) {
         $arenaWrapLoads = [long]$Matches[3]
         $arenaWrapSeconds = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
-    $arenaWrapProfileLine = $lines | Where-Object { $_ -match "\[arena-wrap-profile\] result=" } | Select-Object -Last 1
-    if ($arenaWrapProfileLine -and $arenaWrapProfileLine -match "result=(published|failed) schedule=([^ ]+) source=([^ ]+) checksum=([^ ]+) loads=(\d+) workers=(\d+) begin=([0-9.]+) copy_checksum=([0-9.]+) finish=([0-9.]+) publish=([0-9.]+) total=([0-9.]+)") {
-        $arenaWrapProfileObserved = $true
-        $arenaWrapProfileResult = $Matches[1]
-        $arenaWrapScheduleObserved = $Matches[2]
-        $arenaWrapSourceObserved = $Matches[3]
-        $arenaWrapChecksumObserved = $Matches[4]
-        $arenaWrapProfileLoads = [long]$Matches[5]
-        $arenaWrapProfileWorkers = [int]$Matches[6]
-        $arenaWrapProfileBeginSeconds = [double]::Parse($Matches[7], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaWrapProfileCopyChecksumSeconds = [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaWrapProfileFinishSeconds = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaWrapProfilePublishSeconds = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaWrapProfileTotalSeconds = [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
-        if ($arenaWrapProfileLine -match "source_parts_copy=([0-9.]+) source_parts_checksum=([0-9.]+) parts=(\d+) copy_workers=(\d+) checksum_workers=(\d+)") {
-            $arenaWrapSourcePartsCopySeconds = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
-            $arenaWrapSourcePartsChecksumSeconds = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
-            $arenaWrapPartCount = [long]$Matches[3]
-            $arenaWrapCopyWorkers = [int]$Matches[4]
-            $arenaWrapChecksumWorkers = [int]$Matches[5]
+    $arenaWrapProfileLines = @($lines | Where-Object { $_ -match "\[arena-wrap-profile\] result=" })
+    $arenaWrapProfileLine = $arenaWrapProfileLines | Select-Object -Last 1
+    foreach ($currentArenaWrapProfileLine in $arenaWrapProfileLines) {
+        if ($currentArenaWrapProfileLine -notmatch "result=(published|failed) schedule=([^ ]+) source=([^ ]+) checksum=([^ ]+) loads=(\d+) workers=(\d+) begin=([0-9.]+) copy_checksum=([0-9.]+) finish=([0-9.]+) publish=([0-9.]+) total=([0-9.]+)") {
+            throw "Arena WRAP profile format mismatch: $currentArenaWrapProfileLine"
         }
-        if ($arenaWrapProfileLine -match "file_qd=(\d+) file_qd_observed=(\d+) file_submits=(\d+) file_completions=(\d+) file_failures=(\d+)") {
+        $arenaWrapProfileObserved = $true
+        $currentWrapResult = $Matches[1]
+        $currentWrapSchedule = $Matches[2]
+        $currentWrapSource = $Matches[3]
+        $currentWrapChecksum = $Matches[4]
+        if ($arenaWrapScheduleObserved -ne "not_observed" -and
+            ($arenaWrapScheduleObserved -ne $currentWrapSchedule -or
+             $arenaWrapSourceObserved -ne $currentWrapSource -or
+             $arenaWrapChecksumObserved -ne $currentWrapChecksum)) {
+            throw "Arena WRAP profile configuration changed across requests"
+        }
+        $arenaWrapProfileResult = $currentWrapResult
+        $arenaWrapScheduleObserved = $currentWrapSchedule
+        $arenaWrapSourceObserved = $currentWrapSource
+        $arenaWrapChecksumObserved = $currentWrapChecksum
+        $arenaWrapProfileLoads += [long]$Matches[5]
+        $arenaWrapProfileWorkers = [math]::Max($arenaWrapProfileWorkers, [int]$Matches[6])
+        $arenaWrapProfileBeginSeconds += [double]::Parse($Matches[7], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfileCopyChecksumSeconds += [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfileFinishSeconds += [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfilePublishSeconds += [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaWrapProfileTotalSeconds += [double]::Parse($Matches[11], [Globalization.CultureInfo]::InvariantCulture)
+        if ($currentArenaWrapProfileLine -match "source_parts_copy=([0-9.]+) source_parts_checksum=([0-9.]+) parts=(\d+) copy_workers=(\d+) checksum_workers=(\d+)") {
+            $arenaWrapSourcePartsCopySeconds += [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaWrapSourcePartsChecksumSeconds += [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaWrapPartCount += [long]$Matches[3]
+            $arenaWrapCopyWorkers = [math]::Max($arenaWrapCopyWorkers, [int]$Matches[4])
+            $arenaWrapChecksumWorkers += [int]$Matches[5]
+        }
+        if ($currentArenaWrapProfileLine -match "file_qd=(\d+) file_qd_observed=(\d+) file_submits=(\d+) file_completions=(\d+) file_failures=(\d+)") {
             $arenaWrapFileQDRequestedObserved = [int]$Matches[1]
             $arenaWrapFileQDObserved = [int]$Matches[2]
-            $arenaWrapFileSubmits = [uint64]$Matches[3]
-            $arenaWrapFileCompletions = [uint64]$Matches[4]
-            $arenaWrapFileFailures = [uint32]$Matches[5]
+            $arenaWrapFileSubmits += [uint64]$Matches[3]
+            $arenaWrapFileCompletions += [uint64]$Matches[4]
+            $arenaWrapFileFailures += [uint32]$Matches[5]
         }
     }
     $arenaWrapPartProfileLine = $lines | Where-Object { $_ -match "\[arena-wrap-part-profile\] result=" } | Select-Object -Last 1
@@ -2599,19 +2728,6 @@ if (Test-Path $stderrLog) {
         $arenaFinalUploadedGiB = [double]::Parse($Matches[4], [Globalization.CultureInfo]::InvariantCulture)
     }
 }
-if ($SplitFused) {
-    if (-not $gpuRoutesObserved -or $gpuRoutesCalls -le 0 -or
-        -not $splitFusedObserved -or $splitFusedCalls -ne $gpuRoutesCalls) {
-        throw "SplitFused was requested but fused calls were not observed on every GPU route call"
-    }
-    if (($splitFusedHits + $splitFusedMisses) -ne ($gpuRoutesCalls * 6)) {
-        throw "SplitFused route accounting does not match selected route population"
-    }
-    if ($splitFusedMissScratchBytesAvoided -le 0 -or
-        $splitFusedSumReadBytesAvoided -le 0) {
-        throw "SplitFused was requested but avoided byte counters were not positive"
-    }
-}
 if ($RoutePackedCopy) {
     if (-not $gpuRoutesObserved -or
         $gpuRoutesPackedCopyRequested -ne 1 -or
@@ -2699,9 +2815,131 @@ if ($Iq1SExpertSidecar) {
     throw "IQ1_S sidecar runtime summary appeared while sidecar was disabled"
 }
 
+$iq1SRamCacheRequestedBytes = [UInt64]0
+$iq1SRamCacheAllocatedBytes = [UInt64]0
+$iq1SRamCacheCapacity = [UInt32]0
+$iq1SRamCacheCount = [UInt32]0
+$iq1SRamCacheSlotBytes = [UInt64]0
+$iq1SRamCacheHits = [UInt64]0
+$iq1SRamCacheMisses = [UInt64]0
+$iq1SRamCacheEvictions = [UInt64]0
+$iq1SRamCacheSsdBytes = [UInt64]0
+$iq1SRamCacheH2dBytes = [UInt64]0
+$iq1SRamCacheFailures = [UInt64]0
+$iq1SRamCacheHitRate = 0.0
+$iq1SRamCacheSsdAvoidedBytes = [UInt64]0
+$iq1SRamCacheRuntimeObserved = $false
+$iq1SRamCacheReadyMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-s-ram-cache\] result=ready requested_gib=([0-9.]+) allocated_gib=([0-9.]+) capacity=(\d+) slot_bytes=(\d+) pinned=1 mapped=0 policy=lru')
+$iq1SRamCacheSummaryMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-s-ram-cache\] result=summary requested_bytes=(\d+) allocated_bytes=(\d+) capacity=(\d+) count=(\d+) slot_bytes=(\d+) hits=(\d+) misses=(\d+) evictions=(\d+) ssd_bytes=(\d+) h2d_bytes=(\d+) failures=(\d+) pinned=1 mapped=0')
+if ($Iq1SRamCacheGiB -gt 0.0) {
+    if ($iq1SRamCacheReadyMatches.Count -ne 1 -or
+        $iq1SRamCacheSummaryMatches.Count -ne 1) {
+        throw "IQ1_S RAM cache requires exactly one ready marker and one summary; observed ready=$($iq1SRamCacheReadyMatches.Count) summary=$($iq1SRamCacheSummaryMatches.Count)"
+    }
+    $iq1SRamCacheSummary = $iq1SRamCacheSummaryMatches[0]
+    $iq1SRamCacheRequestedBytes = [UInt64]$iq1SRamCacheSummary.Groups[1].Value
+    $iq1SRamCacheAllocatedBytes = [UInt64]$iq1SRamCacheSummary.Groups[2].Value
+    $iq1SRamCacheCapacity = [UInt32]$iq1SRamCacheSummary.Groups[3].Value
+    $iq1SRamCacheCount = [UInt32]$iq1SRamCacheSummary.Groups[4].Value
+    $iq1SRamCacheSlotBytes = [UInt64]$iq1SRamCacheSummary.Groups[5].Value
+    $iq1SRamCacheHits = [UInt64]$iq1SRamCacheSummary.Groups[6].Value
+    $iq1SRamCacheMisses = [UInt64]$iq1SRamCacheSummary.Groups[7].Value
+    $iq1SRamCacheEvictions = [UInt64]$iq1SRamCacheSummary.Groups[8].Value
+    $iq1SRamCacheSsdBytes = [UInt64]$iq1SRamCacheSummary.Groups[9].Value
+    $iq1SRamCacheH2dBytes = [UInt64]$iq1SRamCacheSummary.Groups[10].Value
+    $iq1SRamCacheFailures = [UInt64]$iq1SRamCacheSummary.Groups[11].Value
+    $iq1SRamCacheExpectedSsdBytes = [UInt64]($iq1SRamCacheMisses * $iq1SRamCacheSlotBytes)
+    $iq1SRamCacheExpectedH2dBytes = [UInt64](
+        ($iq1SRamCacheHits + $iq1SRamCacheMisses) * $iq1SRamCacheSlotBytes)
+    if ($iq1SRamCacheRequestedBytes -eq 0 -or
+        $iq1SRamCacheAllocatedBytes -eq 0 -or
+        $iq1SRamCacheCapacity -eq 0 -or
+        $iq1SRamCacheCount -gt $iq1SRamCacheCapacity -or
+        $iq1SRamCacheSlotBytes -eq 0 -or
+        ($iq1SRamCacheHits + $iq1SRamCacheMisses) -eq 0 -or
+        ($iq1SRamCacheCount + $iq1SRamCacheEvictions) -ne $iq1SRamCacheMisses -or
+        $iq1SRamCacheSsdBytes -ne $iq1SRamCacheExpectedSsdBytes -or
+        $iq1SRamCacheH2dBytes -ne $iq1SRamCacheExpectedH2dBytes -or
+        $iq1SRamCacheFailures -ne 0) {
+        throw "IQ1_S RAM cache runtime counters are inconsistent"
+    }
+    $iq1SRamCacheAccesses = [UInt64]($iq1SRamCacheHits + $iq1SRamCacheMisses)
+    $iq1SRamCacheHitRate = [double]$iq1SRamCacheHits / [double]$iq1SRamCacheAccesses
+    $iq1SRamCacheSsdAvoidedBytes = [UInt64]($iq1SRamCacheHits * $iq1SRamCacheSlotBytes)
+    $iq1SRamCacheRuntimeObserved = $true
+} elseif ($iq1SRamCacheReadyMatches.Count -ne 0 -or
+          $iq1SRamCacheSummaryMatches.Count -ne 0) {
+    throw "IQ1_S RAM cache telemetry appeared while the cache was disabled"
+}
+
+$iq1SVramCacheRuntimeObserved = $false
+$iq1SVramCacheCapacity = [UInt32]0
+$iq1SVramCacheCount = [UInt32]0
+$iq1SVramCacheSlotBytes = [UInt64]0
+$iq1SVramCacheHits = [UInt64]0
+$iq1SVramCacheMisses = [UInt64]0
+$iq1SVramCacheEvictions = [UInt64]0
+$iq1SVramCacheH2dBytes = [UInt64]0
+$iq1SVramCacheFailures = [UInt64]0
+$iq1SVramCacheReadyMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-s-vram-cache\] result=ready per_layer=(\d+) capacity=(\d+) allocated_bytes=(\d+) slot_bytes=(\d+) policy=layer-lru')
+$iq1SVramCacheSummaryMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-s-vram-cache\] result=summary per_layer=(\d+) capacity=(\d+) count=(\d+) slot_bytes=(\d+) hits=(\d+) misses=(\d+) evictions=(\d+) h2d_bytes=(\d+) failures=(\d+)')
+if ($Iq1SVramCachePerLayer -gt 0) {
+    if ($iq1SVramCacheReadyMatches.Count -ne 1 -or
+        $iq1SVramCacheSummaryMatches.Count -ne 1) {
+        throw "IQ1_S VRAM cache requires exactly one ready marker and summary; observed ready=$($iq1SVramCacheReadyMatches.Count) summary=$($iq1SVramCacheSummaryMatches.Count)"
+    }
+    $iq1SVramReady = $iq1SVramCacheReadyMatches[0]
+    $iq1SVramSummary = $iq1SVramCacheSummaryMatches[0]
+    $iq1SVramReadyPerLayer = [UInt32]$iq1SVramReady.Groups[1].Value
+    $iq1SVramReadyCapacity = [UInt32]$iq1SVramReady.Groups[2].Value
+    $iq1SVramReadyAllocatedBytes = [UInt64]$iq1SVramReady.Groups[3].Value
+    $iq1SVramReadySlotBytes = [UInt64]$iq1SVramReady.Groups[4].Value
+    $iq1SVramSummaryPerLayer = [UInt32]$iq1SVramSummary.Groups[1].Value
+    $iq1SVramCacheCapacity = [UInt32]$iq1SVramSummary.Groups[2].Value
+    $iq1SVramCacheCount = [UInt32]$iq1SVramSummary.Groups[3].Value
+    $iq1SVramCacheSlotBytes = [UInt64]$iq1SVramSummary.Groups[4].Value
+    $iq1SVramCacheHits = [UInt64]$iq1SVramSummary.Groups[5].Value
+    $iq1SVramCacheMisses = [UInt64]$iq1SVramSummary.Groups[6].Value
+    $iq1SVramCacheEvictions = [UInt64]$iq1SVramSummary.Groups[7].Value
+    $iq1SVramCacheH2dBytes = [UInt64]$iq1SVramSummary.Groups[8].Value
+    $iq1SVramCacheFailures = [UInt64]$iq1SVramSummary.Groups[9].Value
+    $iq1SVramExpectedCapacity = [UInt32](43 * $Iq1SVramCachePerLayer)
+    $iq1SVramExpectedH2dBytes = [UInt64]($iq1SVramCacheMisses * $iq1SVramCacheSlotBytes)
+    if ($iq1SVramReadyPerLayer -ne $Iq1SVramCachePerLayer -or
+        $iq1SVramSummaryPerLayer -ne $Iq1SVramCachePerLayer -or
+        $iq1SVramReadyCapacity -ne $iq1SVramExpectedCapacity -or
+        $iq1SVramCacheCapacity -ne $iq1SVramExpectedCapacity -or
+        $iq1SVramReadySlotBytes -ne $iq1SVramCacheSlotBytes -or
+        $iq1SVramReadyAllocatedBytes -ne
+            ([UInt64]$iq1SVramCacheCapacity * $iq1SVramCacheSlotBytes) -or
+        $iq1SVramCacheCount -gt $iq1SVramCacheCapacity -or
+        ($iq1SVramCacheCount + $iq1SVramCacheEvictions) -ne
+            $iq1SVramCacheMisses -or
+        ($iq1SVramCacheHits + $iq1SVramCacheMisses) -ne
+            $iq1SSidecarCalls -or
+        $iq1SVramCacheH2dBytes -ne $iq1SVramExpectedH2dBytes -or
+        $iq1SVramCacheFailures -ne 0) {
+        throw "IQ1_S VRAM cache runtime counters are inconsistent"
+    }
+    $iq1SVramCacheRuntimeObserved = $true
+} elseif ($iq1SVramCacheReadyMatches.Count -ne 0 -or
+          $iq1SVramCacheSummaryMatches.Count -ne 0) {
+    throw "IQ1_S VRAM cache telemetry appeared while the cache was disabled"
+}
+
 $iq1MixedCalls = [UInt64]0
 $iq1MixedHotMain = [UInt64]0
 $iq1MixedColdIq1 = [UInt64]0
+$iq1MixedPrimaryColdAvoided = [UInt64]0
+$iq1MixedJoins = [UInt64]0
 $iq1MixedFailures = [UInt64]0
 $iq1MixedLastLayer = [UInt32]::MaxValue
 $iq1MixedLastSlot = [UInt32]::MaxValue
@@ -2709,7 +2947,7 @@ $iq1MixedLastExpert = -1
 $iq1MixedRuntimeObserved = $false
 $iq1MixedSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
-    '\[iq1-mixed\] result=summary calls=(\d+) hot_main=(\d+) cold_iq1=(\d+) failures=(\d+) last_layer=(\d+) last_slot=(\d+) last_expert=(-?\d+)')
+    '\[iq1-mixed\] result=summary calls=(\d+) hot_main=(\d+) cold_iq1=(\d+) primary_cold_avoided=(\d+) joins=(\d+) failures=(\d+) last_layer=(\d+) last_slot=(\d+) last_expert=(-?\d+)')
 if ($Iq1SMixedColdOne) {
     if ($iq1MixedSummaryMatches.Count -ne 1) {
         throw "IQ1_S mixed decode requires exactly one runtime summary; observed $($iq1MixedSummaryMatches.Count)"
@@ -2718,13 +2956,17 @@ if ($Iq1SMixedColdOne) {
     $iq1MixedCalls = [UInt64]$iq1MixedSummary.Groups[1].Value
     $iq1MixedHotMain = [UInt64]$iq1MixedSummary.Groups[2].Value
     $iq1MixedColdIq1 = [UInt64]$iq1MixedSummary.Groups[3].Value
-    $iq1MixedFailures = [UInt64]$iq1MixedSummary.Groups[4].Value
-    $iq1MixedLastLayer = [UInt32]$iq1MixedSummary.Groups[5].Value
-    $iq1MixedLastSlot = [UInt32]$iq1MixedSummary.Groups[6].Value
-    $iq1MixedLastExpert = [int]$iq1MixedSummary.Groups[7].Value
+    $iq1MixedPrimaryColdAvoided = [UInt64]$iq1MixedSummary.Groups[4].Value
+    $iq1MixedJoins = [UInt64]$iq1MixedSummary.Groups[5].Value
+    $iq1MixedFailures = [UInt64]$iq1MixedSummary.Groups[6].Value
+    $iq1MixedLastLayer = [UInt32]$iq1MixedSummary.Groups[7].Value
+    $iq1MixedLastSlot = [UInt32]$iq1MixedSummary.Groups[8].Value
+    $iq1MixedLastExpert = [int]$iq1MixedSummary.Groups[9].Value
     if ($iq1MixedCalls -eq 0 -or
         $iq1MixedHotMain -ne (5 * $iq1MixedCalls) -or
         $iq1MixedColdIq1 -ne $iq1MixedCalls -or
+        $iq1MixedPrimaryColdAvoided -ne $iq1MixedCalls -or
+        $iq1MixedJoins -ne $iq1MixedCalls -or
         $iq1MixedFailures -ne 0 -or
         $iq1MixedLastSlot -ge 6 -or
         $iq1MixedLastExpert -lt 0) {
@@ -2733,6 +2975,86 @@ if ($Iq1SMixedColdOne) {
     $iq1MixedRuntimeObserved = $true
 } elseif ($iq1MixedSummaryMatches.Count -ne 0) {
     throw "IQ1_S mixed decode summary appeared while mixed mode was disabled"
+}
+
+$iq1ProfileSsdReadCalls = [UInt64]0
+$iq1ProfileSsdReadMs = 0.0
+$iq1ProfileH2dBatches = [UInt64]0
+$iq1ProfileH2dCopies = [UInt64]0
+$iq1ProfileH2dEnqueueMs = 0.0
+$iq1ProfileH2dSyncs = [UInt64]0
+$iq1ProfileH2dSyncMs = 0.0
+$iq1MixedProfileCalls = [UInt64]0
+$iq1MixedProfileRouterD2hMs = 0.0
+$iq1MixedProfileMetadataH2dMs = 0.0
+$iq1MixedProfileMainSubmitMs = 0.0
+$iq1MixedProfileMainSyncMs = 0.0
+$iq1MixedProfileColdSubmitMs = 0.0
+$iq1MixedProfileJoinSubmitMs = 0.0
+$iq1TransportProfileMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-s-profile\] result=summary ssd_read_calls=(\d+) ssd_read_ms=([0-9.]+) h2d_batches=(\d+) h2d_copies=(\d+) h2d_enqueue_ms=([0-9.]+) h2d_syncs=(\d+) h2d_sync_ms=([0-9.]+) h2d_bytes=(\d+)')
+$iq1MixedProfileMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '\[iq1-mixed-profile\] result=summary calls=(\d+) router_d2h_ms=([0-9.]+) metadata_h2d_ms=([0-9.]+) main_submit_ms=([0-9.]+) main_sync_ms=([0-9.]+) cold_submit_ms=([0-9.]+) join_submit_ms=([0-9.]+)')
+if ($Iq1SProfile) {
+    if ($iq1TransportProfileMatches.Count -ne 1 -or
+        $iq1MixedProfileMatches.Count -ne 1) {
+        throw "IQ1_S profile requires exactly one transport and mixed summary; observed transport=$($iq1TransportProfileMatches.Count) mixed=$($iq1MixedProfileMatches.Count)"
+    }
+    $iq1TransportProfile = $iq1TransportProfileMatches[0]
+    $iq1ProfileSsdReadCalls = [UInt64]$iq1TransportProfile.Groups[1].Value
+    $iq1ProfileSsdReadMs = [double]::Parse($iq1TransportProfile.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1ProfileH2dBatches = [UInt64]$iq1TransportProfile.Groups[3].Value
+    $iq1ProfileH2dCopies = [UInt64]$iq1TransportProfile.Groups[4].Value
+    $iq1ProfileH2dEnqueueMs = [double]::Parse($iq1TransportProfile.Groups[5].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1ProfileH2dSyncs = [UInt64]$iq1TransportProfile.Groups[6].Value
+    $iq1ProfileH2dSyncMs = [double]::Parse($iq1TransportProfile.Groups[7].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1ProfileH2dBytes = [UInt64]$iq1TransportProfile.Groups[8].Value
+    $iq1MixedProfile = $iq1MixedProfileMatches[0]
+    $iq1MixedProfileCalls = [UInt64]$iq1MixedProfile.Groups[1].Value
+    $iq1MixedProfileRouterD2hMs = [double]::Parse($iq1MixedProfile.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1MixedProfileMetadataH2dMs = [double]::Parse($iq1MixedProfile.Groups[3].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1MixedProfileMainSubmitMs = [double]::Parse($iq1MixedProfile.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1MixedProfileMainSyncMs = [double]::Parse($iq1MixedProfile.Groups[5].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1MixedProfileColdSubmitMs = [double]::Parse($iq1MixedProfile.Groups[6].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1MixedProfileJoinSubmitMs = [double]::Parse($iq1MixedProfile.Groups[7].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $iq1ProfileExpectedH2dBatches = if ($Iq1SVramCachePerLayer -gt 0) {
+        $iq1SVramCacheMisses
+    } else {
+        $iq1SSidecarCalls
+    }
+    if ($iq1ProfileSsdReadCalls -ne $iq1SRamCacheMisses -or
+        $iq1ProfileH2dBatches -ne $iq1ProfileExpectedH2dBatches -or
+        $iq1ProfileH2dSyncs -ne $iq1ProfileH2dBatches -or
+        ($iq1ProfileH2dCopies -ne $iq1ProfileH2dBatches -and
+         $iq1ProfileH2dCopies -ne (3 * $iq1ProfileH2dBatches)) -or
+        $iq1ProfileH2dBytes -ne $iq1SRamCacheH2dBytes -or
+        $iq1MixedProfileCalls -ne $iq1MixedCalls) {
+        throw "IQ1_S profile counters are inconsistent with runtime telemetry"
+    }
+} elseif ($iq1TransportProfileMatches.Count -ne 0 -or
+          $iq1MixedProfileMatches.Count -ne 0) {
+    throw "IQ1_S profile telemetry appeared while profiling was disabled"
+}
+
+$gpuRoutesExpectedPrimarySelected = [UInt64](6 * $gpuRoutesCalls)
+if ($iq1MixedPrimaryColdAvoided -gt $gpuRoutesExpectedPrimarySelected) {
+    throw "IQ1_S mixed decode excluded more primary routes than the GPU resolver observed"
+}
+$gpuRoutesExpectedPrimarySelected -= $iq1MixedPrimaryColdAvoided
+if ($SplitFused) {
+    if (-not $gpuRoutesObserved -or $gpuRoutesCalls -le 0 -or
+        -not $splitFusedObserved -or $splitFusedCalls -ne $gpuRoutesCalls) {
+        throw "SplitFused was requested but fused calls were not observed on every GPU route call"
+    }
+    if (($splitFusedHits + $splitFusedMisses) -ne $gpuRoutesExpectedPrimarySelected) {
+        throw "SplitFused route accounting does not match the primary-model route population"
+    }
+    if ($splitFusedMissScratchBytesAvoided -le 0 -or
+        $splitFusedSumReadBytesAvoided -le 0) {
+        throw "SplitFused was requested but avoided byte counters were not positive"
+    }
 }
 
 if (-not $httpOk) { throw "Measurement failed: one or more HTTP requests did not complete" }
@@ -2752,8 +3074,106 @@ if ($ExpertTiering -eq "off") {
     }
 } else {
     if ($expertTieringControlLineCount -ne 0) { throw "Expert tiering measurement failed: control telemetry was observed" }
-    if ($expertTieringFinalLineCount -ne 1 -or -not $expertTieringFinalObserved) { throw "Expert tiering measurement failed: final counters were not observed exactly once" }
+    $expectedExpertTieringFinalLines = if ($ComposePrefillMassTiering) { $requestCountExpected } else { 1 }
+    if ($expertTieringFinalLineCount -ne $expectedExpertTieringFinalLines -or -not $expertTieringFinalObserved) {
+        throw "Expert tiering measurement failed: expected $expectedExpertTieringFinalLines final counter lines, observed $expertTieringFinalLineCount"
+    }
     if ($ComposePrefillMassTiering) {
+        if ($prefillMassWrapParsedEvents.Count -ne $requestCountExpected) {
+            throw "Expert tiering compose failed: WRAP event count is unavailable for per-request validation"
+        }
+        $tierAggregate = @{}
+        foreach ($aggregateField in @(
+                "snapshot_backing_hits", "snapshot_backing_misses",
+                "snapshot_to_vram_bytes", "forbidden_cold_ssd_to_vram",
+                "calls", "selected", "cold", "ram_hits", "vram_hits",
+                "cold_to_ram", "cold_to_vram", "ram_to_warm",
+                "vram_promotions", "vram_demotions", "ram_evictions",
+                "ram_admit_skips", "transient", "failures", "ssd_bytes",
+                "ram_h2d_bytes", "policy_epochs", "policy_free_promotions",
+                "policy_replacements", "policy_min_frequency_skips",
+                "policy_budget_skips", "policy_score_skips")) {
+            $tierAggregate[$aggregateField] = [uint64]0
+        }
+        $tierMassSumAggregate = 0.0
+        $tierLfruTopMaximum = 0.0
+        for ($tierLineIndex = 0; $tierLineIndex -lt $expertTieringFinalLines.Count; $tierLineIndex++) {
+            $tierFields = @{}
+            foreach ($fieldMatch in [regex]::Matches($expertTieringFinalLines[$tierLineIndex], " ([a-z0-9_]+)=([^ ]+)")) {
+                $tierFields[$fieldMatch.Groups[1].Value] = $fieldMatch.Groups[2].Value
+            }
+            foreach ($requiredTierField in @(
+                    "compose_prefill_mass_tiering", "snapshot_generation",
+                    "snapshot_backing_entries", "snapshot_backing_hits",
+                    "snapshot_backing_misses", "snapshot_to_vram_bytes",
+                    "forbidden_cold_ssd_to_vram", "cold_to_vram",
+                    "failures", "ssd_bytes")) {
+                if (-not $tierFields.ContainsKey($requiredTierField)) {
+                    throw "Expert tiering compose failed: final line $tierLineIndex missing $requiredTierField"
+                }
+            }
+            $matchingWrap = $prefillMassWrapParsedEvents[$tierLineIndex]
+            if ([uint32]$tierFields["compose_prefill_mass_tiering"] -ne 1 -or
+                [uint64]$tierFields["snapshot_generation"] -ne [uint64]$matchingWrap.generation -or
+                [uint32]$tierFields["snapshot_backing_entries"] -ne [uint32]$matchingWrap.candidate -or
+                [uint64]$tierFields["snapshot_backing_hits"] -le 0 -or
+                [uint64]$tierFields["snapshot_backing_misses"] -ne 0 -or
+                [uint64]$tierFields["snapshot_to_vram_bytes"] -le 0 -or
+                [uint64]$tierFields["forbidden_cold_ssd_to_vram"] -ne 0 -or
+                [uint64]$tierFields["cold_to_vram"] -ne 0 -or
+                [uint64]$tierFields["failures"] -ne 0 -or
+                [uint64]$tierFields["ssd_bytes"] -ne 0) {
+                throw "Expert tiering compose failed: per-request final counters are inconsistent at request $($tierLineIndex + 1)"
+            }
+            foreach ($aggregateField in @($tierAggregate.Keys)) {
+                if (-not $tierFields.ContainsKey($aggregateField)) {
+                    throw "Expert tiering compose failed: final line $tierLineIndex missing aggregate field $aggregateField"
+                }
+                $tierAggregate[$aggregateField] =
+                    [uint64]$tierAggregate[$aggregateField] +
+                    [uint64]$tierFields[$aggregateField]
+            }
+            if (-not $tierFields.ContainsKey("mass_sum") -or
+                -not $tierFields.ContainsKey("lfru_top")) {
+                throw "Expert tiering compose failed: final line $tierLineIndex missing score fields"
+            }
+            $tierMassSumAggregate += [double]::Parse(
+                $tierFields["mass_sum"],
+                [Globalization.CultureInfo]::InvariantCulture)
+            $tierLfruTopMaximum = [math]::Max(
+                $tierLfruTopMaximum,
+                [double]::Parse(
+                    $tierFields["lfru_top"],
+                    [Globalization.CultureInfo]::InvariantCulture))
+        }
+        $expertTieringSnapshotBackingHits = $tierAggregate["snapshot_backing_hits"]
+        $expertTieringSnapshotBackingMisses = $tierAggregate["snapshot_backing_misses"]
+        $expertTieringSnapshotToVramBytes = $tierAggregate["snapshot_to_vram_bytes"]
+        $expertTieringForbiddenColdSsdToVram = $tierAggregate["forbidden_cold_ssd_to_vram"]
+        $expertTieringCalls = $tierAggregate["calls"]
+        $expertTieringSelected = $tierAggregate["selected"]
+        $expertTieringCold = $tierAggregate["cold"]
+        $expertTieringRamHits = $tierAggregate["ram_hits"]
+        $expertTieringVramHits = $tierAggregate["vram_hits"]
+        $expertTieringColdToRam = $tierAggregate["cold_to_ram"]
+        $expertTieringColdToVram = $tierAggregate["cold_to_vram"]
+        $expertTieringRamToWarm = $tierAggregate["ram_to_warm"]
+        $expertTieringVramPromotions = $tierAggregate["vram_promotions"]
+        $expertTieringVramDemotions = $tierAggregate["vram_demotions"]
+        $expertTieringRamEvictions = $tierAggregate["ram_evictions"]
+        $expertTieringRamAdmitSkips = $tierAggregate["ram_admit_skips"]
+        $expertTieringTransient = $tierAggregate["transient"]
+        $expertTieringFailures = $tierAggregate["failures"]
+        $expertTieringSsdBytes = $tierAggregate["ssd_bytes"]
+        $expertTieringRamH2DBytes = $tierAggregate["ram_h2d_bytes"]
+        $expertTieringPolicyEpochs = $tierAggregate["policy_epochs"]
+        $expertTieringPolicyFreePromotions = $tierAggregate["policy_free_promotions"]
+        $expertTieringPolicyReplacements = $tierAggregate["policy_replacements"]
+        $expertTieringPolicyMinFrequencySkips = $tierAggregate["policy_min_frequency_skips"]
+        $expertTieringPolicyBudgetSkips = $tierAggregate["policy_budget_skips"]
+        $expertTieringPolicyScoreSkips = $tierAggregate["policy_score_skips"]
+        $expertTieringMassSum = $tierMassSumAggregate
+        $expertTieringLfruTop = $tierLfruTopMaximum
         if (-not $expertTieringComposeObserved -or $expertTieringComposeFlag -ne 1) { throw "Expert tiering compose failed: final compose flag was not observed" }
         if ($expertTieringSnapshotGeneration -le 0 -or $expertTieringSnapshotBackingEntries -le 0) { throw "Expert tiering compose failed: snapshot backing was empty" }
         if ($expertTieringSnapshotBackingHits -le 0) { throw "Expert tiering compose failed: snapshot backing was not used" }
@@ -2804,7 +3224,14 @@ if ($ExpertTiering -eq "off") {
     }
     if ($expertTieringCalls -le 0 -or $expertTieringSelected -le 0) { throw "Expert tiering measurement failed: no routed calls were observed" }
     if ($expertTieringFailures -ne 0) { throw "Expert tiering measurement failed: runtime failures observed" }
-    if ($expertTieringSelected -ne ($expertTieringCalls * 6)) { throw "Expert tiering measurement failed: selected count does not equal calls*6" }
+    $expertTieringExpectedSelected = [UInt64](6 * $expertTieringCalls)
+    if ($iq1MixedPrimaryColdAvoided -gt $expertTieringExpectedSelected) {
+        throw "Expert tiering measurement failed: IQ1_S exclusions exceed routed population"
+    }
+    $expertTieringExpectedSelected -= $iq1MixedPrimaryColdAvoided
+    if ($expertTieringSelected -ne $expertTieringExpectedSelected) {
+        throw "Expert tiering measurement failed: selected count does not match primary-model routes"
+    }
     if ($expertTieringCold -gt $expertTieringSelected -or
         $expertTieringRamHits -gt $expertTieringSelected -or
         $expertTieringVramHits -gt $expertTieringSelected -or
@@ -2844,12 +3271,16 @@ if ($ExpertTiering -eq "off") {
     if ($expertTieringStatesVram -gt $ExpertCacheN) {
         throw "Expert tiering measurement failed: VRAM state count exceeds ExpertCacheN"
     }
-    if ($ExpertTiering -eq "enforce" -and -not $ComposePrefillMassTiering -and
-        ($expertTieringColdToVram -ne 0 -or
-         $expertTieringColdToRam -le 0 -or
-         $expertTieringTransient -le 0 -or
-         $expertTieringVramPromotions -le 0)) {
-        throw "Expert tiering measurement failed: enforce transition contract was violated"
+    if ($ExpertTiering -eq "enforce" -and -not $ComposePrefillMassTiering) {
+        if ($expertTieringColdToVram -ne 0 -or
+            $expertTieringColdToRam -le 0 -or
+            $expertTieringTransient -le 0) {
+            throw "Expert tiering measurement failed: enforce transition contract was violated"
+        }
+        if ($GateKind -ne "structural-safety" -and
+            $expertTieringVramPromotions -le 0) {
+            throw "Expert tiering measurement failed: no VRAM promotion was observed"
+        }
     }
     $expertTieringStateTotal = [uint64]$expertTieringStatesSsd + [uint64]$expertTieringStatesProbation + [uint64]$expertTieringStatesWarm + [uint64]$expertTieringStatesVram
     if ($expertTieringStateTotal -le 0 -or $expertTieringStateTotal -gt 1000000) {
@@ -2919,7 +3350,15 @@ if ($SpexCpuProbeK -gt 0) {
     throw "SPEX CPU probe measurement failed: final counters appeared while not requested"
 }
 if ($PrefillMassObserve -or $PrefillMassWrap) {
-    if (-not $prefillMassArmed -or -not $prefillMassFinalized) { throw "Prefill mass measurement failed: observer did not arm/finalize" }
+    if (-not $prefillMassArmed -or -not $prefillMassFinalized -or
+        $prefillMassArmedEventCount -ne $requestCountExpected -or
+        $prefillMassFinalizeEventCount -ne $requestCountExpected -or
+        ($ComposePrefillMassTiering -and
+         $prefillMassDecodeEventCount -notin @(0, $requestCountExpected)) -or
+        (-not $ComposePrefillMassTiering -and
+         $prefillMassDecodeEventCount -ne $requestCountExpected)) {
+        throw "Prefill mass measurement failed: expected $requestCountExpected complete observer lifecycles; armed=$prefillMassArmedEventCount finalized=$prefillMassFinalizeEventCount decode=$prefillMassDecodeEventCount"
+    }
     if ($prefillMassCandidate -le 0 -or $prefillMassCandidate -gt $prefillMassCapacity) { throw "Prefill mass measurement failed: invalid candidate size" }
     if ($prefillMassCoverage -le 0.0 -or $prefillMassCoverage -gt 1.0) { throw "Prefill mass measurement failed: invalid mass coverage" }
     if (-not $ComposePrefillMassTiering -and
@@ -2930,23 +3369,63 @@ if ($PrefillMassObserve -or $PrefillMassWrap) {
     if ($prefillMassPolicy -ne $expectedPrefillMassPolicy) { throw "Prefill mass measurement failed: runtime policy mismatch" }
 }
 if ($PrefillMassWrap) {
-    if ($prefillMassWrapEventCount -ne 1 -or -not $prefillMassWrapObserved) { throw "Prefill mass WRAP failed: expected exactly one well-formed terminal event" }
+    if ($prefillMassWrapEventCount -ne $requestCountExpected -or
+        $prefillMassWrapParsedEvents.Count -ne $requestCountExpected -or
+        -not $prefillMassWrapObserved) {
+        throw "Prefill mass WRAP failed: expected $requestCountExpected well-formed terminal events, observed $prefillMassWrapEventCount/$($prefillMassWrapParsedEvents.Count)"
+    }
+    $previousWrap = $null
+    for ($wrapIndex = 0; $wrapIndex -lt $prefillMassWrapParsedEvents.Count; $wrapIndex++) {
+        $wrapEvent = $prefillMassWrapParsedEvents[$wrapIndex]
+        if ($wrapEvent.result -ne "published" -or $wrapEvent.reason -ne "ok" -or
+            $wrapEvent.candidate -le 0 -or
+            $wrapEvent.loads -gt $wrapEvent.candidate -or
+            $wrapEvent.resident_after -ne $wrapEvent.candidate -or
+            $wrapEvent.snapshot_after -le $wrapEvent.snapshot_before -or
+            $wrapEvent.generation -ne $wrapEvent.snapshot_after -or
+            $wrapEvent.preloaded -ne 0 -or $wrapEvent.router -ne "unbiased" -or
+            $wrapEvent.mask -ne $(if ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" })) {
+            throw "Prefill mass WRAP failed: malformed publication at request $($wrapIndex + 1)"
+        }
+        if ($null -eq $previousWrap) {
+            if ($wrapEvent.snapshot_before -ne 0 -or
+                $wrapEvent.resident_before -ne 0 -or
+                $wrapEvent.loads -ne $wrapEvent.candidate) {
+                throw "Prefill mass WRAP failed: first-snapshot invariants differ"
+            }
+        } elseif ($wrapEvent.snapshot_before -ne $previousWrap.snapshot_after -or
+                  $wrapEvent.resident_before -ne $previousWrap.resident_after) {
+            throw "Prefill mass WRAP failed: snapshot sequence broke at request $($wrapIndex + 1)"
+        } elseif ($prefillMassComposeFingerprints[$wrapIndex] -eq
+                      $prefillMassComposeFingerprints[$wrapIndex - 1] -and
+                  ($wrapEvent.candidate -ne $previousWrap.candidate -or
+                   $wrapEvent.loads -ne 0)) {
+            throw "Prefill mass WRAP failed: identical candidate was not reused without loads at request $($wrapIndex + 1)"
+        }
+        $previousWrap = $wrapEvent
+    }
     if ($prefillMassWrapResult -ne "published" -or $prefillMassWrapReason -ne "ok") { throw "Prefill mass WRAP failed: publication missing or unsuccessful" }
     if ($prefillMassWrapCandidate -ne $prefillMassCandidate -or
-        $prefillMassWrapLoads -ne $prefillMassCandidate -or
+        $prefillMassWrapLoads -gt $prefillMassCandidate -or
         $prefillMassWrapResidentAfter -ne $prefillMassCandidate) {
         throw "Prefill mass WRAP failed: candidate/load/resident counts differ"
-    }
-    if ($prefillMassWrapSnapshotBefore -ne 0 -or $prefillMassWrapResidentBefore -ne 0 -or
-        $prefillMassWrapSnapshotAfter -le 0 -or $prefillMassWrapGeneration -le 0) {
-        throw "Prefill mass WRAP failed: first-snapshot invariants differ"
     }
     $expectedPrefillMassMask = if ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" }
     if ($prefillMassWrapPreloaded -ne 0 -or $prefillMassWrapRouter -ne "unbiased" -or $prefillMassWrapMask -ne $expectedPrefillMassMask) {
         throw "Prefill mass WRAP failed: isolation telemetry differs"
     }
     if ($ComposePrefillMassTiering) {
-        if ($prefillMassComposeEventCount -ne 1 -or -not $prefillMassComposeObserved) { throw "Prefill mass compose failed: hash seed telemetry missing" }
+        if ($prefillMassComposeEventCount -ne $requestCountExpected -or
+            $prefillMassComposeParsedCount -ne $requestCountExpected -or
+            -not $prefillMassComposeObserved) {
+            throw "Prefill mass compose failed: expected $requestCountExpected hash seed events, observed $prefillMassComposeEventCount/$prefillMassComposeParsedCount"
+        }
+        if ($prefillMassComposeMaskFailedCount -ne 0 -or
+            $prefillMassComposeMaskAppliedCount -ne $requestCountExpected -or
+            $prefillMassComposeMaskRestoreCount -ne $requestCountExpected -or
+            $prefillMassComposeMaskEventCount -ne (2 * $requestCountExpected)) {
+            throw "Prefill mass compose failed: mask lifecycle mismatch applied=$prefillMassComposeMaskAppliedCount restored=$prefillMassComposeMaskRestoreCount failed=$prefillMassComposeMaskFailedCount events=$prefillMassComposeMaskEventCount"
+        }
         if ($prefillMassComposeHashLayers -ne 3 -or $prefillMassComposeHashSeedEntries -ne (3 * 256)) { throw "Prefill mass compose failed: hash-routed layer seed differs" }
         if ($prefillMassComposeTotalCandidate -ne $prefillMassCandidate -or $prefillMassComposeCapacity -ne $prefillMassCapacity) { throw "Prefill mass compose failed: candidate/capacity telemetry differs" }
         if ($prefillMassComposeRankedEntries + $prefillMassComposeHashSeedEntries -ne $prefillMassComposeTotalCandidate) { throw "Prefill mass compose failed: ranked/hash candidate accounting differs" }
@@ -3494,15 +3973,59 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_sidecar_route_slots = $iq1SSidecarSlots
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
+    iq1_s_ram_cache_requested_gib = $Iq1SRamCacheGiB
+    iq1_s_ram_cache_runtime_observed = $iq1SRamCacheRuntimeObserved
+    iq1_s_ram_cache_requested_bytes = $iq1SRamCacheRequestedBytes
+    iq1_s_ram_cache_allocated_bytes = $iq1SRamCacheAllocatedBytes
+    iq1_s_ram_cache_capacity = $iq1SRamCacheCapacity
+    iq1_s_ram_cache_count = $iq1SRamCacheCount
+    iq1_s_ram_cache_slot_bytes = $iq1SRamCacheSlotBytes
+    iq1_s_ram_cache_hits = $iq1SRamCacheHits
+    iq1_s_ram_cache_misses = $iq1SRamCacheMisses
+    iq1_s_ram_cache_evictions = $iq1SRamCacheEvictions
+    iq1_s_ram_cache_ssd_bytes = $iq1SRamCacheSsdBytes
+    iq1_s_ram_cache_h2d_bytes = $iq1SRamCacheH2dBytes
+    iq1_s_ram_cache_failures = $iq1SRamCacheFailures
+    iq1_s_ram_cache_hit_rate = $iq1SRamCacheHitRate
+    iq1_s_ram_cache_ssd_avoided_bytes = $iq1SRamCacheSsdAvoidedBytes
+    iq1_s_vram_cache_per_layer_requested = $Iq1SVramCachePerLayer
+    iq1_s_vram_cache_runtime_observed = $iq1SVramCacheRuntimeObserved
+    iq1_s_vram_cache_capacity = $iq1SVramCacheCapacity
+    iq1_s_vram_cache_count = $iq1SVramCacheCount
+    iq1_s_vram_cache_slot_bytes = $iq1SVramCacheSlotBytes
+    iq1_s_vram_cache_hits = $iq1SVramCacheHits
+    iq1_s_vram_cache_misses = $iq1SVramCacheMisses
+    iq1_s_vram_cache_evictions = $iq1SVramCacheEvictions
+    iq1_s_vram_cache_h2d_bytes = $iq1SVramCacheH2dBytes
+    iq1_s_vram_cache_failures = $iq1SVramCacheFailures
     iq1_s_mixed_cold_one = [bool]$Iq1SMixedColdOne
     iq1_s_mixed_runtime_observed = $iq1MixedRuntimeObserved
     iq1_s_mixed_calls = $iq1MixedCalls
     iq1_s_mixed_hot_main = $iq1MixedHotMain
     iq1_s_mixed_cold_iq1 = $iq1MixedColdIq1
+    iq1_s_mixed_primary_cold_avoided = $iq1MixedPrimaryColdAvoided
+    iq1_s_mixed_joins = $iq1MixedJoins
     iq1_s_mixed_failures = $iq1MixedFailures
     iq1_s_mixed_last_layer = $iq1MixedLastLayer
     iq1_s_mixed_last_slot = $iq1MixedLastSlot
     iq1_s_mixed_last_expert = $iq1MixedLastExpert
+    iq1_s_profile_requested = [bool]$Iq1SProfile
+    iq1_s_no_main_sync_requested = [bool]$Iq1SNoMainSync
+    iq1_s_packed_h2d_requested = [bool]$Iq1SPackedH2D
+    iq1_s_profile_ssd_read_calls = $iq1ProfileSsdReadCalls
+    iq1_s_profile_ssd_read_ms = $iq1ProfileSsdReadMs
+    iq1_s_profile_h2d_batches = $iq1ProfileH2dBatches
+    iq1_s_profile_h2d_copies = $iq1ProfileH2dCopies
+    iq1_s_profile_h2d_enqueue_ms = $iq1ProfileH2dEnqueueMs
+    iq1_s_profile_h2d_syncs = $iq1ProfileH2dSyncs
+    iq1_s_profile_h2d_sync_ms = $iq1ProfileH2dSyncMs
+    iq1_s_mixed_profile_calls = $iq1MixedProfileCalls
+    iq1_s_mixed_profile_router_d2h_ms = $iq1MixedProfileRouterD2hMs
+    iq1_s_mixed_profile_metadata_h2d_ms = $iq1MixedProfileMetadataH2dMs
+    iq1_s_mixed_profile_main_submit_ms = $iq1MixedProfileMainSubmitMs
+    iq1_s_mixed_profile_main_sync_ms = $iq1MixedProfileMainSyncMs
+    iq1_s_mixed_profile_cold_submit_ms = $iq1MixedProfileColdSubmitMs
+    iq1_s_mixed_profile_join_submit_ms = $iq1MixedProfileJoinSubmitMs
     warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
@@ -3573,15 +4096,59 @@ $summary = [pscustomobject]@{
     iq1_s_sidecar_route_slots = $iq1SSidecarSlots
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
+    iq1_s_ram_cache_requested_gib = $Iq1SRamCacheGiB
+    iq1_s_ram_cache_runtime_observed = $iq1SRamCacheRuntimeObserved
+    iq1_s_ram_cache_requested_bytes = $iq1SRamCacheRequestedBytes
+    iq1_s_ram_cache_allocated_bytes = $iq1SRamCacheAllocatedBytes
+    iq1_s_ram_cache_capacity = $iq1SRamCacheCapacity
+    iq1_s_ram_cache_count = $iq1SRamCacheCount
+    iq1_s_ram_cache_slot_bytes = $iq1SRamCacheSlotBytes
+    iq1_s_ram_cache_hits = $iq1SRamCacheHits
+    iq1_s_ram_cache_misses = $iq1SRamCacheMisses
+    iq1_s_ram_cache_evictions = $iq1SRamCacheEvictions
+    iq1_s_ram_cache_ssd_bytes = $iq1SRamCacheSsdBytes
+    iq1_s_ram_cache_h2d_bytes = $iq1SRamCacheH2dBytes
+    iq1_s_ram_cache_failures = $iq1SRamCacheFailures
+    iq1_s_ram_cache_hit_rate = $iq1SRamCacheHitRate
+    iq1_s_ram_cache_ssd_avoided_bytes = $iq1SRamCacheSsdAvoidedBytes
+    iq1_s_vram_cache_per_layer_requested = $Iq1SVramCachePerLayer
+    iq1_s_vram_cache_runtime_observed = $iq1SVramCacheRuntimeObserved
+    iq1_s_vram_cache_capacity = $iq1SVramCacheCapacity
+    iq1_s_vram_cache_count = $iq1SVramCacheCount
+    iq1_s_vram_cache_slot_bytes = $iq1SVramCacheSlotBytes
+    iq1_s_vram_cache_hits = $iq1SVramCacheHits
+    iq1_s_vram_cache_misses = $iq1SVramCacheMisses
+    iq1_s_vram_cache_evictions = $iq1SVramCacheEvictions
+    iq1_s_vram_cache_h2d_bytes = $iq1SVramCacheH2dBytes
+    iq1_s_vram_cache_failures = $iq1SVramCacheFailures
     iq1_s_mixed_cold_one = [bool]$Iq1SMixedColdOne
     iq1_s_mixed_runtime_observed = $iq1MixedRuntimeObserved
     iq1_s_mixed_calls = $iq1MixedCalls
     iq1_s_mixed_hot_main = $iq1MixedHotMain
     iq1_s_mixed_cold_iq1 = $iq1MixedColdIq1
+    iq1_s_mixed_primary_cold_avoided = $iq1MixedPrimaryColdAvoided
+    iq1_s_mixed_joins = $iq1MixedJoins
     iq1_s_mixed_failures = $iq1MixedFailures
     iq1_s_mixed_last_layer = $iq1MixedLastLayer
     iq1_s_mixed_last_slot = $iq1MixedLastSlot
     iq1_s_mixed_last_expert = $iq1MixedLastExpert
+    iq1_s_profile_requested = [bool]$Iq1SProfile
+    iq1_s_no_main_sync_requested = [bool]$Iq1SNoMainSync
+    iq1_s_packed_h2d_requested = [bool]$Iq1SPackedH2D
+    iq1_s_profile_ssd_read_calls = $iq1ProfileSsdReadCalls
+    iq1_s_profile_ssd_read_ms = $iq1ProfileSsdReadMs
+    iq1_s_profile_h2d_batches = $iq1ProfileH2dBatches
+    iq1_s_profile_h2d_copies = $iq1ProfileH2dCopies
+    iq1_s_profile_h2d_enqueue_ms = $iq1ProfileH2dEnqueueMs
+    iq1_s_profile_h2d_syncs = $iq1ProfileH2dSyncs
+    iq1_s_profile_h2d_sync_ms = $iq1ProfileH2dSyncMs
+    iq1_s_mixed_profile_calls = $iq1MixedProfileCalls
+    iq1_s_mixed_profile_router_d2h_ms = $iq1MixedProfileRouterD2hMs
+    iq1_s_mixed_profile_metadata_h2d_ms = $iq1MixedProfileMetadataH2dMs
+    iq1_s_mixed_profile_main_submit_ms = $iq1MixedProfileMainSubmitMs
+    iq1_s_mixed_profile_main_sync_ms = $iq1MixedProfileMainSyncMs
+    iq1_s_mixed_profile_cold_submit_ms = $iq1MixedProfileColdSubmitMs
+    iq1_s_mixed_profile_join_submit_ms = $iq1MixedProfileJoinSubmitMs
     prompt = $Prompt
     prompt_file = $PromptFile
     prompt_sha256 = $promptHash
@@ -3737,6 +4304,10 @@ $summary = [pscustomobject]@{
     arena_wrap_unlock_source_ranges_summary_seconds = $arenaWrapUnlockSummarySeconds
     prefill_mass_observe_requested = [bool]$PrefillMassObserve
     prefill_mass_wrap_requested = [bool]$PrefillMassWrap
+    request_count_expected = $requestCountExpected
+    prefill_mass_armed_event_count = $prefillMassArmedEventCount
+    prefill_mass_finalize_event_count = $prefillMassFinalizeEventCount
+    prefill_mass_decode_event_count = $prefillMassDecodeEventCount
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
     prefill_mass_layer_full_every_requested = $PrefillMassLayerFullEvery
     prefill_mass_layer_full_phase_requested = $PrefillMassLayerFullPhase
@@ -3847,6 +4418,7 @@ $summary = [pscustomobject]@{
     prefill_mass_compose_mask_failed_count = $prefillMassComposeMaskFailedCount
     prefill_mass_compose_mask_base = $prefillMassComposeMaskBase
     prefill_mass_compose_mask_existing_layers = $prefillMassComposeMaskExistingLayers
+    prefill_mass_compose_mask_applied_count = $prefillMassComposeMaskAppliedCount
     prefill_mass_compose_mask_restore_count = $prefillMassComposeMaskRestoreCount
     prefill_mass_layer_stripe_observed = $prefillMassLayerStripeObserved
     prefill_mass_layer_stripe_event_count = $prefillMassLayerStripeEventCount
@@ -4228,6 +4800,14 @@ Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLat
 Write-Host ("spex cpu probe req/observed/submitted/dropped/completed/predicted/matched/ready/useful/failures: " + $SpexCpuProbeK + " / " + $spexCpuProbeKObserved + " / " + $spexCpuProbeSubmitted + " / " + $spexCpuProbeDropped + " / " + $spexCpuProbeCompleted + " / " + $spexCpuProbePredicted + " / " + $spexCpuProbeMatched + " / " + $spexCpuProbeReadyAtTransport + " / " + $spexCpuProbeUsefulReady + " / " + $spexCpuProbeFailures)
 Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitMs + " / " + $spexCpuProbeCpuMs + " / " + $spexCpuProbeQueueMs + " / " + $spexCpuProbeChecksum)
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
+Write-Host ("IQ1_S RAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
+Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math]::Round($iq1SRamCacheHitRate, 4) + " / " + [math]::Round($iq1SRamCacheSsdBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheH2dBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheSsdAvoidedBytes / 1GB, 3))
+Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SVramCachePerLayer + " / " + $iq1SVramCacheRuntimeObserved + " / " + $iq1SVramCacheCapacity + " / " + $iq1SVramCacheCount + " / " + $iq1SVramCacheHits + " / " + $iq1SVramCacheMisses + " / " + $iq1SVramCacheEvictions + " / " + $iq1SVramCacheFailures)
+Write-Host ("IQ1_S VRAM cache hit-rate/H2D GiB: " + $(if (($iq1SVramCacheHits + $iq1SVramCacheMisses) -gt 0) { [math]::Round([double]$iq1SVramCacheHits / [double]($iq1SVramCacheHits + $iq1SVramCacheMisses), 4) } else { 0 }) + " / " + [math]::Round($iq1SVramCacheH2dBytes / 1GB, 3))
+Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures: " + $iq1MixedCalls + " / " + $iq1MixedHotMain + " / " + $iq1MixedColdIq1 + " / " + $iq1MixedPrimaryColdAvoided + " / " + $iq1MixedJoins + " / " + $iq1MixedFailures)
+Write-Host ("IQ1_S profile/no-main-sync/packed-H2D: " + [bool]$Iq1SProfile + " / " + [bool]$Iq1SNoMainSync + " / " + [bool]$Iq1SPackedH2D)
+Write-Host ("IQ1_S profile SSD reads/ms H2D batches/copies/enqueue-ms/syncs/sync-ms: " + $iq1ProfileSsdReadCalls + " / " + $iq1ProfileSsdReadMs + " / " + $iq1ProfileH2dBatches + " / " + $iq1ProfileH2dCopies + " / " + $iq1ProfileH2dEnqueueMs + " / " + $iq1ProfileH2dSyncs + " / " + $iq1ProfileH2dSyncMs)
+Write-Host ("IQ1_S mixed profile calls/router-D2H/meta-H2D/main-submit/main-sync/cold-submit/join ms: " + $iq1MixedProfileCalls + " / " + $iq1MixedProfileRouterD2hMs + " / " + $iq1MixedProfileMetadataH2dMs + " / " + $iq1MixedProfileMainSubmitMs + " / " + $iq1MixedProfileMainSyncMs + " / " + $iq1MixedProfileColdSubmitMs + " / " + $iq1MixedProfileJoinSubmitMs)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="
 } finally {
