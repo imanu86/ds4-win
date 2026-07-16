@@ -5604,6 +5604,13 @@ static void cuda_prefill_mass_observer_finalize(void) {
         return;
     }
     const size_t ranked_capacity = residency_capacity - hash_entries;
+    const auto sparse_entry_retained = [](uint32_t entry) {
+        if (!g_sparse_bake_active) return 1;
+        const uint32_t layer = entry / g_dynamic_arena.n_expert;
+        const uint32_t expert = entry % g_dynamic_arena.n_expert;
+        return cuda_sparse_bake_expert_retained(layer, expert);
+    };
+    uint32_t sparse_skipped_ranked = 0;
     uint32_t stripe_stride = 0;
     uint32_t stripe_phase = 0;
     const int stripe_config = cuda_prefill_mass_layer_stripe_config(
@@ -5754,11 +5761,43 @@ static void cuda_prefill_mass_observer_finalize(void) {
                 capacity + (uint32_t)hash_entries,
                 (uint32_t)residency_capacity);
     } else {
-        for (uint32_t i = 0; i < capacity; i++) {
-            observer.candidate[ranked[i].entry] = 1;
+        capacity = 0;
+        for (const ranked_entry &item : ranked) {
+            if ((size_t)capacity >= ranked_capacity) break;
+            if (!sparse_entry_retained(item.entry)) {
+                sparse_skipped_ranked++;
+                continue;
+            }
+            if (observer.candidate[item.entry]) continue;
+            observer.candidate[item.entry] = 1;
+            capacity++;
+        }
+        if (compose_requested > 0 && (size_t)capacity != ranked_capacity) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-wrap] result=failed reason=compose-retained-capacity candidate=%u loads=0 workers=0 seconds=0.000 snapshot_before=%llu snapshot_after=%llu resident_before=%u resident_after=%u generation=0 preloaded=0 router=unbiased mask=off\n",
+                    capacity,
+                    (unsigned long long)g_dynamic_arena.snapshot_generation,
+                    (unsigned long long)g_dynamic_arena.snapshot_generation,
+                    cuda_dynamic_arena_active_count(),
+                    cuda_dynamic_arena_active_count());
+            cuda_prefill_mass_compose_fail_closed();
+            cuda_request_phase_trace("prefill-finalize-return");
+            return;
         }
     }
     for (uint32_t entry = 0; entry < hash_entries; entry++) {
+        if (!sparse_entry_retained(entry)) {
+            fprintf(stderr,
+                    "ds4: [prefill-mass-wrap] result=failed reason=compose-hash-sparse-absent candidate=%u loads=0 workers=0 seconds=0.000 snapshot_before=%llu snapshot_after=%llu resident_before=%u resident_after=%u generation=0 preloaded=0 router=unbiased mask=off\n",
+                    capacity,
+                    (unsigned long long)g_dynamic_arena.snapshot_generation,
+                    (unsigned long long)g_dynamic_arena.snapshot_generation,
+                    cuda_dynamic_arena_active_count(),
+                    cuda_dynamic_arena_active_count());
+            cuda_prefill_mass_compose_fail_closed();
+            cuda_request_phase_trace("prefill-finalize-return");
+            return;
+        }
         observer.candidate[entry] = 1;
     }
     observer.candidate_entries = capacity + (uint32_t)hash_entries;
@@ -5779,11 +5818,12 @@ static void cuda_prefill_mass_observer_finalize(void) {
         const uint64_t candidate_hash = cuda_dynamic_arena_fnv1a64(
             observer.candidate.data(), observer.candidate.size());
         fprintf(stderr,
-                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u candidate_fnv1a64=%016llx mass_source=full-probability-normalized-per-token\n",
+                "ds4: [prefill-mass-compose] hash_layers=%u hash_seed_entries=%u ranked_entries=%u total_candidate=%u capacity=%u candidate_fnv1a64=%016llx sparse_skipped_ranked=%u mass_source=full-probability-normalized-per-token\n",
                 hash_layers, (uint32_t)hash_entries, capacity,
                 observer.candidate_entries,
                 (uint32_t)residency_capacity,
-                (unsigned long long)candidate_hash);
+                (unsigned long long)candidate_hash,
+                sparse_skipped_ranked);
     }
 
     uint32_t rows_min = UINT32_MAX;

@@ -1292,6 +1292,7 @@ $prefillMassComposeObserved = $false; $prefillMassComposeEventCount = 0
 $prefillMassComposeHashLayers = 0; $prefillMassComposeHashSeedEntries = 0
 $prefillMassComposeRankedEntries = 0; $prefillMassComposeTotalCandidate = 0
 $prefillMassComposeCapacity = 0; $prefillMassComposeCandidateFNV1A64 = "not_observed"
+$prefillMassComposeSparseSkippedRanked = 0
 $prefillMassLayerStripeObserved = $false; $prefillMassLayerStripeEventCount = 0
 $prefillMassLayerStripeFailedCount = 0; $prefillMassLayerStripeResult = "not_observed"
 $prefillMassLayerStripeReason = "not_observed"; $prefillMassLayerStripeStride = 0
@@ -1849,6 +1850,9 @@ if (Test-Path $stderrLog) {
         $prefillMassComposeTotalCandidate = [long]$Matches[4]
         $prefillMassComposeCapacity = [long]$Matches[5]
         $prefillMassComposeCandidateFNV1A64 = $Matches[6]
+    }
+    if ($prefillMassComposeLine -and $prefillMassComposeLine -match "sparse_skipped_ranked=(\d+)") {
+        $prefillMassComposeSparseSkippedRanked = [long]$Matches[1]
     }
     $prefillMassLayerStripeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-layer-stripe\] result=" })
     $prefillMassLayerStripeEventCount = $prefillMassLayerStripeLines.Count
@@ -3016,6 +3020,7 @@ $summary = [pscustomobject]@{
     prefill_mass_compose_total_candidate = $prefillMassComposeTotalCandidate
     prefill_mass_compose_capacity = $prefillMassComposeCapacity
     prefill_mass_compose_candidate_fnv1a64 = $prefillMassComposeCandidateFNV1A64
+    prefill_mass_compose_sparse_skipped_ranked = $prefillMassComposeSparseSkippedRanked
     prefill_mass_layer_stripe_observed = $prefillMassLayerStripeObserved
     prefill_mass_layer_stripe_event_count = $prefillMassLayerStripeEventCount
     prefill_mass_layer_stripe_failed_count = $prefillMassLayerStripeFailedCount
