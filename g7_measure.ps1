@@ -107,6 +107,7 @@ param(
     [ValidateRange(3, 42)][int]$Q1_0LayerFirst = 3,
     [ValidateRange(3, 42)][int]$Q1_0LayerLast = 42,
     [switch]$Q1_0SelectedLoad,
+    [switch]$Q1_0ResidentArena,
     [string]$Iq1SExpertSidecar = "",
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
@@ -174,12 +175,13 @@ function Read-G7Q1_0SidecarTelemetry {
         [AllowEmptyString()][string]$LogText,
         [bool]$SidecarConfigured,
         [bool]$SelectedLoadRequested,
+        [bool]$ResidentArenaRequested,
         [AllowEmptyString()][string]$SidecarPath
     )
 
     $summaryMatches = [regex]::Matches(
         $LogText,
-        '(?m)^(?:ds4: )?\[q1-0-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)(?: [A-Za-z0-9_]+=[^ \r\n]+)*\r?$')
+        '(?m)^(?:ds4: )?\[q1-0-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)((?: [A-Za-z0-9_]+=[^ \x0d\x0a]+)*)\x0d?$')
     $runtimeMarkerPattern =
         'Q1_0 (?:routed-expert sidecar validated|expert sidecar source:|routed-expert sidecar installed)|\[q1-0-sidecar\]'
 
@@ -195,6 +197,14 @@ function Read-G7Q1_0SidecarTelemetry {
             route_slots = [UInt64]0
             selected_loads = [UInt64]0
             failures = [UInt64]0
+            resident_arena_requested = $false
+            resident_mode = 0
+            resident_hits = [UInt64]0
+            resident_misses = [UInt64]0
+            resident_h2d_bytes = [UInt64]0
+            direct_pread_fallbacks = [UInt64]0
+            direct_pread_bytes = [UInt64]0
+            bootstrap_entries = [UInt64]0
             runtime_contract_valid = $true
             fail_closed_observed = $false
         }
@@ -217,14 +227,58 @@ function Read-G7Q1_0SidecarTelemetry {
     $slots = [UInt64]$summary.Groups[2].Value
     $selectedLoads = [UInt64]$summary.Groups[3].Value
     $failures = [UInt64]$summary.Groups[4].Value
+    $suffix = [string]$summary.Groups[5].Value
     if ($calls -eq 0 -or $slots -lt $calls) {
         throw "Q1_0 sidecar runtime counters are inconsistent"
     }
+
+    $suffixCounters = @{}
+    foreach ($counterMatch in [regex]::Matches(
+            $suffix, ' ([A-Za-z0-9_]+)=([^ \x0d\x0a]+)')) {
+        $suffixCounters[$counterMatch.Groups[1].Value] =
+            $counterMatch.Groups[2].Value
+    }
+    foreach ($requiredCounter in @(
+            "resident_mode", "resident_hits", "resident_misses",
+            "resident_h2d_bytes", "direct_pread_fallbacks",
+            "direct_pread_bytes")) {
+        if (-not $suffixCounters.ContainsKey($requiredCounter)) {
+            throw "Q1_0 sidecar summary missing suffix counter: $requiredCounter"
+        }
+    }
+    $bootstrapKey = ""
+    foreach ($candidateKey in @("bootstrap_entries", "candidate_entries")) {
+        if ($suffixCounters.ContainsKey($candidateKey)) {
+            $bootstrapKey = $candidateKey
+            break
+        }
+    }
+    if (-not $bootstrapKey) {
+        throw "Q1_0 sidecar summary missing suffix counter: bootstrap_entries"
+    }
+    $residentMode = [int]$suffixCounters["resident_mode"]
+    $residentHits = [UInt64]$suffixCounters["resident_hits"]
+    $residentMisses = [UInt64]$suffixCounters["resident_misses"]
+    $residentH2DBytes = [UInt64]$suffixCounters["resident_h2d_bytes"]
+    $directPreadFallbacks = [UInt64]$suffixCounters["direct_pread_fallbacks"]
+    $directPreadBytes = [UInt64]$suffixCounters["direct_pread_bytes"]
+    $bootstrapEntries = [UInt64]$suffixCounters[$bootstrapKey]
 
     $failClosedObserved = $false
     if ($SelectedLoadRequested) {
         if ($selectedLoads -ne $calls -or $failures -ne 0) {
             throw "Q1_0 sidecar selected-load counters are inconsistent"
+        }
+        if ($ResidentArenaRequested) {
+            if ($residentMode -ne 1 -or $residentHits -eq 0 -or
+                $residentMisses -ne 0 -or $directPreadFallbacks -ne 0 -or
+                $directPreadBytes -ne 0 -or $bootstrapEntries -ne 256) {
+                throw "Q1_0 resident arena structural counters are inconsistent"
+            }
+        } else {
+            if ($residentMode -ne 0) {
+                throw "Q1_0 direct-file structural counters are inconsistent"
+            }
         }
     } else {
         if ($selectedLoads -ne 0 -or $failures -ne $calls) {
@@ -241,6 +295,14 @@ function Read-G7Q1_0SidecarTelemetry {
         route_slots = $slots
         selected_loads = $selectedLoads
         failures = $failures
+        resident_arena_requested = $ResidentArenaRequested
+        resident_mode = $residentMode
+        resident_hits = $residentHits
+        resident_misses = $residentMisses
+        resident_h2d_bytes = $residentH2DBytes
+        direct_pread_fallbacks = $directPreadFallbacks
+        direct_pread_bytes = $directPreadBytes
+        bootstrap_entries = $bootstrapEntries
         runtime_contract_valid = $true
         fail_closed_observed = $failClosedObserved
     }
@@ -662,7 +724,7 @@ $modelIq1SuiteLockProofObserved = $false
 $modelIq1SuiteLockProof = $null
 if (-not $Q1_0ExpertSidecar -and
     ($Q1_0SelectedLoad -or $ExpectedQ1_0ExpertSidecarSHA256 -or
-     $ExpectedQ1_0ExpertSidecarBytes -ne 0 -or
+     $ExpectedQ1_0ExpertSidecarBytes -ne 0 -or $Q1_0ResidentArena -or
      $ReuseVerifiedQ1_0Receipt)) {
     throw "Q1_0 selected-load and provenance options require Q1_0ExpertSidecar"
 }
@@ -678,6 +740,10 @@ if ($Q1_0ExpertSidecar) {
     }
     if ($Q1_0SelectedLoad -and $NoSelectedLoad) {
         throw "Q1_0SelectedLoad is incompatible with NoSelectedLoad"
+    }
+    if ($Q1_0ResidentArena -and
+        (-not $Q1_0SelectedLoad -or $DynamicArenaGiB -le 0.0)) {
+        throw "Q1_0ResidentArena requires Q1_0ExpertSidecar, Q1_0SelectedLoad, structural-safety, Repeats=1, no warmup, and DynamicArenaGiB > 0"
     }
     if (-not (Test-Path -LiteralPath $Q1_0ExpertSidecar -PathType Leaf)) {
         throw "Q1_0 sidecar missing: $Q1_0ExpertSidecar"
@@ -978,9 +1044,15 @@ if ($Q1_0ExpertSidecar) {
     } else {
         Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
     }
+    if ($Q1_0ResidentArena) {
+        $env:DS4_Q1_0_RESIDENT_ARENA = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_RESIDENT_ARENA -ErrorAction SilentlyContinue
+    }
 } else {
     Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_RESIDENT_ARENA -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_LAYER_FIRST -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_LAYER_LAST -ErrorAction SilentlyContinue
 }
@@ -3621,12 +3693,20 @@ $q1_0Telemetry = Read-G7Q1_0SidecarTelemetry `
     -LogText $q1_0SidecarLogText `
     -SidecarConfigured ([bool]$Q1_0ExpertSidecar) `
     -SelectedLoadRequested ([bool]$Q1_0SelectedLoad) `
+    -ResidentArenaRequested ([bool]$Q1_0ResidentArena) `
     -SidecarPath $Q1_0ExpertSidecar
 $q1_0SidecarRuntimeObserved = [bool]$q1_0Telemetry.runtime_observed
 $q1_0SidecarCalls = [UInt64]$q1_0Telemetry.route_calls
 $q1_0SidecarSlots = [UInt64]$q1_0Telemetry.route_slots
 $q1_0SidecarSelectedLoads = [UInt64]$q1_0Telemetry.selected_loads
 $q1_0SidecarFailures = [UInt64]$q1_0Telemetry.failures
+$q1_0ResidentMode = [int]$q1_0Telemetry.resident_mode
+$q1_0ResidentHits = [UInt64]$q1_0Telemetry.resident_hits
+$q1_0ResidentMisses = [UInt64]$q1_0Telemetry.resident_misses
+$q1_0ResidentH2DBytes = [UInt64]$q1_0Telemetry.resident_h2d_bytes
+$q1_0DirectPreadFallbacks = [UInt64]$q1_0Telemetry.direct_pread_fallbacks
+$q1_0DirectPreadBytes = [UInt64]$q1_0Telemetry.direct_pread_bytes
+$q1_0BootstrapEntries = [UInt64]$q1_0Telemetry.bootstrap_entries
 $q1_0RuntimeContractValid = [bool]$q1_0Telemetry.runtime_contract_valid
 $q1_0FailClosedObserved = [bool]$q1_0Telemetry.fail_closed_observed
 $q1_0StructuralSmokeEligible = [bool](
@@ -5219,10 +5299,12 @@ $rawOutputs = [pscustomobject]@{
     expected_warmup_content_sha256 = if ($ExpectedWarmupContentSHA256) { $ExpectedWarmupContentSHA256.ToLowerInvariant() } else { "" }
     ds4_q1_0_expert_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
     ds4_q1_0_selected_load = $(if ($Q1_0ExpertSidecar -and $Q1_0SelectedLoad) { "1" } else { "" })
+    ds4_q1_0_resident_arena = $(if ($Q1_0ExpertSidecar -and $Q1_0ResidentArena) { "1" } else { "" })
     ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
     ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
     q1_0_sidecar_enabled = [bool]$Q1_0ExpertSidecar
     q1_0_selected_load_requested = [bool]$Q1_0SelectedLoad
+    q1_0_resident_arena_requested = [bool]$Q1_0ResidentArena
     q1_0_layer_first_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerFirst } else { 0 })
     q1_0_layer_last_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerLast } else { 0 })
     q1_0_sidecar_path = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
@@ -5240,6 +5322,13 @@ $rawOutputs = [pscustomobject]@{
     q1_0_sidecar_route_slots = $q1_0SidecarSlots
     q1_0_sidecar_selected_loads = $q1_0SidecarSelectedLoads
     q1_0_sidecar_failures = $q1_0SidecarFailures
+    q1_0_resident_mode = $q1_0ResidentMode
+    q1_0_resident_hits = $q1_0ResidentHits
+    q1_0_resident_misses = $q1_0ResidentMisses
+    q1_0_resident_h2d_bytes = $q1_0ResidentH2DBytes
+    q1_0_direct_pread_fallbacks = $q1_0DirectPreadFallbacks
+    q1_0_direct_pread_bytes = $q1_0DirectPreadBytes
+    q1_0_bootstrap_entries = $q1_0BootstrapEntries
     q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
     q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
     q1_0_fail_closed_observed = $q1_0FailClosedObserved
@@ -5440,10 +5529,12 @@ $summary = [pscustomobject]@{
     model_iq1_suite_lock_proof = $modelIq1SuiteLockProof
     ds4_q1_0_expert_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
     ds4_q1_0_selected_load = $(if ($Q1_0ExpertSidecar -and $Q1_0SelectedLoad) { "1" } else { "" })
+    ds4_q1_0_resident_arena = $(if ($Q1_0ExpertSidecar -and $Q1_0ResidentArena) { "1" } else { "" })
     ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
     ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
     q1_0_sidecar_enabled = [bool]$Q1_0ExpertSidecar
     q1_0_selected_load_requested = [bool]$Q1_0SelectedLoad
+    q1_0_resident_arena_requested = [bool]$Q1_0ResidentArena
     q1_0_layer_first_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerFirst } else { 0 })
     q1_0_layer_last_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerLast } else { 0 })
     q1_0_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
@@ -5462,6 +5553,13 @@ $summary = [pscustomobject]@{
     q1_0_sidecar_route_slots = $q1_0SidecarSlots
     q1_0_sidecar_selected_loads = $q1_0SidecarSelectedLoads
     q1_0_sidecar_failures = $q1_0SidecarFailures
+    q1_0_resident_mode = $q1_0ResidentMode
+    q1_0_resident_hits = $q1_0ResidentHits
+    q1_0_resident_misses = $q1_0ResidentMisses
+    q1_0_resident_h2d_bytes = $q1_0ResidentH2DBytes
+    q1_0_direct_pread_fallbacks = $q1_0DirectPreadFallbacks
+    q1_0_direct_pread_bytes = $q1_0DirectPreadBytes
+    q1_0_bootstrap_entries = $q1_0BootstrapEntries
     q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
     q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
     q1_0_fail_closed_observed = $q1_0FailClosedObserved
@@ -6255,7 +6353,8 @@ Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLat
 Write-Host ("spex cpu probe req/observed/submitted/dropped/completed/predicted/matched/ready/useful/failures: " + $SpexCpuProbeK + " / " + $spexCpuProbeKObserved + " / " + $spexCpuProbeSubmitted + " / " + $spexCpuProbeDropped + " / " + $spexCpuProbeCompleted + " / " + $spexCpuProbePredicted + " / " + $spexCpuProbeMatched + " / " + $spexCpuProbeReadyAtTransport + " / " + $spexCpuProbeUsefulReady + " / " + $spexCpuProbeFailures)
 Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitMs + " / " + $spexCpuProbeCpuMs + " / " + $spexCpuProbeQueueMs + " / " + $spexCpuProbeChecksum)
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
-Write-Host ("Q1_0 sidecar enabled/selected-load/observed/calls/slots/loads/failures: " + [bool]$Q1_0ExpertSidecar + " / " + [bool]$Q1_0SelectedLoad + " / " + $q1_0SidecarRuntimeObserved + " / " + $q1_0SidecarCalls + " / " + $q1_0SidecarSlots + " / " + $q1_0SidecarSelectedLoads + " / " + $q1_0SidecarFailures)
+Write-Host ("Q1_0 sidecar enabled/selected-load/resident/observed/calls/slots/loads/failures: " + [bool]$Q1_0ExpertSidecar + " / " + [bool]$Q1_0SelectedLoad + " / " + [bool]$Q1_0ResidentArena + " / " + $q1_0SidecarRuntimeObserved + " / " + $q1_0SidecarCalls + " / " + $q1_0SidecarSlots + " / " + $q1_0SidecarSelectedLoads + " / " + $q1_0SidecarFailures)
+Write-Host ("Q1_0 resident mode/hits/misses/H2D bytes/direct-fallbacks/direct-bytes/bootstrap: " + $q1_0ResidentMode + " / " + $q1_0ResidentHits + " / " + $q1_0ResidentMisses + " / " + $q1_0ResidentH2DBytes + " / " + $q1_0DirectPreadFallbacks + " / " + $q1_0DirectPreadBytes + " / " + $q1_0BootstrapEntries)
 Write-Host ("Q1_0 runtime-contract/fail-closed/structural-eligible/performance-eligible: " + $q1_0RuntimeContractValid + " / " + $q1_0FailClosedObserved + " / " + $q1_0StructuralSmokeEligible + " / False")
 Write-Host ("IQ1_S RAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
 Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math]::Round($iq1SRamCacheHitRate, 4) + " / " + [math]::Round($iq1SRamCacheSsdBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheH2dBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheSsdAvoidedBytes / 1GB, 3))
