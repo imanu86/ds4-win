@@ -667,16 +667,17 @@ function Assert-G101RawBinding {
                 ConvertTo-Json -Depth 8 -Compress)) {
         throw "G101 raw/result provenance mismatch: tag=$tag"
     }
-    $rawHashes = @($Raw.output_hashes | ForEach-Object { [string]$_ })
+    $rawUniqueHashes = @($Raw.output_hashes | ForEach-Object { [string]$_ })
     $rawResultHashes = @($Raw.results | ForEach-Object {
         [string]$_.content_sha256
     })
     $resultHashes = @($Result.results | ForEach-Object {
         [string]$_.content_sha256
     })
-    if ($rawHashes.Count -ne $resultHashes.Count -or
-        $rawResultHashes.Count -ne $resultHashes.Count -or
-        ($rawHashes -join "`n") -ne ($resultHashes -join "`n") -or
+    $resultUniqueHashes = @($resultHashes | Select-Object -Unique)
+    if ($rawResultHashes.Count -ne $resultHashes.Count -or
+        ($rawUniqueHashes.Count -ne $resultUniqueHashes.Count) -or
+        ($rawUniqueHashes -join "`n") -ne ($resultUniqueHashes -join "`n") -or
         ($rawResultHashes -join "`n") -ne ($resultHashes -join "`n")) {
         throw "G101 raw/result output hash mismatch: tag=$tag"
     }
