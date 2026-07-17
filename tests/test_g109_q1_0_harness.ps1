@@ -70,6 +70,31 @@ if (-not [bool]$resident.runtime_observed -or
     throw "G109 resident Q1_0 summary parse mismatch"
 }
 
+$dualArenaLog = @"
+ds4: CUDA dynamic arena ready size=20.00 GiB backing=primary
+ds4: Q1_0 routed-expert sidecar validated: layers=43 active=12..12
+ds4: Q1_0 expert sidecar source: $sidecarPath
+ds4: CUDA Q1_0 routed-expert sidecar installed: 1.00 GiB
+ds4: [q1-0-resident-arena] result=bootstrapped entries=256
+ds4: [q1-0-sidecar] result=summary calls=11 slots=66 selected_loads=11 failures=0 resident_mode=1 resident_hits=11 resident_misses=0 resident_h2d_bytes=555555 direct_pread_fallbacks=0 direct_pread_bytes=0 candidate_entries=256 iq2_vram_cache=q1-routes-bypass iq2_host_arena=disabled mixed_host_backing=dual-arena
+"@
+$dualArena = Read-G7Q1_0SidecarTelemetry -LogText $dualArenaLog `
+    -SidecarConfigured $true -SelectedLoadRequested $true `
+    -ResidentArenaRequested $true `
+    -SidecarPath $sidecarPath
+$dualArenaRuntimeObserved = [bool](
+    $dualArenaLog -match 'mixed_host_backing=dual-arena' -and
+    $dualArenaLog -match 'CUDA dynamic arena ready .* backing=primary' -and
+    $dualArenaLog -match '\[q1-0-resident-arena\] result=bootstrapped')
+if (-not [bool]$dualArena.runtime_observed -or
+    -not $dualArenaRuntimeObserved -or
+    [UInt64]$dualArena.route_calls -ne 11 -or
+    [UInt64]$dualArena.selected_loads -ne 11 -or
+    [int]$dualArena.resident_mode -ne 1 -or
+    [UInt64]$dualArena.bootstrap_entries -ne 256) {
+    throw "G109 positive Q1_0 dual-arena marker parse mismatch"
+}
+
 $envOffLog = @"
 ds4: CUDA split-fused hit/miss execution enabled
 ds4: [iq1-s-sidecar] result=summary calls=3 slots=18 selected_loads=3 failures=0
@@ -173,12 +198,17 @@ foreach ($needle in @(
     'DS4_Q1_0_EXPERT_SIDECAR',
     'DS4_Q1_0_SELECTED_LOAD',
     'DS4_Q1_0_RESIDENT_ARENA',
+    'DS4_Q1_0_DUAL_ARENA',
     'DS4_Q1_0_LAYER_FIRST',
     'DS4_Q1_0_LAYER_LAST',
+    '[switch]$Q1_0DualArena',
     '[q1-0-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)((?: [A-Za-z0-9_]+=[^ \x0d\x0a]+)*)',
     'Q1_0 runtime step3 requires GateKind=structural-safety, Repeats=1, and no warmup',
     'Q1_0ResidentArena requires Q1_0ExpertSidecar, Q1_0SelectedLoad, structural-safety, Repeats=1, no warmup, and DynamicArenaGiB > 0',
+    'Q1_0DualArena requires Q1_0ResidentArena',
     'q1_0_sidecar_runtime_observed',
+    'q1_0_dual_arena_requested',
+    'q1_0_dual_arena_runtime_observed',
     'q1_0_sidecar_route_calls',
     'q1_0_sidecar_route_slots',
     'q1_0_sidecar_selected_loads',
@@ -194,6 +224,11 @@ foreach ($needle in @(
     'q1_0_structural_smoke_eligible',
     'q1_0_performance_eligible = $false',
     'q1_0_quality_eligible = $false',
+    'mixed_host_backing=dual-arena',
+    'CUDA dynamic arena ready .* backing=primary',
+    '[q1-0-resident-arena\] result=bootstrapped',
+    'Q1_0DualArena was requested but separate primary/Q1 arena markers were not observed',
+    'Q1_0 dual arena activated while not requested',
     '"not_requested"',
     '$ReuseVerifiedQ1_0Receipt')) {
     if ($harnessText -notmatch [regex]::Escape($needle)) {
