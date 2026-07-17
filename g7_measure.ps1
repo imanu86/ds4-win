@@ -100,6 +100,13 @@ param(
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [string]$ExpectedModelSHA256 = "",
     [switch]$ReuseVerifiedModelReceipt,
+    [string]$Q1_0ExpertSidecar = "",
+    [string]$ExpectedQ1_0ExpertSidecarSHA256 = "",
+    [UInt64]$ExpectedQ1_0ExpertSidecarBytes = 0,
+    [switch]$ReuseVerifiedQ1_0Receipt,
+    [ValidateRange(3, 42)][int]$Q1_0LayerFirst = 3,
+    [ValidateRange(3, 42)][int]$Q1_0LayerLast = 42,
+    [switch]$Q1_0SelectedLoad,
     [string]$Iq1SExpertSidecar = "",
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
@@ -162,6 +169,82 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "g7_process_isolation.ps1")
+function Read-G7Q1_0SidecarTelemetry {
+    param(
+        [AllowEmptyString()][string]$LogText,
+        [bool]$SidecarConfigured,
+        [bool]$SelectedLoadRequested,
+        [AllowEmptyString()][string]$SidecarPath
+    )
+
+    $summaryMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)(?: [A-Za-z0-9_]+=[^ \r\n]+)*\r?$')
+    $runtimeMarkerPattern =
+        'Q1_0 (?:routed-expert sidecar validated|expert sidecar source:|routed-expert sidecar installed)|\[q1-0-sidecar\]'
+
+    if (-not $SidecarConfigured) {
+        if ($LogText -match $runtimeMarkerPattern) {
+            throw "Q1_0 sidecar runtime telemetry appeared while Q1_0 was disabled"
+        }
+        return [pscustomobject]@{
+            enabled = $false
+            selected_load_requested = $false
+            runtime_observed = $false
+            route_calls = [UInt64]0
+            route_slots = [UInt64]0
+            selected_loads = [UInt64]0
+            failures = [UInt64]0
+            runtime_contract_valid = $true
+            fail_closed_observed = $false
+        }
+    }
+
+    foreach ($marker in @(
+            "Q1_0 routed-expert sidecar validated:",
+            "Q1_0 expert sidecar source: $SidecarPath",
+            "CUDA Q1_0 routed-expert sidecar installed:")) {
+        if ($LogText -notmatch [regex]::Escape($marker)) {
+            throw "Q1_0 sidecar runtime marker missing: $marker"
+        }
+    }
+    if ($summaryMatches.Count -ne 1) {
+        throw "Q1_0 sidecar requires exactly one runtime summary; observed $($summaryMatches.Count)"
+    }
+
+    $summary = $summaryMatches[0]
+    $calls = [UInt64]$summary.Groups[1].Value
+    $slots = [UInt64]$summary.Groups[2].Value
+    $selectedLoads = [UInt64]$summary.Groups[3].Value
+    $failures = [UInt64]$summary.Groups[4].Value
+    if ($calls -eq 0 -or $slots -lt $calls) {
+        throw "Q1_0 sidecar runtime counters are inconsistent"
+    }
+
+    $failClosedObserved = $false
+    if ($SelectedLoadRequested) {
+        if ($selectedLoads -ne $calls -or $failures -ne 0) {
+            throw "Q1_0 sidecar selected-load counters are inconsistent"
+        }
+    } else {
+        if ($selectedLoads -ne 0 -or $failures -ne $calls) {
+            throw "Q1_0 sidecar did not fail closed without selected-load opt-in"
+        }
+        $failClosedObserved = $true
+    }
+
+    [pscustomobject]@{
+        enabled = $true
+        selected_load_requested = $SelectedLoadRequested
+        runtime_observed = $true
+        route_calls = $calls
+        route_slots = $slots
+        selected_loads = $selectedLoads
+        failures = $failures
+        runtime_contract_valid = $true
+        fail_closed_observed = $failClosedObserved
+    }
+}
 function Get-G7PreflightMedian([double[]]$Values) {
     if ($null -eq $Values -or $Values.Count -eq 0) { return $null }
     $sorted = @($Values | Sort-Object)
@@ -391,6 +474,10 @@ if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[
 if ($ExpectedModelSHA256 -and $ExpectedModelSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedModelSHA256 must be a 64-character hexadecimal SHA-256"
 }
+if ($ExpectedQ1_0ExpertSidecarSHA256 -and
+    $ExpectedQ1_0ExpertSidecarSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedQ1_0ExpertSidecarSHA256 must be a 64-character hexadecimal SHA-256"
+}
 if ($ExpectedModelIq1SuiteReceiptSHA256 -and
     $ExpectedModelIq1SuiteReceiptSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedModelIq1SuiteReceiptSHA256 must be a 64-character hexadecimal SHA-256"
@@ -398,7 +485,11 @@ if ($ExpectedModelIq1SuiteReceiptSHA256 -and
 if ($ReuseVerifiedModelReceipt -and -not $ExpectedModelSHA256) {
     throw "ReuseVerifiedModelReceipt requires ExpectedModelSHA256"
 }
-if (($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt) -and
+if ($ReuseVerifiedQ1_0Receipt -and -not $ExpectedQ1_0ExpertSidecarSHA256) {
+    throw "ReuseVerifiedQ1_0Receipt requires ExpectedQ1_0ExpertSidecarSHA256"
+}
+if (($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt -or
+     $ReuseVerifiedQ1_0Receipt) -and
     $GateKind -ne "structural-safety") {
     throw "Verified receipt reuse is restricted to structural-safety diagnostics"
 }
@@ -551,6 +642,11 @@ $modelReceiptAtStart = $null
 $modelReceiptPath = ""
 $modelReceiptHashAtStart = ""
 $modelLockStream = $null
+$q1_0SidecarInfoAtStart = $null
+$q1_0SidecarReceiptAtStart = $null
+$q1_0SidecarReceiptPath = ""
+$q1_0SidecarReceiptHashAtStart = ""
+$q1_0SidecarLockStream = $null
 $iq1SSidecarInfoAtStart = $null
 $iq1SSidecarReceiptAtStart = $null
 $iq1SSidecarReceiptPath = ""
@@ -564,6 +660,53 @@ $modelIq1SuiteFullHashVerified = $false
 $modelIq1SuiteLockProofRequired = $false
 $modelIq1SuiteLockProofObserved = $false
 $modelIq1SuiteLockProof = $null
+if (-not $Q1_0ExpertSidecar -and
+    ($Q1_0SelectedLoad -or $ExpectedQ1_0ExpertSidecarSHA256 -or
+     $ExpectedQ1_0ExpertSidecarBytes -ne 0 -or
+     $ReuseVerifiedQ1_0Receipt)) {
+    throw "Q1_0 selected-load and provenance options require Q1_0ExpertSidecar"
+}
+if ($Q1_0ExpertSidecar) {
+    if ($Q1_0LayerFirst -gt $Q1_0LayerLast) {
+        throw "Q1_0LayerFirst must be less than or equal to Q1_0LayerLast"
+    }
+    if ($GateKind -ne "structural-safety" -or $Repeats -ne 1 -or $Warmup) {
+        throw "Q1_0 runtime step3 requires GateKind=structural-safety, Repeats=1, and no warmup"
+    }
+    if ($Iq1SExpertSidecar) {
+        throw "Q1_0 and IQ1_S expert sidecars must be measured separately"
+    }
+    if ($Q1_0SelectedLoad -and $NoSelectedLoad) {
+        throw "Q1_0SelectedLoad is incompatible with NoSelectedLoad"
+    }
+    if (-not (Test-Path -LiteralPath $Q1_0ExpertSidecar -PathType Leaf)) {
+        throw "Q1_0 sidecar missing: $Q1_0ExpertSidecar"
+    }
+    $q1_0SidecarLockStream = [IO.File]::Open(
+        $Q1_0ExpertSidecar, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $q1_0SidecarInfoAtStart = Get-Item -LiteralPath $Q1_0ExpertSidecar
+    if ($ExpectedQ1_0ExpertSidecarBytes -ne 0 -and
+        [UInt64]$q1_0SidecarInfoAtStart.Length -ne
+            $ExpectedQ1_0ExpertSidecarBytes) {
+        throw "Q1_0 sidecar byte count differs from expected provenance"
+    }
+    $Q1_0ExpertSidecar = $q1_0SidecarInfoAtStart.FullName
+    if ($ReuseVerifiedQ1_0Receipt) {
+        $q1_0SidecarReceiptPath = "$Q1_0ExpertSidecar.receipt.json"
+        if (-not (Test-Path -LiteralPath $q1_0SidecarReceiptPath -PathType Leaf)) {
+            throw "Q1_0 sidecar verified receipt missing: $q1_0SidecarReceiptPath"
+        }
+        $q1_0SidecarReceiptSnapshot = Read-G7ReceiptSnapshot `
+            -Path $q1_0SidecarReceiptPath -Kind "Q1_0 sidecar"
+        $q1_0SidecarReceiptAtStart = $q1_0SidecarReceiptSnapshot.receipt
+        $q1_0SidecarReceiptHashAtStart = $q1_0SidecarReceiptSnapshot.sha256
+        Assert-G7VerifiedFileReceipt -Receipt $q1_0SidecarReceiptAtStart `
+            -Info $q1_0SidecarInfoAtStart `
+            -ExpectedSHA256 $ExpectedQ1_0ExpertSidecarSHA256 `
+            -Kind "Q1_0 sidecar"
+    }
+}
 if ($Iq1SExpertSidecar) {
     if ($Iq1SLayerFirst -gt $Iq1SLayerLast) {
         throw "Iq1SLayerFirst must be less than or equal to Iq1SLayerLast"
@@ -826,6 +969,21 @@ foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | 
 }
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
+if ($Q1_0ExpertSidecar) {
+    $env:DS4_Q1_0_EXPERT_SIDECAR = $Q1_0ExpertSidecar
+    $env:DS4_Q1_0_LAYER_FIRST = [string]$Q1_0LayerFirst
+    $env:DS4_Q1_0_LAYER_LAST = [string]$Q1_0LayerLast
+    if ($Q1_0SelectedLoad) {
+        $env:DS4_Q1_0_SELECTED_LOAD = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
+    }
+} else {
+    Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_LAYER_FIRST -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_LAYER_LAST -ErrorAction SilentlyContinue
+}
 if ($Iq1SExpertSidecar) {
     $env:DS4_IQ1_S_EXPERT_SIDECAR = $Iq1SExpertSidecar
     $env:DS4_IQ1_S_LAYER_FIRST = [string]$Iq1SLayerFirst
@@ -1537,6 +1695,36 @@ if ($iq1SSidecarInfoAtStart -and
     $iq1SSidecarHashAtStart -ine $ExpectedIq1SExpertSidecarSHA256) {
     throw "IQ1_S sidecar provenance failed: expected $($ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()), observed $iq1SSidecarHashAtStart"
 }
+$q1_0SidecarHashMethod = if (-not $q1_0SidecarInfoAtStart) {
+    "not_applicable"
+} elseif (-not $ExpectedQ1_0ExpertSidecarSHA256) {
+    "not_requested"
+} elseif ($ReuseVerifiedQ1_0Receipt) {
+    "verified_receipt_reuse"
+} else {
+    "full_file_sha256"
+}
+$q1_0SidecarHashAtStart = if (-not $q1_0SidecarInfoAtStart -or
+    -not $ExpectedQ1_0ExpertSidecarSHA256) {
+    ""
+} elseif ($ReuseVerifiedQ1_0Receipt) {
+    $ExpectedQ1_0ExpertSidecarSHA256.ToLowerInvariant()
+} else {
+    (Get-FileHash -Algorithm SHA256 `
+        -LiteralPath $Q1_0ExpertSidecar).Hash.ToLowerInvariant()
+}
+if ($ExpectedQ1_0ExpertSidecarSHA256 -and
+    $q1_0SidecarHashAtStart -ine $ExpectedQ1_0ExpertSidecarSHA256) {
+    throw "Q1_0 sidecar provenance failed: expected $($ExpectedQ1_0ExpertSidecarSHA256.ToLowerInvariant()), observed $q1_0SidecarHashAtStart"
+}
+$q1_0SidecarProvenanceVerified = [bool](
+    $q1_0SidecarInfoAtStart -and $ExpectedQ1_0ExpertSidecarSHA256 -and
+    $q1_0SidecarHashAtStart -ieq $ExpectedQ1_0ExpertSidecarSHA256 -and
+    ($ExpectedQ1_0ExpertSidecarBytes -eq 0 -or
+     [UInt64]$q1_0SidecarInfoAtStart.Length -eq
+        $ExpectedQ1_0ExpertSidecarBytes) -and
+    (-not $ReuseVerifiedQ1_0Receipt -or
+     ($q1_0SidecarReceiptPath -and $q1_0SidecarReceiptHashAtStart)))
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
 $systemPromptBytes = [Text.Encoding]::UTF8.GetBytes($SystemPrompt)
@@ -1614,6 +1802,15 @@ if ($iq1SSidecarInfoAtStart) {
         $iq1SSidecarInfoAfterCooldown.LastWriteTimeUtc -ne
             $iq1SSidecarInfoAtStart.LastWriteTimeUtc) {
         throw "IQ1_S sidecar provenance changed during quiescence cooldown"
+    }
+}
+if ($q1_0SidecarInfoAtStart) {
+    $q1_0SidecarInfoAfterCooldown = Get-Item -LiteralPath $Q1_0ExpertSidecar
+    if ($q1_0SidecarInfoAfterCooldown.Length -ne
+            $q1_0SidecarInfoAtStart.Length -or
+        $q1_0SidecarInfoAfterCooldown.LastWriteTimeUtc -ne
+            $q1_0SidecarInfoAtStart.LastWriteTimeUtc) {
+        throw "Q1_0 sidecar provenance changed during quiescence cooldown"
     }
 }
 
@@ -1721,6 +1918,12 @@ $systemQuiescencePreflight = [pscustomobject][ordered]@{
     build_manifest_sha256 = $buildManifestHashAtStart
     model_path = $modelInfoAtStart.FullName
     model_size_bytes = [Int64]$modelInfoAtStart.Length
+    q1_0_sidecar_path = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
+    q1_0_sidecar_size_bytes = $(if ($q1_0SidecarInfoAtStart) { [UInt64]$q1_0SidecarInfoAtStart.Length } else { [UInt64]0 })
+    q1_0_sidecar_expected_sha256 = $(if ($ExpectedQ1_0ExpertSidecarSHA256) { $ExpectedQ1_0ExpertSidecarSHA256.ToLowerInvariant() } else { "" })
+    q1_0_sidecar_receipt_path = $q1_0SidecarReceiptPath
+    q1_0_sidecar_receipt_sha256 = $q1_0SidecarReceiptHashAtStart
+    q1_0_sidecar_provenance_verified = $q1_0SidecarProvenanceVerified
     iq1_s_sidecar_path = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
     iq1_s_sidecar_size_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
     iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
@@ -3407,6 +3610,31 @@ if ($spexCpuProbeLineCount -gt 0) {
     }
 }
 
+$q1_0SidecarLogText = ""
+if (Test-Path -LiteralPath $stderrLog) {
+    $q1_0SidecarLogText += (Get-Content -LiteralPath $stderrLog -Raw)
+}
+if (Test-Path -LiteralPath $stdoutLog) {
+    $q1_0SidecarLogText += "`n" + (Get-Content -LiteralPath $stdoutLog -Raw)
+}
+$q1_0Telemetry = Read-G7Q1_0SidecarTelemetry `
+    -LogText $q1_0SidecarLogText `
+    -SidecarConfigured ([bool]$Q1_0ExpertSidecar) `
+    -SelectedLoadRequested ([bool]$Q1_0SelectedLoad) `
+    -SidecarPath $Q1_0ExpertSidecar
+$q1_0SidecarRuntimeObserved = [bool]$q1_0Telemetry.runtime_observed
+$q1_0SidecarCalls = [UInt64]$q1_0Telemetry.route_calls
+$q1_0SidecarSlots = [UInt64]$q1_0Telemetry.route_slots
+$q1_0SidecarSelectedLoads = [UInt64]$q1_0Telemetry.selected_loads
+$q1_0SidecarFailures = [UInt64]$q1_0Telemetry.failures
+$q1_0RuntimeContractValid = [bool]$q1_0Telemetry.runtime_contract_valid
+$q1_0FailClosedObserved = [bool]$q1_0Telemetry.fail_closed_observed
+$q1_0StructuralSmokeEligible = [bool](
+    $Q1_0ExpertSidecar -and $Q1_0SelectedLoad -and
+    $GateKind -eq "structural-safety" -and $Repeats -eq 1 -and
+    -not $Warmup -and $q1_0SidecarRuntimeObserved -and
+    $q1_0RuntimeContractValid -and $q1_0SidecarProvenanceVerified)
+
 $iq1SSidecarCalls = [UInt64]0
 $iq1SSidecarSlots = [UInt64]0
 $iq1SSidecarSelectedLoads = [UInt64]0
@@ -4989,6 +5217,35 @@ $rawOutputs = [pscustomobject]@{
     warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     expected_content_sha256 = if ($ExpectedContentSHA256) { $ExpectedContentSHA256.ToLowerInvariant() } else { "" }
     expected_warmup_content_sha256 = if ($ExpectedWarmupContentSHA256) { $ExpectedWarmupContentSHA256.ToLowerInvariant() } else { "" }
+    ds4_q1_0_expert_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
+    ds4_q1_0_selected_load = $(if ($Q1_0ExpertSidecar -and $Q1_0SelectedLoad) { "1" } else { "" })
+    ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
+    ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
+    q1_0_sidecar_enabled = [bool]$Q1_0ExpertSidecar
+    q1_0_selected_load_requested = [bool]$Q1_0SelectedLoad
+    q1_0_layer_first_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerFirst } else { 0 })
+    q1_0_layer_last_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerLast } else { 0 })
+    q1_0_sidecar_path = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
+    q1_0_sidecar_size_bytes = $(if ($q1_0SidecarInfoAtStart) { [UInt64]$q1_0SidecarInfoAtStart.Length } else { [UInt64]0 })
+    q1_0_sidecar_expected_size_bytes = $ExpectedQ1_0ExpertSidecarBytes
+    q1_0_sidecar_expected_sha256 = $(if ($ExpectedQ1_0ExpertSidecarSHA256) { $ExpectedQ1_0ExpertSidecarSHA256.ToLowerInvariant() } else { "" })
+    q1_0_sidecar_sha256 = $q1_0SidecarHashAtStart
+    q1_0_sidecar_hash_method = $q1_0SidecarHashMethod
+    q1_0_sidecar_receipt_path = $q1_0SidecarReceiptPath
+    q1_0_sidecar_receipt_sha256 = $q1_0SidecarReceiptHashAtStart
+    q1_0_sidecar_provenance_verified = $q1_0SidecarProvenanceVerified
+    q1_0_sidecar_receipt_reuse_requested = [bool]$ReuseVerifiedQ1_0Receipt
+    q1_0_sidecar_runtime_observed = $q1_0SidecarRuntimeObserved
+    q1_0_sidecar_route_calls = $q1_0SidecarCalls
+    q1_0_sidecar_route_slots = $q1_0SidecarSlots
+    q1_0_sidecar_selected_loads = $q1_0SidecarSelectedLoads
+    q1_0_sidecar_failures = $q1_0SidecarFailures
+    q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
+    q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
+    q1_0_fail_closed_observed = $q1_0FailClosedObserved
+    q1_0_structural_smoke_eligible = $q1_0StructuralSmokeEligible
+    q1_0_performance_eligible = $false
+    q1_0_quality_eligible = $false
     iq1_s_sidecar_path = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
     iq1_s_sidecar_size_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
     iq1_s_sidecar_expected_sha256 = $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
@@ -5181,6 +5438,36 @@ $summary = [pscustomobject]@{
     model_iq1_suite_lock_proof_observed =
         $modelIq1SuiteLockProofObserved
     model_iq1_suite_lock_proof = $modelIq1SuiteLockProof
+    ds4_q1_0_expert_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
+    ds4_q1_0_selected_load = $(if ($Q1_0ExpertSidecar -and $Q1_0SelectedLoad) { "1" } else { "" })
+    ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
+    ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
+    q1_0_sidecar_enabled = [bool]$Q1_0ExpertSidecar
+    q1_0_selected_load_requested = [bool]$Q1_0SelectedLoad
+    q1_0_layer_first_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerFirst } else { 0 })
+    q1_0_layer_last_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerLast } else { 0 })
+    q1_0_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
+    q1_0_sidecar_bytes = $(if ($q1_0SidecarInfoAtStart) { [UInt64]$q1_0SidecarInfoAtStart.Length } else { [UInt64]0 })
+    q1_0_sidecar_last_write_utc = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.LastWriteTimeUtc.ToString("o") } else { "" })
+    q1_0_sidecar_expected_size_bytes = $ExpectedQ1_0ExpertSidecarBytes
+    q1_0_sidecar_expected_sha256 = $(if ($ExpectedQ1_0ExpertSidecarSHA256) { $ExpectedQ1_0ExpertSidecarSHA256.ToLowerInvariant() } else { "" })
+    q1_0_sidecar_sha256 = $q1_0SidecarHashAtStart
+    q1_0_sidecar_hash_method = $q1_0SidecarHashMethod
+    q1_0_sidecar_receipt_path = $q1_0SidecarReceiptPath
+    q1_0_sidecar_receipt_sha256 = $q1_0SidecarReceiptHashAtStart
+    q1_0_sidecar_provenance_verified = $q1_0SidecarProvenanceVerified
+    q1_0_sidecar_receipt_reuse_requested = [bool]$ReuseVerifiedQ1_0Receipt
+    q1_0_sidecar_runtime_observed = $q1_0SidecarRuntimeObserved
+    q1_0_sidecar_route_calls = $q1_0SidecarCalls
+    q1_0_sidecar_route_slots = $q1_0SidecarSlots
+    q1_0_sidecar_selected_loads = $q1_0SidecarSelectedLoads
+    q1_0_sidecar_failures = $q1_0SidecarFailures
+    q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
+    q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
+    q1_0_fail_closed_observed = $q1_0FailClosedObserved
+    q1_0_structural_smoke_eligible = $q1_0StructuralSmokeEligible
+    q1_0_performance_eligible = $false
+    q1_0_quality_eligible = $false
     iq1_s_sidecar = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
     iq1_s_sidecar_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
     iq1_s_sidecar_last_write_utc = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.LastWriteTimeUtc.ToString("o") } else { "" })
@@ -5968,6 +6255,8 @@ Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLat
 Write-Host ("spex cpu probe req/observed/submitted/dropped/completed/predicted/matched/ready/useful/failures: " + $SpexCpuProbeK + " / " + $spexCpuProbeKObserved + " / " + $spexCpuProbeSubmitted + " / " + $spexCpuProbeDropped + " / " + $spexCpuProbeCompleted + " / " + $spexCpuProbePredicted + " / " + $spexCpuProbeMatched + " / " + $spexCpuProbeReadyAtTransport + " / " + $spexCpuProbeUsefulReady + " / " + $spexCpuProbeFailures)
 Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitMs + " / " + $spexCpuProbeCpuMs + " / " + $spexCpuProbeQueueMs + " / " + $spexCpuProbeChecksum)
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
+Write-Host ("Q1_0 sidecar enabled/selected-load/observed/calls/slots/loads/failures: " + [bool]$Q1_0ExpertSidecar + " / " + [bool]$Q1_0SelectedLoad + " / " + $q1_0SidecarRuntimeObserved + " / " + $q1_0SidecarCalls + " / " + $q1_0SidecarSlots + " / " + $q1_0SidecarSelectedLoads + " / " + $q1_0SidecarFailures)
+Write-Host ("Q1_0 runtime-contract/fail-closed/structural-eligible/performance-eligible: " + $q1_0RuntimeContractValid + " / " + $q1_0FailClosedObserved + " / " + $q1_0StructuralSmokeEligible + " / False")
 Write-Host ("IQ1_S RAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
 Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math]::Round($iq1SRamCacheHitRate, 4) + " / " + [math]::Round($iq1SRamCacheSsdBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheH2dBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheSsdAvoidedBytes / 1GB, 3))
 Write-Host ("IQ1_S full preload pageable/frozen/layers/entries/SSD GiB/read-calls/ms: " + [bool]$Iq1SRamCachePageable + " / " + $iq1SRamCachePreloadFrozen + " / " + $iq1SRamCachePreloadLayers + " / " + $iq1SRamCachePreloadEntries + " / " + [math]::Round($iq1SRamCachePreloadSsdBytes / 1GB, 3) + " / " + $iq1SRamCachePreloadReadCalls + " / " + $iq1SRamCachePreloadMs)
@@ -5989,6 +6278,9 @@ Write-Host "=================================================="
     }
     if ($null -ne $iq1SSidecarLockStream) {
         try { $iq1SSidecarLockStream.Dispose() } catch {}
+    }
+    if ($null -ne $q1_0SidecarLockStream) {
+        try { $q1_0SidecarLockStream.Dispose() } catch {}
     }
     if ($measurementLockAcquired) {
         try { $measurementMutex.ReleaseMutex() } catch {}
