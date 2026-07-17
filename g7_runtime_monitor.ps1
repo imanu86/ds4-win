@@ -4,6 +4,7 @@ param(
     [ValidateRange(250, 10000)][int]$IntervalMs = 1000,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 2.0,
     [ValidateRange(0.0, 100000.0)][double]$MaximumDiskQueueLength = 8.0,
+    [ValidateRange(0.0, 1024.0)][double]$HardMinimumAvailableGiB = 0.0,
     [ValidateRange(0.0, 1000000000.0)][double]$MaximumPagesOutputPerSecond = 0.0,
     [ValidateRange(0.0, 10.0)][double]$MinimumPrivateWorkingSetRatio = 0.0,
     [ValidateRange(0.0, 1024.0)][double]$PrivateWorkingSetMinimumGiB = 4.0,
@@ -273,6 +274,8 @@ try {
             $workingSetBytes / $privateBytes
         } else { $null }
         $legacyPressure = $lowMemory -and $highQueue
+        $hardLowMemory = $HardMinimumAvailableGiB -gt 0.0 -and $haveMemory -and
+            ([double]$memory.ullAvailPhys -le $HardMinimumAvailableGiB * 1GB)
         $pageOutputCountersRequired = $MaximumPagesOutputPerSecond -gt 0.0
         $pageOutputCountersMissing = $pageOutputCountersRequired -and -not $memoryPressure.seen
         $highPageOutput = $pageOutputCountersRequired -and $memoryPressure.seen -and
@@ -284,6 +287,7 @@ try {
             ($privateWorkingSetRatio -le $MinimumPrivateWorkingSetRatio)
         $pressureReasons = @()
         if ($legacyPressure) { $pressureReasons += "low-memory-and-disk-queue" }
+        if ($hardLowMemory) { $pressureReasons += "hard-low-memory" }
         if ($highPageOutput) { $pressureReasons += "system-page-output" }
         if ($lowPrivateResidency) { $pressureReasons += "private-working-set-collapse" }
         if ($pageOutputCountersMissing) { $pressureReasons += "memory-pressure-counters-missing" }

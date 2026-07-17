@@ -142,6 +142,7 @@ param(
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [ValidateRange(0.0, 1024.0)][double]$RuntimeMinimumAvailableGiB = 2.0,
     [ValidateRange(0.0, 100000.0)][double]$RuntimeMaximumDiskQueueLength = 8.0,
+    [ValidateRange(0.0, 1024.0)][double]$RuntimeHardMinimumAvailableGiB = 0.0,
     [ValidateRange(0.0, 1000000000.0)][double]$RuntimeMaximumPagesOutputPerSecond = 0.0,
     [ValidateRange(0.0, 10.0)][double]$RuntimeMinimumPrivateWorkingSetRatio = 0.0,
     [ValidateRange(0.0, 1024.0)][double]$RuntimePrivateWorkingSetMinimumGiB = 4.0,
@@ -1775,6 +1776,7 @@ $telemetryProc = Start-Process -FilePath powershell.exe -ArgumentList @(
     "-IntervalMs", "$TelemetryIntervalMs",
     "-MinimumAvailableGiB", $RuntimeMinimumAvailableGiB.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-MaximumDiskQueueLength", $RuntimeMaximumDiskQueueLength.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-HardMinimumAvailableGiB", $RuntimeHardMinimumAvailableGiB.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-MaximumPagesOutputPerSecond", $RuntimeMaximumPagesOutputPerSecond.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-MinimumPrivateWorkingSetRatio", $RuntimeMinimumPrivateWorkingSetRatio.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-PrivateWorkingSetMinimumGiB", $RuntimePrivateWorkingSetMinimumGiB.ToString([Globalization.CultureInfo]::InvariantCulture),
@@ -2054,11 +2056,12 @@ $runtimeTelemetry = [pscustomobject]@{
     contamination_abort_observed = [bool]$contaminationAbortObserved
     contamination_runtime_minimum_available_gib = $RuntimeMinimumAvailableGiB
     contamination_runtime_maximum_disk_queue_length = $RuntimeMaximumDiskQueueLength
+    contamination_runtime_hard_minimum_available_gib = $RuntimeHardMinimumAvailableGiB
     contamination_runtime_maximum_pages_output_per_second = $RuntimeMaximumPagesOutputPerSecond
     contamination_runtime_minimum_private_working_set_ratio = $RuntimeMinimumPrivateWorkingSetRatio
     contamination_runtime_private_working_set_minimum_gib = $RuntimePrivateWorkingSetMinimumGiB
     contamination_runtime_consecutive_samples = $RuntimeContaminationSamples
-    contamination_contract = "abort after $RuntimeContaminationSamples consecutive samples matching legacy low-RAM+queue, page-output, residency-collapse, or required-counter-missing gates"
+    contamination_contract = "abort after $RuntimeContaminationSamples consecutive samples matching legacy low-RAM+queue, hard-low-RAM, page-output, residency-collapse, or required-counter-missing gates"
     win32_process_read_transfer_delta_bytes = if ($null -ne $firstRuntimeSample.read_transfer_bytes -and $null -ne $lastRuntimeSample.read_transfer_bytes) { [Int64]$lastRuntimeSample.read_transfer_bytes - [Int64]$firstRuntimeSample.read_transfer_bytes } else { $null }
     win32_process_read_operation_delta = if ($null -ne $firstRuntimeSample.read_operation_count -and $null -ne $lastRuntimeSample.read_operation_count) { [Int64]$lastRuntimeSample.read_operation_count - [Int64]$firstRuntimeSample.read_operation_count } else { $null }
     win32_process_other_operation_delta = if ($null -ne $firstRuntimeSample.other_operation_count -and $null -ne $lastRuntimeSample.other_operation_count) { [Int64]$lastRuntimeSample.other_operation_count - [Int64]$firstRuntimeSample.other_operation_count } else { $null }

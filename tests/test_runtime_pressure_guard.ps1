@@ -12,6 +12,7 @@ try {
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $monitor `
         -TargetProcessId $child.Id -OutputPath $output -IntervalMs 250 `
         -MinimumAvailableGiB 0 -MaximumDiskQueueLength 100000 `
+        -HardMinimumAvailableGiB 1024 `
         -MaximumPagesOutputPerSecond 0 `
         -MinimumPrivateWorkingSetRatio 2.0 -PrivateWorkingSetMinimumGiB 0 `
         -ContaminationSamples 1
@@ -26,6 +27,9 @@ try {
     if (-not $abort) { throw "Runtime monitor did not emit an abort sample" }
     if (@($abort.contamination_reasons) -notcontains "private-working-set-collapse") {
         throw "Runtime monitor did not identify the residency-collapse reason"
+    }
+    if (@($abort.contamination_reasons) -notcontains "hard-low-memory") {
+        throw "Runtime monitor did not identify the hard-low-memory reason"
     }
     if (-not $abort.system_memory_pressure.seen) {
         throw "Runtime monitor did not expose system memory-pressure counters"
