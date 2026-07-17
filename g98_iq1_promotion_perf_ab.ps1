@@ -104,7 +104,9 @@ function Assert-G98StaticContract {
         "DynamicArenaGiB", "ArenaWrapTrustWorkerChecksum",
         "ArenaWrapSourceParts", "ArenaWrapUnlockSourceRanges",
         "ArenaWrapUnlockWaveGiB", "PrefillMassWrap",
-        "ComposePrefillMassTiering", "DisableQ8F16Cache",
+        "ComposePrefillMassTiering", "ComposePrefillMassOpenRouter",
+        "ComposePrefillMassReserveSlots",
+        "DisableQ8F16Cache",
         "EmbedRowStaging", "ExpertCacheN", "ExpertCacheReserveGB",
         "ExpertCachePolicy", "ExpertTiering", "ExpertTierPolicy",
         "ExpertTierClockCalls", "ExpertTierReplacementBudget",
@@ -129,6 +131,10 @@ function Assert-G98StaticContract {
         "think = `$false",
         "runtime-contamination-abort",
         "DS4_IQ1_PROMOTION_PROBATION_SLOTS",
+        "DS4_CUDA_PREFILL_TIER_ROUTER",
+        "DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS",
+        "compose_prefill_mass_open_router_requested",
+        "compose_prefill_mass_reserve_slots_requested",
         "iq1-promotion",
         "promotion_2bit_ssd_seconds",
         "iq1_promotion_runtime_observed",
@@ -165,6 +171,16 @@ function Assert-G98StaticContract {
     if (@($candidateArgs | Where-Object { $_ -eq "-Iq1Promotion" }).Count -ne 1) {
         throw "G98 static diff failed: candidate does not enable promotion exactly once."
     }
+    if (@($candidateArgs | Where-Object { $_ -eq "-ComposePrefillMassOpenRouter" }).Count -ne 1) {
+        throw "G98 static diff failed: candidate does not enable open-router promotion exactly once."
+    }
+    if (@($controlArgs | Where-Object { $_ -eq "-ComposePrefillMassOpenRouter" }).Count -ne 1) {
+        throw "G98 static diff failed: control does not enable open-router baseline exactly once."
+    }
+    if (@($controlArgs | Where-Object { $_ -eq "-ComposePrefillMassReserveSlots" }).Count -ne 1 -or
+        @($candidateArgs | Where-Object { $_ -eq "-ComposePrefillMassReserveSlots" }).Count -ne 1) {
+        throw "G98 static diff failed: an arm does not reserve matched open-router capacity exactly once."
+    }
 }
 
 function New-G98Args {
@@ -181,7 +197,7 @@ function New-G98Args {
         "-Prompt", $prompt,
         "-Context", "256",
         "-BudgetGB", "2", "-ReserveMB", "1024",
-        "-DynamicArenaGiB", "20",
+        "-DynamicArenaGiB", "12",
         "-ArenaWrapTrustWorkerChecksum",
         "-ArenaWrapSourceParts",
         "-ArenaWrapUnlockSourceRanges",
@@ -190,6 +206,8 @@ function New-G98Args {
         "-EmbedRowStaging",
         "-PrefillMassWrap",
         "-ComposePrefillMassTiering",
+        "-ComposePrefillMassOpenRouter",
+        "-ComposePrefillMassReserveSlots", ([string]$PromotionSlots),
         "-ExpertCacheN", "320",
         "-ExpertCacheReserveGB", "0.125",
         "-ExpertCachePolicy", "lru",
@@ -213,10 +231,10 @@ function New-G98Args {
         "-Iq1SLayerLast", "42",
         "-Iq1SMixedColdOne",
         "-Iq1SMixedGpuPlan",
-        "-Iq1SRamCacheGiB", "4",
+        "-Iq1SRamCacheGiB", "1",
         "-GateKind", "benchmark",
-        "-QuiescenceCooldownSec", "30",
-        "-RuntimeMinimumAvailableGiB", "2",
+        "-QuiescenceCooldownSec", "90",
+        "-RuntimeMinimumAvailableGiB", "4",
         "-RuntimeMaximumDiskQueueLength", "8",
         "-RuntimeContaminationSamples", "3"
     )
@@ -250,6 +268,8 @@ function Assert-G98RunContract {
         "iq1_promotion_2bit_ssd_bytes_per_second",
         "iq1_promotion_direct_ssd_to_vram_rejected",
         "iq1_promotion_failures",
+        "compose_prefill_mass_open_router_requested",
+        "compose_prefill_mass_reserve_slots_requested",
         "route_packed_copy_requested",
         "route_packed_copy_observed",
         "expert_tiering",
@@ -299,7 +319,7 @@ function Assert-G98RunContract {
         [int]$Result.context_observed -ne 256 -or
         [int]$Result.budget_gb -ne 2 -or
         [int]$Result.reserve_mb -ne 1024 -or
-        [double]$Result.dynamic_arena_gib_requested -ne 20.0 -or
+        [double]$Result.dynamic_arena_gib_requested -ne 12.0 -or
         [bool]$Result.q8_f16_cache_disabled -ne $true -or
         [bool]$Result.embed_row_staging_requested -ne $true -or
         [bool]$Result.outputs_identical -ne $true -or
@@ -315,6 +335,8 @@ function Assert-G98RunContract {
         [bool]$Result.prefill_mass_wrap_requested -ne $true -or
         [bool]$Result.prefill_mass_wrap_observed -ne $true -or
         [bool]$Result.compose_prefill_mass_tiering_requested -ne $true -or
+        [bool]$Result.compose_prefill_mass_open_router_requested -ne $true -or
+        [int]$Result.compose_prefill_mass_reserve_slots_requested -ne $PromotionSlots -or
         [bool]$tier.compose_prefill_mass_tiering_observed -ne $true -or
         [int]$Result.expert_cache_requested -ne 320 -or
         [double]$Result.expert_cache_reserve_gb -ne 0.125 -or
@@ -329,8 +351,9 @@ function Assert-G98RunContract {
         [string]$tier.policy -ne "mass-lfru" -or
         [UInt64]$tier.failures -ne 0 -or
         [UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
-        [UInt64]$tier.snapshot_backing_misses -ne 0 -or
         [UInt64]$tier.cold_to_vram -ne 0 -or
+        [UInt64]$tier.snapshot_backing_entries -ne
+            [UInt64]$Result.prefill_mass_wrap_candidate_entries -or
         [bool]$Result.gpu_resident_routes_requested -ne $true -or
         [bool]$Result.gpu_resident_routes_observed -ne $true -or
         [bool]$Result.route_no_default_sync_requested -ne $true -or
@@ -352,7 +375,7 @@ function Assert-G98RunContract {
         [bool]$Result.iq1_s_mixed_gpu_plan_runtime_observed -ne $true -or
         [UInt64]$Result.iq1_s_mixed_gpu_plan_calls -le 0 -or
         [UInt64]$Result.iq1_s_mixed_gpu_plan_failures -ne 0 -or
-        [double]$Result.iq1_s_ram_cache_requested_gib -ne 4.0 -or
+        [double]$Result.iq1_s_ram_cache_requested_gib -ne 1.0 -or
         [bool]$Result.iq1_s_ram_cache_runtime_observed -ne $true -or
         [UInt64]$Result.iq1_s_ram_cache_failures -ne 0 -or
         [bool]$Result.iq1_s_packed_h2d_requested -ne $false -or
@@ -362,7 +385,7 @@ function Assert-G98RunContract {
         [bool]$Result.memory_preflight.ready_to_launch -ne $true -or
         [bool]$Result.process_isolation_preflight.ready_to_launch -ne $true -or
         [bool]$sys.skipped -ne $false -or
-        [int]$sys.requested_cooldown_seconds -ne 30 -or
+        [int]$sys.requested_cooldown_seconds -ne 90 -or
         [bool]$sys.ready_to_launch -ne $true -or
         [bool]$rt.contamination_abort_observed -ne $false -or
         [string]$Result.contamination_reason -ne "" -or
@@ -396,7 +419,16 @@ function Assert-G98RunContract {
             [double]$Result.iq1_promotion_2bit_ssd_bytes_per_second -le 0.0 -or
             [UInt64]$Result.iq1_promotion_direct_ssd_to_vram_rejected -ne 0 -or
             [UInt64]$Result.iq1_promotion_failures -ne 0 -or
+            [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_ROUTER -ne
+                "open" -or
+            [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS -ne
+                ([string]$PromotionSlots) -or
             [string]$Result.effective_ds4_environment.DS4_IQ1_PROMOTION_PROBATION_SLOTS -ne
+                ([string]$PromotionSlots) -or
+            [UInt64]$tier.snapshot_backing_entries -ne
+                [UInt64]$Result.prefill_mass_wrap_candidate_entries -or
+            [UInt64]$Result.iq1_promotion_snapshot_evictions -ne 0 -or
+            [UInt64]$Result.iq1_promotion_reserved_slots -ne
                 ([string]$PromotionSlots)) {
             throw "G98 candidate promotion aggregate contract mismatch"
         }
@@ -406,7 +438,7 @@ function Assert-G98RunContract {
         foreach ($row in @($Result.iq1_promotion_requests)) {
             if ([UInt64]$row.requested_slots -ne [UInt64]$PromotionSlots -or
                 [UInt64]$row.reserved_slots -ne [UInt64]$PromotionSlots -or
-                [UInt64]$row.snapshot_evictions -ne [UInt64]$PromotionSlots -or
+                [UInt64]$row.snapshot_evictions -ne 0 -or
                 [UInt64]$row.cold_observed -le 0 -or
                 [UInt64]$row.cold_to_2bit_ram -le 0 -or
                 [UInt64]$row.promotion_2bit_ssd_bytes -le 0 -or
@@ -423,7 +455,11 @@ function Assert-G98RunContract {
             [double]$Result.iq1_promotion_2bit_ssd_seconds -ne 0.0 -or
             [double]$Result.iq1_promotion_2bit_ssd_bytes_per_second -ne 0.0 -or
             [UInt64]$Result.iq1_promotion_direct_ssd_to_vram_rejected -ne 0 -or
-            [UInt64]$Result.iq1_promotion_failures -ne 0) {
+            [UInt64]$Result.iq1_promotion_failures -ne 0 -or
+            [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_ROUTER -ne
+                "open" -or
+            [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS -ne
+                ([string]$PromotionSlots)) {
             throw "G98 control promotion telemetry appeared while disabled"
         }
     }
@@ -564,15 +600,17 @@ $staticChecks = [pscustomobject]@{
     warmup_max_tokens = 64
     max_tokens = 64
     context = 256
-    dynamic_arena_gib = 20
-    iq1_s_ram_cache_gib = 4
+    dynamic_arena_gib = 12
+    iq1_s_ram_cache_gib = 1
     expert_cache_n = 320
     gpu_planner_on_both_arms = $true
     route_packed_copy = $true
-    promotion_control = "off"
-    promotion_candidate = "-Iq1Promotion slots16"
+    compose_prefill_mass_open_router = $true
+    compose_prefill_mass_reserve_slots = $PromotionSlots
+    promotion_control = "open-router reserve16, promotion off"
+    promotion_candidate = "open-router reserve16, -Iq1Promotion slots16"
     quiescence_required = $true
-    quiescence_cooldown_seconds = 30
+    quiescence_cooldown_seconds = 90
     contamination_abort_fail_closed = $true
     require_same_provenance_except_promotion = $true
     require_intra_arm_determinism = $true
@@ -661,7 +699,7 @@ $performanceClaim = if ($timingValid) {
 
 $summary = [pscustomobject]@{
     schema = "g98_iq1_promotion_perf_ab_v1"
-    question = "Promotion OFF versus identical setup with -Iq1Promotion -Iq1PromotionProbationSlots 16."
+    question = "Open-router reserve16 promotion OFF versus identical setup with -Iq1Promotion -Iq1PromotionProbationSlots 16."
     gate_kind = "benchmark"
     quality_claim = "none"
     general_sota_claim = "none"
@@ -674,16 +712,18 @@ $summary = [pscustomobject]@{
     warmup_max_tokens = 64
     context = 256
     repeats_per_arm = 3
-    dynamic_arena_gib = 20
-    iq1_s_ram_cache_gib = 4
+    dynamic_arena_gib = 12
+    iq1_s_ram_cache_gib = 1
     iq1_s_layers = "3..42"
     mixed_cold_one = $true
     gpu_planner = "on in both arms"
     promotion_only_difference = $true
     promotion_candidate_slots = $PromotionSlots
+    compose_prefill_mass_open_router = $true
+    compose_prefill_mass_reserve_slots = $PromotionSlots
     quiescence = [pscustomobject]@{
         skipped = $false
-        cooldown_seconds = 30
+        cooldown_seconds = 90
         abort_fail_closed_on_contamination = $true
     }
     arena_wrap = [pscustomobject]@{

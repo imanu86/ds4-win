@@ -29,7 +29,7 @@ $maxTokens = 768
 $context = 1024
 $warmupMaxTokens = 64
 $stopSequence = "</html>"
-$quiescenceCooldownSec = 30
+$quiescenceCooldownSec = 90
 $timeoutSec = 7200
 $cacheLabel = $Iq1CacheGiB.ToString(
     "0.###", [Globalization.CultureInfo]::InvariantCulture).Replace(".", "p")
@@ -130,7 +130,7 @@ function Assert-G99StaticContract {
     }
     if ($repeatsPerArm -ne 3 -or $maxTokens -ne 768 -or
         $context -ne 1024 -or $warmupMaxTokens -ne 64 -or
-        $stopSequence -ne "</html>" -or $quiescenceCooldownSec -ne 30) {
+        $stopSequence -ne "</html>" -or $quiescenceCooldownSec -ne 90) {
         throw "G99 prompt/token/quiescence contract mismatch"
     }
     if ($PromotionSlots -ne 16) {
@@ -152,6 +152,7 @@ function Assert-G99StaticContract {
         "ArenaWrapUnlockSourceRanges", "ArenaWrapUnlockWaveGiB",
         "DisableQ8F16Cache", "EmbedRowStaging", "ReapPrefetchThreads",
         "PrefillMassWrap", "ComposePrefillMassTiering", "ExpertCacheN",
+        "ComposePrefillMassOpenRouter", "ComposePrefillMassReserveSlots",
         "ExpertCacheReserveGB", "ExpertCachePolicy", "GpuResidentRoutes",
         "RouteNoDefaultSync", "RoutePackedCopy", "SplitFused", "ExpertTiering",
         "ExpertTierPolicy", "ExpertTierClockCalls",
@@ -175,6 +176,10 @@ function Assert-G99StaticContract {
         'temperature = 0',
         'think = $false',
         'DS4_IQ1_PROMOTION_PROBATION_SLOTS',
+        'DS4_CUDA_PREFILL_TIER_ROUTER',
+        'DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS',
+        'compose_prefill_mass_open_router_requested',
+        'compose_prefill_mass_reserve_slots_requested',
         'iq1_promotion_runtime_observed',
         'iq1_promotion_requests',
         'iq1_promotion_2bit_ssd_seconds',
@@ -183,6 +188,12 @@ function Assert-G99StaticContract {
         if ($harnessText -notmatch [regex]::Escape($needle)) {
             throw "G99 harness static marker missing: $needle"
         }
+    }
+    $baseArgs = New-G99BaseMeasureArgs "static"
+    if (@($baseArgs | Where-Object { $_ -eq "-ComposePrefillMassOpenRouter" }).Count -ne 1 -or
+        @($baseArgs | Where-Object { $_ -eq "-ComposePrefillMassReserveSlots" }).Count -ne 1 -or
+        @($baseArgs | Where-Object { $_ -eq "-Iq1Promotion" }).Count -ne 0) {
+        throw "G99 static arm shape mismatch: baseline must be open-router reserve without promotion"
     }
 }
 
@@ -214,6 +225,8 @@ function New-G99BaseMeasureArgs([string]$Tag) {
         "-ReapPrefetchThreads", "8",
         "-PrefillMassWrap",
         "-ComposePrefillMassTiering",
+        "-ComposePrefillMassOpenRouter",
+        "-ComposePrefillMassReserveSlots", "$PromotionSlots",
         "-ExpertCacheN", "320",
         "-ExpertCacheReserveGB", "0.125",
         "-ExpertCachePolicy", "lru",
@@ -314,7 +327,9 @@ function Assert-G99ArmResult {
         "iq1_promotion_2bit_ssd_seconds",
         "iq1_promotion_2bit_ssd_bytes_per_second",
         "route_packed_copy_requested", "route_packed_copy_observed",
-        "route_packed_copy_bytes", "route_packed_copy_legacy_submissions")) {
+        "route_packed_copy_bytes", "route_packed_copy_legacy_submissions",
+        "compose_prefill_mass_open_router_requested",
+        "compose_prefill_mass_reserve_slots_requested")) {
         Assert-G99Property -Object $Result -Name $name -Context $Arm
     }
 
@@ -348,6 +363,9 @@ function Assert-G99ArmResult {
         [bool]$Result.prefill_mass_observe_requested -or
         -not [bool]$Result.prefill_mass_wrap_requested -or
         -not [bool]$Result.compose_prefill_mass_tiering_requested -or
+        -not [bool]$Result.compose_prefill_mass_open_router_requested -or
+        [int]$Result.compose_prefill_mass_reserve_slots_requested -ne
+            $PromotionSlots -or
         [int]$Result.expert_cache_requested -ne 320 -or
         [double]$Result.expert_cache_reserve_gb -ne 0.125 -or
         [string]$Result.expert_cache_policy -ne "lru" -or
@@ -378,6 +396,10 @@ function Assert-G99ArmResult {
             [UInt64]$Result.iq1_s_sidecar_selected_loads -or
         [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_FIRST -ne 3 -or
         [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_LAST -ne 42 -or
+        [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_ROUTER -ne
+            "open" -or
+        [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS -ne
+            ([string]$PromotionSlots) -or
         [double]$Result.iq1_s_ram_cache_requested_gib -ne $Iq1CacheGiB -or
         -not [bool]$Result.iq1_s_ram_cache_runtime_observed -or
         [UInt64]$Result.iq1_s_ram_cache_failures -ne 0 -or
@@ -394,6 +416,16 @@ function Assert-G99ArmResult {
         $plannerCalls -ne $mixedCalls -or
         [UInt64]$Result.iq1_s_mixed_gpu_plan_failures -ne 0) {
         throw "G99 common mixed-IQ1/G95 quality contract mismatch: arm=$Arm"
+    }
+    if ($Result.PSObject.Properties["expert_tiering"]) {
+        $tier = $Result.expert_tiering
+        if ([UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
+            [UInt64]$tier.cold_to_vram -ne 0 -or
+            [UInt64]$tier.failures -ne 0 -or
+            [UInt64]$tier.snapshot_backing_entries -ne
+                [UInt64]$Result.prefill_mass_wrap_candidate_entries) {
+            throw "G99 open-router tier contract mismatch: arm=$Arm"
+        }
     }
 
     foreach ($sample in @($Result.results)) {
@@ -426,6 +458,9 @@ function Assert-G99ArmResult {
             [UInt64]$Result.iq1_promotion_cold_observed -le 0 -or
             [UInt64]$Result.iq1_promotion_cold_to_2bit_ram -le 0 -or
             [UInt64]$Result.iq1_promotion_2bit_ssd_bytes -le 0 -or
+            [UInt64]$Result.iq1_promotion_snapshot_evictions -ne 0 -or
+            [string]$Result.effective_ds4_environment.DS4_IQ1_PROMOTION_PROBATION_SLOTS -ne
+                ([string]$PromotionSlots) -or
             [double]::IsNaN([double]$Result.iq1_promotion_2bit_ssd_seconds) -or
             [double]::IsInfinity([double]$Result.iq1_promotion_2bit_ssd_seconds) -or
             [double]$Result.iq1_promotion_2bit_ssd_seconds -le 0.0 -or
@@ -436,17 +471,18 @@ function Assert-G99ArmResult {
         }
         if ($Result.PSObject.Properties["expert_tiering"]) {
             $tier = $Result.expert_tiering
-            if ([UInt64]$tier.snapshot_backing_misses -ne 0 -or
-                [UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
+            if ([UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
                 [UInt64]$tier.cold_to_vram -ne 0 -or
-                [UInt64]$tier.failures -ne 0) {
+                [UInt64]$tier.failures -ne 0 -or
+                [UInt64]$tier.snapshot_backing_entries -ne
+                    [UInt64]$Result.prefill_mass_wrap_candidate_entries) {
                 throw "G99 candidate promotion tier fail-closed contract mismatch"
             }
         }
         foreach ($row in @($Result.iq1_promotion_requests)) {
             if ([UInt64]$row.requested_slots -ne [UInt64]$PromotionSlots -or
                 [UInt64]$row.reserved_slots -ne [UInt64]$PromotionSlots -or
-                [UInt64]$row.snapshot_evictions -ne [UInt64]$PromotionSlots -or
+                [UInt64]$row.snapshot_evictions -ne 0 -or
                 [UInt64]$row.cold_observed -le 0 -or
                 ([UInt64]$row.cold_existing_2bit +
                     [UInt64]$row.cold_to_2bit_ram) -le 0 -or
@@ -786,6 +822,8 @@ $summary = [ordered]@{
         prefill_mass_explicit_observe = $false
         prefill_mass_wrap = $true
         compose_prefill_mass_tiering = $true
+        compose_prefill_mass_open_router = $true
+        compose_prefill_mass_reserve_slots = $PromotionSlots
         expert_cache_n = 320
         expert_cache_reserve_gb = 0.125
         expert_cache_policy = "lru"

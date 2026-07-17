@@ -39,6 +39,8 @@ param(
     [switch]$PrefillMassObserve,
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
+    [switch]$ComposePrefillMassOpenRouter,
+    [ValidateRange(0, 512)][int]$ComposePrefillMassReserveSlots = 0,
     [ValidateRange(0, 40)][int]$PrefillMassLayerFullEvery = 0,
     [ValidateRange(0, 39)][int]$PrefillMassLayerFullPhase = 0,
     [ValidateRange(0, 32)][int]$PrefillVramSeedPerLayer = 0,
@@ -331,6 +333,14 @@ if ($Iq1Promotion) {
     if (-not $ComposePrefillMassTiering) { throw "Iq1Promotion requires ComposePrefillMassTiering" }
     if ($ExpertTiering -ne "enforce") { throw "Iq1Promotion requires ExpertTiering enforce" }
 }
+if ($ComposePrefillMassOpenRouter) {
+    if (-not $ComposePrefillMassTiering) { throw "ComposePrefillMassOpenRouter requires ComposePrefillMassTiering" }
+    if (-not $PrefillMassWrap) { throw "ComposePrefillMassOpenRouter requires PrefillMassWrap" }
+    if (-not $Iq1Promotion -and $ComposePrefillMassReserveSlots -le 0) { throw "ComposePrefillMassOpenRouter requires Iq1Promotion or ComposePrefillMassReserveSlots > 0" }
+}
+if ($ComposePrefillMassReserveSlots -gt 0 -and -not $ComposePrefillMassOpenRouter) {
+    throw "ComposePrefillMassReserveSlots requires ComposePrefillMassOpenRouter"
+}
 if ($Iq1SRamCacheGiB -gt 0.0 -and -not $Iq1SExpertSidecar) {
     throw "Iq1SRamCacheGiB requires Iq1SExpertSidecar"
 }
@@ -620,6 +630,16 @@ if ($ComposePrefillMassTiering) {
     $env:DS4_CUDA_PREFILL_TIER_COMPOSE = "1"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_TIER_COMPOSE -ErrorAction SilentlyContinue
+}
+if ($ComposePrefillMassOpenRouter) {
+    $env:DS4_CUDA_PREFILL_TIER_ROUTER = "open"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_TIER_ROUTER -ErrorAction SilentlyContinue
+}
+if ($ComposePrefillMassReserveSlots -gt 0) {
+    $env:DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS = "$ComposePrefillMassReserveSlots"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS -ErrorAction SilentlyContinue
 }
 if ($PrefillMassLayerFullEvery -gt 0) {
     $env:DS4_CUDA_PREFILL_MASS_LAYER_FULL_EVERY = "$PrefillMassLayerFullEvery"
@@ -1566,6 +1586,7 @@ $expertTieringStatesSsd = 0; $expertTieringStatesProbation = 0
 $expertTieringStatesWarm = 0; $expertTieringStatesVram = 0
 $expertTieringMassSum = 0.0; $expertTieringLfruTop = 0.0
 $expertTieringComposeObserved = $false; $expertTieringComposeFlag = 0
+$expertTieringComposeRouterOpen = 0
 $expertTieringSnapshotGeneration = 0; $expertTieringSnapshotBackingEntries = 0
 $expertTieringSnapshotBackingHits = 0; $expertTieringSnapshotBackingMisses = 0
 $expertTieringSnapshotToVramBytes = 0; $expertTieringForbiddenColdSsdToVram = 0
@@ -1639,7 +1660,7 @@ $prefillMassComposeSparseSkippedRanked = 0
 $prefillMassComposeMaskObserved = $false; $prefillMassComposeMaskEventCount = 0
 $prefillMassComposeMaskFailedCount = 0; $prefillMassComposeMaskBase = "not_observed"
 $prefillMassComposeMaskExistingLayers = 0; $prefillMassComposeMaskAppliedCount = 0
-$prefillMassComposeMaskRestoreCount = 0
+$prefillMassComposeMaskRestoreCount = 0; $prefillMassComposeMaskSemantics = "not_observed"
 $prefillMassLayerStripeObserved = $false; $prefillMassLayerStripeEventCount = 0
 $prefillMassLayerStripeFailedCount = 0; $prefillMassLayerStripeResult = "not_observed"
 $prefillMassLayerStripeReason = "not_observed"; $prefillMassLayerStripeStride = 0
@@ -1992,7 +2013,7 @@ if (Test-Path $stderrLog) {
         $expertTieringFinalLine = $expertTieringFinalLines | Select-Object -Last 1
         $numberPattern = "([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
         $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
-        $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
+        $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) compose_router_open=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
         if ($expertTieringFinalLine -match " adaptive_budget=") {
             $expertTieringFields = @{}
             foreach ($fieldMatch in [regex]::Matches($expertTieringFinalLine, " ([a-z0-9_]+)=([^ ]+)")) {
@@ -2021,7 +2042,7 @@ if (Test-Path $stderrLog) {
             }
             if ($expertTieringFields.ContainsKey("compose_prefill_mass_tiering")) {
                 foreach ($requiredExpertTieringField in @(
-                    "snapshot_generation", "snapshot_backing_entries",
+                    "compose_router_open", "snapshot_generation", "snapshot_backing_entries",
                     "snapshot_backing_hits", "snapshot_backing_misses",
                     "snapshot_to_vram_bytes", "forbidden_cold_ssd_to_vram"
                 )) {
@@ -2031,6 +2052,7 @@ if (Test-Path $stderrLog) {
                 }
                 $expertTieringComposeObserved = $true
                 $expertTieringComposeFlag = [uint32]$expertTieringFields["compose_prefill_mass_tiering"]
+                $expertTieringComposeRouterOpen = [uint32]$expertTieringFields["compose_router_open"]
                 $expertTieringSnapshotGeneration = [uint64]$expertTieringFields["snapshot_generation"]
                 $expertTieringSnapshotBackingEntries = [uint32]$expertTieringFields["snapshot_backing_entries"]
                 $expertTieringSnapshotBackingHits = [uint64]$expertTieringFields["snapshot_backing_hits"]
@@ -2082,33 +2104,34 @@ if (Test-Path $stderrLog) {
             $expertTieringModeObserved = $Matches[1]
             $expertTieringPolicyObserved = $Matches[2]
             $expertTieringComposeFlag = [uint32]$Matches[3]
-            $expertTieringSnapshotGeneration = [uint64]$Matches[4]
-            $expertTieringSnapshotBackingEntries = [uint32]$Matches[5]
-            $expertTieringSnapshotBackingHits = [uint64]$Matches[6]
-            $expertTieringSnapshotBackingMisses = [uint64]$Matches[7]
-            $expertTieringSnapshotToVramBytes = [uint64]$Matches[8]
-            $expertTieringForbiddenColdSsdToVram = [uint64]$Matches[9]
-            $expertTieringClockCalls = [uint32]$Matches[10]; $expertTieringReplacementBudget = [uint32]$Matches[11]
-            $expertTieringMinFrequency = [uint32]$Matches[12]
-            $expertTieringHysteresis = [double]::Parse($Matches[13], [Globalization.CultureInfo]::InvariantCulture)
-            $expertTieringCalls = [uint64]$Matches[14]; $expertTieringSelected = [uint64]$Matches[15]
-            $expertTieringCold = [uint64]$Matches[16]; $expertTieringRamHits = [uint64]$Matches[17]
-            $expertTieringVramHits = [uint64]$Matches[18]; $expertTieringColdToRam = [uint64]$Matches[19]
-            $expertTieringColdToVram = [uint64]$Matches[20]; $expertTieringRamToWarm = [uint64]$Matches[21]
-            $expertTieringVramPromotions = [uint64]$Matches[22]; $expertTieringVramDemotions = [uint64]$Matches[23]
-            $expertTieringRamEvictions = [uint64]$Matches[24]; $expertTieringRamAdmitSkips = [uint64]$Matches[25]
-            $expertTieringTransient = [uint64]$Matches[26]; $expertTieringFailures = [uint64]$Matches[27]
-            $expertTieringSsdBytes = [uint64]$Matches[28]; $expertTieringRamH2DBytes = [uint64]$Matches[29]
-            $expertTieringPolicyEpochs = [uint64]$Matches[30]
-            $expertTieringPolicyFreePromotions = [uint64]$Matches[31]
-            $expertTieringPolicyReplacements = [uint64]$Matches[32]
-            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[33]
-            $expertTieringPolicyBudgetSkips = [uint64]$Matches[34]
-            $expertTieringPolicyScoreSkips = [uint64]$Matches[35]
-            $expertTieringStatesSsd = [uint32]$Matches[36]; $expertTieringStatesProbation = [uint32]$Matches[37]
-            $expertTieringStatesWarm = [uint32]$Matches[38]; $expertTieringStatesVram = [uint32]$Matches[39]
-            $expertTieringMassSum = [double]::Parse($Matches[40], [Globalization.CultureInfo]::InvariantCulture)
-            $expertTieringLfruTop = [double]::Parse($Matches[41], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringComposeRouterOpen = [uint32]$Matches[4]
+            $expertTieringSnapshotGeneration = [uint64]$Matches[5]
+            $expertTieringSnapshotBackingEntries = [uint32]$Matches[6]
+            $expertTieringSnapshotBackingHits = [uint64]$Matches[7]
+            $expertTieringSnapshotBackingMisses = [uint64]$Matches[8]
+            $expertTieringSnapshotToVramBytes = [uint64]$Matches[9]
+            $expertTieringForbiddenColdSsdToVram = [uint64]$Matches[10]
+            $expertTieringClockCalls = [uint32]$Matches[11]; $expertTieringReplacementBudget = [uint32]$Matches[12]
+            $expertTieringMinFrequency = [uint32]$Matches[13]
+            $expertTieringHysteresis = [double]::Parse($Matches[14], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringCalls = [uint64]$Matches[15]; $expertTieringSelected = [uint64]$Matches[16]
+            $expertTieringCold = [uint64]$Matches[17]; $expertTieringRamHits = [uint64]$Matches[18]
+            $expertTieringVramHits = [uint64]$Matches[19]; $expertTieringColdToRam = [uint64]$Matches[20]
+            $expertTieringColdToVram = [uint64]$Matches[21]; $expertTieringRamToWarm = [uint64]$Matches[22]
+            $expertTieringVramPromotions = [uint64]$Matches[23]; $expertTieringVramDemotions = [uint64]$Matches[24]
+            $expertTieringRamEvictions = [uint64]$Matches[25]; $expertTieringRamAdmitSkips = [uint64]$Matches[26]
+            $expertTieringTransient = [uint64]$Matches[27]; $expertTieringFailures = [uint64]$Matches[28]
+            $expertTieringSsdBytes = [uint64]$Matches[29]; $expertTieringRamH2DBytes = [uint64]$Matches[30]
+            $expertTieringPolicyEpochs = [uint64]$Matches[31]
+            $expertTieringPolicyFreePromotions = [uint64]$Matches[32]
+            $expertTieringPolicyReplacements = [uint64]$Matches[33]
+            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[34]
+            $expertTieringPolicyBudgetSkips = [uint64]$Matches[35]
+            $expertTieringPolicyScoreSkips = [uint64]$Matches[36]
+            $expertTieringStatesSsd = [uint32]$Matches[37]; $expertTieringStatesProbation = [uint32]$Matches[38]
+            $expertTieringStatesWarm = [uint32]$Matches[39]; $expertTieringStatesVram = [uint32]$Matches[40]
+            $expertTieringMassSum = [double]::Parse($Matches[41], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringLfruTop = [double]::Parse($Matches[42], [Globalization.CultureInfo]::InvariantCulture)
         } elseif ($expertTieringFinalLine -notmatch $expertTieringFinalPattern) {
             throw "Expert tiering measurement failed: final line format mismatch"
         } else {
@@ -2391,10 +2414,19 @@ if (Test-Path $stderrLog) {
     $prefillMassComposeMaskAppliedLines = @($prefillMassComposeMaskLines | Where-Object { $_ -match "result=applied" })
     $prefillMassComposeMaskAppliedCount = $prefillMassComposeMaskAppliedLines.Count
     $prefillMassComposeMaskAppliedLine = $prefillMassComposeMaskAppliedLines | Select-Object -Last 1
-    if ($prefillMassComposeMaskAppliedLine -and $prefillMassComposeMaskAppliedLine -match "base=([a-z-]+) existing_layers=(\d+)") {
-        $prefillMassComposeMaskObserved = $true
-        $prefillMassComposeMaskBase = $Matches[1]
-        $prefillMassComposeMaskExistingLayers = [int]$Matches[2]
+    if ($prefillMassComposeMaskAppliedLine) {
+        $hasMaskBase = $prefillMassComposeMaskAppliedLine -match "base=([a-z-]+)"
+        if ($hasMaskBase) { $prefillMassComposeMaskBase = $Matches[1] }
+        $hasExistingLayers = $prefillMassComposeMaskAppliedLine -match "existing_layers=(\d+)"
+        if ($hasExistingLayers) {
+            $prefillMassComposeMaskExistingLayers = [int]$Matches[1]
+        }
+        if ($prefillMassComposeMaskAppliedLine -match "semantics=([a-z-]+)") {
+            $prefillMassComposeMaskSemantics = $Matches[1]
+        } else {
+            $prefillMassComposeMaskSemantics = "request-scoped-closed"
+        }
+        $prefillMassComposeMaskObserved = $hasMaskBase -and $hasExistingLayers
     }
     $prefillMassComposeMaskRestoreCount = @($prefillMassComposeMaskLines | Where-Object { $_ -match "result=restored" }).Count
     $prefillMassLayerStripeLines = @($lines | Where-Object { $_ -match "\[prefill-mass-layer-stripe\] result=" })
@@ -3015,6 +3047,7 @@ $iq1PromotionRows = @()
 $iq1PromotionRequestedSlots = [UInt64]0
 $iq1PromotionReservedSlots = [UInt64]0
 $iq1PromotionSnapshotEvictions = [UInt64]0
+$iq1PromotionReserveStrategies = @()
 $iq1PromotionColdObserved = [UInt64]0
 $iq1PromotionColdExisting2Bit = [UInt64]0
 $iq1PromotionColdTo2BitRam = [UInt64]0
@@ -3024,6 +3057,7 @@ $iq1Promotion2BitSsdBytes = [UInt64]0
 $iq1Promotion2BitSsdSeconds = 0.0
 $iq1Promotion2BitSsdBytesPerSecond = 0.0
 $iq1PromotionDirectSsdToVramRejected = [UInt64]0
+$iq1PromotionProbationBackingReclaims = [UInt64]0
 $iq1PromotionFailures = [UInt64]0
 $iq1MixedSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
@@ -3083,7 +3117,7 @@ if ($Iq1SMixedGpuPlan) {
 
 $iq1PromotionMatches = [regex]::Matches(
     $iq1SSidecarLogText,
-    '(?m)^(?:ds4: )?\[iq1-promotion\] final requested_slots=(\d+) reserved_slots=(\d+) snapshot_evictions=(\d+) cold_observed=(\d+) cold_existing_2bit=(\d+) cold_to_2bit_ram=(\d+) probation_ram_hits=(\d+) next_token_waits=(\d+) promotion_2bit_ssd_bytes=(\d+) promotion_2bit_ssd_seconds=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) direct_ssd_to_vram_rejected=(\d+) failures=(\d+)$')
+    '(?m)^(?:ds4: )?\[iq1-promotion\] final requested_slots=(\d+) reserved_slots=(\d+)(?: strategy=([a-z0-9-]+))? snapshot_evictions=(\d+) cold_observed=(\d+) cold_existing_2bit=(\d+) cold_to_2bit_ram=(\d+) probation_ram_hits=(\d+) next_token_waits=(\d+) promotion_2bit_ssd_bytes=(\d+) promotion_2bit_ssd_seconds=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) direct_ssd_to_vram_rejected=(\d+) probation_backing_reclaims=(\d+) failures=(\d+)\r?$')
 $iq1PromotionLineCount = $iq1PromotionMatches.Count
 if ($Iq1Promotion) {
     if ($iq1PromotionLineCount -ne $requestCountExpected) {
@@ -3097,27 +3131,31 @@ if ($Iq1Promotion) {
             warmup = [bool]($Warmup -and $iq1PromotionIndex -eq 0)
             requested_slots = [UInt64]$iq1PromotionMatch.Groups[1].Value
             reserved_slots = [UInt64]$iq1PromotionMatch.Groups[2].Value
-            snapshot_evictions = [UInt64]$iq1PromotionMatch.Groups[3].Value
-            cold_observed = [UInt64]$iq1PromotionMatch.Groups[4].Value
-            cold_existing_2bit = [UInt64]$iq1PromotionMatch.Groups[5].Value
-            cold_to_2bit_ram = [UInt64]$iq1PromotionMatch.Groups[6].Value
-            probation_ram_hits = [UInt64]$iq1PromotionMatch.Groups[7].Value
-            next_token_waits = [UInt64]$iq1PromotionMatch.Groups[8].Value
-            promotion_2bit_ssd_bytes = [UInt64]$iq1PromotionMatch.Groups[9].Value
+            reserve_strategy = $(if ($iq1PromotionMatch.Groups[3].Success) { $iq1PromotionMatch.Groups[3].Value } else { "snapshot-evict" })
+            snapshot_evictions = [UInt64]$iq1PromotionMatch.Groups[4].Value
+            cold_observed = [UInt64]$iq1PromotionMatch.Groups[5].Value
+            cold_existing_2bit = [UInt64]$iq1PromotionMatch.Groups[6].Value
+            cold_to_2bit_ram = [UInt64]$iq1PromotionMatch.Groups[7].Value
+            probation_ram_hits = [UInt64]$iq1PromotionMatch.Groups[8].Value
+            next_token_waits = [UInt64]$iq1PromotionMatch.Groups[9].Value
+            promotion_2bit_ssd_bytes = [UInt64]$iq1PromotionMatch.Groups[10].Value
             promotion_2bit_ssd_seconds = [double]::Parse(
-                $iq1PromotionMatch.Groups[10].Value,
+                $iq1PromotionMatch.Groups[11].Value,
                 [Globalization.CultureInfo]::InvariantCulture)
-            direct_ssd_to_vram_rejected = [UInt64]$iq1PromotionMatch.Groups[11].Value
-            failures = [UInt64]$iq1PromotionMatch.Groups[12].Value
+            direct_ssd_to_vram_rejected = [UInt64]$iq1PromotionMatch.Groups[12].Value
+            probation_backing_reclaims = [UInt64]$iq1PromotionMatch.Groups[13].Value
+            failures = [UInt64]$iq1PromotionMatch.Groups[14].Value
         }
         if ([double]::IsNaN($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
             [double]::IsInfinity($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
             $iq1PromotionRow.promotion_2bit_ssd_seconds -lt 0.0) {
             throw "IQ1 promotion SSD seconds are invalid at request $($iq1PromotionIndex + 1)"
         }
+        $expectedPromotionSnapshotEvictions = if ($ComposePrefillMassOpenRouter) { [UInt64]0 } else { [UInt64]$Iq1PromotionProbationSlots }
         if ($iq1PromotionRow.requested_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
             $iq1PromotionRow.reserved_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
-            $iq1PromotionRow.snapshot_evictions -ne [UInt64]$Iq1PromotionProbationSlots -or
+            ($ComposePrefillMassOpenRouter -and $iq1PromotionRow.reserve_strategy -ne "pre-reserved-open-router") -or
+            $iq1PromotionRow.snapshot_evictions -ne $expectedPromotionSnapshotEvictions -or
             $iq1PromotionRow.cold_observed -le 0 -or
             ($iq1PromotionRow.cold_to_2bit_ram + $iq1PromotionRow.cold_existing_2bit) -le 0 -or
             $iq1PromotionRow.direct_ssd_to_vram_rejected -ne 0 -or
@@ -3128,6 +3166,7 @@ if ($Iq1Promotion) {
         $iq1PromotionRequestedSlots += $iq1PromotionRow.requested_slots
         $iq1PromotionReservedSlots += $iq1PromotionRow.reserved_slots
         $iq1PromotionSnapshotEvictions += $iq1PromotionRow.snapshot_evictions
+        $iq1PromotionReserveStrategies += $iq1PromotionRow.reserve_strategy
         $iq1PromotionColdObserved += $iq1PromotionRow.cold_observed
         $iq1PromotionColdExisting2Bit += $iq1PromotionRow.cold_existing_2bit
         $iq1PromotionColdTo2BitRam += $iq1PromotionRow.cold_to_2bit_ram
@@ -3136,6 +3175,7 @@ if ($Iq1Promotion) {
         $iq1Promotion2BitSsdBytes += $iq1PromotionRow.promotion_2bit_ssd_bytes
         $iq1Promotion2BitSsdSeconds += $iq1PromotionRow.promotion_2bit_ssd_seconds
         $iq1PromotionDirectSsdToVramRejected += $iq1PromotionRow.direct_ssd_to_vram_rejected
+        $iq1PromotionProbationBackingReclaims += $iq1PromotionRow.probation_backing_reclaims
         $iq1PromotionFailures += $iq1PromotionRow.failures
     }
     if ($iq1Promotion2BitSsdSeconds -gt 0.0) {
@@ -3280,6 +3320,7 @@ if ($ExpertTiering -eq "off") {
             }
             foreach ($requiredTierField in @(
                     "compose_prefill_mass_tiering", "snapshot_generation",
+                    "compose_router_open",
                     "snapshot_backing_entries", "snapshot_backing_hits",
                     "snapshot_backing_misses", "snapshot_to_vram_bytes",
                     "forbidden_cold_ssd_to_vram", "cold_to_vram",
@@ -3291,7 +3332,7 @@ if ($ExpertTiering -eq "off") {
             $matchingWrap = $prefillMassWrapParsedEvents[$tierLineIndex]
             $matchingPromotion = if ($Iq1Promotion) { $iq1PromotionRows[$tierLineIndex] } else { $null }
             $expectedSnapshotBackingEntries = [uint32]$matchingWrap.candidate
-            if ($Iq1Promotion) {
+            if ($Iq1Promotion -and -not $ComposePrefillMassOpenRouter) {
                 if ([UInt64]$matchingPromotion.reserved_slots -gt [UInt64]$matchingWrap.candidate) {
                     throw "Expert tiering compose failed: IQ1 promotion reserved more slots than the candidate snapshot at request $($tierLineIndex + 1)"
                 }
@@ -3299,15 +3340,16 @@ if ($ExpertTiering -eq "off") {
                     [uint32]([UInt64]$matchingWrap.candidate - [UInt64]$matchingPromotion.reserved_slots)
             }
             if ([uint32]$tierFields["compose_prefill_mass_tiering"] -ne 1 -or
+                [uint32]$tierFields["compose_router_open"] -ne $(if ($ComposePrefillMassOpenRouter) { 1 } else { 0 }) -or
                 [uint64]$tierFields["snapshot_generation"] -ne [uint64]$matchingWrap.generation -or
                 [uint32]$tierFields["snapshot_backing_entries"] -ne $expectedSnapshotBackingEntries -or
                 [uint64]$tierFields["snapshot_backing_hits"] -le 0 -or
-                [uint64]$tierFields["snapshot_backing_misses"] -ne 0 -or
+                (-not $ComposePrefillMassOpenRouter -and [uint64]$tierFields["snapshot_backing_misses"] -ne 0) -or
                 [uint64]$tierFields["snapshot_to_vram_bytes"] -le 0 -or
                 [uint64]$tierFields["forbidden_cold_ssd_to_vram"] -ne 0 -or
                 [uint64]$tierFields["cold_to_vram"] -ne 0 -or
                 [uint64]$tierFields["failures"] -ne 0 -or
-                [uint64]$tierFields["ssd_bytes"] -ne 0) {
+                (-not $ComposePrefillMassOpenRouter -and [uint64]$tierFields["ssd_bytes"] -ne 0)) {
                 throw "Expert tiering compose failed: per-request final counters are inconsistent at request $($tierLineIndex + 1)"
             }
             foreach ($aggregateField in @($tierAggregate.Keys)) {
@@ -3360,16 +3402,22 @@ if ($ExpertTiering -eq "off") {
         $expertTieringMassSum = $tierMassSumAggregate
         $expertTieringLfruTop = $tierLfruTopMaximum
         if (-not $expertTieringComposeObserved -or $expertTieringComposeFlag -ne 1) { throw "Expert tiering compose failed: final compose flag was not observed" }
+        if ($expertTieringComposeRouterOpen -ne $(if ($ComposePrefillMassOpenRouter) { 1 } else { 0 })) { throw "Expert tiering compose failed: compose_router_open flag mismatch" }
         if ($expertTieringSnapshotGeneration -le 0 -or $expertTieringSnapshotBackingEntries -le 0) { throw "Expert tiering compose failed: snapshot backing was empty" }
         if ($expertTieringSnapshotBackingHits -le 0) { throw "Expert tiering compose failed: snapshot backing was not used" }
-        if ($expertTieringSnapshotBackingMisses -ne 0) { throw "Expert tiering compose failed: decode requested an expert outside the closed snapshot" }
+        if (-not $ComposePrefillMassOpenRouter -and $expertTieringSnapshotBackingMisses -ne 0) { throw "Expert tiering compose failed: decode requested an expert outside the closed snapshot" }
         if ($expertTieringSnapshotToVramBytes -le 0) { throw "Expert tiering compose failed: snapshot backing produced no H2D traffic" }
         if ($expertTieringForbiddenColdSsdToVram -ne 0) { throw "Expert tiering compose failed: cold SSD to VRAM violation observed" }
-        if ($expertTieringColdToRam -ne 0 -or $expertTieringSsdBytes -ne 0) { throw "Expert tiering compose failed: decode touched cold SSD backing" }
+        if (-not $ComposePrefillMassOpenRouter -and ($expertTieringColdToRam -ne 0 -or $expertTieringSsdBytes -ne 0)) { throw "Expert tiering compose failed: decode touched cold SSD backing" }
         if ($expertTieringColdToVram -ne 0) { throw "Expert tiering compose failed: cold_to_vram must remain zero" }
         if ($expertTieringFailures -ne 0) { throw "Expert tiering compose failed: runtime failures observed" }
         if ($prefillMassWrapGeneration -le 0 -or $expertTieringSnapshotGeneration -ne $prefillMassWrapGeneration) { throw "Expert tiering compose failed: snapshot generation differs from prefill publish" }
-        if ($Iq1Promotion) {
+        if ($ComposePrefillMassOpenRouter) {
+            if ($expertTieringSnapshotBackingEntries -ne $prefillMassWrapResidentAfter -or
+                $expertTieringSnapshotBackingEntries -ne $prefillMassWrapCandidate) {
+                throw "Expert tiering compose failed: open snapshot backing differs from prefill publication"
+            }
+        } elseif ($Iq1Promotion) {
             if ([UInt64]$iq1PromotionReservedSlots -gt
                 [UInt64]$prefillMassWrapCandidate) {
                 throw "Expert tiering compose failed: aggregate IQ1 promotion slots exceed published candidates"
@@ -3424,7 +3472,12 @@ if ($ExpertTiering -eq "off") {
     if ($iq1MixedPrimaryColdAvoided -gt $expertTieringExpectedSelected) {
         throw "Expert tiering measurement failed: IQ1_S exclusions exceed routed population"
     }
-    $expertTieringExpectedSelected -= $iq1MixedPrimaryColdAvoided
+    # Without promotion, the IQ1 cold lane bypasses primary-model tiering.
+    # Promotion observes that lane while staging its exact IQ2 backing, so it
+    # is already present in expertTieringSelected and must not be subtracted.
+    if (-not $Iq1Promotion) {
+        $expertTieringExpectedSelected -= $iq1MixedPrimaryColdAvoided
+    }
     if ($expertTieringSelected -ne $expertTieringExpectedSelected) {
         throw "Expert tiering measurement failed: selected count does not match primary-model routes"
     }
@@ -3580,7 +3633,7 @@ if ($PrefillMassWrap) {
             $wrapEvent.snapshot_after -le $wrapEvent.snapshot_before -or
             $wrapEvent.generation -ne $wrapEvent.snapshot_after -or
             $wrapEvent.preloaded -ne 0 -or $wrapEvent.router -ne "unbiased" -or
-            $wrapEvent.mask -ne $(if ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" })) {
+            $wrapEvent.mask -ne $(if ($ComposePrefillMassOpenRouter) { "request-scoped-open" } elseif ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" })) {
             throw "Prefill mass WRAP failed: malformed publication at request $($wrapIndex + 1)"
         }
         if ($null -eq $previousWrap) {
@@ -3606,7 +3659,7 @@ if ($PrefillMassWrap) {
         $prefillMassWrapResidentAfter -ne $prefillMassCandidate) {
         throw "Prefill mass WRAP failed: candidate/load/resident counts differ"
     }
-    $expectedPrefillMassMask = if ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" }
+    $expectedPrefillMassMask = if ($ComposePrefillMassOpenRouter) { "request-scoped-open" } elseif ($ComposePrefillMassTiering) { "request-scoped-closed" } else { "off" }
     if ($prefillMassWrapPreloaded -ne 0 -or $prefillMassWrapRouter -ne "unbiased" -or $prefillMassWrapMask -ne $expectedPrefillMassMask) {
         throw "Prefill mass WRAP failed: isolation telemetry differs"
     }
@@ -3616,14 +3669,29 @@ if ($PrefillMassWrap) {
             -not $prefillMassComposeObserved) {
             throw "Prefill mass compose failed: expected $requestCountExpected hash seed events, observed $prefillMassComposeEventCount/$prefillMassComposeParsedCount"
         }
+        $expectedComposeMaskRestoreCount = if ($ComposePrefillMassOpenRouter) { 0 } else { $requestCountExpected }
+        $expectedComposeMaskEventCount = if ($ComposePrefillMassOpenRouter) { $requestCountExpected } else { (2 * $requestCountExpected) }
+        $expectedComposeMaskSemantics = if ($ComposePrefillMassOpenRouter) { "request-scoped-open" } else { "request-scoped-closed" }
         if ($prefillMassComposeMaskFailedCount -ne 0 -or
             $prefillMassComposeMaskAppliedCount -ne $requestCountExpected -or
-            $prefillMassComposeMaskRestoreCount -ne $requestCountExpected -or
-            $prefillMassComposeMaskEventCount -ne (2 * $requestCountExpected)) {
+            $prefillMassComposeMaskRestoreCount -ne $expectedComposeMaskRestoreCount -or
+            $prefillMassComposeMaskEventCount -ne $expectedComposeMaskEventCount -or
+            $prefillMassComposeMaskSemantics -ne $expectedComposeMaskSemantics) {
             throw "Prefill mass compose failed: mask lifecycle mismatch applied=$prefillMassComposeMaskAppliedCount restored=$prefillMassComposeMaskRestoreCount failed=$prefillMassComposeMaskFailedCount events=$prefillMassComposeMaskEventCount"
         }
         if ($prefillMassComposeHashLayers -ne 3 -or $prefillMassComposeHashSeedEntries -ne (3 * 256)) { throw "Prefill mass compose failed: hash-routed layer seed differs" }
-        if ($prefillMassComposeTotalCandidate -ne $prefillMassCandidate -or $prefillMassComposeCapacity -ne $prefillMassCapacity) { throw "Prefill mass compose failed: candidate/capacity telemetry differs" }
+        $expectedComposeCapacity = $prefillMassCapacity
+        if ($ComposePrefillMassOpenRouter) {
+            if ($prefillMassCapacity -lt $ComposePrefillMassReserveSlots) {
+                throw "Prefill mass compose failed: reserved slots exceed arena capacity"
+            }
+            $expectedComposeCapacity =
+                $prefillMassCapacity - $ComposePrefillMassReserveSlots
+        }
+        if ($prefillMassComposeTotalCandidate -ne $prefillMassCandidate -or
+            $prefillMassComposeCapacity -ne $expectedComposeCapacity) {
+            throw "Prefill mass compose failed: candidate/capacity telemetry differs"
+        }
         if ($prefillMassComposeRankedEntries + $prefillMassComposeHashSeedEntries -ne $prefillMassComposeTotalCandidate) { throw "Prefill mass compose failed: ranked/hash candidate accounting differs" }
         if ($prefillMassComposeCandidateFNV1A64 -notmatch '^[0-9a-f]{16}$') { throw "Prefill mass compose failed: candidate fingerprint missing" }
     } elseif ($prefillMassComposeEventCount -ne 0 -or $prefillMassComposeObserved) {
@@ -4046,6 +4114,8 @@ $expertTieringResult = [pscustomobject]@{
     requested_mode = $ExpertTiering
     requested_policy = $ExpertTierPolicy
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
+    compose_prefill_mass_open_router_requested = [bool]$ComposePrefillMassOpenRouter
+    compose_prefill_mass_reserve_slots_requested = $ComposePrefillMassReserveSlots
     prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
     prefill_vram_seed_observed = $prefillVramSeedObserved
     prefill_vram_seed_line_count = $prefillVramSeedLineCount
@@ -4065,11 +4135,13 @@ $expertTieringResult = [pscustomobject]@{
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
     iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
+    iq1_promotion_reserve_strategies = $iq1PromotionReserveStrategies
     iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
     iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
     iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
     compose_prefill_mass_tiering_observed = $expertTieringComposeObserved
     compose_prefill_mass_tiering_flag = $expertTieringComposeFlag
+    compose_router_open = $expertTieringComposeRouterOpen
     snapshot_generation = $expertTieringSnapshotGeneration
     snapshot_backing_entries = $expertTieringSnapshotBackingEntries
     snapshot_backing_hits = $expertTieringSnapshotBackingHits
@@ -4226,6 +4298,7 @@ $rawOutputs = [pscustomobject]@{
     iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
     iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
     iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
+    iq1_promotion_reserve_strategies = $iq1PromotionReserveStrategies
     iq1_promotion_cold_observed = $iq1PromotionColdObserved
     iq1_promotion_cold_existing_2bit = $iq1PromotionColdExisting2Bit
     iq1_promotion_cold_to_2bit_ram = $iq1PromotionColdTo2BitRam
@@ -4235,6 +4308,7 @@ $rawOutputs = [pscustomobject]@{
     iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
     iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
     iq1_promotion_direct_ssd_to_vram_rejected = $iq1PromotionDirectSsdToVramRejected
+    iq1_promotion_probation_backing_reclaims = $iq1PromotionProbationBackingReclaims
     iq1_promotion_failures = $iq1PromotionFailures
     iq1_promotion_requests = $iq1PromotionRows
     iq1_s_profile_requested = [bool]$Iq1SProfile
@@ -4381,6 +4455,7 @@ $summary = [pscustomobject]@{
     iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
     iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
     iq1_promotion_direct_ssd_to_vram_rejected = $iq1PromotionDirectSsdToVramRejected
+    iq1_promotion_probation_backing_reclaims = $iq1PromotionProbationBackingReclaims
     iq1_promotion_failures = $iq1PromotionFailures
     iq1_promotion_requests = $iq1PromotionRows
     iq1_s_profile_requested = [bool]$Iq1SProfile
@@ -4561,6 +4636,8 @@ $summary = [pscustomobject]@{
     prefill_mass_finalize_event_count = $prefillMassFinalizeEventCount
     prefill_mass_decode_event_count = $prefillMassDecodeEventCount
     compose_prefill_mass_tiering_requested = [bool]$ComposePrefillMassTiering
+    compose_prefill_mass_open_router_requested = [bool]$ComposePrefillMassOpenRouter
+    compose_prefill_mass_reserve_slots_requested = $ComposePrefillMassReserveSlots
     prefill_mass_layer_full_every_requested = $PrefillMassLayerFullEvery
     prefill_mass_layer_full_phase_requested = $PrefillMassLayerFullPhase
     prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
@@ -4670,6 +4747,7 @@ $summary = [pscustomobject]@{
     prefill_mass_compose_mask_failed_count = $prefillMassComposeMaskFailedCount
     prefill_mass_compose_mask_base = $prefillMassComposeMaskBase
     prefill_mass_compose_mask_existing_layers = $prefillMassComposeMaskExistingLayers
+    prefill_mass_compose_mask_semantics = $prefillMassComposeMaskSemantics
     prefill_mass_compose_mask_applied_count = $prefillMassComposeMaskAppliedCount
     prefill_mass_compose_mask_restore_count = $prefillMassComposeMaskRestoreCount
     prefill_mass_layer_stripe_observed = $prefillMassLayerStripeObserved
@@ -4704,7 +4782,7 @@ $summary = [pscustomobject]@{
     prefill_mass_decode_slots = $prefillMassDecodeSlots
     prefill_mass_decode_candidate_hits = $prefillMassDecodeHits
     prefill_mass_decode_hit_rate = $prefillMassDecodeHitRate
-    prefill_mass_residency_semantics = $(if ($PrefillMassLayerFullEvery -gt 0) { "budget-preserving per-layer mass profile published transactionally into pinned RAM; periodic routed layers remain full; router unbiased; request-scoped closed mask" } elseif ($PrefillMassWrap) { "ranked prefill candidate published transactionally into pinned RAM; router and mask unchanged" } else { "observe-only; no router, mask, arena publication, or residency changes" })
+    prefill_mass_residency_semantics = $(if ($ComposePrefillMassOpenRouter) { "ranked prefill candidate published transactionally into pinned RAM; router unbiased; request-scoped open mask" } elseif ($PrefillMassLayerFullEvery -gt 0) { "budget-preserving per-layer mass profile published transactionally into pinned RAM; periodic routed layers remain full; router unbiased; request-scoped closed mask" } elseif ($PrefillMassWrap) { "ranked prefill candidate published transactionally into pinned RAM; router and mask unchanged" } else { "observe-only; no router, mask, arena publication, or residency changes" })
     dynamic_arena_observed_window_requested = $DynamicArenaObservedWindow
     dynamic_arena_observed_min_hits_requested = $DynamicArenaObservedMinHits
     dynamic_arena_grow_interval_requested = $DynamicArenaGrowInterval
@@ -5058,7 +5136,7 @@ Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/
 Write-Host ("IQ1_S VRAM cache hit-rate/H2D GiB: " + $(if (($iq1SVramCacheHits + $iq1SVramCacheMisses) -gt 0) { [math]::Round([double]$iq1SVramCacheHits / [double]($iq1SVramCacheHits + $iq1SVramCacheMisses), 4) } else { 0 }) + " / " + [math]::Round($iq1SVramCacheH2dBytes / 1GB, 3))
 Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures: " + $iq1MixedCalls + " / " + $iq1MixedHotMain + " / " + $iq1MixedColdIq1 + " / " + $iq1MixedPrimaryColdAvoided + " / " + $iq1MixedJoins + " / " + $iq1MixedFailures)
 Write-Host ("IQ1_S mixed GPU plan requested/observed/calls/wait-ms/failures: " + [bool]$Iq1SMixedGpuPlan + " / " + $iq1MixedGpuPlanRuntimeObserved + " / " + $iq1MixedGpuPlanCalls + " / " + $iq1MixedGpuPlanWaitMs + " / " + $iq1MixedGpuPlanFailures)
-Write-Host ("IQ1 promotion requested/observed/lines/slots/cold/existing2bit/to2bitram/ssd-GiB/ssd-sec/ssd-Bps/direct-rejected/failures: " + [bool]$Iq1Promotion + " / " + $iq1PromotionRuntimeObserved + " / " + $iq1PromotionLineCount + " / " + $Iq1PromotionProbationSlots + " / " + $iq1PromotionColdObserved + " / " + $iq1PromotionColdExisting2Bit + " / " + $iq1PromotionColdTo2BitRam + " / " + [math]::Round($iq1Promotion2BitSsdBytes / 1GB, 3) + " / " + $iq1Promotion2BitSsdSeconds + " / " + [math]::Round($iq1Promotion2BitSsdBytesPerSecond, 3) + " / " + $iq1PromotionDirectSsdToVramRejected + " / " + $iq1PromotionFailures)
+Write-Host ("IQ1 promotion requested/observed/lines/slots/cold/existing2bit/to2bitram/ssd-GiB/ssd-sec/ssd-Bps/direct-rejected/backing-reclaims/failures: " + [bool]$Iq1Promotion + " / " + $iq1PromotionRuntimeObserved + " / " + $iq1PromotionLineCount + " / " + $Iq1PromotionProbationSlots + " / " + $iq1PromotionColdObserved + " / " + $iq1PromotionColdExisting2Bit + " / " + $iq1PromotionColdTo2BitRam + " / " + [math]::Round($iq1Promotion2BitSsdBytes / 1GB, 3) + " / " + $iq1Promotion2BitSsdSeconds + " / " + [math]::Round($iq1Promotion2BitSsdBytesPerSecond, 3) + " / " + $iq1PromotionDirectSsdToVramRejected + " / " + $iq1PromotionProbationBackingReclaims + " / " + $iq1PromotionFailures)
 Write-Host ("IQ1_S profile/no-main-sync/packed-H2D: " + [bool]$Iq1SProfile + " / " + [bool]$Iq1SNoMainSync + " / " + [bool]$Iq1SPackedH2D)
 Write-Host ("IQ1_S profile SSD reads/ms H2D batches/copies/enqueue-ms/syncs/sync-ms: " + $iq1ProfileSsdReadCalls + " / " + $iq1ProfileSsdReadMs + " / " + $iq1ProfileH2dBatches + " / " + $iq1ProfileH2dCopies + " / " + $iq1ProfileH2dEnqueueMs + " / " + $iq1ProfileH2dSyncs + " / " + $iq1ProfileH2dSyncMs)
 Write-Host ("IQ1_S mixed profile calls/router-D2H/meta-H2D/main-submit/main-sync/cold-submit/join ms: " + $iq1MixedProfileCalls + " / " + $iq1MixedProfileRouterD2hMs + " / " + $iq1MixedProfileMetadataH2dMs + " / " + $iq1MixedProfileMainSubmitMs + " / " + $iq1MixedProfileMainSyncMs + " / " + $iq1MixedProfileColdSubmitMs + " / " + $iq1MixedProfileJoinSubmitMs)

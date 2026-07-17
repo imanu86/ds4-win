@@ -65,7 +65,9 @@ function Assert-G97StaticContract {
         "WarmupMaxTokens", "Repeats", "BudgetGB", "ReserveMB",
         "DynamicArenaGiB", "ArenaWrapTrustWorkerChecksum",
         "ArenaWrapSourceParts", "PrefillMassWrap",
-        "ComposePrefillMassTiering", "DisableQ8F16Cache",
+        "ComposePrefillMassTiering", "ComposePrefillMassOpenRouter",
+        "ComposePrefillMassReserveSlots",
+        "DisableQ8F16Cache",
         "EmbedRowStaging", "ExpertCacheN", "ExpertCacheReserveGB",
         "ExpertCachePolicy", "ExpertTiering", "ExpertTierPolicy",
         "ExpertTierClockCalls", "ExpertTierReplacementBudget",
@@ -73,10 +75,12 @@ function Assert-G97StaticContract {
         "GpuResidentRoutes", "RouteNoDefaultSync", "SplitFused",
         "ExpectedModelSHA256", "Iq1SExpertSidecar",
         "ExpectedIq1SExpertSidecarSHA256",
-        "ExpectedIq1SExpertSidecarBytes", "Iq1SLayerFirst",
+        "ExpectedIq1SExpertSidecarBytes", "ReuseVerifiedIq1SReceipt",
+        "Iq1SLayerFirst",
         "Iq1SLayerLast", "Iq1SMixedColdOne", "Iq1SMixedGpuPlan",
         "Iq1Promotion", "Iq1PromotionProbationSlots",
-        "Iq1SRamCacheGiB", "GateKind", "QuiescenceCooldownSec")) {
+        "Iq1SRamCacheGiB", "GateKind", "SkipSystemQuiescencePreflight",
+        "QuiescenceCooldownSec")) {
         if (-not (Test-G97HarnessParameter -ParameterName $parameter)) {
             throw "Harness does not expose -$parameter; refusing to run."
         }
@@ -84,9 +88,14 @@ function Assert-G97StaticContract {
     $harnessText = Get-Content -LiteralPath $harness -Raw
     foreach ($requiredText in @(
         "DS4_IQ1_PROMOTION_PROBATION_SLOTS",
+        "DS4_CUDA_PREFILL_TIER_ROUTER",
+        "DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS",
+        "compose_prefill_mass_open_router_requested",
+        "compose_prefill_mass_reserve_slots_requested",
         "iq1-promotion",
         "requested_slots=(\d+) reserved_slots=",
         "promotion_2bit_ssd_seconds",
+        "iq1_promotion_probation_backing_reclaims",
         "iq1_promotion_runtime_observed",
         "iq1_promotion_requests")) {
         if ($harnessText -notmatch [regex]::Escape($requiredText)) {
@@ -121,13 +130,15 @@ function New-G97Args {
         "-Prompt", $prompt,
         "-Context", "128",
         "-BudgetGB", "2", "-ReserveMB", "1024",
-        "-DynamicArenaGiB", "20",
+        "-DynamicArenaGiB", "12",
         "-ArenaWrapTrustWorkerChecksum",
         "-ArenaWrapSourceParts",
         "-DisableQ8F16Cache",
         "-EmbedRowStaging",
         "-PrefillMassWrap",
         "-ComposePrefillMassTiering",
+        "-ComposePrefillMassOpenRouter",
+        "-ComposePrefillMassReserveSlots", ([string]$PromotionSlots),
         "-ExpertCacheN", "320",
         "-ExpertCacheReserveGB", "0.125",
         "-ExpertCachePolicy", "lru",
@@ -145,6 +156,7 @@ function New-G97Args {
         "-Iq1SExpertSidecar", $iq1Sidecar,
         "-ExpectedIq1SExpertSidecarSHA256", $expectedIq1SidecarSHA256,
         "-ExpectedIq1SExpertSidecarBytes", ([string]$expectedIq1SidecarBytes),
+        "-ReuseVerifiedIq1SReceipt",
         "-Iq1SLayerFirst", "3",
         "-Iq1SLayerLast", "42",
         "-Iq1SMixedColdOne",
@@ -153,7 +165,8 @@ function New-G97Args {
         "-Iq1PromotionProbationSlots", ([string]$PromotionSlots),
         "-Iq1SRamCacheGiB", "1",
         "-GateKind", "structural-safety",
-        "-QuiescenceCooldownSec", "30"
+        "-SkipSystemQuiescencePreflight",
+        "-QuiescenceCooldownSec", "90"
     )
 }
 
@@ -163,6 +176,7 @@ function Assert-G97RunContract {
 
     foreach ($name in @(
         "server_exit_code", "model_sha256", "iq1_s_sidecar_sha256",
+        "iq1_s_sidecar_hash_method",
         "iq1_s_mixed_runtime_observed",
         "iq1_s_mixed_gpu_plan_runtime_observed",
         "iq1_promotion_requested",
@@ -170,9 +184,14 @@ function Assert-G97RunContract {
         "iq1_promotion_runtime_observed",
         "iq1_promotion_line_count",
         "iq1_promotion_requests",
+        "iq1_promotion_probation_backing_reclaims",
         "iq1_promotion_2bit_ssd_seconds",
         "iq1_promotion_2bit_ssd_bytes_per_second",
+        "compose_prefill_mass_open_router_requested",
+        "compose_prefill_mass_reserve_slots_requested",
         "prefill_mass_wrap_candidate_entries",
+        "system_quiescence_preflight", "quality_eligible",
+        "sota_eligible", "contamination_reason",
         "expert_tiering")) {
         Assert-G97Property -Object $Result -Name $name
     }
@@ -185,13 +204,22 @@ function Assert-G97RunContract {
         [int]$Result.requested_max_tokens -ne 8 -or
         [int]$Result.requested_warmup_max_tokens -ne 4 -or
         [int]$Result.context_requested -ne 128 -or
-        [double]$Result.dynamic_arena_gib_requested -ne 20.0 -or
+        [double]$Result.dynamic_arena_gib_requested -ne 12.0 -or
         [int]$Result.expert_cache_requested -ne 320 -or
         [bool]$Result.compose_prefill_mass_tiering_requested -ne $true -or
+        [bool]$Result.compose_prefill_mass_open_router_requested -ne $true -or
+        [int]$Result.compose_prefill_mass_reserve_slots_requested -ne $PromotionSlots -or
+        [bool]$Result.system_quiescence_preflight.skipped -ne $true -or
+        [bool]$Result.quality_eligible -ne $false -or
+        [bool]$Result.sota_eligible -ne $false -or
+        [string]$Result.contamination_reason -ne
+            "structural-safety-gate-not-quality-eligible" -or
         [string]$Result.expert_tiering_requested -ne "enforce" -or
         [bool]$Result.iq1_s_mixed_cold_one -ne $true -or
         [bool]$Result.iq1_s_mixed_gpu_plan_requested -ne $true -or
         [bool]$Result.iq1_promotion_requested -ne $true -or
+        [string]$Result.iq1_s_sidecar_hash_method -ne
+            "verified_receipt_reuse" -or
         [int]$Result.iq1_promotion_probation_slots_requested -ne
             $PromotionSlots -or
         [bool]$Result.iq1_promotion_runtime_observed -ne $true -or
@@ -206,14 +234,20 @@ function Assert-G97RunContract {
         [double]$Result.iq1_promotion_2bit_ssd_bytes_per_second -lt 0.0 -or
         [UInt64]$Result.iq1_promotion_cold_observed -le 0 -or
         [UInt64]$Result.iq1_promotion_cold_to_2bit_ram -le 0 -or
+        [UInt64]$Result.iq1_promotion_probation_backing_reclaims -le 0 -or
         [UInt64]$Result.iq1_promotion_2bit_ssd_bytes -le 0 -or
         [double]$Result.iq1_promotion_2bit_ssd_seconds -le 0.0 -or
         [double]$Result.iq1_promotion_2bit_ssd_bytes_per_second -le 0.0 -or
-        [UInt64]$tier.snapshot_backing_misses -ne 0 -or
         [UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
         [UInt64]$tier.cold_to_vram -ne 0 -or
         [UInt64]$tier.failures -ne 0 -or
+        [UInt64]$tier.snapshot_backing_entries -ne
+            [UInt64]$Result.prefill_mass_wrap_candidate_entries -or
         [string]$Result.effective_ds4_environment.DS4_IQ1_PROMOTION_PROBATION_SLOTS -ne
+            ([string]$PromotionSlots) -or
+        [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_ROUTER -ne
+            "open" -or
+        [string]$Result.effective_ds4_environment.DS4_CUDA_PREFILL_TIER_RESERVE_SLOTS -ne
             ([string]$PromotionSlots) -or
         $Result.executable_sha256 -ne $Provenance.executable_sha256 -or
         $Result.harness_sha256 -ne $Provenance.harness_sha256 -or
@@ -225,21 +259,30 @@ function Assert-G97RunContract {
     if (@($Result.iq1_promotion_requests).Count -ne $expectedRequests) {
         throw "G97 promotion request row count mismatch"
     }
+    [UInt64]$probationBackingReclaimsTotal = 0
     for ($i = 0; $i -lt $expectedRequests; $i++) {
         $row = $Result.iq1_promotion_requests[$i]
+        Assert-G97Property -Object $row -Name "probation_backing_reclaims"
+        Assert-G97Property -Object $row -Name "reserve_strategy"
+        $probationBackingReclaimsTotal += [UInt64]$row.probation_backing_reclaims
         if ([UInt64]$row.requested_slots -ne [UInt64]$PromotionSlots -or
             [UInt64]$row.reserved_slots -ne [UInt64]$PromotionSlots -or
-            [UInt64]$row.snapshot_evictions -ne [UInt64]$PromotionSlots -or
+            [string]$row.reserve_strategy -ne "pre-reserved-open-router" -or
+            [UInt64]$row.snapshot_evictions -ne 0 -or
             [UInt64]$row.cold_observed -le 0 -or
-            ([UInt64]$row.cold_existing_2bit +
-                [UInt64]$row.cold_to_2bit_ram) -le 0 -or
+            [UInt64]$row.cold_to_2bit_ram -le 0 -or
+            [UInt64]$row.promotion_2bit_ssd_bytes -le 0 -or
             [double]::IsNaN([double]$row.promotion_2bit_ssd_seconds) -or
             [double]::IsInfinity([double]$row.promotion_2bit_ssd_seconds) -or
-            [double]$row.promotion_2bit_ssd_seconds -lt 0.0 -or
+            [double]$row.promotion_2bit_ssd_seconds -le 0.0 -or
             [UInt64]$row.direct_ssd_to_vram_rejected -ne 0 -or
             [UInt64]$row.failures -ne 0) {
             throw "G97 promotion row contract mismatch at request $($i + 1)"
         }
+    }
+    if ($probationBackingReclaimsTotal -ne
+        [UInt64]$Result.iq1_promotion_probation_backing_reclaims) {
+        throw "G97 promotion probation backing reclaim total mismatch"
     }
 }
 
@@ -259,10 +302,12 @@ $staticChecks = [pscustomobject]@{
     warmup_max_tokens = 4
     max_tokens = 8
     context = 128
-    dynamic_arena_gib = 20
+    dynamic_arena_gib = 12
     iq1_s_ram_cache_gib = 1
     expert_cache_n = 320
     promotion_slots = $PromotionSlots
+    compose_prefill_mass_open_router = $true
+    compose_prefill_mass_reserve_slots = $PromotionSlots
     quality_claim = "none"
     performance_claim = "none"
     runner_sha256 = $selfSha
@@ -323,24 +368,27 @@ $summary = [pscustomobject]@{
     warmup_max_tokens = 4
     max_tokens = 8
     context = 128
-    dynamic_arena_gib = 20
+    dynamic_arena_gib = 12
     iq1_s_ram_cache_gib = 1
     expert_cache_n = 320
     promotion_slots = $PromotionSlots
     promotion_lines = [int]$result.iq1_promotion_line_count
+    promotion_probation_backing_reclaims =
+        [UInt64]$result.iq1_promotion_probation_backing_reclaims
     promotion_2bit_ssd_seconds = [double]$result.iq1_promotion_2bit_ssd_seconds
     promotion_2bit_ssd_bytes_per_second =
         [double]$result.iq1_promotion_2bit_ssd_bytes_per_second
     checks = [pscustomobject]@{
         promotion_lines_for_all_requests = $true
-        requested_reserved_evicted_equal_slots = $true
+        requested_reserved_equal_slots_no_snapshot_evictions = $true
         cold_observed_positive = $true
         iq2_ssd_to_probation_ram_stage_observed = $true
+        probation_backing_reclaims_total_positive = $true
         iq2_stage_bytes_seconds_bandwidth_positive = $true
         direct_ssd_to_vram_rejected_zero = $true
         promotion_failures_zero = $true
         promotion_2bit_ssd_seconds_finite_nonnegative = $true
-        snapshot_backing_misses_zero = $true
+        snapshot_backing_entries_equal_prefill_candidate = $true
         forbidden_cold_ssd_to_vram_zero = $true
         cold_to_vram_zero = $true
     }
