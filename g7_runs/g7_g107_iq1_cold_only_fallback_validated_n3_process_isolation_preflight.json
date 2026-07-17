@@ -1,0 +1,27 @@
+﻿{
+    "schema":  "g7_process_isolation_preflight_v2",
+    "checked_utc":  "2026-07-17T13:07:14.5977459Z",
+    "mutex_name":  "Local\\DS4_G7_MEASUREMENT_LOCK",
+    "mutex_acquired":  true,
+    "current_harness_pid":  15864,
+    "gate_kind":  "structural-safety",
+    "ancestor_process_ids":  [
+                                 10408,
+                                 19604,
+                                 4060,
+                                 8020,
+                                 8012
+                             ],
+    "conflict_count":  0,
+    "conflicts":  [
+
+                  ],
+    "blocked_maintenance_process_names":  [
+                                              "Defrag.exe"
+                                          ],
+    "maintenance_conflict_count":  0,
+    "maintenance_conflicts":  [
+
+                              ],
+    "ready_to_launch":  true
+}

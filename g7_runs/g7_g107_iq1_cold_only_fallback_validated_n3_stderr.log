@@ -1,0 +1,97 @@
+ds4: validated concatenated split GGUF: shards=2 tensors=1328 bytes=61540805344
+ds4: ignoring legacy V3 expert grouping metadata (8/4); DeepSeek V4 routing is ungrouped
+ds4: IQ1_S checkpoint identity validated: controls=126 bytes=1449984 fnv1a64=39cfc09d8cf754ad
+ds4: IQ1_S routed-expert sidecar validated: layers=43 active=3..42 gate_up=iq1_s down=q2_k[0..2]+iq1_s[3..42]
+ds4: IQ1_S expert sidecar source: C:\ds4-models\DeepSeek-V4-Flash-IQ1_S-XL.gguf
+ds4: IQ1_S mixed decode fixture enabled: hot_main=5 cold_iq1=1 prefill=main
+ds4: CUDA backend initialized on NVIDIA GeForce RTX 3060 (sm_86)
+ds4: CUDA IQ1_S routed-expert sidecar installed: 57.31 GiB
+ds4: CUDA loading model tensors into device cache
+ds4: CUDA startup cache excluded 72.56 GiB of routed-expert tensors; dedicated expert cache owns residency
+ds4: CUDA startup cache excluded 0.99 GiB token embedding table; row staging owns access
+ds4: CUDA startup model cache prepared 7.21 GiB of tensor spans in 5.340s
+ds4: cuda backend initialized for graph diagnostics
+0717 15:07:40 ds4-server: context buffers 25.17 MiB (ctx=256, backend=cuda, prefill_chunk=256, raw_kv_rows=256, compressed_kv_rows=66)
+ds4: [arena-cap] requested_gib=29.999 min_available_gib=0.000 available_before_gib=54.597 requested_bytes=32211468288 requested_slots=4551 chosen_bytes=32211468288 chosen_slots=4551 capped=0 result=ready reason=ok
+ds4: CUDA dynamic arena ready 30.00 GiB, 4551 slots, 6.75 MiB/slot, available_ram=24.56 GiB bytes=32211468288 slot_bytes=7077888
+0717 15:07:43 ds4-server: listening on http://127.0.0.1:8000
+0717 15:07:44 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 candidate_fnv1a64=c59a437fe9c6c376 sparse_skipped_ranked=0 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=4551 capacity=4551 mass_total=1720.000000 mass_candidate=1010.291848 mass_coverage=0.5874 cutoff=0.170601 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=0 target=1 resident=4551 loads=4551 slots=4551
+ds4: [arena-wrap-source-unlock] result=ok phase=gate waves=3 max_wave_bytes=4293894144 parts=4551 ranges=2395 bytes_requested=9852203008 calls=2395 true=0 error_not_locked=2395 failed=0 seconds=0.993121 available_before=20443045888 available_after=24561733632 working_set_before=37328760832 working_set_after=33035018240 page_fault_before=9141366 page_fault_after=10502824 read_transfer_before=29602346117 read_transfer_after=29602346117 last_error=0
+ds4: [arena-wrap-source-unlock] result=ok phase=up waves=3 max_wave_bytes=4293894144 parts=4551 ranges=2395 bytes_requested=9852203008 calls=2395 true=0 error_not_locked=2395 failed=0 seconds=1.101317 available_before=20331212800 available_after=24254545920 working_set_before=37328809984 working_set_after=33035026432 page_fault_before=11553926 page_fault_after=12915333 read_transfer_before=29602346117 read_transfer_after=29602346117 last_error=0
+ds4: [arena-wrap-source-unlock] result=ok phase=down waves=3 max_wave_bytes=4293083136 parts=4551 ranges=2397 bytes_requested=12536500224 calls=2397 true=0 error_not_locked=2397 failed=0 seconds=1.353130 available_before=20058210304 available_after=24489840640 working_set_before=37328199680 working_set_after=33035116544 page_fault_before=13966003 page_fault_after=15984472 read_transfer_before=29602346117 read_transfer_after=29602346117 last_error=0
+ds4: [arena-wrap-source-unlock-summary] result=complete phases=3 waves=9 wave_gib=4.000000 max_wave_bytes=4293894144 parts=13653 ranges=7187 bytes_requested=32240906240 calls=7187 true=0 error_not_locked=7187 failed=0 seconds=3.447568
+ds4: [arena] publish generation=1 loads=4551
+ds4: [arena-wrap-profile] result=published schedule=source-parts source=mmap checksum=fnv1a64-worker-only loads=4551 workers=8 begin=0.008 copy_checksum=25.643 finish=0.000 publish=0.005 total=25.656 source_parts_copy=25.643 source_parts_checksum=0.000 parts=13653 copy_workers=8 checksum_workers=0 file_qd=1 file_qd_observed=1 file_submits=0 file_completions=0 file_failures=0
+ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=40 kept=3783 pruned=6457 semantics=request-scoped-closed base=none existing_layers=0
+ds4: [prefill-mass-wrap] result=published reason=ok candidate=4551 loads=4551 workers=8 seconds=25.656 snapshot_before=0 snapshot_after=1 resident_before=0 resident_after=4551 generation=1 preloaded=0 router=unbiased mask=request-scoped-closed
+0717 15:08:33 ds4-server: chat ctx=0..43:43 prompt done 49.227s
+ds4: CUDA embedding row staging ready (pinned host + device, 0.01 MiB)
+ds4: expert tiering active mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 compose_router_open=0 snapshot_generation=1 snapshot_backing_entries=4551 clock_calls=430 replacement_budget=32 replacement_budget_base=32 adaptive_budget=0 adaptive_current_budget=32 adaptive_min=16 adaptive_max=32 adaptive_step=8 adaptive_pressure_threshold=64 adaptive_ups=0 adaptive_downs=0 adaptive_pressure_epochs=0 adaptive_quiet_epochs=0 adaptive_last_budget_skips_delta=0 adaptive_last_replacements_delta=0 min_frequency=3 hysteresis=1.25 entries=11008 ram_slots=4551
+ds4: CUDA resident expert cache ready: 320/320 experts, 6.75 MiB/expert, 2.11 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 320 slots
+ds4: [gpu-route-debug] request seq=1 layer=0 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=0
+ds4: [gpu-route-debug] request seq=2 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=1
+0717 15:08:44 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=4.49 t/s avg=4.49 t/s 11.126s
+0717 15:08:47 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=4.39 t/s avg=4.47 t/s 14.317s
+0717 15:08:47 ds4-server: chat ctx=0..43:43 gen=64 finish=length 63.559s
+0717 15:08:47 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [expert-tiering] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 compose_router_open=0 snapshot_generation=1 snapshot_backing_entries=4551 snapshot_backing_hits=10692 snapshot_backing_misses=0 snapshot_to_vram_bytes=75676778496 forbidden_cold_ssd_to_vram=0 general_backing_reclaims=0 clock_calls=430 replacement_budget=32 replacement_budget_base=32 adaptive_budget=0 adaptive_current_budget=32 adaptive_min=16 adaptive_max=32 adaptive_step=8 adaptive_pressure_threshold=64 adaptive_ups=0 adaptive_downs=0 adaptive_pressure_epochs=0 adaptive_quiet_epochs=0 adaptive_last_budget_skips_delta=0 adaptive_last_replacements_delta=0 min_frequency=3 hysteresis=1.25 calls=2752 selected=16512 cold=0 ram_hits=10692 vram_hits=5820 cold_to_ram=0 cold_to_vram=0 ram_to_warm=512 vram_promotions=512 vram_demotions=192 ram_evictions=0 ram_admit_skips=0 transient=10180 failures=0 ssd_bytes=0 ram_h2d_bytes=75676778496 policy_epochs=6 policy_free_promotions=320 policy_replacements=192 policy_min_frequency_skips=5398 policy_budget_skips=4731 policy_score_skips=51 states_ssd=6457 states_probation=4231 states_warm=0 states_vram=320 mass_sum=2969.89552 lfru_top=28.8409946
+ds4: [prefill-mass-compose-mask] result=restored reason=ok where=request-end layers=0 kept=0 pruned=0 base=none
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 candidate_fnv1a64=c59a437fe9c6c376 sparse_skipped_ranked=0 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=4551 capacity=4551 mass_total=1720.000000 mass_candidate=1010.291848 mass_coverage=0.5874 cutoff=0.170601 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=1 target=4553 resident=4551 loads=0 slots=4551
+ds4: [arena] publish generation=4553 loads=0
+ds4: [arena-wrap-profile] result=published schedule=source-parts source=mmap checksum=fnv1a64-worker-only loads=0 workers=0 begin=0.008 copy_checksum=0.000 finish=0.000 publish=0.005 total=0.013 source_parts_copy=0.000 source_parts_checksum=0.000 parts=0 copy_workers=0 checksum_workers=0 file_qd=1 file_qd_observed=1 file_submits=0 file_completions=0 file_failures=0
+ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=40 kept=3783 pruned=6457 semantics=request-scoped-closed base=none existing_layers=0
+ds4: [prefill-mass-wrap] result=published reason=ok candidate=4551 loads=0 workers=0 seconds=0.013 snapshot_before=1 snapshot_after=4553 resident_before=4551 resident_after=4551 generation=4553 preloaded=0 router=unbiased mask=request-scoped-closed
+0717 15:08:55 ds4-server: chat ctx=0..43:43 prompt done 8.238s
+ds4: [gpu-resident-routes] final calls=2752 split_calls=0 all_hit=19 worker_jobs=2733 miss_experts=10692 errors=0 worker=1.609ms/job resolve=0.000ms/call wait=1.652ms/call queries=0 default_sync=0 no_default_sync=2752 cache_count=320 cache_calls=2752 cache_hits=5820 cache_misses=10692 cache_admissions=512 cache_evictions=192 direct_loads=0 split_fused_calls=2752 split_fused_hits=5820 split_fused_misses=10692 split_fused_miss_scratch_bytes_avoided=175177728 split_fused_sum_read_bytes_avoided=175177728 packed_copy_requested=0 packed_copy_experts=0 packed_copy_submissions=0 packed_copy_bytes=0 legacy_copy_submissions=32076
+ds4: expert tiering active mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 compose_router_open=0 snapshot_generation=4553 snapshot_backing_entries=4551 clock_calls=430 replacement_budget=32 replacement_budget_base=32 adaptive_budget=0 adaptive_current_budget=32 adaptive_min=16 adaptive_max=32 adaptive_step=8 adaptive_pressure_threshold=64 adaptive_ups=0 adaptive_downs=0 adaptive_pressure_epochs=0 adaptive_quiet_epochs=0 adaptive_last_budget_skips_delta=0 adaptive_last_replacements_delta=0 min_frequency=3 hysteresis=1.25 entries=11008 ram_slots=4551
+ds4: CUDA resident expert cache ready: 320/320 experts, 6.75 MiB/expert, 2.11 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 320 slots
+ds4: [gpu-route-debug] request seq=1 layer=0 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=0
+ds4: [gpu-route-debug] request seq=2 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=1
+0717 15:09:07 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=4.52 t/s avg=4.52 t/s 11.066s
+0717 15:09:10 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=4.31 t/s avg=4.47 t/s 14.317s
+0717 15:09:10 ds4-server: chat ctx=0..43:43 gen=64 finish=length 22.570s
+0717 15:09:10 ds4-server: chat ctx=0..43:43 prompt start
+ds4: [expert-tiering] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 compose_router_open=0 snapshot_generation=4553 snapshot_backing_entries=4551 snapshot_backing_hits=10692 snapshot_backing_misses=0 snapshot_to_vram_bytes=75676778496 forbidden_cold_ssd_to_vram=0 general_backing_reclaims=0 clock_calls=430 replacement_budget=32 replacement_budget_base=32 adaptive_budget=0 adaptive_current_budget=32 adaptive_min=16 adaptive_max=32 adaptive_step=8 adaptive_pressure_threshold=64 adaptive_ups=0 adaptive_downs=0 adaptive_pressure_epochs=0 adaptive_quiet_epochs=0 adaptive_last_budget_skips_delta=0 adaptive_last_replacements_delta=0 min_frequency=3 hysteresis=1.25 calls=2752 selected=16512 cold=0 ram_hits=10692 vram_hits=5820 cold_to_ram=0 cold_to_vram=0 ram_to_warm=512 vram_promotions=512 vram_demotions=192 ram_evictions=0 ram_admit_skips=0 transient=10180 failures=0 ssd_bytes=0 ram_h2d_bytes=75676778496 policy_epochs=6 policy_free_promotions=320 policy_replacements=192 policy_min_frequency_skips=5398 policy_budget_skips=4731 policy_score_skips=51 states_ssd=6457 states_probation=4231 states_warm=0 states_vram=320 mass_sum=2969.89552 lfru_top=28.8409946
+ds4: [prefill-mass-compose-mask] result=restored reason=ok where=request-end layers=0 kept=0 pruned=0 base=none
+ds4: [prefill-mass] armed slots=4551 layers=3..42 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [prefill-mass-compose] hash_layers=3 hash_seed_entries=768 ranked_entries=3783 total_candidate=4551 capacity=4551 candidate_fnv1a64=c59a437fe9c6c376 sparse_skipped_ranked=0 mass_source=full-probability-normalized-per-token
+ds4: [prefill-mass] finalize layers=40 rows_min=43 rows_max=43 routed_slots=10320 unique=10240 candidate=4551 capacity=4551 mass_total=1720.000000 mass_candidate=1010.291848 mass_coverage=0.5874 cutoff=0.170601 router=unbiased residency=prefill-ranked policy=bulk-wrap
+ds4: [arena] begin base=4553 target=4554 resident=4551 loads=0 slots=4551
+ds4: [arena] publish generation=4554 loads=0
+ds4: [arena-wrap-profile] result=published schedule=source-parts source=mmap checksum=fnv1a64-worker-only loads=0 workers=0 begin=0.009 copy_checksum=0.000 finish=0.000 publish=0.005 total=0.013 source_parts_copy=0.000 source_parts_checksum=0.000 parts=0 copy_workers=0 checksum_workers=0 file_qd=1 file_qd_observed=1 file_submits=0 file_completions=0 file_failures=0
+ds4: [prefill-mass-compose-mask] result=applied reason=ok layers=40 kept=3783 pruned=6457 semantics=request-scoped-closed base=none existing_layers=0
+ds4: [prefill-mass-wrap] result=published reason=ok candidate=4551 loads=0 workers=0 seconds=0.013 snapshot_before=4553 snapshot_after=4554 resident_before=4551 resident_after=4551 generation=4554 preloaded=0 router=unbiased mask=request-scoped-closed
+0717 15:09:15 ds4-server: chat ctx=0..43:43 prompt done 5.096s
+ds4: [gpu-resident-routes] final calls=2752 split_calls=0 all_hit=19 worker_jobs=2733 miss_experts=10692 errors=0 worker=1.591ms/job resolve=0.000ms/call wait=1.601ms/call queries=0 default_sync=0 no_default_sync=2752 cache_count=320 cache_calls=2752 cache_hits=5820 cache_misses=10692 cache_admissions=512 cache_evictions=192 direct_loads=0 split_fused_calls=2752 split_fused_hits=5820 split_fused_misses=10692 split_fused_miss_scratch_bytes_avoided=175177728 split_fused_sum_read_bytes_avoided=175177728 packed_copy_requested=0 packed_copy_experts=0 packed_copy_submissions=0 packed_copy_bytes=0 legacy_copy_submissions=32076
+ds4: expert tiering active mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 compose_router_open=0 snapshot_generation=4554 snapshot_backing_entries=4551 clock_calls=430 replacement_budget=32 replacement_budget_base=32 adaptive_budget=0 adaptive_current_budget=32 adaptive_min=16 adaptive_max=32 adaptive_step=8 adaptive_pressure_threshold=64 adaptive_ups=0 adaptive_downs=0 adaptive_pressure_epochs=0 adaptive_quiet_epochs=0 adaptive_last_budget_skips_delta=0 adaptive_last_replacements_delta=0 min_frequency=3 hysteresis=1.25 entries=11008 ram_slots=4551
+ds4: CUDA resident expert cache ready: 320/320 experts, 6.75 MiB/expert, 2.11 GiB total
+ds4: CUDA GPU-resident route resolver active: exact miss worker, 320 slots
+ds4: [gpu-route-debug] request seq=1 layer=0 misses=6
+ds4: [gpu-route-debug] submit seq=1 layer=0
+ds4: [gpu-route-debug] request seq=2 layer=1 misses=6
+ds4: [gpu-route-debug] submit seq=2 layer=1
+0717 15:09:26 ds4-server: chat ctx=0..43:43 gen=50 decoding chunk=4.53 t/s avg=4.53 t/s 11.042s
+0717 15:09:29 ds4-server: chat ctx=0..43:43 gen=64 decoding chunk=4.42 t/s avg=4.50 t/s 14.213s
+0717 15:09:29 ds4-server: chat ctx=0..43:43 gen=64 finish=length 19.325s
+0717 15:09:29 ds4-server: benchmark request target reached; shutting down cleanly
+0717 15:09:29 ds4-server: shutdown requested, draining requests
+ds4: [gpu-resident-routes] final calls=2752 split_calls=0 all_hit=19 worker_jobs=2733 miss_experts=10692 errors=0 worker=1.588ms/job resolve=0.000ms/call wait=1.597ms/call queries=0 default_sync=0 no_default_sync=2752 cache_count=320 cache_calls=2752 cache_hits=5820 cache_misses=10692 cache_admissions=512 cache_evictions=192 direct_loads=0 split_fused_calls=2752 split_fused_hits=5820 split_fused_misses=10692 split_fused_miss_scratch_bytes_avoided=175177728 split_fused_sum_read_bytes_avoided=175177728 packed_copy_requested=0 packed_copy_experts=0 packed_copy_submissions=0 packed_copy_bytes=0 legacy_copy_submissions=32076
+ds4: [expert-tiering] final mode=enforce policy=mass-lfru compose_prefill_mass_tiering=1 compose_router_open=0 snapshot_generation=4554 snapshot_backing_entries=4551 snapshot_backing_hits=10692 snapshot_backing_misses=0 snapshot_to_vram_bytes=75676778496 forbidden_cold_ssd_to_vram=0 general_backing_reclaims=0 clock_calls=430 replacement_budget=32 replacement_budget_base=32 adaptive_budget=0 adaptive_current_budget=32 adaptive_min=16 adaptive_max=32 adaptive_step=8 adaptive_pressure_threshold=64 adaptive_ups=0 adaptive_downs=0 adaptive_pressure_epochs=0 adaptive_quiet_epochs=0 adaptive_last_budget_skips_delta=0 adaptive_last_replacements_delta=0 min_frequency=3 hysteresis=1.25 calls=2752 selected=16512 cold=0 ram_hits=10692 vram_hits=5820 cold_to_ram=0 cold_to_vram=0 ram_to_warm=512 vram_promotions=512 vram_demotions=192 ram_evictions=0 ram_admit_skips=0 transient=10180 failures=0 ssd_bytes=0 ram_h2d_bytes=75676778496 policy_epochs=6 policy_free_promotions=320 policy_replacements=192 policy_min_frequency_skips=5398 policy_budget_skips=4731 policy_score_skips=51 states_ssd=6457 states_probation=4231 states_warm=0 states_vram=320 mass_sum=2969.89552 lfru_top=28.8409946
+ds4: [arena] final hits=4824 misses=1352 fatal=0 uploaded=31.80 GiB
+ds4: [prefill-mass-compose-mask] result=restored reason=ok where=request-end layers=0 kept=0 pruned=0 base=none
+ds4: [iq1-s-sidecar] result=summary calls=0 slots=0 selected_loads=0 failures=0
+ds4: [iq1-mixed] result=summary calls=7680 hot_main=46080 cold_iq1=0 primary_cold_avoided=0 joins=0 failures=0 last_layer=4294967295 last_slot=4294967295 last_expert=-1
+ds4: [iq1-cold-only] result=summary calls=7680 routes=46080 main_vram=17439 main_snapshot_ram=28641 main_tier_ram=0 main_ssd_cold=0 iq1_ram_hits=0 eligible=0 substitutions=0 fallback_all_main=7680 skipped_iq1_miss=0 uncertain=0 failures=0

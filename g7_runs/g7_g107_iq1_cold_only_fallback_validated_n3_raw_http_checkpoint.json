@@ -1,0 +1,32 @@
+﻿{
+    "schema":  "g7_raw_http_checkpoint_v1",
+    "tag":  "g107_iq1_cold_only_fallback_validated_n3",
+    "http_ok":  true,
+    "warmup":  null,
+    "results":  [
+                    {
+                        "repeat":  1,
+                        "seconds":  63.943774,
+                        "completion_tokens":  64,
+                        "tokens_per_second":  1.000879,
+                        "content_sha256":  "31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8",
+                        "content":  "Here is a complete single-file HTML landing page for a cyberpunk AI programming shop. It includes all requested sections: CSS, navigation, hero, request form, and a JavaScript confirmation popup.\n```html\n\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n    \u003cmeta charset=\"UTF-8\"\u003e\n    \u003c"
+                    },
+                    {
+                        "repeat":  2,
+                        "seconds":  22.568429,
+                        "completion_tokens":  64,
+                        "tokens_per_second":  2.83582,
+                        "content_sha256":  "31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8",
+                        "content":  "Here is a complete single-file HTML landing page for a cyberpunk AI programming shop. It includes all requested sections: CSS, navigation, hero, request form, and a JavaScript confirmation popup.\n```html\n\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n    \u003cmeta charset=\"UTF-8\"\u003e\n    \u003c"
+                    },
+                    {
+                        "repeat":  3,
+                        "seconds":  19.329626,
+                        "completion_tokens":  64,
+                        "tokens_per_second":  3.31098,
+                        "content_sha256":  "31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8",
+                        "content":  "Here is a complete single-file HTML landing page for a cyberpunk AI programming shop. It includes all requested sections: CSS, navigation, hero, request form, and a JavaScript confirmation popup.\n```html\n\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n    \u003cmeta charset=\"UTF-8\"\u003e\n    \u003c"
+                    }
+                ]
+}
