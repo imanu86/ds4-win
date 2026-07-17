@@ -51,6 +51,9 @@ foreach ($needle in @(
     '-Iq1SRamCacheGiB',
     'iq1_s_ram_cache_ssd_bytes',
     'tier.ssd_bytes',
+    'build_manifest_input_fingerprint_sha256',
+    'validating existing locked model/IQ1 suite receipt',
+    'G103 resumed suite $Kind identity mismatch',
     'mixed or missing provenance',
     'contamination_abort_observed',
     'structural-safety-gate-not-quality-eligible',
@@ -80,6 +83,9 @@ foreach ($forbiddenArg in @(
 
 if ($runnerText -match 'D:\\') {
     throw "G103 runner must not reference D:"
+}
+if ($runnerText -match '"build_input_fingerprint_sha256"') {
+    throw "G103 runner must use the emitted build manifest fingerprint field"
 }
 
 $candidateArgFunc = [regex]::Match(

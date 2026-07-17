@@ -91,7 +91,84 @@ function Open-G103ReadDenyWriteDeleteLock {
         [IO.FileAccess]::Read, [IO.FileShare]::Read)
 }
 
+function Get-G103FileId {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $raw = & fsutil.exe file queryfileid $Path 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "G103 file-id query failed: $Path"
+    }
+    $match = [regex]::Match(($raw -join " "), '0x[0-9a-fA-F]{32}')
+    if (-not $match.Success) {
+        throw "G103 file-id parse failed: $Path"
+    }
+    $match.Value.ToLowerInvariant()
+}
+
+function Assert-G103SuiteMemberIdentity {
+    param(
+        [Parameter(Mandatory=$true)][object]$Member,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedSHA256,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedBytes,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+    $info = Get-Item -LiteralPath $Path
+    $fullPath = [IO.Path]::GetFullPath($info.FullName)
+    if (-not [string]::Equals(
+            [string]$Member.path, $fullPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [UInt64]$Member.bytes -ne $ExpectedBytes -or
+        [UInt64]$info.Length -ne $ExpectedBytes -or
+        [string]$Member.sha256 -ine $ExpectedSHA256 -or
+        [string]$Member.hash_method -ne "locked_stream_sha256" -or
+        -not [bool]$Member.full_hash_verified -or
+        [Int64]$Member.creation_utc_ticks -ne $info.CreationTimeUtc.Ticks -or
+        [Int64]$Member.last_write_utc_ticks -ne $info.LastWriteTimeUtc.Ticks -or
+        [string]$Member.file_id -ine (Get-G103FileId $fullPath) -or
+        ($info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "G103 resumed suite $Kind identity mismatch"
+    }
+}
+
+function Get-G103ResumedSuiteReceipt {
+    if (-not $Resume -or
+        -not (Test-Path -LiteralPath $suiteReceiptPath -PathType Leaf)) {
+        return $null
+    }
+    Write-Host "[g103] validating existing locked model/IQ1 suite receipt"
+    try {
+        $receipt = Get-Content -LiteralPath $suiteReceiptPath -Raw |
+            ConvertFrom-Json
+    } catch {
+        throw "G103 resumed suite receipt is invalid JSON"
+    }
+    if ([string]$receipt.schema -ne "g7_model_iq1_suite_receipt_v1" -or
+        [string]$receipt.status -ne "verified" -or
+        -not [bool]$receipt.immutable -or
+        -not [bool]$receipt.full_hash_verified) {
+        throw "G103 resumed suite receipt contract mismatch"
+    }
+    $modelBytes = [UInt64](Get-Item -LiteralPath $model).Length
+    Assert-G103SuiteMemberIdentity -Member $receipt.model -Path $model `
+        -ExpectedSHA256 $expectedModelSHA256 -ExpectedBytes $modelBytes `
+        -Kind "model"
+    Assert-G103SuiteMemberIdentity -Member $receipt.iq1_s_sidecar `
+        -Path $sidecar -ExpectedSHA256 $expectedIq1SidecarSHA256 `
+        -ExpectedBytes $expectedIq1SidecarBytes -Kind "IQ1_S sidecar"
+    $script:g103SuiteReceiptSHA256 = Get-G103FileSHA256 $suiteReceiptPath
+    [pscustomobject]@{
+        path = [IO.Path]::GetFullPath($suiteReceiptPath)
+        sha256 = $script:g103SuiteReceiptSHA256
+        schema = [string]$receipt.schema
+        status = [string]$receipt.status
+    }
+}
+
 function New-G103LockedSuiteReceipt {
+    $resumed = Get-G103ResumedSuiteReceipt
+    if ($null -ne $resumed) {
+        return $resumed
+    }
     if (-not (Test-Path -LiteralPath $suiteReceiptHelper -PathType Leaf)) {
         throw "G103 suite receipt helper missing: $suiteReceiptHelper"
     }
@@ -591,7 +668,7 @@ function Assert-G103Aggregate {
     $matrixRows = @($controlRows + $candidateRows)
     foreach ($field in @(
         "head", "executable_sha256", "ds4_cuda_sha256", "ds4_c_sha256",
-        "build_manifest_sha256", "build_input_fingerprint_sha256",
+        "build_manifest_sha256", "build_manifest_input_fingerprint_sha256",
         "harness_sha256", "model_sha256", "prompt_sha256")) {
         $values = @($matrixRows | ForEach-Object {
             [string](Get-G103Property $_.result $field "")

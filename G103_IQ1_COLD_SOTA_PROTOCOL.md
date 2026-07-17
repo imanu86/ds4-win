@@ -72,7 +72,7 @@ The runner must not enable:
 - `RoutePackedCopy`
 - `Iq1SPackedH2D`
 - IQ1_S VRAM cache
-- suite receipt reuse
+- path-bound receipt reuse for benchmark members
 
 ## Execution Plan
 
@@ -135,3 +135,42 @@ and C source hashes, build manifest/fingerprint, harness, model and prompt
 provenance. Runtime contamination aborts and non-empty contamination reasons
 invalidate the process. G73 reclaim accounting remains fixed at three phases,
 nine waves, waves at most 4 GiB and zero failures.
+
+## Measured Result
+
+The preregistered interleaved matrix completed on 2026-07-17 with three
+independent processes per arm and no outlier extension:
+
+| Arm | Server decode t/s | Mean | Median |
+| --- | --- | ---: | ---: |
+| G73 control | 5.04, 5.11, 4.96 | 5.0367 | 5.04 |
+| G73 plus one cold IQ1_S expert | 2.71, 2.71, 2.69 | 2.7033 | 2.71 |
+
+The candidate is 46.32% slower in server decode throughput. Every candidate
+process recorded 2,560 mixed calls, 178 IQ1 RAM-cache hits, 2,382 misses,
+2,273 evictions, 10.904 GiB read from the IQ1 sidecar, 11.719 GiB sent over
+IQ1 H2D, and zero failures. The 109-slot cache therefore achieved only a
+6.95% hit rate. The G73 IQ2 backing path remained at zero SSD bytes.
+
+The control retained the expected content SHA-256
+`31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8`.
+The candidate was deterministic across all three processes with content
+SHA-256
+`4aaf0f0813f4cb15ac21a88f195f4f7d2c2af797e81524935e22eea60603c6b1`.
+This 64-token matrix is not a quality verdict; L0-L3 quality remains a
+separate n>=3 gate.
+
+The aggregate initially stopped after all six valid runs because it requested
+the nonexistent `build_input_fingerprint_sha256` field instead of the emitted
+`build_manifest_input_fingerprint_sha256`. Resume now validates the existing
+full-hash suite receipt against current path, bytes, timestamps, file IDs and
+declared hashes under the parent locks. The corrected aggregate reused the six
+raw results without launching DS4 again.
+
+## Next Gate
+
+Profile one candidate process to split IQ1 SSD read, H2D enqueue/sync, hot-IQ2
+submit, cold-IQ1 submit and join time. Only after that structural profile,
+test one transport lever at a time. The predictive branch may combine router
+weight, recent mass and SPEX surprise `-p_i log(q_i)`; cross-entropy controls
+probation width and promotion urgency, not quality by itself.
