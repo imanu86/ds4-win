@@ -100,18 +100,27 @@ function Assert-G7SuiteIdentityUnchanged {
 function Get-G7SuiteStreamSHA256 {
     param(
         [Parameter(Mandatory=$true)][IO.Stream]$Stream,
-        [Parameter(Mandatory=$true)][string]$Kind
+        [Parameter(Mandatory=$true)][string]$Kind,
+        [int]$BufferBytes = 8MB
     )
     if (-not $Stream.CanRead) {
         throw "$Kind locked stream is not readable"
     }
+    if ($BufferBytes -lt 1MB) {
+        throw "$Kind hash buffer must be at least 1 MiB"
+    }
     if ($Stream.CanSeek) {
         $Stream.Position = 0
     }
-    $sha = [Security.Cryptography.SHA256]::Create()
+    $sha = [Security.Cryptography.IncrementalHash]::CreateHash(
+        [Security.Cryptography.HashAlgorithmName]::SHA256)
+    $buffer = New-Object byte[] $BufferBytes
     try {
+        while (($read = $Stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $sha.AppendData($buffer, 0, $read)
+        }
         return [BitConverter]::ToString(
-            $sha.ComputeHash($Stream)).Replace("-", "").ToLowerInvariant()
+            $sha.GetHashAndReset()).Replace("-", "").ToLowerInvariant()
     } finally {
         $sha.Dispose()
     }
@@ -230,14 +239,15 @@ $modelInfo = Get-Item -LiteralPath $ModelPath
 $sidecarInfo = Get-Item -LiteralPath $Iq1SExpertSidecar
 $modelFull = [IO.Path]::GetFullPath($modelInfo.FullName)
 $sidecarFull = [IO.Path]::GetFullPath($sidecarInfo.FullName)
-$modelLock = [IO.File]::Open(
-    $modelFull, [IO.FileMode]::Open,
-    [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$hashBufferBytes = 8MB
+$modelLock = [IO.FileStream]::new(
+    $modelFull, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+    [IO.FileShare]::Read, $hashBufferBytes, [IO.FileOptions]::SequentialScan)
 $sidecarLock = $null
 try {
-$sidecarLock = [IO.File]::Open(
-    $sidecarFull, [IO.FileMode]::Open,
-    [IO.FileAccess]::Read, [IO.FileShare]::Read)
+$sidecarLock = [IO.FileStream]::new(
+    $sidecarFull, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+    [IO.FileShare]::Read, $hashBufferBytes, [IO.FileOptions]::SequentialScan)
 $modelIdentityBefore = Get-G7SuiteIdentity $modelInfo
 $sidecarIdentityBefore = Get-G7SuiteIdentity $sidecarInfo
 $modelHash = Get-G7SuiteStreamSHA256 -Stream $modelLock -Kind "Model"
