@@ -109,6 +109,11 @@ int ds4_gpu_dynamic_arena_bind(
         const void *model_map, uint64_t model_size,
         const ds4_gpu_dynamic_arena_layer *layers,
         uint32_t n_layer, uint32_t n_expert);
+int ds4_gpu_dynamic_arena_bind_q1_0(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_dynamic_arena_layer *layers,
+        uint32_t n_layer, uint32_t n_expert,
+        uint32_t active_layer_first, uint32_t active_layer_last);
 int ds4_gpu_dynamic_arena_prepare(
         uint64_t requested_bytes,
         uint64_t *allocated_bytes,

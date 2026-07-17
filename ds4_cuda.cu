@@ -214,6 +214,12 @@ static uint64_t g_q1_0_route_calls;
 static uint64_t g_q1_0_route_slots;
 static uint64_t g_q1_0_selected_loads;
 static uint64_t g_q1_0_selected_load_failures;
+static uint64_t g_q1_0_resident_hits;
+static uint64_t g_q1_0_resident_misses;
+static uint64_t g_q1_0_resident_h2d_bytes;
+static uint64_t g_q1_0_direct_pread_fallbacks;
+static uint64_t g_q1_0_direct_pread_bytes;
+static uint32_t g_q1_0_resident_bootstrap_entries;
 struct cuda_iq1_s_ram_cache_slot {
     uint32_t layer_index;
     uint32_t expert_id;
@@ -566,6 +572,12 @@ struct cuda_dynamic_arena_slot {
 
 struct ds4_gpu_dynamic_arena_txn;
 
+enum cuda_dynamic_arena_backing : uint32_t {
+    CUDA_DYNAMIC_ARENA_BACKING_NONE = 0,
+    CUDA_DYNAMIC_ARENA_BACKING_PRIMARY,
+    CUDA_DYNAMIC_ARENA_BACKING_Q1_0,
+};
+
 struct cuda_dynamic_arena {
     const void *model_map;
     uint64_t model_size;
@@ -581,6 +593,9 @@ struct cuda_dynamic_arena {
     uint64_t request_sequence;
     uint32_t n_layer;
     uint32_t n_expert;
+    uint32_t active_layer_first;
+    uint32_t active_layer_last;
+    cuda_dynamic_arena_backing backing;
     int submissions_blocked;
     int hits_disabled;
     int tiering_exclusive;
@@ -605,6 +620,20 @@ struct ds4_gpu_dynamic_arena_txn {
 };
 
 static cuda_dynamic_arena g_dynamic_arena;
+
+static const char *cuda_dynamic_arena_backing_name(
+        cuda_dynamic_arena_backing backing) {
+    switch (backing) {
+    case CUDA_DYNAMIC_ARENA_BACKING_PRIMARY: return "primary";
+    case CUDA_DYNAMIC_ARENA_BACKING_Q1_0:    return "q1_0";
+    default:                                 return "none";
+    }
+}
+
+static int cuda_q1_0_resident_arena_requested(void) {
+    const char *value = getenv("DS4_Q1_0_RESIDENT_ARENA");
+    return value && strcmp(value, "1") == 0;
+}
 
 struct cuda_dynamic_arena_observer {
     uint32_t window;
@@ -1693,11 +1722,24 @@ static void cuda_q1_0_sidecar_clear(void) {
     if (g_q1_0_sidecar_file_valid || g_q1_0_route_calls != 0) {
         fprintf(stderr,
                 "ds4: [q1-0-sidecar] result=summary calls=%llu slots=%llu "
-                "selected_loads=%llu failures=%llu\n",
+                "selected_loads=%llu failures=%llu resident_mode=%d "
+                "resident_hits=%llu resident_misses=%llu resident_h2d_bytes=%llu "
+                "direct_pread_fallbacks=%llu direct_pread_bytes=%llu "
+                "candidate_entries=%u iq2_vram_cache=q1-routes-bypass "
+                "iq2_host_arena=%s mixed_host_backing=%s\n",
                 (unsigned long long)g_q1_0_route_calls,
                 (unsigned long long)g_q1_0_route_slots,
                 (unsigned long long)g_q1_0_selected_loads,
-                (unsigned long long)g_q1_0_selected_load_failures);
+                (unsigned long long)g_q1_0_selected_load_failures,
+                cuda_q1_0_resident_arena_requested(),
+                (unsigned long long)g_q1_0_resident_hits,
+                (unsigned long long)g_q1_0_resident_misses,
+                (unsigned long long)g_q1_0_resident_h2d_bytes,
+                (unsigned long long)g_q1_0_direct_pread_fallbacks,
+                (unsigned long long)g_q1_0_direct_pread_bytes,
+                g_q1_0_resident_bootstrap_entries,
+                cuda_q1_0_resident_arena_requested() ? "disabled" : "unchanged",
+                cuda_q1_0_resident_arena_requested() ? "not-implemented" : "n/a");
     }
     if (g_q1_0_sidecar_file_valid) {
         os_file_close(&g_q1_0_sidecar_file);
@@ -1711,6 +1753,12 @@ static void cuda_q1_0_sidecar_clear(void) {
     g_q1_0_route_slots = 0;
     g_q1_0_selected_loads = 0;
     g_q1_0_selected_load_failures = 0;
+    g_q1_0_resident_hits = 0;
+    g_q1_0_resident_misses = 0;
+    g_q1_0_resident_h2d_bytes = 0;
+    g_q1_0_direct_pread_fallbacks = 0;
+    g_q1_0_direct_pread_bytes = 0;
+    g_q1_0_resident_bootstrap_entries = 0;
 }
 
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
@@ -3086,12 +3134,21 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
     if (g_dynamic_arena.host_base &&
         (g_dynamic_arena.hits || g_dynamic_arena.misses ||
          g_dynamic_arena.fatal_errors)) {
-        fprintf(stderr,
-                "ds4: [arena] final hits=%llu misses=%llu fatal=%llu uploaded=%.2f GiB\n",
-                (unsigned long long)g_dynamic_arena.hits,
-                (unsigned long long)g_dynamic_arena.misses,
-                (unsigned long long)g_dynamic_arena.fatal_errors,
-                (double)g_dynamic_arena.bytes_uploaded / 1073741824.0);
+        if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+            fprintf(stderr,
+                    "ds4: [arena] final hits=%llu misses=%llu fatal=%llu uploaded=%.2f GiB backing=q1_0\n",
+                    (unsigned long long)g_dynamic_arena.hits,
+                    (unsigned long long)g_dynamic_arena.misses,
+                    (unsigned long long)g_dynamic_arena.fatal_errors,
+                    (double)g_dynamic_arena.bytes_uploaded / 1073741824.0);
+        } else {
+            fprintf(stderr,
+                    "ds4: [arena] final hits=%llu misses=%llu fatal=%llu uploaded=%.2f GiB\n",
+                    (unsigned long long)g_dynamic_arena.hits,
+                    (unsigned long long)g_dynamic_arena.misses,
+                    (unsigned long long)g_dynamic_arena.fatal_errors,
+                    (double)g_dynamic_arena.bytes_uploaded / 1073741824.0);
+        }
     }
     cuda_prefill_mass_observer_release(1);
     cuda_reap_mass_observer_release(1);
@@ -3109,19 +3166,35 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
     g_dynamic_arena.dma_sequence = 0;
     g_dynamic_arena.n_layer = 0;
     g_dynamic_arena.n_expert = 0;
+    g_dynamic_arena.active_layer_first = 0;
+    g_dynamic_arena.active_layer_last = 0;
+    g_dynamic_arena.backing = CUDA_DYNAMIC_ARENA_BACKING_NONE;
     g_dynamic_arena.layers.clear();
 }
 
-extern "C" int ds4_gpu_dynamic_arena_bind(
+static int cuda_dynamic_arena_bind(
         const void *model_map, uint64_t model_size,
         const ds4_gpu_dynamic_arena_layer *layers,
-        uint32_t n_layer, uint32_t n_expert) {
+        uint32_t n_layer, uint32_t n_expert,
+        cuda_dynamic_arena_backing backing,
+        uint32_t active_layer_first,
+        uint32_t active_layer_last) {
     if (!model_map || model_size == 0 || !layers ||
-        n_layer == 0 || n_expert == 0) {
+        n_layer == 0 || n_expert == 0 ||
+        backing == CUDA_DYNAMIC_ARENA_BACKING_NONE ||
+        active_layer_first >= n_layer ||
+        active_layer_last < active_layer_first ||
+        active_layer_last >= n_layer) {
         return 0;
     }
+    const uint32_t geometry_first =
+        backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0
+            ? active_layer_first : 0u;
+    const uint32_t geometry_last =
+        backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0
+            ? active_layer_last : n_layer - 1u;
     uint64_t slot_bytes = 0;
-    for (uint32_t il = 0; il < n_layer; il++) {
+    for (uint32_t il = geometry_first; il <= geometry_last; il++) {
         const ds4_gpu_dynamic_arena_layer &layer = layers[il];
         if (!cuda_dynamic_arena_range_valid(layer.gate_offset,
                                              layer.gate_expert_bytes,
@@ -3139,7 +3212,7 @@ extern "C" int ds4_gpu_dynamic_arena_bind(
         }
         const uint64_t layer_slot_bytes = layer.gate_expert_bytes +
             layer.up_expert_bytes + layer.down_expert_bytes;
-        if (il == 0) slot_bytes = layer_slot_bytes;
+        if (il == geometry_first) slot_bytes = layer_slot_bytes;
         if (layer_slot_bytes != slot_bytes) {
             fprintf(stderr,
                     "ds4: CUDA dynamic arena requires uniform expert geometry "
@@ -3154,6 +3227,9 @@ extern "C" int ds4_gpu_dynamic_arena_bind(
         g_dynamic_arena.n_layer == n_layer &&
         g_dynamic_arena.n_expert == n_expert &&
         g_dynamic_arena.slot_bytes == slot_bytes &&
+        g_dynamic_arena.backing == backing &&
+        g_dynamic_arena.active_layer_first == active_layer_first &&
+        g_dynamic_arena.active_layer_last == active_layer_last &&
         g_dynamic_arena.layers.size() == n_layer) {
         int same = 1;
         for (uint32_t il = 0; il < n_layer; il++) {
@@ -3178,7 +3254,44 @@ extern "C" int ds4_gpu_dynamic_arena_bind(
     g_dynamic_arena.n_layer = n_layer;
     g_dynamic_arena.n_expert = n_expert;
     g_dynamic_arena.slot_bytes = slot_bytes;
+    g_dynamic_arena.active_layer_first = active_layer_first;
+    g_dynamic_arena.active_layer_last = active_layer_last;
+    g_dynamic_arena.backing = backing;
     return 1;
+}
+
+extern "C" int ds4_gpu_dynamic_arena_bind(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_dynamic_arena_layer *layers,
+        uint32_t n_layer, uint32_t n_expert) {
+    return cuda_dynamic_arena_bind(
+        model_map, model_size, layers, n_layer, n_expert,
+        CUDA_DYNAMIC_ARENA_BACKING_PRIMARY, 0u, n_layer ? n_layer - 1u : 0u);
+}
+
+extern "C" int ds4_gpu_dynamic_arena_bind_q1_0(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_dynamic_arena_layer *layers,
+        uint32_t n_layer, uint32_t n_expert,
+        uint32_t active_layer_first, uint32_t active_layer_last) {
+    if (!cuda_q1_0_resident_arena_requested() ||
+        !g_q1_0_sidecar_file_valid ||
+        model_map != g_q1_0_sidecar_host_base ||
+        model_size != g_q1_0_sidecar_size) {
+        fprintf(stderr,
+                "ds4: [q1-0-resident-arena] result=failed reason=sidecar-binding\n");
+        return 0;
+    }
+    const int bound = cuda_dynamic_arena_bind(
+        model_map, model_size, layers, n_layer, n_expert,
+        CUDA_DYNAMIC_ARENA_BACKING_Q1_0,
+        active_layer_first, active_layer_last);
+    if (bound) {
+        fprintf(stderr,
+                "ds4: [q1-0-resident-arena] result=bound backing=q1_0 layers=%u..%u iq2_host_arena=disabled mixed_host_backing=not-implemented iq2_vram_cache=q1-routes-bypass\n",
+                active_layer_first, active_layer_last);
+    }
+    return bound;
 }
 
 extern "C" int ds4_gpu_dynamic_arena_prepare(
@@ -3321,11 +3434,16 @@ extern "C" int ds4_gpu_dynamic_arena_prepare(
     const double avail_gib = -1.0;
 #endif
     fprintf(stderr,
-            "ds4: CUDA dynamic arena ready %.2f GiB, %u slots, %.2f MiB/slot, available_ram=%.2f GiB bytes=%llu slot_bytes=%llu\n",
+            "ds4: CUDA dynamic arena ready %.2f GiB, %u slots, %.2f MiB/slot, available_ram=%.2f GiB bytes=%llu slot_bytes=%llu backing=%s iq2_host_arena=%s mixed_host_backing=%s\n",
             (double)bytes / 1073741824.0, (uint32_t)slots64,
             (double)g_dynamic_arena.slot_bytes / 1048576.0, avail_gib,
             (unsigned long long)bytes,
-            (unsigned long long)g_dynamic_arena.slot_bytes);
+            (unsigned long long)g_dynamic_arena.slot_bytes,
+            cuda_dynamic_arena_backing_name(g_dynamic_arena.backing),
+            g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0
+                ? "disabled" : "enabled",
+            g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0
+                ? "not-implemented" : "n/a");
     ds4_gpu_dynamic_arena_observer_reset();
     return 1;
 }
@@ -3552,6 +3670,36 @@ extern "C" int ds4_gpu_dynamic_arena_publish(
         uint64_t *snapshot_generation) {
     if (snapshot_generation) *snapshot_generation = 0;
     if (!txn || txn != g_dynamic_arena.txn || txn->failed) return 0;
+    const uint32_t entries =
+        g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
+    uint32_t q1_bootstrap_entries = 0;
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        const uint64_t expected =
+            (uint64_t)(g_dynamic_arena.active_layer_last -
+                       g_dynamic_arena.active_layer_first + 1u) *
+            g_dynamic_arena.n_expert;
+        int target_out_of_range = txn->target.size() != entries;
+        uint32_t target_entries = 0;
+        if (!target_out_of_range) {
+            for (uint32_t entry = 0; entry < entries; entry++) {
+                if (!txn->target[entry]) continue;
+                const uint32_t layer = entry / g_dynamic_arena.n_expert;
+                target_entries++;
+                target_out_of_range |=
+                    layer < g_dynamic_arena.active_layer_first ||
+                    layer > g_dynamic_arena.active_layer_last;
+            }
+        }
+        if (expected > UINT32_MAX || target_out_of_range ||
+            target_entries != (uint32_t)expected) {
+            txn->failed = 1;
+            fprintf(stderr,
+                    "ds4: [q1-0-resident-arena] result=failed reason=full-bootstrap-snapshot-required target_entries=%u required_entries=%llu router=unchanged\n",
+                    target_entries, (unsigned long long)expected);
+            return 0;
+        }
+        q1_bootstrap_entries = target_entries;
+    }
     std::vector<uint8_t> referenced;
     try {
         referenced.assign(g_dynamic_arena.slots.size(), 0);
@@ -3559,8 +3707,6 @@ extern "C" int ds4_gpu_dynamic_arena_publish(
         txn->failed = 1;
         return 0;
     }
-    const uint32_t entries =
-        g_dynamic_arena.n_layer * g_dynamic_arena.n_expert;
     for (uint32_t entry = 0; entry < entries; entry++) {
         if (!txn->target[entry]) continue;
         const uint32_t layer = entry / g_dynamic_arena.n_expert;
@@ -3611,6 +3757,9 @@ extern "C" int ds4_gpu_dynamic_arena_publish(
     g_dynamic_arena.snapshot_generation = txn->target_generation;
     g_dynamic_arena.submissions_blocked = 0;
     g_dynamic_arena.hits_disabled = 0;
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        g_q1_0_resident_bootstrap_entries = q1_bootstrap_entries;
+    }
     if (snapshot_generation) {
         *snapshot_generation = g_dynamic_arena.snapshot_generation;
     }
@@ -5024,6 +5173,16 @@ static int cuda_dynamic_arena_wrap_publish_target(
     const char *checksum_name = trust_worker_checksum ?
             "fnv1a64-worker-only" :
             "fnv1a64-worker-plus-finish";
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0 &&
+        (sequential_file_requested || random_file_requested)) {
+        local.reason = "q1-sidecar-file-source-unavailable";
+        local.seconds = cuda_wall_sec() - started_at;
+        fprintf(stderr,
+                "ds4: [q1-0-resident-arena] result=failed reason=%s route_pread=disabled\n",
+                local.reason);
+        if (result) *result = local;
+        return 0;
+    }
     if (sequential_file_requested && random_file_requested) {
         local.reason = "multiple-file-sources";
         local.seconds = cuda_wall_sec() - started_at;
@@ -6865,6 +7024,11 @@ static void cuda_prefill_mass_compose_fail_closed(void) {
 static int cuda_prefill_mass_compose_apply_router_mask(void) {
     cuda_prefill_mass_observer &observer = g_prefill_mass_observer;
     if (cuda_moe_prefill_tier_compose_requested() <= 0) return 1;
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        fprintf(stderr,
+                "ds4: [q1-0-resident-arena] result=failed reason=mixed-host-resolver-not-implemented router=unchanged\n");
+        return 0;
+    }
     const int router_open =
         cuda_moe_prefill_tier_router_open_requested();
     if (router_open < 0) return 0;
@@ -6950,6 +7114,11 @@ static int cuda_prefill_mass_compose_apply_router_mask(void) {
 
 static void cuda_prefill_mass_observer_reset(void) {
     cuda_prefill_mass_observer_release(1);
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        fprintf(stderr,
+                "ds4: [q1-0-resident-arena] prefill_mass=disabled snapshot=full-bootstrap router=unchanged dynamic_masks=not-implemented\n");
+        return;
+    }
     const int wrap = cuda_prefill_mass_wrap_requested();
     const int observe = cuda_prefill_mass_observe_requested();
     if (!observe && !wrap) return;
@@ -7044,7 +7213,6 @@ static int cuda_prefill_mass_publish_candidate(void) {
             reason = "invalid-target";
             break;
         }
-
         cuda_request_phase_trace("wrap-copy-enter");
         const int published = cuda_dynamic_arena_wrap_publish_target(
                 observer.candidate.data(), entry_count, &wrap);
@@ -7628,6 +7796,9 @@ static void cuda_reap_mass_observe_selected(
 }
 
 static int cuda_dynamic_arena_carry_mode(void) {
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        return 1;
+    }
     const char *value =
         getenv("DS4_CUDA_DYNAMIC_ARENA_CARRY_ACROSS_REQUESTS");
     if (!value || !value[0]) return -1;
@@ -7661,7 +7832,11 @@ static uint32_t cuda_dynamic_arena_active_count(void) {
 extern "C" void ds4_gpu_dynamic_arena_request_begin(void) {
     cuda_moe_tiering_request_boundary_reset();
     cuda_prefill_mass_observer_reset();
-    cuda_reap_mass_observer_reset();
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        cuda_reap_mass_observer_release(1);
+    } else {
+        cuda_reap_mass_observer_reset();
+    }
     const int mode = cuda_dynamic_arena_carry_mode();
     if (mode < 0 || !g_dynamic_arena.host_base) return;
 
@@ -7687,6 +7862,12 @@ extern "C" void ds4_gpu_dynamic_arena_request_begin(void) {
 }
 
 extern "C" void ds4_gpu_dynamic_arena_observer_reset(void) {
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        cuda_prefill_mass_observer_release(1);
+        cuda_dynamic_arena_observer_release();
+        cuda_reap_mass_observer_release(1);
+        return;
+    }
     cuda_prefill_mass_observer_finalize();
     const uint32_t window = cuda_dynamic_arena_observer_window();
     const uint32_t min_hits = cuda_dynamic_arena_observer_min_hits();
@@ -18449,6 +18630,16 @@ static int cuda_moe_tiering_prepare(void) {
         cuda_moe_prefill_tier_reserve_slots_requested();
     if (compose_requested < 0 || compose_router_open < 0 ||
         iq1_probation_slots < 0 || configured_reserve_slots < 0) return 0;
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0 &&
+        (requested != CUDA_MOE_TIER_OFF || compose_requested > 0 ||
+         compose_router_open > 0 || iq1_probation_slots > 0 ||
+         configured_reserve_slots > 0)) {
+        fprintf(stderr,
+                "ds4: [q1-0-resident-arena] result=failed reason=mixed-host-resolver-not-implemented expert_tiering=%d compose=%d router_open=%d iq1_probation=%d reserve=%d\n",
+                requested, compose_requested, compose_router_open,
+                iq1_probation_slots, configured_reserve_slots);
+        return 0;
+    }
     uint64_t iq1_min_touches = 1u;
     double iq1_min_weight = 0.0;
     double iq1_min_mass = 0.0;
@@ -23227,9 +23418,9 @@ static int cuda_moe_selected_load_q1_0(
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg) {
-    (void)model_size;
     if (!g_q1_0_sidecar_file_valid ||
         model_map != g_q1_0_sidecar_host_base ||
+        model_size != g_q1_0_sidecar_size ||
         getenv("DS4_Q1_0_SELECTED_LOAD") == NULL) {
         return 0;
     }
@@ -23290,60 +23481,112 @@ static int cuda_moe_selected_load_q1_0(
         return 0;
     }
 
-    std::vector<uint8_t> host_gate;
-    std::vector<uint8_t> host_up;
-    std::vector<uint8_t> host_down;
-    try {
-        host_gate.resize((size_t)cgate);
-        host_up.resize((size_t)cgate);
-        host_down.resize((size_t)cdown);
-    } catch (...) {
-        return 0;
-    }
-
-    for (uint32_t i = 0; i < compact_count; i++) {
-        const uint32_t expert = (uint32_t)compact[i];
-        const uint64_t gate_src = gate_offset +
-            (uint64_t)expert * gate_expert_bytes;
-        const uint64_t up_src = up_offset +
-            (uint64_t)expert * gate_expert_bytes;
-        const uint64_t down_src = down_offset +
-            (uint64_t)expert * down_expert_bytes;
-        if (gate_src > g_q1_0_sidecar_size ||
-            gate_expert_bytes > g_q1_0_sidecar_size - gate_src ||
-            up_src > g_q1_0_sidecar_size ||
-            gate_expert_bytes > g_q1_0_sidecar_size - up_src ||
-            down_src > g_q1_0_sidecar_size ||
-            down_expert_bytes > g_q1_0_sidecar_size - down_src) {
+    if (cuda_q1_0_resident_arena_requested()) {
+        if (g_dynamic_arena.backing != CUDA_DYNAMIC_ARENA_BACKING_Q1_0 ||
+            g_dynamic_arena.model_map != model_map ||
+            g_dynamic_arena.model_size != model_size ||
+            layer_index < g_dynamic_arena.active_layer_first ||
+            layer_index > g_dynamic_arena.active_layer_last ||
+            !g_dynamic_arena.host_base ||
+            g_dynamic_arena.snapshot_generation == 0 ||
+            g_dynamic_arena.hits_disabled ||
+            g_dynamic_arena.submissions_blocked) {
+            g_q1_0_resident_misses++;
             return 0;
         }
-        if (!cuda_pread_full(&g_q1_0_sidecar_file,
-                             host_gate.data() + (uint64_t)i * gate_expert_bytes,
-                             gate_expert_bytes, gate_src) ||
-            !cuda_pread_full(&g_q1_0_sidecar_file,
-                             host_up.data() + (uint64_t)i * gate_expert_bytes,
-                             gate_expert_bytes, up_src) ||
-            !cuda_pread_full(&g_q1_0_sidecar_file,
-                             host_down.data() + (uint64_t)i * down_expert_bytes,
-                             down_expert_bytes, down_src)) {
+        uint64_t route_h2d_bytes = 0;
+        for (uint32_t i = 0; i < compact_count; i++) {
+            const uint32_t expert = (uint32_t)compact[i];
+            const uint64_t gate_dst = (uint64_t)i * gate_expert_bytes;
+            const uint64_t down_dst = (uint64_t)i * down_expert_bytes;
+            const cuda_dynamic_arena_copy_status status =
+                cuda_dynamic_arena_copy_expert_async(
+                    model_map, layer_index, expert,
+                    gate_offset, up_offset, down_offset,
+                    g_moe_gather.gate + gate_dst,
+                    g_moe_gather.up + gate_dst,
+                    g_moe_gather.down + down_dst,
+                    gate_expert_bytes, gate_expert_bytes,
+                    down_expert_bytes);
+            if (status != CUDA_DYNAMIC_ARENA_ENQUEUED) {
+                g_q1_0_resident_misses++;
+                (void)cudaStreamSynchronize(g_model_upload_stream);
+                return 0;
+            }
+            route_h2d_bytes += gate_expert_bytes * 2u + down_expert_bytes;
+        }
+        if (!cuda_ok(cudaMemcpyAsync(
+                         g_moe_gather.slot, slots.data(),
+                         (size_t)slot_count * sizeof(int32_t),
+                         cudaMemcpyHostToDevice, g_model_upload_stream),
+                     "Q1_0 resident slots H2D") ||
+            !cuda_ok(cudaStreamSynchronize(g_model_upload_stream),
+                     "Q1_0 resident compact upload sync")) {
             return 0;
         }
-    }
+        g_q1_0_resident_hits += compact_count;
+        g_q1_0_resident_h2d_bytes += route_h2d_bytes;
+    } else {
+        std::vector<uint8_t> host_gate;
+        std::vector<uint8_t> host_up;
+        std::vector<uint8_t> host_down;
+        try {
+            host_gate.resize((size_t)cgate);
+            host_up.resize((size_t)cgate);
+            host_down.resize((size_t)cdown);
+        } catch (...) {
+            return 0;
+        }
 
-    if (!cuda_ok(cudaMemcpy(g_moe_gather.gate, host_gate.data(),
-                            (size_t)cgate, cudaMemcpyHostToDevice),
-                 "Q1_0 gate H2D") ||
-        !cuda_ok(cudaMemcpy(g_moe_gather.up, host_up.data(),
-                            (size_t)cgate, cudaMemcpyHostToDevice),
-                 "Q1_0 up H2D") ||
-        !cuda_ok(cudaMemcpy(g_moe_gather.down, host_down.data(),
-                            (size_t)cdown, cudaMemcpyHostToDevice),
-                 "Q1_0 down H2D") ||
-        !cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
-                            (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyHostToDevice),
-                 "Q1_0 slots H2D")) {
-        return 0;
+        g_q1_0_direct_pread_fallbacks++;
+        for (uint32_t i = 0; i < compact_count; i++) {
+            const uint32_t expert = (uint32_t)compact[i];
+            const uint64_t gate_src = gate_offset +
+                (uint64_t)expert * gate_expert_bytes;
+            const uint64_t up_src = up_offset +
+                (uint64_t)expert * gate_expert_bytes;
+            const uint64_t down_src = down_offset +
+                (uint64_t)expert * down_expert_bytes;
+            if (gate_src > g_q1_0_sidecar_size ||
+                gate_expert_bytes > g_q1_0_sidecar_size - gate_src ||
+                up_src > g_q1_0_sidecar_size ||
+                gate_expert_bytes > g_q1_0_sidecar_size - up_src ||
+                down_src > g_q1_0_sidecar_size ||
+                down_expert_bytes > g_q1_0_sidecar_size - down_src) {
+                return 0;
+            }
+            if (!cuda_pread_full(
+                    &g_q1_0_sidecar_file,
+                    host_gate.data() + (uint64_t)i * gate_expert_bytes,
+                    gate_expert_bytes, gate_src) ||
+                !cuda_pread_full(
+                    &g_q1_0_sidecar_file,
+                    host_up.data() + (uint64_t)i * gate_expert_bytes,
+                    gate_expert_bytes, up_src) ||
+                !cuda_pread_full(
+                    &g_q1_0_sidecar_file,
+                    host_down.data() + (uint64_t)i * down_expert_bytes,
+                    down_expert_bytes, down_src)) {
+                return 0;
+            }
+        }
+
+        if (!cuda_ok(cudaMemcpy(g_moe_gather.gate, host_gate.data(),
+                                (size_t)cgate, cudaMemcpyHostToDevice),
+                     "Q1_0 gate H2D") ||
+            !cuda_ok(cudaMemcpy(g_moe_gather.up, host_up.data(),
+                                (size_t)cgate, cudaMemcpyHostToDevice),
+                     "Q1_0 up H2D") ||
+            !cuda_ok(cudaMemcpy(g_moe_gather.down, host_down.data(),
+                                (size_t)cdown, cudaMemcpyHostToDevice),
+                     "Q1_0 down H2D") ||
+            !cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
+                                (size_t)slot_count * sizeof(int32_t),
+                                cudaMemcpyHostToDevice),
+                     "Q1_0 slots H2D")) {
+            return 0;
+        }
+        g_q1_0_direct_pread_bytes += cgate * 2u + cdown;
     }
 
     g_moe_gather.slot_tensor.ptr = g_moe_gather.slot;
