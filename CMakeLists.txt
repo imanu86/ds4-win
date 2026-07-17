@@ -72,6 +72,14 @@ set_target_properties(ds4_iq1_s_bench PROPERTIES
     CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
 )
 
+add_executable(ds4_q1_0_bench ds4_q1_0_bench.cu)
+target_compile_features(ds4_q1_0_bench PRIVATE cxx_std_17)
+target_link_libraries(ds4_q1_0_bench PRIVATE CUDA::cudart)
+set_target_properties(ds4_q1_0_bench PROPERTIES
+    CUDA_SEPARABLE_COMPILATION OFF
+    CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
+)
+
 add_executable(ds4_inspect ds4_inspect.c)
 target_link_libraries(ds4_inspect PRIVATE
     ds4
@@ -91,6 +99,7 @@ if(MSVC)
     target_compile_options(ds4_moe_gate_bench PRIVATE /W3)
     target_compile_options(ds4_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>)
     target_compile_options(ds4_iq1_s_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>)
+    target_compile_options(ds4_q1_0_bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W3>)
     target_compile_options(ds4_inspect PRIVATE /W3)
 endif()
 
