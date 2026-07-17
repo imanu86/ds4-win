@@ -104,6 +104,9 @@ param(
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
     [switch]$ReuseVerifiedIq1SReceipt,
+    [string]$ModelIq1SuiteReceiptPath = "",
+    [string]$ExpectedModelIq1SuiteReceiptSHA256 = "",
+    [switch]$ReuseVerifiedSuiteReceipt,
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [switch]$Iq1SMixedColdOne,
@@ -237,6 +240,123 @@ function Assert-G7VerifiedFileReceipt {
         throw "$Kind verified receipt identity mismatch"
     }
 }
+function Assert-G7SuiteChildBinding {
+    param(
+        [Parameter(Mandatory=$true)][object]$Child,
+        [Parameter(Mandatory=$true)][string]$ExpectedReceiptPath,
+        [Parameter(Mandatory=$true)][string]$ObservedReceiptSHA256,
+        [Parameter(Mandatory=$true)][IO.FileInfo]$Info,
+        [Parameter(Mandatory=$true)][string]$ExpectedFileSHA256,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedBytes,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+    $livePath = [IO.Path]::GetFullPath($Info.FullName)
+    $childReceiptPath = [IO.Path]::GetFullPath([string]$Child.receipt_path)
+    $expectedReceiptFull = [IO.Path]::GetFullPath($ExpectedReceiptPath)
+    $childPath = [IO.Path]::GetFullPath([string]$Child.path)
+    $fileId = Get-G7FileId $livePath
+    if (-not [string]::Equals(
+            $childReceiptPath, $expectedReceiptFull,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [string]$Child.receipt_sha256 -ine $ObservedReceiptSHA256 -or
+        -not [string]::Equals(
+            $childPath, $livePath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [UInt64]$Child.bytes -ne $ExpectedBytes -or
+        [UInt64]$Info.Length -ne $ExpectedBytes -or
+        [string]$Child.sha256 -ine $ExpectedFileSHA256 -or
+        [string]$Child.hash_method -ne "locked_stream_sha256" -or
+        [bool]$Child.full_hash_verified -ne $true -or
+        [Int64]$Child.creation_utc_ticks -ne $Info.CreationTimeUtc.Ticks -or
+        [Int64]$Child.last_write_utc_ticks -ne $Info.LastWriteTimeUtc.Ticks -or
+        [string]$Child.file_id -ine $fileId -or
+        ($Info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "$Kind suite receipt binding mismatch"
+    }
+}
+function Get-G7Win32CodeFromException([Exception]$Exception) {
+    return ($Exception.HResult -band 0xffff)
+}
+function Ensure-G7NativeShareProbe {
+    if ("G7NativeShareProbe" -as [type]) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class G7NativeShareProbe {
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    public static extern IntPtr CreateFileW(
+        string lpFileName, UInt32 dwDesiredAccess, UInt32 dwShareMode,
+        IntPtr lpSecurityAttributes, UInt32 dwCreationDisposition,
+        UInt32 dwFlagsAndAttributes, IntPtr hTemplateFile);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+}
+"@
+}
+function Test-G7SharingViolationProof {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+    $writeObserved = $false
+    $writeError = ""
+    $writeWin32 = 0
+    $deleteObserved = $false
+    $deleteError = ""
+    $deleteWin32 = 0
+    try {
+        $writeProbe = [IO.File]::Open(
+            $Path, [IO.FileMode]::Open,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        $writeProbe.Dispose()
+        $writeError = "opened"
+    } catch [IO.IOException] {
+        $writeWin32 = Get-G7Win32CodeFromException $_.Exception
+        if ($writeWin32 -eq 32) {
+            $writeObserved = $true
+            $writeError = "ERROR_SHARING_VIOLATION"
+        } else {
+            throw "$Kind deny-write lock proof failed with IO error $writeWin32"
+        }
+    } catch [UnauthorizedAccessException] {
+        throw "$Kind deny-write lock proof hit ACL denial, not sharing violation"
+    }
+    Ensure-G7NativeShareProbe
+    $deleteAccess = [UInt32]0x00010000
+    $shareAll = [UInt32]7
+    $openExisting = [UInt32]3
+    $normal = [UInt32]0x00000080
+    $handle = [G7NativeShareProbe]::CreateFileW(
+        $Path, $deleteAccess, $shareAll, [IntPtr]::Zero,
+        $openExisting, $normal, [IntPtr]::Zero)
+    if ($handle -eq [IntPtr]::Zero -or $handle -eq [IntPtr](-1)) {
+        $deleteWin32 = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($deleteWin32 -eq 32) {
+            $deleteObserved = $true
+            $deleteError = "ERROR_SHARING_VIOLATION"
+        } elseif ($deleteWin32 -eq 5) {
+            throw "$Kind deny-delete lock proof hit ACL denial, not sharing violation"
+        } else {
+            throw "$Kind deny-delete lock proof failed with Win32 error $deleteWin32"
+        }
+    } else {
+        [G7NativeShareProbe]::CloseHandle($handle) | Out-Null
+        $deleteError = "opened"
+    }
+    [pscustomobject]@{
+        path = [IO.Path]::GetFullPath($Path)
+        deny_write_observed = $writeObserved
+        deny_write_error = $writeError
+        deny_write_win32 = $writeWin32
+        deny_delete_observed = $deleteObserved
+        deny_delete_error = $deleteError
+        deny_delete_win32 = $deleteWin32
+        acl_denial = $false
+        sharing_violation_lock_proof =
+            [bool]($writeObserved -and $deleteObserved)
+    }
+}
 if ($PromptFile) {
     $PromptFile = (Resolve-Path -LiteralPath $PromptFile).Path
     $Prompt = [IO.File]::ReadAllText($PromptFile, [Text.Encoding]::UTF8)
@@ -262,12 +382,39 @@ if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[
 if ($ExpectedModelSHA256 -and $ExpectedModelSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedModelSHA256 must be a 64-character hexadecimal SHA-256"
 }
+if ($ExpectedModelIq1SuiteReceiptSHA256 -and
+    $ExpectedModelIq1SuiteReceiptSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedModelIq1SuiteReceiptSHA256 must be a 64-character hexadecimal SHA-256"
+}
 if ($ReuseVerifiedModelReceipt -and -not $ExpectedModelSHA256) {
     throw "ReuseVerifiedModelReceipt requires ExpectedModelSHA256"
 }
 if (($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt) -and
     $GateKind -ne "structural-safety") {
     throw "Verified receipt reuse is restricted to structural-safety diagnostics"
+}
+if ($ReuseVerifiedSuiteReceipt) {
+    if ($GateKind -eq "quality") {
+        throw "Verified suite receipt reuse is restricted to benchmark and structural-safety gates"
+    }
+    if ($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt) {
+        throw "ReuseVerifiedSuiteReceipt cannot be combined with per-file verified receipt reuse switches"
+    }
+    if (-not $ModelIq1SuiteReceiptPath -or -not $ExpectedModelIq1SuiteReceiptSHA256) {
+        throw "ReuseVerifiedSuiteReceipt requires ModelIq1SuiteReceiptPath and ExpectedModelIq1SuiteReceiptSHA256"
+    }
+    if (-not $ExpectedModelSHA256) {
+        throw "ReuseVerifiedSuiteReceipt requires ExpectedModelSHA256"
+    }
+    if (-not $Iq1SExpertSidecar -or
+        -not $ExpectedIq1SExpertSidecarSHA256 -or
+        $ExpectedIq1SExpertSidecarBytes -eq 0) {
+        throw "ReuseVerifiedSuiteReceipt requires IQ1_S sidecar path, SHA-256, and byte count"
+    }
+}
+if ((-not $ReuseVerifiedSuiteReceipt) -and
+    ($ModelIq1SuiteReceiptPath -or $ExpectedModelIq1SuiteReceiptSHA256)) {
+    throw "ModelIq1SuiteReceiptPath and ExpectedModelIq1SuiteReceiptSHA256 require ReuseVerifiedSuiteReceipt"
 }
 if ($AllowEmbeddedBakeMask -and
     $ExpectedEmbeddedBakeMaskSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
@@ -381,6 +528,14 @@ $iq1SSidecarReceiptAtStart = $null
 $iq1SSidecarReceiptPath = ""
 $iq1SSidecarReceiptHashAtStart = ""
 $iq1SSidecarLockStream = $null
+$modelIq1SuiteReceiptAtStart = $null
+$modelIq1SuiteReceiptPathAtStart = ""
+$modelIq1SuiteReceiptHashAtStart = ""
+$modelIq1SuiteReceiptSchemaAtStart = ""
+$modelIq1SuiteFullHashVerified = $false
+$modelIq1SuiteLockProofRequired = $false
+$modelIq1SuiteLockProofObserved = $false
+$modelIq1SuiteLockProof = $null
 if ($Iq1SExpertSidecar) {
     if ($Iq1SLayerFirst -gt $Iq1SLayerLast) {
         throw "Iq1SLayerFirst must be less than or equal to Iq1SLayerLast"
@@ -393,9 +548,11 @@ if ($Iq1SExpertSidecar) {
         $ExpectedIq1SExpertSidecarBytes -eq 0) {
         throw "IQ1_S sidecar requires expected SHA256 and byte count provenance"
     }
-    $iq1SSidecarLockStream = [IO.File]::Open(
-        $Iq1SExpertSidecar, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    if (-not $ReuseVerifiedSuiteReceipt) {
+        $iq1SSidecarLockStream = [IO.File]::Open(
+            $Iq1SExpertSidecar, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    }
     $iq1SSidecarInfoAtStart = Get-Item -LiteralPath $Iq1SExpertSidecar
     if ([UInt64]$iq1SSidecarInfoAtStart.Length -ne $ExpectedIq1SExpertSidecarBytes) {
         throw "IQ1_S sidecar byte count differs from verified provenance"
@@ -418,14 +575,15 @@ if ($Iq1SExpertSidecar) {
         [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.imatrix_provenance)) {
         throw "IQ1_S sidecar receipt does not match requested path/bytes/SHA-256"
     }
-    if ($ReuseVerifiedIq1SReceipt) {
+    if ($ReuseVerifiedIq1SReceipt -or $ReuseVerifiedSuiteReceipt) {
         Assert-G7VerifiedFileReceipt -Receipt $iq1SSidecarReceiptAtStart `
             -Info $iq1SSidecarInfoAtStart `
             -ExpectedSHA256 $ExpectedIq1SExpertSidecarSHA256 `
             -Kind "IQ1_S sidecar"
     }
 }
-if ($ReuseVerifiedIq1SReceipt -and -not $Iq1SExpertSidecar) {
+if (($ReuseVerifiedIq1SReceipt -or $ReuseVerifiedSuiteReceipt) -and
+    -not $Iq1SExpertSidecar) {
     throw "ReuseVerifiedIq1SReceipt requires Iq1SExpertSidecar"
 }
 if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar) {
@@ -452,6 +610,25 @@ if (-not $Iq1Promotion -and
      $Iq1PromotionWindowCalls -ne 0 -or
      $Iq1PromotionWindowBudget -ne 0)) {
     throw "Non-default IQ1 promotion knobs require -Iq1Promotion"
+}
+if ($ReuseVerifiedSuiteReceipt -and $GateKind -eq "benchmark") {
+    $modelIq1SuiteLockProofRequired = $true
+    $modelLockProof = Test-G7SharingViolationProof -Path $model `
+        -Kind "Model"
+    $sidecarLockProof = Test-G7SharingViolationProof `
+        -Path $Iq1SExpertSidecar -Kind "IQ1_S sidecar"
+    $modelIq1SuiteLockProofObserved = [bool](
+        [bool]$modelLockProof.sharing_violation_lock_proof -and
+        [bool]$sidecarLockProof.sharing_violation_lock_proof)
+    $modelIq1SuiteLockProof = [pscustomobject]@{
+        required = $true
+        observed = $modelIq1SuiteLockProofObserved
+        model = $modelLockProof
+        iq1_s_sidecar = $sidecarLockProof
+    }
+    if (-not $modelIq1SuiteLockProofObserved) {
+        throw "Benchmark suite receipt reuse requires active parent-held deny-write/delete locks"
+    }
 }
 if ($ComposePrefillMassOpenRouter) {
     if (-not $ComposePrefillMassTiering) { throw "ComposePrefillMassOpenRouter requires ComposePrefillMassTiering" }
@@ -1149,14 +1326,14 @@ $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPa
 if ($ExpectedSpexSHA256 -and $spexHashAtStart -ine $ExpectedSpexSHA256) {
     throw "SPEX provenance failed: expected $($ExpectedSpexSHA256.ToLowerInvariant()), observed $spexHashAtStart"
 }
-$modelLockStream = if ($ExpectedModelSHA256) {
+$modelLockStream = if ($ExpectedModelSHA256 -and -not $ReuseVerifiedSuiteReceipt) {
     [IO.File]::Open(
         $model, [IO.FileMode]::Open,
         [IO.FileAccess]::Read, [IO.FileShare]::Read)
 } else { $null }
 $modelInfoAtStart = Get-Item -LiteralPath $model
 $model = $modelInfoAtStart.FullName
-if ($ReuseVerifiedModelReceipt) {
+if ($ReuseVerifiedModelReceipt -or $ReuseVerifiedSuiteReceipt) {
     $modelReceiptPath = "$model.receipt.json"
     if (-not (Test-Path -LiteralPath $modelReceiptPath -PathType Leaf)) {
         throw "Model verified receipt missing: $modelReceiptPath"
@@ -1169,8 +1346,89 @@ if ($ReuseVerifiedModelReceipt) {
         -Info $modelInfoAtStart -ExpectedSHA256 $ExpectedModelSHA256 `
         -Kind "Model"
 }
+if ($ReuseVerifiedSuiteReceipt) {
+    $modelIq1SuiteReceiptPathAtStart =
+        [IO.Path]::GetFullPath($ModelIq1SuiteReceiptPath)
+    if (-not (Test-Path -LiteralPath $modelIq1SuiteReceiptPathAtStart `
+            -PathType Leaf)) {
+        throw "Model/IQ1 suite receipt missing: $modelIq1SuiteReceiptPathAtStart"
+    }
+    $suiteReceiptSnapshot = Read-G7ReceiptSnapshot `
+        -Path $modelIq1SuiteReceiptPathAtStart -Kind "Model/IQ1 suite"
+    $modelIq1SuiteReceiptAtStart = $suiteReceiptSnapshot.receipt
+    $modelIq1SuiteReceiptHashAtStart = $suiteReceiptSnapshot.sha256
+    $modelIq1SuiteReceiptSchemaAtStart =
+        [string]$modelIq1SuiteReceiptAtStart.schema
+    if ($modelIq1SuiteReceiptHashAtStart -ine
+        $ExpectedModelIq1SuiteReceiptSHA256) {
+        throw "Model/IQ1 suite receipt SHA-256 mismatch"
+    }
+    if ([string]$modelIq1SuiteReceiptAtStart.schema -ne
+            "g7_model_iq1_suite_receipt_v1" -or
+        [string]$modelIq1SuiteReceiptAtStart.status -ne "verified" -or
+        [string]$modelIq1SuiteReceiptAtStart.purpose -ne
+            "model_iq1_provenance_reuse" -or
+        [string]$modelIq1SuiteReceiptAtStart.hash_method -ne
+            "locked_stream_sha256" -or
+        [bool]$modelIq1SuiteReceiptAtStart.full_hash_verified -ne $true) {
+        throw "Model/IQ1 suite receipt schema/status/purpose mismatch"
+    }
+    $modelIq1SuiteFullHashVerified = $true
+    Assert-G7SuiteChildBinding -Child $modelIq1SuiteReceiptAtStart.model `
+        -ExpectedReceiptPath $modelReceiptPath `
+        -ObservedReceiptSHA256 $modelReceiptHashAtStart `
+        -Info $modelInfoAtStart `
+        -ExpectedFileSHA256 $ExpectedModelSHA256 `
+        -ExpectedBytes ([UInt64]$modelInfoAtStart.Length) `
+        -Kind "Model"
+    Assert-G7SuiteChildBinding `
+        -Child $modelIq1SuiteReceiptAtStart.iq1_s_sidecar `
+        -ExpectedReceiptPath $iq1SSidecarReceiptPath `
+        -ObservedReceiptSHA256 $iq1SSidecarReceiptHashAtStart `
+        -Info $iq1SSidecarInfoAtStart `
+        -ExpectedFileSHA256 $ExpectedIq1SExpertSidecarSHA256 `
+        -ExpectedBytes $ExpectedIq1SExpertSidecarBytes `
+        -Kind "IQ1_S sidecar"
+    $modelIq1SuiteLockProofRequired = [bool]($GateKind -eq "benchmark")
+    if ($modelIq1SuiteLockProofRequired -and
+        $null -eq $modelIq1SuiteLockProof) {
+        $modelLockProof = Test-G7SharingViolationProof -Path $model `
+            -Kind "Model"
+        $sidecarLockProof = Test-G7SharingViolationProof `
+            -Path $Iq1SExpertSidecar -Kind "IQ1_S sidecar"
+        $modelIq1SuiteLockProofObserved = [bool](
+            [bool]$modelLockProof.sharing_violation_lock_proof -and
+            [bool]$sidecarLockProof.sharing_violation_lock_proof)
+        $modelIq1SuiteLockProof = [pscustomobject]@{
+            required = $true
+            observed = $modelIq1SuiteLockProofObserved
+            model = $modelLockProof
+            iq1_s_sidecar = $sidecarLockProof
+        }
+        if (-not $modelIq1SuiteLockProofObserved) {
+            throw "Benchmark suite receipt reuse requires active parent-held deny-write/delete locks"
+        }
+    } elseif (-not $modelIq1SuiteLockProofRequired) {
+        $modelIq1SuiteLockProof = [pscustomobject]@{
+            required = $false
+            observed = $false
+            model = $null
+            iq1_s_sidecar = $null
+        }
+    }
+    $modelLockStream = [IO.File]::Open(
+        $model, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    if ($null -eq $iq1SSidecarLockStream) {
+        $iq1SSidecarLockStream = [IO.File]::Open(
+            $Iq1SExpertSidecar, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    }
+}
 $modelHashMethod = if (-not $ExpectedModelSHA256) {
     "not_requested"
+} elseif ($ReuseVerifiedSuiteReceipt) {
+    "verified_suite_receipt_reuse"
 } elseif ($ReuseVerifiedModelReceipt) {
     "verified_receipt_reuse"
 } else {
@@ -1178,7 +1436,7 @@ $modelHashMethod = if (-not $ExpectedModelSHA256) {
 }
 $modelHashAtStart = if (-not $ExpectedModelSHA256) {
     ""
-} elseif ($ReuseVerifiedModelReceipt) {
+} elseif ($ReuseVerifiedModelReceipt -or $ReuseVerifiedSuiteReceipt) {
     $ExpectedModelSHA256.ToLowerInvariant()
 } else {
     (Get-FileHash -Algorithm SHA256 -LiteralPath $model).Hash.ToLowerInvariant()
@@ -1188,6 +1446,8 @@ if ($ExpectedModelSHA256 -and $modelHashAtStart -ine $ExpectedModelSHA256) {
 }
 $iq1SSidecarHashMethod = if (-not $iq1SSidecarInfoAtStart) {
     "not_applicable"
+} elseif ($ReuseVerifiedSuiteReceipt) {
+    "verified_suite_receipt_reuse"
 } elseif ($ReuseVerifiedIq1SReceipt) {
     "verified_receipt_reuse"
 } else {
@@ -1195,7 +1455,7 @@ $iq1SSidecarHashMethod = if (-not $iq1SSidecarInfoAtStart) {
 }
 $iq1SSidecarHashAtStart = if (-not $iq1SSidecarInfoAtStart) {
     ""
-} elseif ($ReuseVerifiedIq1SReceipt) {
+} elseif ($ReuseVerifiedIq1SReceipt -or $ReuseVerifiedSuiteReceipt) {
     $ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()
 } else {
     (Get-FileHash -Algorithm SHA256 -LiteralPath $Iq1SExpertSidecar).Hash.ToLowerInvariant()
@@ -4529,6 +4789,15 @@ $rawOutputs = [pscustomobject]@{
     model_hash_method = $modelHashMethod
     model_receipt_path = $modelReceiptPath
     model_receipt_sha256 = $modelReceiptHashAtStart
+    model_iq1_suite_receipt_path = $modelIq1SuiteReceiptPathAtStart
+    model_iq1_suite_receipt_sha256 = $modelIq1SuiteReceiptHashAtStart
+    model_iq1_suite_receipt_schema = $modelIq1SuiteReceiptSchemaAtStart
+    model_iq1_suite_full_hash_verified = $modelIq1SuiteFullHashVerified
+    model_iq1_suite_lock_proof_required =
+        $modelIq1SuiteLockProofRequired
+    model_iq1_suite_lock_proof_observed =
+        $modelIq1SuiteLockProofObserved
+    model_iq1_suite_lock_proof = $modelIq1SuiteLockProof
     prompt_sha256 = $promptHash
     system_prompt = $SystemPrompt
     system_prompt_sha256 = $systemPromptHash
@@ -4704,6 +4973,15 @@ $summary = [pscustomobject]@{
     model_hash_method = $modelHashMethod
     model_receipt_path = $modelReceiptPath
     model_receipt_sha256 = $modelReceiptHashAtStart
+    model_iq1_suite_receipt_path = $modelIq1SuiteReceiptPathAtStart
+    model_iq1_suite_receipt_sha256 = $modelIq1SuiteReceiptHashAtStart
+    model_iq1_suite_receipt_schema = $modelIq1SuiteReceiptSchemaAtStart
+    model_iq1_suite_full_hash_verified = $modelIq1SuiteFullHashVerified
+    model_iq1_suite_lock_proof_required =
+        $modelIq1SuiteLockProofRequired
+    model_iq1_suite_lock_proof_observed =
+        $modelIq1SuiteLockProofObserved
+    model_iq1_suite_lock_proof = $modelIq1SuiteLockProof
     iq1_s_sidecar = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
     iq1_s_sidecar_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
     iq1_s_sidecar_last_write_utc = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.LastWriteTimeUtc.ToString("o") } else { "" })
