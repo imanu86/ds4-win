@@ -66,9 +66,6 @@ foreach ($needle in @(
 }
 
 foreach ($forbiddenArg in @(
-    '-ReuseVerifiedSuiteReceipt',
-    '-ModelIq1SuiteReceiptPath',
-    '-ExpectedModelIq1SuiteReceiptSHA256',
     '-Iq1Promotion',
     '-ComposePrefillMassOpenRouter',
     '-ComposePrefillMassReserveSlots',
@@ -166,7 +163,9 @@ if ($receipt.schema -ne "g103_iq1_cold_sota_ab_static_v1" -or
         $true -or
     [double]$receipt.common_config.runtime_minimum_available_gib -ne 1.0 -or
     [double]$receipt.candidate_config.iq1_s_ram_cache_gib -ne 0.5 -or
-    [bool]$receipt.common_config.suite_receipt -ne $false -or
+    [bool]$receipt.common_config.suite_receipt -ne $true -or
+    [string]$receipt.common_config.suite_receipt_path -notmatch
+        'g103_model_iq1_suite\.receipt\.json$' -or
     [bool]$receipt.candidate_config.iq1_promotion -ne $false -or
     [bool]$receipt.candidate_config.route_packed_copy -ne $false -or
     [bool]$receipt.candidate_config.iq1_s_packed_h2d -ne $false -or

@@ -98,6 +98,13 @@ Native child stdout is consumed by `Out-Host`; only the typed arm receipt is
 allowed onto the runner's success pipeline. This prevents harness progress
 lines from becoming false matrix rows or replacing the safety receipt.
 
+Path-bound receipt reuse is restricted to structural safety by the harness.
+For the benchmark matrix, the parent holds read/deny-write/delete locks on the
+IQ2 model and IQ1_S sidecar, creates one full-hash model+IQ1 suite receipt, and
+reuses it only for candidate members. Control members remain sidecar-free G73
+and independently hash the IQ2 model, so provenance amortization cannot alter
+the control runtime configuration.
+
 ## Gates
 
 Candidate gate requires:

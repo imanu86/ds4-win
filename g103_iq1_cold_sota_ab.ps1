@@ -11,9 +11,13 @@ $ErrorActionPreference = "Stop"
 $runnerPath = $MyInvocation.MyCommand.Path
 $root = Split-Path -Parent $runnerPath
 $harness = Join-Path $root "g7_measure.ps1"
+$suiteReceiptHelper = Join-Path $root "g7_suite_receipt.ps1"
 $outdir = Join-Path $root "g7_runs"
 $summaryPath = Join-Path $outdir "g103_iq1_cold_sota_ab_result.json"
 $safetySummaryPath = Join-Path $outdir "g103_iq1_cold_sota_safety_result.json"
+$suiteReceiptPath = Join-Path $outdir "g103_model_iq1_suite.receipt.json"
+$script:g103SuiteReceiptSHA256 =
+    "0000000000000000000000000000000000000000000000000000000000000000"
 
 $model = "C:\ds4-models\ds4-2bit.gguf"
 $expectedModelSHA256 =
@@ -74,6 +78,47 @@ function Get-G103FileSHA256 {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Open-G103ReadDenyWriteDeleteLock {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "G103 $Kind missing before suite lock: $Path"
+    }
+    [IO.File]::Open(
+        $Path, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+}
+
+function New-G103LockedSuiteReceipt {
+    if (-not (Test-Path -LiteralPath $suiteReceiptHelper -PathType Leaf)) {
+        throw "G103 suite receipt helper missing: $suiteReceiptHelper"
+    }
+    Write-Host "[g103] verifying one locked model/IQ1 suite receipt"
+    $created = & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass `
+        -File $suiteReceiptHelper `
+        -ModelPath $model `
+        -Iq1SExpertSidecar $sidecar `
+        -OutPath $suiteReceiptPath `
+        -ExpectedModelSHA256 $expectedModelSHA256 `
+        -ExpectedIq1SExpertSidecarSHA256 $expectedIq1SidecarSHA256 `
+        -ExpectedIq1SExpertSidecarBytes $expectedIq1SidecarBytes `
+        -Force | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or
+        [string]$created.suite_receipt_sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "G103 suite receipt helper failed"
+    }
+    $script:g103SuiteReceiptSHA256 =
+        ([string]$created.suite_receipt_sha256).ToLowerInvariant()
+    [pscustomobject]@{
+        path = [IO.Path]::GetFullPath([string]$created.suite_receipt_path)
+        sha256 = $script:g103SuiteReceiptSHA256
+        schema = [string]$created.schema
+        status = [string]$created.status
+    }
+}
+
 function Test-G103HarnessParameter {
     param([Parameter(Mandatory=$true)][string]$Name)
     $script:harnessText -match ("\$" + [regex]::Escape($Name) + "(\s|=|,|\))")
@@ -103,6 +148,8 @@ function Assert-G103StaticContract {
         "ReuseVerifiedModelReceipt", "Iq1SExpertSidecar",
         "ExpectedIq1SExpertSidecarSHA256",
         "ExpectedIq1SExpertSidecarBytes", "ReuseVerifiedIq1SReceipt",
+        "ModelIq1SuiteReceiptPath", "ExpectedModelIq1SuiteReceiptSHA256",
+        "ReuseVerifiedSuiteReceipt",
         "Iq1SLayerFirst", "Iq1SLayerLast", "Iq1SMixedColdOne",
         "Iq1SMixedGpuPlan", "Iq1SRamCacheGiB", "Iq1Promotion",
         "Iq1SPackedH2D", "Iq1SVramCachePerLayer", "RoutePackedCopy",
@@ -157,8 +204,9 @@ function New-G103StaticReceipt {
             split_fused = $true
             runtime_minimum_available_gib = $runtimeMinimumAvailableGiB
             quiescence_required = $true
-            receipt_mode = "ReuseVerifiedModelReceipt for control; ReuseVerifiedModelReceipt+ReuseVerifiedIq1SReceipt for candidate"
-            suite_receipt = $false
+            receipt_mode = "safety uses path-bound receipts; benchmark control hashes the model; benchmark candidate reuses one locked full-hash model+IQ1 suite receipt"
+            suite_receipt = $true
+            suite_receipt_path = $suiteReceiptPath
         }
         candidate_config = [ordered]@{
             iq1_s_sidecar = $sidecar
@@ -191,7 +239,6 @@ function New-G103BaseArgs {
         "-GateKind", $GateKind,
         "-ModelPath", $model,
         "-ExpectedModelSHA256", $expectedModelSHA256,
-        "-ReuseVerifiedModelReceipt",
         "-Prompt", $prompt,
         "-MaxTokens", ([string]$maxTokens),
         "-Repeats", "1",
@@ -238,6 +285,9 @@ function New-G103MeasureArgs {
         [ValidateSet("benchmark", "structural-safety")][string]$GateKind
     )
     $args = @(New-G103BaseArgs -Tag $Tag -GateKind $GateKind)
+    if ($GateKind -eq "structural-safety") {
+        $args += "-ReuseVerifiedModelReceipt"
+    }
     if ($Arm -eq "control") {
         $args += @("-ExpectedContentSHA256", $expectedControlContentSHA256)
     } else {
@@ -246,13 +296,22 @@ function New-G103MeasureArgs {
             "-ExpectedIq1SExpertSidecarSHA256", $expectedIq1SidecarSHA256,
             "-ExpectedIq1SExpertSidecarBytes",
                 ([string]$expectedIq1SidecarBytes),
-            "-ReuseVerifiedIq1SReceipt",
             "-Iq1SLayerFirst", "3",
             "-Iq1SLayerLast", "42",
             "-Iq1SMixedColdOne",
             "-Iq1SMixedGpuPlan",
             "-Iq1SRamCacheGiB", "0.5"
         )
+        if ($GateKind -eq "structural-safety") {
+            $args += "-ReuseVerifiedIq1SReceipt"
+        } else {
+            $args += @(
+                "-ModelIq1SuiteReceiptPath", $suiteReceiptPath,
+                "-ExpectedModelIq1SuiteReceiptSHA256",
+                    $script:g103SuiteReceiptSHA256,
+                "-ReuseVerifiedSuiteReceipt"
+            )
+        }
     }
     $args
 }
@@ -315,7 +374,6 @@ function Assert-G103CommonG73Contract {
     if ([int]$Result.server_exit_code -ne 0 -or
         [string]$Result.model -ne $model -or
         [string]$Result.model_sha256 -ine $expectedModelSHA256 -or
-        [string]$Result.model_hash_method -ne "verified_receipt_reuse" -or
         [string]$Result.prompt_sha256 -ine $expectedPromptSHA256 -or
         [int]$Result.requested_max_tokens -ne $maxTokens -or
         [int]$Result.context_requested -ne $context -or
@@ -397,6 +455,16 @@ function Assert-G103Result {
         [string]$Result.contamination_reason -ne $expectedEligibilityReason) {
         throw "G103 member eligibility contract mismatch: tag=$($Result.tag)"
     }
+    $expectedModelHashMethod = if ($Safety) {
+        "verified_receipt_reuse"
+    } elseif ($Arm -eq "control") {
+        "full_file_sha256"
+    } else {
+        "verified_suite_receipt_reuse"
+    }
+    if ([string]$Result.model_hash_method -ne $expectedModelHashMethod) {
+        throw "G103 model provenance mode mismatch: tag=$($Result.tag)"
+    }
     if (@($Result.results).Count -ne 1) {
         throw "G103 requires one repeat per independent process"
     }
@@ -416,6 +484,8 @@ function Assert-G103Result {
             [string]$sample.content_sha256 -ine $expectedControlContentSHA256 -or
             -not [bool]$Result.outputs_identical -or
             [string]$Result.iq1_s_sidecar -ne "" -or
+            [string]$Result.model_iq1_suite_receipt_path -ne "" -or
+            [bool]$Result.model_iq1_suite_full_hash_verified -or
             [bool]$Result.iq1_s_mixed_cold_one -or
             [bool]$Result.iq1_s_mixed_runtime_observed -or
             [bool]$Result.iq1_s_mixed_gpu_plan_requested -or
@@ -429,8 +499,11 @@ function Assert-G103Result {
                 $expectedIq1SidecarSHA256 -or
             [UInt64]$Result.iq1_s_sidecar_bytes -ne
                 $expectedIq1SidecarBytes -or
-            [string]$Result.iq1_s_sidecar_hash_method -ne
-                "verified_receipt_reuse" -or
+            [string]$Result.iq1_s_sidecar_hash_method -ne $(if ($Safety) {
+                "verified_receipt_reuse"
+            } else {
+                "verified_suite_receipt_reuse"
+            }) -or
             -not [bool]$Result.iq1_s_sidecar_runtime_observed -or
             [UInt64]$Result.iq1_s_sidecar_failures -ne 0 -or
             [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_FIRST -ne 3 -or
@@ -458,6 +531,21 @@ function Assert-G103Result {
             [UInt64]$Result.iq1_promotion_failures -ne 0 -or
             [bool]$Result.iq1_s_packed_h2d_requested) {
             throw "G103 candidate IQ1 cold/planner/no-promotion contract mismatch"
+        }
+        if ($Safety) {
+            if ([string]$Result.model_iq1_suite_receipt_path -ne "" -or
+                [bool]$Result.model_iq1_suite_full_hash_verified) {
+                throw "G103 safety unexpectedly used a suite receipt"
+            }
+        } elseif (
+            [string]$Result.model_iq1_suite_receipt_path -ne
+                [IO.Path]::GetFullPath($suiteReceiptPath) -or
+            [string]$Result.model_iq1_suite_receipt_sha256 -ine
+                $script:g103SuiteReceiptSHA256 -or
+            -not [bool]$Result.model_iq1_suite_full_hash_verified -or
+            -not [bool]$Result.model_iq1_suite_lock_proof_required -or
+            -not [bool]$Result.model_iq1_suite_lock_proof_observed) {
+            throw "G103 candidate suite provenance contract mismatch"
         }
         if ([UInt64]$Result.expert_tiering.ssd_bytes -ne 0) {
             throw "G103 tier.ssd_bytes is IQ2 backing and must stay zero"
@@ -558,27 +646,45 @@ if ($SafetyOnly) {
     exit 0
 }
 
-for ($i = 1; $i -le $processesPerArm; $i++) {
-    $rows += Invoke-G103Arm -Arm "control" `
-        -Tag ("g103_control_g73_static32_split_fused_p" + $i) `
-        -GateKind "benchmark" -Safety $false
-    $rows += Invoke-G103Arm -Arm "candidate" `
-        -Tag ("g103_candidate_iq1_cold_sota_p" + $i) `
-        -GateKind "benchmark" -Safety $false
-}
+$modelSuiteLock = $null
+$iq1SuiteLock = $null
+$suiteReceipt = $null
+try {
+    $modelSuiteLock = Open-G103ReadDenyWriteDeleteLock -Path $model `
+        -Kind "model"
+    $iq1SuiteLock = Open-G103ReadDenyWriteDeleteLock -Path $sidecar `
+        -Kind "IQ1_S sidecar"
+    $suiteReceipt = New-G103LockedSuiteReceipt
 
-$outlierAfterN3 = [bool](
-    (Test-G103Outlier -Rows $rows -Arm "control") -or
-    (Test-G103Outlier -Rows $rows -Arm "candidate"))
-if ($outlierAfterN3) {
-    for ($i = ($processesPerArm + 1);
-         $i -le ($processesPerArm + $extraProcessesPerArm); $i++) {
+    for ($i = 1; $i -le $processesPerArm; $i++) {
         $rows += Invoke-G103Arm -Arm "control" `
             -Tag ("g103_control_g73_static32_split_fused_p" + $i) `
             -GateKind "benchmark" -Safety $false
         $rows += Invoke-G103Arm -Arm "candidate" `
             -Tag ("g103_candidate_iq1_cold_sota_p" + $i) `
             -GateKind "benchmark" -Safety $false
+    }
+
+    $outlierAfterN3 = [bool](
+        (Test-G103Outlier -Rows $rows -Arm "control") -or
+        (Test-G103Outlier -Rows $rows -Arm "candidate"))
+    if ($outlierAfterN3) {
+        for ($i = ($processesPerArm + 1);
+             $i -le ($processesPerArm + $extraProcessesPerArm); $i++) {
+            $rows += Invoke-G103Arm -Arm "control" `
+                -Tag ("g103_control_g73_static32_split_fused_p" + $i) `
+                -GateKind "benchmark" -Safety $false
+            $rows += Invoke-G103Arm -Arm "candidate" `
+                -Tag ("g103_candidate_iq1_cold_sota_p" + $i) `
+                -GateKind "benchmark" -Safety $false
+        }
+    }
+} finally {
+    if ($null -ne $iq1SuiteLock) {
+        try { $iq1SuiteLock.Dispose() } catch {}
+    }
+    if ($null -ne $modelSuiteLock) {
+        try { $modelSuiteLock.Dispose() } catch {}
     }
 }
 
@@ -601,6 +707,8 @@ $summary = [ordered]@{
     candidate_deterministic_intra_arm = $true
     zero_failures = $true
     outlier_after_n3 = $outlierAfterN3
+    model_iq1_suite_receipt_path = [string]$suiteReceipt.path
+    model_iq1_suite_receipt_sha256 = [string]$suiteReceipt.sha256
     independent_processes = [ordered]@{
         control = $controlRows.Count
         candidate = $candidateRows.Count
