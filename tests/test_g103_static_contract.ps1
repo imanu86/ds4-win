@@ -97,6 +97,14 @@ if ($candidateBlock -notmatch '\$Arm -eq "control"[\s\S]+?-ExpectedContentSHA256
     throw "G103 ExpectedContentSHA256 must be control-only"
 }
 
+$invokeArmFunc = [regex]::Match(
+    $runnerText,
+    'function Invoke-G103Arm[\s\S]+?function Assert-G103CommonG73Contract')
+if (-not $invokeArmFunc.Success -or
+    $invokeArmFunc.Value -notmatch '& powershell\.exe @args \| Out-Host') {
+    throw "G103 child stdout must not contaminate the row pipeline"
+}
+
 foreach ($parameter in @(
     "ExpectedContentSHA256", "ExpectedModelSHA256",
     "ReuseVerifiedModelReceipt", "Iq1SExpertSidecar",

@@ -94,6 +94,10 @@ aggregate of at least three independent processes per arm may support a
 performance comparison. The safety member must use the exact reason
 `structural-safety-gate-not-quality-eligible`.
 
+Native child stdout is consumed by `Out-Host`; only the typed arm receipt is
+allowed onto the runner's success pipeline. This prevents harness progress
+lines from becoming false matrix rows or replacing the safety receipt.
+
 ## Gates
 
 Candidate gate requires:

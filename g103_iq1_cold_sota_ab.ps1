@@ -273,7 +273,7 @@ function Invoke-G103Arm {
     } else {
         $args = @(New-G103MeasureArgs -Arm $Arm -Tag $Tag -GateKind $GateKind)
         Write-Host ("[g103] start arm=" + $Arm + " tag=" + $Tag)
-        & powershell.exe @args
+        & powershell.exe @args | Out-Host
         if ($LASTEXITCODE -ne 0) {
             throw "G103 harness failed: arm=$Arm tag=$Tag exit=$LASTEXITCODE"
         }
