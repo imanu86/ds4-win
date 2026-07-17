@@ -73,7 +73,8 @@ function Assert-G97StaticContract {
         "ExpertTierClockCalls", "ExpertTierReplacementBudget",
         "ExpertTierMinFrequency", "ExpertTierHysteresis",
         "GpuResidentRoutes", "RouteNoDefaultSync", "SplitFused",
-        "ExpectedModelSHA256", "Iq1SExpertSidecar",
+        "ExpectedModelSHA256", "ReuseVerifiedModelReceipt",
+        "Iq1SExpertSidecar",
         "ExpectedIq1SExpertSidecarSHA256",
         "ExpectedIq1SExpertSidecarBytes", "ReuseVerifiedIq1SReceipt",
         "Iq1SLayerFirst",
@@ -153,6 +154,7 @@ function New-G97Args {
         "-SplitFused",
         "-ModelPath", $model,
         "-ExpectedModelSHA256", $expectedModelSHA256,
+        "-ReuseVerifiedModelReceipt",
         "-Iq1SExpertSidecar", $iq1Sidecar,
         "-ExpectedIq1SExpertSidecarSHA256", $expectedIq1SidecarSHA256,
         "-ExpectedIq1SExpertSidecarBytes", ([string]$expectedIq1SidecarBytes),
@@ -175,8 +177,12 @@ function Assert-G97RunContract {
           [Parameter(Mandatory=$true)][object]$Provenance)
 
     foreach ($name in @(
-        "server_exit_code", "model_sha256", "iq1_s_sidecar_sha256",
+        "server_exit_code", "model_sha256", "model_hash_method",
+        "model_receipt_path", "model_receipt_sha256",
+        "iq1_s_sidecar_sha256",
         "iq1_s_sidecar_hash_method",
+        "iq1_s_sidecar_receipt_path",
+        "iq1_s_sidecar_receipt_sha256",
         "iq1_s_mixed_runtime_observed",
         "iq1_s_mixed_gpu_plan_runtime_observed",
         "iq1_promotion_requested",
@@ -218,8 +224,15 @@ function Assert-G97RunContract {
         [bool]$Result.iq1_s_mixed_cold_one -ne $true -or
         [bool]$Result.iq1_s_mixed_gpu_plan_requested -ne $true -or
         [bool]$Result.iq1_promotion_requested -ne $true -or
+        [string]$Result.model_hash_method -ne "verified_receipt_reuse" -or
+        [string]::IsNullOrWhiteSpace([string]$Result.model_receipt_path) -or
+        [string]$Result.model_receipt_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
         [string]$Result.iq1_s_sidecar_hash_method -ne
             "verified_receipt_reuse" -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Result.iq1_s_sidecar_receipt_path) -or
+        [string]$Result.iq1_s_sidecar_receipt_sha256 -notmatch
+            '^[0-9a-fA-F]{64}$' -or
         [int]$Result.iq1_promotion_probation_slots_requested -ne
             $PromotionSlots -or
         [bool]$Result.iq1_promotion_runtime_observed -ne $true -or
@@ -308,6 +321,16 @@ $staticChecks = [pscustomobject]@{
     promotion_slots = $PromotionSlots
     compose_prefill_mass_open_router = $true
     compose_prefill_mass_reserve_slots = $PromotionSlots
+    model_hash_method_required = "verified_receipt_reuse"
+    model_receipt_path_required = $true
+    model_receipt_sha256_required = $true
+    iq1_s_sidecar_hash_method_required = "verified_receipt_reuse"
+    iq1_s_sidecar_receipt_path_required = $true
+    iq1_s_sidecar_receipt_sha256_required = $true
+    quality_eligible = $false
+    sota_eligible = $false
+    system_quiescence_preflight_skipped = $true
+    reason = "structural-safety-gate-not-quality-eligible"
     quality_claim = "none"
     performance_claim = "none"
     runner_sha256 = $selfSha
@@ -355,6 +378,10 @@ Assert-G97RunContract -Result $result -Provenance $provenance
 $summary = [pscustomobject]@{
     schema = "g97_iq1_promotion_structural_v1"
     gate_kind = "structural-safety"
+    quality_eligible = $false
+    sota_eligible = $false
+    system_quiescence_preflight_skipped = $true
+    reason = "structural-safety-gate-not-quality-eligible"
     quality_claim = "none"
     performance_claim = "none"
     tag = $tag
@@ -364,6 +391,13 @@ $summary = [pscustomobject]@{
     harness_sha256 = $result.harness_sha256
     executable_sha256 = $result.executable_sha256
     build_manifest_sha256 = $result.build_manifest_sha256
+    model_hash_method = [string]$result.model_hash_method
+    model_receipt_path = [string]$result.model_receipt_path
+    model_receipt_sha256 = [string]$result.model_receipt_sha256
+    iq1_s_sidecar_hash_method = [string]$result.iq1_s_sidecar_hash_method
+    iq1_s_sidecar_receipt_path = [string]$result.iq1_s_sidecar_receipt_path
+    iq1_s_sidecar_receipt_sha256 =
+        [string]$result.iq1_s_sidecar_receipt_sha256
     repeats = 1
     warmup_max_tokens = 4
     max_tokens = 8

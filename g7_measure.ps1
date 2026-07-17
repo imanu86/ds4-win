@@ -99,6 +99,7 @@ param(
     [string]$ExpectedWarmupContentSHA256 = "",
     [string]$ModelPath = "D:\ds4-models\ds4-2bit.gguf",
     [string]$ExpectedModelSHA256 = "",
+    [switch]$ReuseVerifiedModelReceipt,
     [string]$Iq1SExpertSidecar = "",
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
@@ -150,6 +151,86 @@ function Get-G7PreflightMedian([double[]]$Values) {
     if (($sorted.Count % 2) -eq 1) { return [double]$sorted[$middle] }
     return ([double]$sorted[$middle - 1] + [double]$sorted[$middle]) / 2.0
 }
+function Get-G7FileId([string]$Path) {
+    $raw = & fsutil.exe file queryfileid $Path 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Verified receipt file-id query failed: $Path"
+    }
+    $match = [regex]::Match(($raw -join " "), '0x[0-9a-fA-F]{32}')
+    if (-not $match.Success) {
+        throw "Verified receipt file-id parse failed: $Path"
+    }
+    $match.Value.ToLowerInvariant()
+}
+function Read-G7ReceiptSnapshot([string]$Path, [string]$Kind) {
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $memory = New-Object IO.MemoryStream
+        try {
+            $stream.CopyTo($memory)
+            $bytes = $memory.ToArray()
+        } finally {
+            $memory.Dispose()
+        }
+    } catch {
+        throw "$Kind verified receipt could not be read: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+    try {
+        $receipt = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    } catch {
+        throw "$Kind verified receipt is invalid JSON"
+    }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $receiptHash = [BitConverter]::ToString(
+            $sha.ComputeHash($bytes)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+    [pscustomobject]@{
+        receipt = $receipt
+        sha256 = $receiptHash
+    }
+}
+function Assert-G7VerifiedFileReceipt {
+    param(
+        [Parameter(Mandatory=$true)][object]$Receipt,
+        [Parameter(Mandatory=$true)][IO.FileInfo]$Info,
+        [Parameter(Mandatory=$true)][string]$ExpectedSHA256,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+    $fullPath = [IO.Path]::GetFullPath($Info.FullName)
+    $receiptPath = [IO.Path]::GetFullPath([string]$Receipt.path)
+    $fileId = Get-G7FileId $fullPath
+    $verifiedAt = [DateTime]::MinValue
+    if (-not [DateTime]::TryParse(
+            [string]$Receipt.verified_at,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::AdjustToUniversal,
+            [ref]$verifiedAt)) {
+        throw "$Kind verified receipt timestamp is invalid"
+    }
+    if ([string]$Receipt.schema -ne "g7_verified_file_receipt_v2" -or
+        [string]$Receipt.status -ne "verified" -or
+        -not [string]::Equals(
+            $receiptPath, $fullPath,
+            [StringComparison]::OrdinalIgnoreCase) -or
+        [UInt64]$Receipt.bytes -ne [UInt64]$Info.Length -or
+        [string]$Receipt.sha256 -ine $ExpectedSHA256 -or
+        [Int64]$Receipt.creation_utc_ticks -ne $Info.CreationTimeUtc.Ticks -or
+        [Int64]$Receipt.last_write_utc_ticks -ne $Info.LastWriteTimeUtc.Ticks -or
+        [string]$Receipt.file_id -ine $fileId -or
+        ($Info.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $verifiedAt.ToUniversalTime() -lt $Info.LastWriteTimeUtc -or
+        [string]::IsNullOrWhiteSpace([string]$Receipt.verification_method)) {
+        throw "$Kind verified receipt identity mismatch"
+    }
+}
 if ($PromptFile) {
     $PromptFile = (Resolve-Path -LiteralPath $PromptFile).Path
     $Prompt = [IO.File]::ReadAllText($PromptFile, [Text.Encoding]::UTF8)
@@ -174,6 +255,13 @@ if ($ExpectedWarmupContentSHA256 -and $ExpectedWarmupContentSHA256 -notmatch '^[
 }
 if ($ExpectedModelSHA256 -and $ExpectedModelSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedModelSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($ReuseVerifiedModelReceipt -and -not $ExpectedModelSHA256) {
+    throw "ReuseVerifiedModelReceipt requires ExpectedModelSHA256"
+}
+if (($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt) -and
+    $GateKind -ne "structural-safety") {
+    throw "Verified receipt reuse is restricted to structural-safety diagnostics"
 }
 if ($AllowEmbeddedBakeMask -and
     $ExpectedEmbeddedBakeMaskSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
@@ -278,9 +366,15 @@ $effectiveSpexCap = if ($SpexCap -gt 0) { $SpexCap } else { 6 }
 $exe   = Join-Path $PSScriptRoot "build\Release\ds4_server.exe"
 $buildManifestPath = Join-Path $PSScriptRoot "build\Release\g7_build_manifest.json"
 $model = $ModelPath
+$modelReceiptAtStart = $null
+$modelReceiptPath = ""
+$modelReceiptHashAtStart = ""
+$modelLockStream = $null
 $iq1SSidecarInfoAtStart = $null
 $iq1SSidecarReceiptAtStart = $null
 $iq1SSidecarReceiptPath = ""
+$iq1SSidecarReceiptHashAtStart = ""
+$iq1SSidecarLockStream = $null
 if ($Iq1SExpertSidecar) {
     if ($Iq1SLayerFirst -gt $Iq1SLayerLast) {
         throw "Iq1SLayerFirst must be less than or equal to Iq1SLayerLast"
@@ -293,6 +387,9 @@ if ($Iq1SExpertSidecar) {
         $ExpectedIq1SExpertSidecarBytes -eq 0) {
         throw "IQ1_S sidecar requires expected SHA256 and byte count provenance"
     }
+    $iq1SSidecarLockStream = [IO.File]::Open(
+        $Iq1SExpertSidecar, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
     $iq1SSidecarInfoAtStart = Get-Item -LiteralPath $Iq1SExpertSidecar
     if ([UInt64]$iq1SSidecarInfoAtStart.Length -ne $ExpectedIq1SExpertSidecarBytes) {
         throw "IQ1_S sidecar byte count differs from verified provenance"
@@ -302,11 +399,10 @@ if ($Iq1SExpertSidecar) {
     if (-not (Test-Path -LiteralPath $iq1SSidecarReceiptPath -PathType Leaf)) {
         throw "IQ1_S sidecar verified receipt missing: $iq1SSidecarReceiptPath"
     }
-    try {
-        $iq1SSidecarReceiptAtStart = Get-Content -LiteralPath $iq1SSidecarReceiptPath -Raw | ConvertFrom-Json
-    } catch {
-        throw "IQ1_S sidecar receipt is invalid JSON"
-    }
+    $iq1SSidecarReceiptSnapshot = Read-G7ReceiptSnapshot `
+        -Path $iq1SSidecarReceiptPath -Kind "IQ1_S sidecar"
+    $iq1SSidecarReceiptAtStart = $iq1SSidecarReceiptSnapshot.receipt
+    $iq1SSidecarReceiptHashAtStart = $iq1SSidecarReceiptSnapshot.sha256
     if ($iq1SSidecarReceiptAtStart.status -ne "verified" -or
         [IO.Path]::GetFullPath([string]$iq1SSidecarReceiptAtStart.path) -ne $Iq1SExpertSidecar -or
         [UInt64]$iq1SSidecarReceiptAtStart.bytes -ne $ExpectedIq1SExpertSidecarBytes -or
@@ -315,6 +411,12 @@ if ($Iq1SExpertSidecar) {
         [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.quantization_layout) -or
         [string]::IsNullOrWhiteSpace([string]$iq1SSidecarReceiptAtStart.imatrix_provenance)) {
         throw "IQ1_S sidecar receipt does not match requested path/bytes/SHA-256"
+    }
+    if ($ReuseVerifiedIq1SReceipt) {
+        Assert-G7VerifiedFileReceipt -Receipt $iq1SSidecarReceiptAtStart `
+            -Info $iq1SSidecarInfoAtStart `
+            -ExpectedSHA256 $ExpectedIq1SExpertSidecarSHA256 `
+            -Kind "IQ1_S sidecar"
     }
 }
 if ($ReuseVerifiedIq1SReceipt -and -not $Iq1SExpertSidecar) {
@@ -359,9 +461,6 @@ if ($Iq1SVramCachePerLayer -gt 0 -and
 }
 if ($Iq1SVramCachePerLayer -gt 0 -and $Iq1SPackedH2D) {
     throw "Iq1SVramCachePerLayer and Iq1SPackedH2D are mutually exclusive"
-}
-if ($ReuseVerifiedIq1SReceipt -and $GateKind -ne "structural-safety") {
-    throw "ReuseVerifiedIq1SReceipt is restricted to structural-safety diagnostics"
 }
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
@@ -1018,10 +1117,40 @@ $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPa
 if ($ExpectedSpexSHA256 -and $spexHashAtStart -ine $ExpectedSpexSHA256) {
     throw "SPEX provenance failed: expected $($ExpectedSpexSHA256.ToLowerInvariant()), observed $spexHashAtStart"
 }
+$modelLockStream = if ($ExpectedModelSHA256) {
+    [IO.File]::Open(
+        $model, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+} else { $null }
 $modelInfoAtStart = Get-Item -LiteralPath $model
-$modelHashAtStart = if ($ExpectedModelSHA256) {
+$model = $modelInfoAtStart.FullName
+if ($ReuseVerifiedModelReceipt) {
+    $modelReceiptPath = "$model.receipt.json"
+    if (-not (Test-Path -LiteralPath $modelReceiptPath -PathType Leaf)) {
+        throw "Model verified receipt missing: $modelReceiptPath"
+    }
+    $modelReceiptSnapshot = Read-G7ReceiptSnapshot `
+        -Path $modelReceiptPath -Kind "Model"
+    $modelReceiptAtStart = $modelReceiptSnapshot.receipt
+    $modelReceiptHashAtStart = $modelReceiptSnapshot.sha256
+    Assert-G7VerifiedFileReceipt -Receipt $modelReceiptAtStart `
+        -Info $modelInfoAtStart -ExpectedSHA256 $ExpectedModelSHA256 `
+        -Kind "Model"
+}
+$modelHashMethod = if (-not $ExpectedModelSHA256) {
+    "not_requested"
+} elseif ($ReuseVerifiedModelReceipt) {
+    "verified_receipt_reuse"
+} else {
+    "full_file_sha256"
+}
+$modelHashAtStart = if (-not $ExpectedModelSHA256) {
+    ""
+} elseif ($ReuseVerifiedModelReceipt) {
+    $ExpectedModelSHA256.ToLowerInvariant()
+} else {
     (Get-FileHash -Algorithm SHA256 -LiteralPath $model).Hash.ToLowerInvariant()
-} else { "" }
+}
 if ($ExpectedModelSHA256 -and $modelHashAtStart -ine $ExpectedModelSHA256) {
     throw "Model provenance failed: expected $($ExpectedModelSHA256.ToLowerInvariant()), observed $modelHashAtStart"
 }
@@ -1043,9 +1172,6 @@ if ($iq1SSidecarInfoAtStart -and
     $iq1SSidecarHashAtStart -ine $ExpectedIq1SExpertSidecarSHA256) {
     throw "IQ1_S sidecar provenance failed: expected $($ExpectedIq1SExpertSidecarSHA256.ToLowerInvariant()), observed $iq1SSidecarHashAtStart"
 }
-$iq1SSidecarReceiptHashAtStart = if ($iq1SSidecarReceiptPath) {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath $iq1SSidecarReceiptPath).Hash.ToLowerInvariant()
-} else { "" }
 $promptBytes = [Text.Encoding]::UTF8.GetBytes($Prompt)
 $promptHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($promptBytes)).Replace("-", "").ToLowerInvariant()
 $systemPromptBytes = [Text.Encoding]::UTF8.GetBytes($SystemPrompt)
@@ -4232,6 +4358,9 @@ $rawOutputs = [pscustomobject]@{
     model_size_bytes = [UInt64]$modelInfoAtStart.Length
     model_expected_sha256 = $ExpectedModelSHA256.ToLowerInvariant()
     model_sha256 = $modelHashAtStart
+    model_hash_method = $modelHashMethod
+    model_receipt_path = $modelReceiptPath
+    model_receipt_sha256 = $modelReceiptHashAtStart
     prompt_sha256 = $promptHash
     system_prompt = $SystemPrompt
     system_prompt_sha256 = $systemPromptHash
@@ -4382,6 +4511,9 @@ $summary = [pscustomobject]@{
     model_last_write_utc = $modelInfoAtStart.LastWriteTimeUtc.ToString("o")
     model_expected_sha256 = $ExpectedModelSHA256.ToLowerInvariant()
     model_sha256 = $modelHashAtStart
+    model_hash_method = $modelHashMethod
+    model_receipt_path = $modelReceiptPath
+    model_receipt_sha256 = $modelReceiptHashAtStart
     iq1_s_sidecar = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.FullName } else { "" })
     iq1_s_sidecar_bytes = $(if ($iq1SSidecarInfoAtStart) { [UInt64]$iq1SSidecarInfoAtStart.Length } else { [UInt64]0 })
     iq1_s_sidecar_last_write_utc = $(if ($iq1SSidecarInfoAtStart) { $iq1SSidecarInfoAtStart.LastWriteTimeUtc.ToString("o") } else { "" })

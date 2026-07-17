@@ -181,6 +181,41 @@ function Assert-G98StaticContract {
         @($candidateArgs | Where-Object { $_ -eq "-ComposePrefillMassReserveSlots" }).Count -ne 1) {
         throw "G98 static diff failed: an arm does not reserve matched open-router capacity exactly once."
     }
+    foreach ($forbiddenArg in @(
+        ("-Reuse" + "Verified" + "ModelReceipt"),
+        ("-Reuse" + "Verified" + "Iq1SReceipt"))) {
+        if (@($controlArgs | Where-Object { $_ -eq $forbiddenArg }).Count -ne 0 -or
+            @($candidateArgs | Where-Object { $_ -eq $forbiddenArg }).Count -ne 0) {
+            throw "G98 static diff failed: benchmark uses $forbiddenArg."
+        }
+    }
+
+    $selfText = Get-Content -LiteralPath $PSCommandPath -Raw
+    foreach ($requiredText in @(
+        "model_hash_method = `$result.model_hash_method",
+        "model_receipt_path = `$result.model_receipt_path",
+        "model_receipt_sha256 = `$result.model_receipt_sha256",
+        "iq1_s_sidecar_hash_method = `$result.iq1_s_sidecar_hash_method",
+        "iq1_s_sidecar_receipt_path = `$result.iq1_s_sidecar_receipt_path",
+        "iq1_s_sidecar_receipt_sha256 =",
+        "`$result.iq1_s_sidecar_receipt_sha256",
+        '[string]$Result.model_hash_method -ne "full_file_sha256"',
+        '[string]$Result.model_receipt_path -ne ""',
+        '[string]$Result.model_receipt_sha256 -ne ""',
+        '[string]$Result.iq1_s_sidecar_hash_method -ne',
+        '"full_file_sha256"',
+        '[string]::IsNullOrWhiteSpace(',
+        '[string]$Result.iq1_s_sidecar_receipt_path)',
+        '[string]$Result.iq1_s_sidecar_receipt_sha256 -notmatch',
+        "'^[0-9a-fA-F]{64}$'",
+        '"model_sha256", "model_hash_method",',
+        '"iq1_s_sidecar_sha256", "iq1_s_sidecar_hash_method",',
+        '"iq1_s_sidecar_receipt_path", "iq1_s_sidecar_receipt_sha256",',
+        '"repeat_count", "outputs_identical"')) {
+        if ($selfText -notmatch [regex]::Escape($requiredText)) {
+            throw "G98 static receipt provenance marker missing: $requiredText"
+        }
+    }
 }
 
 function New-G98Args {
@@ -255,7 +290,10 @@ function Assert-G98RunContract {
 
     foreach ($name in @(
         "server_exit_code", "prompt_sha256", "warmup_prompt_sha256",
-        "model_sha256", "iq1_s_sidecar_sha256",
+        "model_sha256", "model_hash_method", "model_receipt_path",
+        "model_receipt_sha256", "iq1_s_sidecar_sha256",
+        "iq1_s_sidecar_hash_method", "iq1_s_sidecar_receipt_path",
+        "iq1_s_sidecar_receipt_sha256",
         "iq1_s_mixed_runtime_observed",
         "iq1_s_mixed_gpu_plan_requested",
         "iq1_s_mixed_gpu_plan_runtime_observed",
@@ -303,9 +341,18 @@ function Assert-G98RunContract {
         $Result.warmup_prompt_sha256 -ne $expectedPromptSHA256 -or
         $Result.model -ne $model -or
         $Result.model_sha256 -ne $expectedModelSHA256 -or
+        [string]$Result.model_hash_method -ne "full_file_sha256" -or
+        [string]$Result.model_receipt_path -ne "" -or
+        [string]$Result.model_receipt_sha256 -ne "" -or
         [UInt64]$Result.model_bytes -le 0 -or
         $Result.iq1_s_sidecar -ne $iq1Sidecar -or
         $Result.iq1_s_sidecar_sha256 -ne $expectedIq1SidecarSHA256 -or
+        [string]$Result.iq1_s_sidecar_hash_method -ne
+            "full_file_sha256" -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Result.iq1_s_sidecar_receipt_path) -or
+        [string]$Result.iq1_s_sidecar_receipt_sha256 -notmatch
+            '^[0-9a-fA-F]{64}$' -or
         [UInt64]$Result.iq1_s_sidecar_bytes -ne $expectedIq1SidecarBytes -or
         [int]$Result.server_exit_code -ne 0 -or
         $Result.gate_kind -ne "benchmark" -or
@@ -521,9 +568,16 @@ function Invoke-G98Arm {
         model = $result.model
         model_bytes = [UInt64]$result.model_bytes
         model_sha256 = $result.model_sha256
+        model_hash_method = $result.model_hash_method
+        model_receipt_path = $result.model_receipt_path
+        model_receipt_sha256 = $result.model_receipt_sha256
         iq1_s_sidecar = $result.iq1_s_sidecar
         iq1_s_sidecar_bytes = [UInt64]$result.iq1_s_sidecar_bytes
         iq1_s_sidecar_sha256 = $result.iq1_s_sidecar_sha256
+        iq1_s_sidecar_hash_method = $result.iq1_s_sidecar_hash_method
+        iq1_s_sidecar_receipt_path = $result.iq1_s_sidecar_receipt_path
+        iq1_s_sidecar_receipt_sha256 =
+            $result.iq1_s_sidecar_receipt_sha256
         repeat_count = [int]$result.results.Count
         request_count_expected = [int]$result.request_count_expected
         content_sha256_by_repeat = @($result.results | ForEach-Object {
@@ -612,6 +666,10 @@ $staticChecks = [pscustomobject]@{
     quiescence_required = $true
     quiescence_cooldown_seconds = 90
     contamination_abort_fail_closed = $true
+    model_hash_method_required = "full_file_sha256"
+    iq1_s_sidecar_hash_method_required = "full_file_sha256"
+    model_receipt_path_and_hash_required_empty = $true
+    iq1_s_sidecar_receipt_identity_required = $true
     require_same_provenance_except_promotion = $true
     require_intra_arm_determinism = $true
     do_not_require_cross_arm_equality = $true
@@ -652,8 +710,11 @@ foreach ($field in @(
     "ds4_server_c_sha256", "build_manifest_sha256",
     "build_input_fingerprint_sha256", "harness_sha256",
     "runtime_monitor_harness_sha256", "model", "model_bytes",
-    "model_sha256", "iq1_s_sidecar", "iq1_s_sidecar_bytes",
-    "iq1_s_sidecar_sha256", "repeat_count", "outputs_identical")) {
+    "model_sha256", "model_hash_method", "iq1_s_sidecar",
+    "iq1_s_sidecar_bytes",
+    "iq1_s_sidecar_sha256", "iq1_s_sidecar_hash_method",
+    "iq1_s_sidecar_receipt_path", "iq1_s_sidecar_receipt_sha256",
+    "repeat_count", "outputs_identical")) {
     $values = @($runs | ForEach-Object { [string]($_.$field) } |
         Select-Object -Unique)
     if ($values.Count -ne 1) {

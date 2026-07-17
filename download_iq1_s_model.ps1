@@ -10,6 +10,7 @@ $expectedSha256 = 'b049d1eb34c068f19ab007b33c22a7d758b578bf2b10d9276e79654f85d35
 $final = Join-Path $DestinationDirectory $name
 $partial = "$final.partial"
 $receipt = "$final.receipt.json"
+$receiptHelper = Join-Path $PSScriptRoot 'write_verified_file_receipt_v2.ps1'
 
 New-Item -ItemType Directory -Force -Path $DestinationDirectory | Out-Null
 
@@ -48,7 +49,15 @@ if (Test-Path -LiteralPath $final) {
     source_repository = 'https://huggingface.co/persadian/DeepSeek-V4-Flash-IQ1_S-XL'
     quantization_layout = 'routed gate/up IQ1_S all layers; routed down Q2_K layers 0-2 and IQ1_S layers 3-42'
     imatrix_provenance = 'public artifact reports WikiText calibration; not coding-tuned and not evidence of downstream equivalence'
-    verified_at = (Get-Date).ToUniversalTime().ToString('o')
-} | ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
+}
 
+if (-not (Test-Path -LiteralPath $receiptHelper -PathType Leaf)) {
+    throw "Verified receipt helper missing: $receiptHelper"
+}
+& $receiptHelper `
+    -Path $final `
+    -ReceiptPath $receipt `
+    -ExpectedSHA256 $expectedSha256 `
+    -ExpectedBytes $expectedBytes `
+    -Metadata $metadata | Out-Null
 Get-Content -LiteralPath $receipt

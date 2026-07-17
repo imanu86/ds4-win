@@ -144,7 +144,8 @@ function Assert-G99StaticContract {
     }
 
     foreach ($parameter in @(
-        "GateKind", "ModelPath", "ExpectedModelSHA256", "Prompt",
+        "GateKind", "ModelPath", "ExpectedModelSHA256",
+        "Prompt",
         "StopSequence", "Warmup", "WarmupPrompt", "WarmupMaxTokens",
         "MaxTokens", "Repeats", "AllowNonIdenticalRepeatOutputs",
         "Context", "BudgetGB", "ReserveMB", "DynamicArenaGiB",
@@ -194,6 +195,34 @@ function Assert-G99StaticContract {
         @($baseArgs | Where-Object { $_ -eq "-ComposePrefillMassReserveSlots" }).Count -ne 1 -or
         @($baseArgs | Where-Object { $_ -eq "-Iq1Promotion" }).Count -ne 0) {
         throw "G99 static arm shape mismatch: baseline must be open-router reserve without promotion"
+    }
+    foreach ($forbiddenArg in @(
+        ("-Reuse" + "Verified" + "ModelReceipt"),
+        ("-Reuse" + "Verified" + "Iq1SReceipt"))) {
+        if (@($baseArgs | Where-Object { $_ -eq $forbiddenArg }).Count -ne 0) {
+            throw "G99 static arm shape mismatch: quality uses $forbiddenArg"
+        }
+    }
+
+    $selfText = Get-Content -LiteralPath $runnerPath -Raw
+    foreach ($requiredText in @(
+        '[string]$Result.model_hash_method -ne "full_file_sha256"',
+        '[string]$Result.model_receipt_path -ne ""',
+        '[string]$Result.model_receipt_sha256 -ne ""',
+        '[string]$Result.iq1_s_sidecar_hash_method -ne',
+        '"full_file_sha256"',
+        '[string]::IsNullOrWhiteSpace(',
+        '[string]$Result.iq1_s_sidecar_receipt_path)',
+        '[string]$Result.iq1_s_sidecar_receipt_sha256 -notmatch',
+        "'^[0-9a-fA-F]{64}$'",
+        '"model_expected_sha256", "model_hash_method",',
+        '"iq1_s_sidecar_sha256",',
+        '"iq1_s_sidecar_hash_method",',
+        '"iq1_s_sidecar_receipt_path",',
+        '"iq1_s_sidecar_receipt_sha256",')) {
+        if ($selfText -notmatch [regex]::Escape($requiredText)) {
+            throw "G99 static matched-pair receipt marker missing: $requiredText"
+        }
     }
 }
 
@@ -317,6 +346,9 @@ function Assert-G99ArmResult {
         "iq1_s_sidecar_sha256", "iq1_s_sidecar_bytes",
         "iq1_s_mixed_runtime_observed", "iq1_s_mixed_calls",
         "iq1_s_mixed_hot_main", "iq1_s_mixed_cold_iq1",
+        "model_hash_method", "model_receipt_path", "model_receipt_sha256",
+        "iq1_s_sidecar_hash_method", "iq1_s_sidecar_receipt_path",
+        "iq1_s_sidecar_receipt_sha256",
         "iq1_s_mixed_joins", "iq1_s_mixed_primary_cold_avoided",
         "iq1_s_mixed_failures", "iq1_s_mixed_gpu_plan_requested",
         "iq1_s_mixed_gpu_plan_runtime_observed",
@@ -345,6 +377,9 @@ function Assert-G99ArmResult {
         [int]$Result.server_exit_code -ne 0 -or
         [string]$Result.model_sha256 -ine $modelSha256 -or
         [string]$Result.model_expected_sha256 -ine $modelSha256 -or
+        [string]$Result.model_hash_method -ne "full_file_sha256" -or
+        [string]$Result.model_receipt_path -ne "" -or
+        [string]$Result.model_receipt_sha256 -ne "" -or
         [string]$Result.prompt_sha256 -ine $promptSha256 -or
         [string]$Result.requested_stop_sequence -ne $stopSequence -or
         [int]$Result.requested_max_tokens -ne $maxTokens -or
@@ -388,6 +423,12 @@ function Assert-G99ArmResult {
         [bool]$Result.system_quiescence_preflight.skipped -or
         @($Result.results).Count -ne $repeatsPerArm -or
         [string]$Result.iq1_s_sidecar_sha256 -ine $sidecarSha256 -or
+        [string]$Result.iq1_s_sidecar_hash_method -ne
+            "full_file_sha256" -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Result.iq1_s_sidecar_receipt_path) -or
+        [string]$Result.iq1_s_sidecar_receipt_sha256 -notmatch
+            '^[0-9a-fA-F]{64}$' -or
         [UInt64]$Result.iq1_s_sidecar_bytes -ne $sidecarBytes -or
         -not [bool]$Result.iq1_s_sidecar_runtime_observed -or
         [UInt64]$Result.iq1_s_sidecar_failures -ne 0 -or
@@ -517,7 +558,8 @@ function Assert-G99MatchedPair([object]$Control, [object]$Candidate) {
         "build_manifest_input_fingerprint_sha256", "harness_sha256",
         "memory_preflight_harness_sha256",
         "runtime_monitor_harness_sha256", "model_sha256",
-        "model_expected_sha256", "prompt_sha256", "system_prompt_sha256",
+        "model_expected_sha256", "model_hash_method",
+        "prompt_sha256", "system_prompt_sha256",
         "warmup_prompt_sha256", "requested_max_tokens",
         "requested_stop_sequence", "requested_warmup_max_tokens",
         "context_requested", "budget_gb", "reserve_mb",
@@ -537,7 +579,9 @@ function Assert-G99MatchedPair([object]$Control, [object]$Candidate) {
         "expert_tier_replacement_budget_requested",
         "expert_tier_min_frequency_requested",
         "expert_tier_hysteresis_requested", "iq1_s_sidecar_sha256",
-        "iq1_s_sidecar_bytes", "iq1_s_ram_cache_requested_gib",
+        "iq1_s_sidecar_hash_method", "iq1_s_sidecar_receipt_path",
+        "iq1_s_sidecar_receipt_sha256", "iq1_s_sidecar_bytes",
+        "iq1_s_ram_cache_requested_gib",
         "iq1_s_mixed_cold_one", "iq1_s_mixed_gpu_plan_requested")) {
         if ([string]$Control.$field -ne [string]$Candidate.$field) {
             throw "G99 A/B provenance/settings mismatch: field=$field"
@@ -683,6 +727,10 @@ $staticChecks = [ordered]@{
     quiescence_cooldown_seconds = $quiescenceCooldownSec
     skip_system_quiescence = $false
     route_packed_copy = $true
+    model_hash_method_required = "full_file_sha256"
+    iq1_s_sidecar_hash_method_required = "full_file_sha256"
+    model_receipt_path_and_hash_required_empty = $true
+    iq1_s_sidecar_receipt_identity_required = $true
     automatic_quality_verdict = $false
     hash_or_repeat_flag_quality_verdict = "forbidden"
     timing_quality_grade = "forbidden"
