@@ -2250,6 +2250,18 @@ $serverRunsAll = @()
 if (Test-Path $stderrLog) {
     $lines = Get-Content $stderrLog
 
+    if (-not $httpOk -or $results.Count -ne $Repeats) {
+        $runtimeFailureEvidence = @($lines | Where-Object {
+            $_ -match 'allocation failed|failed closed|finish=error|cuda decode failed'
+        } | Select-Object -Last 4)
+        $runtimeFailureSuffix = if ($runtimeFailureEvidence.Count -gt 0) {
+            "; runtime=" + ($runtimeFailureEvidence -join " | ")
+        } else { "" }
+        throw ("Measurement failed before runtime invariant parsing: " +
+            "http_ok=$httpOk completed=$($results.Count) expected=$Repeats" +
+            $runtimeFailureSuffix)
+    }
+
     $requestPhaseLines = @($lines | Where-Object { $_ -match '^ds4: \[request-phase\] ' })
     $requestPhaseLineCount = $requestPhaseLines.Count
     foreach ($phaseLine in $requestPhaseLines) {

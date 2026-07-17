@@ -167,7 +167,7 @@ function New-G103StaticReceipt {
             layers = "3..42"
             iq1_s_mixed_cold_one = $true
             iq1_s_mixed_gpu_plan = $true
-            iq1_s_ram_cache_gib = 1.0
+            iq1_s_ram_cache_gib = 0.5
             iq1_promotion = $false
             route_packed_copy = $false
             iq1_s_packed_h2d = $false
@@ -251,7 +251,7 @@ function New-G103MeasureArgs {
             "-Iq1SLayerLast", "42",
             "-Iq1SMixedColdOne",
             "-Iq1SMixedGpuPlan",
-            "-Iq1SRamCacheGiB", "1"
+            "-Iq1SRamCacheGiB", "0.5"
         )
     }
     $args
@@ -427,7 +427,7 @@ function Assert-G103Result {
             [UInt64]$Result.iq1_s_sidecar_failures -ne 0 -or
             [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_FIRST -ne 3 -or
             [int]$Result.effective_ds4_environment.DS4_IQ1_S_LAYER_LAST -ne 42 -or
-            [double]$Result.iq1_s_ram_cache_requested_gib -ne 1.0 -or
+            [double]$Result.iq1_s_ram_cache_requested_gib -ne 0.5 -or
             -not [bool]$Result.iq1_s_ram_cache_runtime_observed -or
             [UInt64]$Result.iq1_s_ram_cache_failures -ne 0 -or
             [int]$Result.iq1_s_vram_cache_per_layer_requested -ne 0 -or

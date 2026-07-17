@@ -48,7 +48,16 @@ Candidate is the same stack plus:
 - `Iq1SLayerFirst 3`, `Iq1SLayerLast 42`
 - `Iq1SMixedColdOne`
 - `Iq1SMixedGpuPlan`
-- `Iq1SRamCacheGiB 1`
+- `Iq1SRamCacheGiB 0.5`
+
+The original preregistration used 1 GiB. The first post-reboot structural
+safety run measured a fail-closed `cudaHostAlloc` OOM after the unchanged
+30 GiB G73 arena had been published. A same-stack 0.5 GiB probe then
+completed with 109 pinned IQ1_S slots and zero cache/runtime failures. G103
+therefore uses 0.5 GiB so the candidate remains additive to the complete G73
+arena instead of shrinking the SOTA arena. The failed 1 GiB run and the 0.5
+GiB feasibility probe are structural evidence only, never performance or
+quality verdicts.
 
 Candidate must not use `ExpectedContentSHA256`, because IQ1 quantization may
 change the output hash. It must record the observed output hash.

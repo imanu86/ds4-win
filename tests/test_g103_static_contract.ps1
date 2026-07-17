@@ -53,10 +53,12 @@ foreach ($needle in @(
     'tier.ssd_bytes',
     'mixed or missing provenance',
     'contamination_abort_observed',
+    'Measurement failed before runtime invariant parsing',
     'arena_wrap_unlock_source_ranges_summary_phases',
     'split_fused_hits')) {
     if ($runnerText -notmatch [regex]::Escape($needle) -and
-        $protocolText -notmatch [regex]::Escape($needle)) {
+        $protocolText -notmatch [regex]::Escape($needle) -and
+        $harnessText -notmatch [regex]::Escape($needle)) {
         throw "G103 required contract text missing: $needle"
     }
 }
@@ -153,6 +155,7 @@ if ($receipt.schema -ne "g103_iq1_cold_sota_ab_static_v1" -or
     [bool]$receipt.protocol.candidate_requires_intra_arm_determinism_n3 -ne
         $true -or
     [double]$receipt.common_config.runtime_minimum_available_gib -ne 1.0 -or
+    [double]$receipt.candidate_config.iq1_s_ram_cache_gib -ne 0.5 -or
     [bool]$receipt.common_config.suite_receipt -ne $false -or
     [bool]$receipt.candidate_config.iq1_promotion -ne $false -or
     [bool]$receipt.candidate_config.route_packed_copy -ne $false -or
