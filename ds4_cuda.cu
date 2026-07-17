@@ -17317,6 +17317,15 @@ static cuda_moe_tiering g_moe_tiering;
 struct cuda_iq1_promotion {
     uint32_t requested_slots;
     uint32_t reserved_slots;
+    uint64_t min_touches;
+    double min_weight;
+    double min_mass;
+    uint64_t request_budget;
+    uint64_t request_used;
+    uint64_t window_calls;
+    uint64_t window_budget;
+    uint64_t window_epoch;
+    uint64_t window_used;
     uint64_t snapshot_evictions;
     uint64_t cold_observed;
     uint64_t cold_existing_2bit;
@@ -17327,6 +17336,16 @@ struct cuda_iq1_promotion {
     double promotion_2bit_ssd_seconds;
     uint64_t direct_ssd_to_vram_rejected;
     uint64_t probation_backing_reclaims;
+    uint64_t cold_gate_candidates;
+    uint64_t weight_ge_001;
+    uint64_t weight_ge_002;
+    uint64_t weight_ge_005;
+    uint64_t weight_ge_010;
+    uint64_t skips_touches;
+    uint64_t skips_weight;
+    uint64_t skips_mass;
+    uint64_t skips_request_budget;
+    uint64_t skips_window_budget;
     uint64_t failures;
 };
 static cuda_iq1_promotion g_iq1_promotion;
@@ -17593,6 +17612,68 @@ static int cuda_iq1_promotion_probation_slots_requested(void) {
     return (int)value;
 }
 
+static int cuda_moe_tiering_double_env(
+        const char *name, double fallback,
+        double min_value, double max_value, double *value);
+
+static int cuda_iq1_promotion_u64_env(
+        const char *name, uint64_t fallback, uint64_t min_value,
+        uint64_t max_value, uint64_t *value) {
+    const char *env = getenv(name);
+    if (!value) return 0;
+    if (!env || !env[0]) {
+        *value = fallback;
+        return 1;
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long long parsed = strtoull(env, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == env || errno != 0 || !end || *end != '\0' ||
+        parsed < min_value || parsed > max_value) {
+        fprintf(stderr, "ds4: invalid %s=%s\n", name, env);
+        return 0;
+    }
+    *value = (uint64_t)parsed;
+    return 1;
+}
+
+static int cuda_iq1_promotion_gate_config(
+        uint64_t *min_touches, double *min_weight, double *min_mass,
+        uint64_t *request_budget, uint64_t *window_calls,
+        uint64_t *window_budget) {
+    if (!min_touches || !min_weight || !min_mass || !request_budget ||
+        !window_calls || !window_budget) return 0;
+    if (!cuda_iq1_promotion_u64_env(
+            "DS4_IQ1_PROMOTION_MIN_TOUCHES", 1u, 1u, UINT64_MAX,
+            min_touches) ||
+        !cuda_moe_tiering_double_env(
+            "DS4_IQ1_PROMOTION_MIN_WEIGHT", 0.0, 0.0, 1.0e300,
+            min_weight) ||
+        !cuda_moe_tiering_double_env(
+            "DS4_IQ1_PROMOTION_MIN_MASS", 0.0, 0.0, 1.0e300,
+            min_mass) ||
+        !cuda_iq1_promotion_u64_env(
+            "DS4_IQ1_PROMOTION_REQUEST_BUDGET", 0u, 0u, UINT64_MAX,
+            request_budget) ||
+        !cuda_iq1_promotion_u64_env(
+            "DS4_IQ1_PROMOTION_WINDOW_CALLS", 0u, 0u, UINT64_MAX,
+            window_calls) ||
+        !cuda_iq1_promotion_u64_env(
+            "DS4_IQ1_PROMOTION_WINDOW_BUDGET", 0u, 0u, UINT64_MAX,
+            window_budget)) {
+        return 0;
+    }
+    if ((*window_calls == 0u) != (*window_budget == 0u)) {
+        fprintf(stderr,
+                "ds4: invalid IQ1 promotion window config: "
+                "DS4_IQ1_PROMOTION_WINDOW_CALLS and "
+                "DS4_IQ1_PROMOTION_WINDOW_BUDGET must both be zero or both >0\n");
+        return 0;
+    }
+    return 1;
+}
+
 static int cuda_moe_tiering_adaptive_budget_requested(int *value) {
     const char *env = getenv("DS4_EXPERT_TIER_ADAPTIVE_BUDGET");
     if (!value) return 0;
@@ -17791,15 +17872,27 @@ static void cuda_moe_tiering_report_and_reset(void) {
         fprintf(stderr,
             "ds4: [iq1-promotion] final requested_slots=%u reserved_slots=%u "
             "strategy=%s "
+            "min_touches=%llu min_weight=%.9g min_mass=%.9g "
+            "request_budget=%llu window_calls=%llu window_budget=%llu "
             "snapshot_evictions=%llu cold_observed=%llu cold_existing_2bit=%llu "
             "cold_to_2bit_ram=%llu probation_ram_hits=%llu next_token_waits=%llu "
             "promotion_2bit_ssd_bytes=%llu promotion_2bit_ssd_seconds=%.9g "
             "direct_ssd_to_vram_rejected=%llu probation_backing_reclaims=%llu "
+            "cold_gate_candidates=%llu weight_ge_001=%llu weight_ge_002=%llu "
+            "weight_ge_005=%llu weight_ge_010=%llu skips_touches=%llu "
+            "skips_weight=%llu skips_mass=%llu skips_request_budget=%llu "
+            "skips_window_budget=%llu "
             "failures=%llu\n",
             g_iq1_promotion.requested_slots,
             g_iq1_promotion.reserved_slots,
             g_moe_tiering.compose_router_open ?
                 "pre-reserved-open-router" : "snapshot-evict",
+            (unsigned long long)g_iq1_promotion.min_touches,
+            g_iq1_promotion.min_weight,
+            g_iq1_promotion.min_mass,
+            (unsigned long long)g_iq1_promotion.request_budget,
+            (unsigned long long)g_iq1_promotion.window_calls,
+            (unsigned long long)g_iq1_promotion.window_budget,
             (unsigned long long)g_iq1_promotion.snapshot_evictions,
             (unsigned long long)g_iq1_promotion.cold_observed,
             (unsigned long long)g_iq1_promotion.cold_existing_2bit,
@@ -17810,6 +17903,16 @@ static void cuda_moe_tiering_report_and_reset(void) {
             g_iq1_promotion.promotion_2bit_ssd_seconds,
             (unsigned long long)g_iq1_promotion.direct_ssd_to_vram_rejected,
             (unsigned long long)g_iq1_promotion.probation_backing_reclaims,
+            (unsigned long long)g_iq1_promotion.cold_gate_candidates,
+            (unsigned long long)g_iq1_promotion.weight_ge_001,
+            (unsigned long long)g_iq1_promotion.weight_ge_002,
+            (unsigned long long)g_iq1_promotion.weight_ge_005,
+            (unsigned long long)g_iq1_promotion.weight_ge_010,
+            (unsigned long long)g_iq1_promotion.skips_touches,
+            (unsigned long long)g_iq1_promotion.skips_weight,
+            (unsigned long long)g_iq1_promotion.skips_mass,
+            (unsigned long long)g_iq1_promotion.skips_request_budget,
+            (unsigned long long)g_iq1_promotion.skips_window_budget,
             (unsigned long long)g_iq1_promotion.failures);
     }
     cuda_moe_tiering_clear_owned_slots();
@@ -17889,6 +17992,18 @@ static int cuda_moe_tiering_prepare(void) {
         cuda_moe_prefill_tier_reserve_slots_requested();
     if (compose_requested < 0 || compose_router_open < 0 ||
         iq1_probation_slots < 0 || configured_reserve_slots < 0) return 0;
+    uint64_t iq1_min_touches = 1u;
+    double iq1_min_weight = 0.0;
+    double iq1_min_mass = 0.0;
+    uint64_t iq1_request_budget = 0u;
+    uint64_t iq1_window_calls = 0u;
+    uint64_t iq1_window_budget = 0u;
+    if (iq1_probation_slots > 0 &&
+        !cuda_iq1_promotion_gate_config(
+            &iq1_min_touches, &iq1_min_weight, &iq1_min_mass,
+            &iq1_request_budget, &iq1_window_calls, &iq1_window_budget)) {
+        return 0;
+    }
     if (compose_router_open && !compose_requested) {
         fprintf(stderr,
                 "ds4: open prefill tier router requires composed tiering\n");
@@ -17998,6 +18113,12 @@ static int cuda_moe_tiering_prepare(void) {
         g_moe_tiering.policy_hysteresis == hysteresis &&
         g_iq1_promotion.requested_slots ==
             (uint32_t)iq1_probation_slots &&
+        g_iq1_promotion.min_touches == iq1_min_touches &&
+        g_iq1_promotion.min_weight == iq1_min_weight &&
+        g_iq1_promotion.min_mass == iq1_min_mass &&
+        g_iq1_promotion.request_budget == iq1_request_budget &&
+        g_iq1_promotion.window_calls == iq1_window_calls &&
+        g_iq1_promotion.window_budget == iq1_window_budget &&
         g_moe_tiering.open_router_reserve_slots ==
             (uint32_t)configured_reserve_slots &&
         g_moe_tiering.compose_prefill_mass_tiering == compose_requested &&
@@ -18075,6 +18196,12 @@ static int cuda_moe_tiering_prepare(void) {
     g_moe_tiering.policy_epoch = UINT64_MAX;
     g_iq1_promotion = cuda_iq1_promotion();
     g_iq1_promotion.requested_slots = (uint32_t)iq1_probation_slots;
+    g_iq1_promotion.min_touches = iq1_min_touches;
+    g_iq1_promotion.min_weight = iq1_min_weight;
+    g_iq1_promotion.min_mass = iq1_min_mass;
+    g_iq1_promotion.request_budget = iq1_request_budget;
+    g_iq1_promotion.window_calls = iq1_window_calls;
+    g_iq1_promotion.window_budget = iq1_window_budget;
     if (compose_requested) {
         g_moe_tiering.snapshot_generation =
             g_dynamic_arena.snapshot_generation;
@@ -18456,6 +18583,44 @@ static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
         return 1;
     }
 
+    g_iq1_promotion.cold_gate_candidates++;
+    const double abs_weight = fabs((double)weight);
+    if (abs_weight >= 0.01) g_iq1_promotion.weight_ge_001++;
+    if (abs_weight >= 0.02) g_iq1_promotion.weight_ge_002++;
+    if (abs_weight >= 0.05) g_iq1_promotion.weight_ge_005++;
+    if (abs_weight >= 0.10) g_iq1_promotion.weight_ge_010++;
+    if (entry.frequency < g_iq1_promotion.min_touches) {
+        g_iq1_promotion.skips_touches++;
+        return 1;
+    }
+    if (abs_weight < g_iq1_promotion.min_weight) {
+        g_iq1_promotion.skips_weight++;
+        return 1;
+    }
+    if (entry.mass < g_iq1_promotion.min_mass) {
+        g_iq1_promotion.skips_mass++;
+        return 1;
+    }
+    if (g_iq1_promotion.request_budget != 0u &&
+        g_iq1_promotion.request_used >= g_iq1_promotion.request_budget) {
+        g_iq1_promotion.skips_request_budget++;
+        return 1;
+    }
+    if (g_iq1_promotion.window_calls != 0u) {
+        const uint64_t tick =
+            g_moe_tiering.call_tick == 0u ? 1u : g_moe_tiering.call_tick;
+        const uint64_t epoch =
+            (tick - 1u) / g_iq1_promotion.window_calls;
+        if (epoch != g_iq1_promotion.window_epoch) {
+            g_iq1_promotion.window_epoch = epoch;
+            g_iq1_promotion.window_used = 0u;
+        }
+        if (g_iq1_promotion.window_used >= g_iq1_promotion.window_budget) {
+            g_iq1_promotion.skips_window_budget++;
+            return 1;
+        }
+    }
+
     entry.ram_slot = UINT32_MAX;
     entry.ram_generation = 0;
     entry.vram_eligible_after_call = 0;
@@ -18486,6 +18651,12 @@ static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
     g_iq1_promotion.cold_to_2bit_ram++;
     g_iq1_promotion.promotion_2bit_ssd_bytes +=
         gate_expert_bytes * 2ull + down_expert_bytes;
+    if (g_iq1_promotion.request_budget != 0u) {
+        g_iq1_promotion.request_used++;
+    }
+    if (g_iq1_promotion.window_calls != 0u) {
+        g_iq1_promotion.window_used++;
+    }
     return 1;
 }
 
@@ -19112,6 +19283,18 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
     const int packed_copy_requested = cuda_moe_route_packed_copy_requested();
     const int prefill_vram_seed_per_layer =
         cuda_moe_prefill_vram_seed_per_layer_requested();
+    uint64_t iq1_min_touches = 1u;
+    double iq1_min_weight = 0.0;
+    double iq1_min_mass = 0.0;
+    uint64_t iq1_request_budget = 0u;
+    uint64_t iq1_window_calls = 0u;
+    uint64_t iq1_window_budget = 0u;
+    if (iq1_probation_slots > 0 &&
+        !cuda_iq1_promotion_gate_config(
+            &iq1_min_touches, &iq1_min_weight, &iq1_min_mass,
+            &iq1_request_budget, &iq1_window_calls, &iq1_window_budget)) {
+        return NULL;
+    }
     if (compose_requested > 0 && g_prefill_mass_observer.enabled &&
         (!g_prefill_mass_observer.finalized ||
          !g_prefill_mass_observer.wrap_published)) {
@@ -19162,6 +19345,12 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         g_moe_tiering.compose_router_open == compose_router_open &&
         g_iq1_promotion.requested_slots ==
             (uint32_t)iq1_probation_slots &&
+        g_iq1_promotion.min_touches == iq1_min_touches &&
+        g_iq1_promotion.min_weight == iq1_min_weight &&
+        g_iq1_promotion.min_mass == iq1_min_mass &&
+        g_iq1_promotion.request_budget == iq1_request_budget &&
+        g_iq1_promotion.window_calls == iq1_window_calls &&
+        g_iq1_promotion.window_budget == iq1_window_budget &&
         (tier_mode != CUDA_MOE_TIER_ENFORCE ||
          (g_moe_expert_cache.route_transient_gate &&
           g_moe_expert_cache.route_transient_up &&
