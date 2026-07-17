@@ -142,6 +142,9 @@ param(
     [ValidateRange(250, 10000)][int]$TelemetryIntervalMs = 1000,
     [ValidateRange(0.0, 1024.0)][double]$RuntimeMinimumAvailableGiB = 2.0,
     [ValidateRange(0.0, 100000.0)][double]$RuntimeMaximumDiskQueueLength = 8.0,
+    [ValidateRange(0.0, 1000000000.0)][double]$RuntimeMaximumPagesOutputPerSecond = 0.0,
+    [ValidateRange(0.0, 10.0)][double]$RuntimeMinimumPrivateWorkingSetRatio = 0.0,
+    [ValidateRange(0.0, 1024.0)][double]$RuntimePrivateWorkingSetMinimumGiB = 4.0,
     [ValidateRange(1, 60)][int]$RuntimeContaminationSamples = 3,
     [switch]$SkipMemoryPreflight,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 0.0,
@@ -1772,6 +1775,9 @@ $telemetryProc = Start-Process -FilePath powershell.exe -ArgumentList @(
     "-IntervalMs", "$TelemetryIntervalMs",
     "-MinimumAvailableGiB", $RuntimeMinimumAvailableGiB.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-MaximumDiskQueueLength", $RuntimeMaximumDiskQueueLength.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-MaximumPagesOutputPerSecond", $RuntimeMaximumPagesOutputPerSecond.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-MinimumPrivateWorkingSetRatio", $RuntimeMinimumPrivateWorkingSetRatio.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-PrivateWorkingSetMinimumGiB", $RuntimePrivateWorkingSetMinimumGiB.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-ContaminationSamples", "$RuntimeContaminationSamples"
 ) -WindowStyle Hidden -PassThru
 $launchTime = Get-Date
@@ -1974,12 +1980,21 @@ $diskBytesSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.dis
 $diskReadSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.read_bytes_per_second } } | Where-Object { $null -ne $_ })
 $diskWriteSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.write_bytes_per_second } } | Where-Object { $null -ne $_ })
 $diskQueueSamples = @($runtimeSamples | ForEach-Object { if ($_.disk -and $_.disk.seen) { $_.disk.queue_length } } | Where-Object { $null -ne $_ })
+$pagesInputSamples = @($runtimeSamples | ForEach-Object { if ($_.system_memory_pressure -and $_.system_memory_pressure.seen) { $_.system_memory_pressure.pages_input_per_second } } | Where-Object { $null -ne $_ })
+$pagesOutputSamples = @($runtimeSamples | ForEach-Object { if ($_.system_memory_pressure -and $_.system_memory_pressure.seen) { $_.system_memory_pressure.pages_output_per_second } } | Where-Object { $null -ne $_ })
+$privateWorkingSetRatioSamples = @($runtimeSamples | ForEach-Object { $_.private_working_set_ratio } | Where-Object { $null -ne $_ })
 $contaminationSamplesObserved = @($runtimeSamples | ForEach-Object { $_.contamination_consecutive_samples } | Where-Object { $null -ne $_ })
 $contaminationAbortObserved = @($runtimeSamples | Where-Object { $_.contamination_abort }).Count -gt 0
 if ($sharedSamples.Count -eq 0 -or $dedicatedSamples.Count -eq 0 -or
     $gpuUtilSamples.Count -eq 0 -or $vramSamples.Count -eq 0 -or
     $diskQueueSamples.Count -eq 0 -or $diskReadSamples.Count -eq 0) {
     throw "Runtime telemetry failed closed: required WDDM/NVIDIA/disk counters are missing"
+}
+if ($RuntimeMaximumPagesOutputPerSecond -gt 0.0 -and $pagesOutputSamples.Count -eq 0) {
+    throw "Runtime telemetry failed closed: requested system page-output counters are missing"
+}
+if ($RuntimeMinimumPrivateWorkingSetRatio -gt 0.0 -and $privateWorkingSetRatioSamples.Count -eq 0) {
+    throw "Runtime telemetry failed closed: requested private working-set residency counters are missing"
 }
 $firstRuntimeSample = $runtimeSamples[0]
 $lastRuntimeSample = $runtimeSamples[-1]
@@ -2032,12 +2047,18 @@ $runtimeTelemetry = [pscustomobject]@{
     aggregate_disk_write_mib_per_second = if ($diskWriteSamples.Count) { [double](($diskWriteSamples | Measure-Object -Average).Average / 1MB) } else { $null }
     aggregate_disk_queue_length_median = Get-G7Median $diskQueueSamples
     aggregate_disk_queue_length_peak = if ($diskQueueSamples.Count) { [double]($diskQueueSamples | Measure-Object -Maximum).Maximum } else { $null }
+    system_pages_input_per_second_peak = if ($pagesInputSamples.Count) { [double]($pagesInputSamples | Measure-Object -Maximum).Maximum } else { $null }
+    system_pages_output_per_second_peak = if ($pagesOutputSamples.Count) { [double]($pagesOutputSamples | Measure-Object -Maximum).Maximum } else { $null }
+    private_working_set_ratio_minimum = if ($privateWorkingSetRatioSamples.Count) { [double]($privateWorkingSetRatioSamples | Measure-Object -Minimum).Minimum } else { $null }
     contamination_consecutive_peak = if ($contaminationSamplesObserved.Count) { [int]($contaminationSamplesObserved | Measure-Object -Maximum).Maximum } else { 0 }
     contamination_abort_observed = [bool]$contaminationAbortObserved
     contamination_runtime_minimum_available_gib = $RuntimeMinimumAvailableGiB
     contamination_runtime_maximum_disk_queue_length = $RuntimeMaximumDiskQueueLength
+    contamination_runtime_maximum_pages_output_per_second = $RuntimeMaximumPagesOutputPerSecond
+    contamination_runtime_minimum_private_working_set_ratio = $RuntimeMinimumPrivateWorkingSetRatio
+    contamination_runtime_private_working_set_minimum_gib = $RuntimePrivateWorkingSetMinimumGiB
     contamination_runtime_consecutive_samples = $RuntimeContaminationSamples
-    contamination_contract = "abort after $RuntimeContaminationSamples consecutive samples with available RAM <=$RuntimeMinimumAvailableGiB GiB and aggregate disk queue >=$RuntimeMaximumDiskQueueLength"
+    contamination_contract = "abort after $RuntimeContaminationSamples consecutive samples matching legacy low-RAM+queue, page-output, residency-collapse, or required-counter-missing gates"
     win32_process_read_transfer_delta_bytes = if ($null -ne $firstRuntimeSample.read_transfer_bytes -and $null -ne $lastRuntimeSample.read_transfer_bytes) { [Int64]$lastRuntimeSample.read_transfer_bytes - [Int64]$firstRuntimeSample.read_transfer_bytes } else { $null }
     win32_process_read_operation_delta = if ($null -ne $firstRuntimeSample.read_operation_count -and $null -ne $lastRuntimeSample.read_operation_count) { [Int64]$lastRuntimeSample.read_operation_count - [Int64]$firstRuntimeSample.read_operation_count } else { $null }
     win32_process_other_operation_delta = if ($null -ne $firstRuntimeSample.other_operation_count -and $null -ne $lastRuntimeSample.other_operation_count) { [Int64]$lastRuntimeSample.other_operation_count - [Int64]$firstRuntimeSample.other_operation_count } else { $null }
@@ -3339,7 +3360,7 @@ if ($RoutePackedCopy) {
     throw "RoutePackedCopy activated while not requested"
 }
 if ($runtimeTelemetry.contamination_abort_observed) {
-    throw "Runtime telemetry aborted a contaminated measurement (low RAM plus deep disk queue)"
+    throw "Runtime telemetry aborted a contaminated measurement (memory, paging, residency, or disk-pressure gate)"
 }
 
 $spexCpuProbeLines = @()

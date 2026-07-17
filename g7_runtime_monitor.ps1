@@ -4,6 +4,9 @@ param(
     [ValidateRange(250, 10000)][int]$IntervalMs = 1000,
     [ValidateRange(0.0, 1024.0)][double]$MinimumAvailableGiB = 2.0,
     [ValidateRange(0.0, 100000.0)][double]$MaximumDiskQueueLength = 8.0,
+    [ValidateRange(0.0, 1000000000.0)][double]$MaximumPagesOutputPerSecond = 0.0,
+    [ValidateRange(0.0, 10.0)][double]$MinimumPrivateWorkingSetRatio = 0.0,
+    [ValidateRange(0.0, 1024.0)][double]$PrivateWorkingSetMinimumGiB = 4.0,
     [ValidateRange(1, 60)][int]$ContaminationSamples = 3
 )
 
@@ -153,6 +156,33 @@ function Get-PhysicalDiskSample {
     }
 }
 
+function Get-SystemMemoryPressureSample {
+    try {
+        $row = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory `
+            -ErrorAction Stop | Select-Object -First 1
+        if (-not $row) { throw "PerfOS Memory was not found" }
+        return [pscustomobject]@{
+            seen = $true
+            pages_input_per_second = [double]$row.PagesInputPersec
+            pages_output_per_second = [double]$row.PagesOutputPersec
+            page_reads_per_second = [double]$row.PageReadsPersec
+            page_writes_per_second = [double]$row.PageWritesPersec
+            modified_page_list_bytes = [Int64]$row.ModifiedPageListBytes
+            standby_cache_normal_priority_bytes = [Int64]$row.StandbyCacheNormalPriorityBytes
+        }
+    } catch {
+        return [pscustomobject]@{
+            seen = $false
+            pages_input_per_second = $null
+            pages_output_per_second = $null
+            page_reads_per_second = $null
+            page_writes_per_second = $null
+            modified_page_list_bytes = $null
+            standby_cache_normal_priority_bytes = $null
+        }
+    }
+}
+
 function Start-NvidiaSample {
     try {
         $info = New-Object Diagnostics.ProcessStartInfo
@@ -211,6 +241,7 @@ try {
         $nvidiaProcess = Start-NvidiaSample
         $gpuMemory = Get-GpuProcessMemory -TargetPid $TargetProcessId
         $disk = Get-PhysicalDiskSample
+        $memoryPressure = Get-SystemMemoryPressureSample
 
         $io = New-Object NativeTelemetry+IO_COUNTERS
         $processMemory = New-Object NativeTelemetry+PROCESS_MEMORY_COUNTERS_EX
@@ -232,7 +263,33 @@ try {
             ([double]$memory.ullAvailPhys -le $MinimumAvailableGiB * 1GB)
         $highQueue = $disk.seen -and
             ([double]$disk.queue_length -ge $MaximumDiskQueueLength)
-        if ($lowMemory -and $highQueue) {
+        $workingSetBytes = if ($haveProcessMemory) {
+            [double]$processMemory.WorkingSetSize.ToUInt64()
+        } else { $null }
+        $privateBytes = if ($haveProcessMemory) {
+            [double]$processMemory.PrivateUsage.ToUInt64()
+        } else { $null }
+        $privateWorkingSetRatio = if ($haveProcessMemory -and $privateBytes -gt 0.0) {
+            $workingSetBytes / $privateBytes
+        } else { $null }
+        $legacyPressure = $lowMemory -and $highQueue
+        $pageOutputCountersRequired = $MaximumPagesOutputPerSecond -gt 0.0
+        $pageOutputCountersMissing = $pageOutputCountersRequired -and -not $memoryPressure.seen
+        $highPageOutput = $pageOutputCountersRequired -and $memoryPressure.seen -and
+            ([double]$memoryPressure.pages_output_per_second -ge $MaximumPagesOutputPerSecond)
+        $residencyGateEnabled = $MinimumPrivateWorkingSetRatio -gt 0.0
+        $residencyCountersMissing = $residencyGateEnabled -and -not $haveProcessMemory
+        $lowPrivateResidency = $residencyGateEnabled -and $haveProcessMemory -and
+            ($privateBytes -ge $PrivateWorkingSetMinimumGiB * 1GB) -and
+            ($privateWorkingSetRatio -le $MinimumPrivateWorkingSetRatio)
+        $pressureReasons = @()
+        if ($legacyPressure) { $pressureReasons += "low-memory-and-disk-queue" }
+        if ($highPageOutput) { $pressureReasons += "system-page-output" }
+        if ($lowPrivateResidency) { $pressureReasons += "private-working-set-collapse" }
+        if ($pageOutputCountersMissing) { $pressureReasons += "memory-pressure-counters-missing" }
+        if ($residencyCountersMissing) { $pressureReasons += "process-memory-counters-missing" }
+        $contaminationTriggered = $pressureReasons.Count -gt 0
+        if ($contaminationTriggered) {
             $contaminationCount++
         } else {
             $contaminationCount = 0
@@ -253,9 +310,13 @@ try {
             other_operation_count = if ($haveIo) { [Int64]$io.OtherOperationCount } else { $null }
             page_faults = if ($haveProcessMemory) { [Int64]$processMemory.PageFaultCount } else { $null }
             windows_available_bytes = if ($haveMemory) { [Int64]$memory.ullAvailPhys } else { $null }
+            private_working_set_ratio = $privateWorkingSetRatio
             gpu_process_shared_bytes = $gpuMemory.shared_bytes
             gpu_process_dedicated_bytes = $gpuMemory.dedicated_bytes
             disk = $disk
+            system_memory_pressure = $memoryPressure
+            contamination_triggered = $contaminationTriggered
+            contamination_reasons = @($pressureReasons)
             contamination_consecutive_samples = $contaminationCount
             contamination_abort = $contaminationAbort
             nvidia = $gpu
