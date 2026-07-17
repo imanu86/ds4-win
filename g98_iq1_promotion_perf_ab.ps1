@@ -111,7 +111,7 @@ function Assert-G98StaticContract {
         "ExpertCachePolicy", "ExpertTiering", "ExpertTierPolicy",
         "ExpertTierClockCalls", "ExpertTierReplacementBudget",
         "ExpertTierMinFrequency", "ExpertTierHysteresis",
-        "GpuResidentRoutes", "RouteNoDefaultSync", "RoutePackedCopy",
+        "GpuResidentRoutes", "RouteNoDefaultSync",
         "SplitFused", "ReapPrefetchThreads", "ExpectedModelSHA256",
         "Iq1SExpertSidecar", "ExpectedIq1SExpertSidecarSHA256",
         "ExpectedIq1SExpertSidecarBytes", "Iq1SLayerFirst",
@@ -182,6 +182,7 @@ function Assert-G98StaticContract {
         throw "G98 static diff failed: an arm does not reserve matched open-router capacity exactly once."
     }
     foreach ($forbiddenArg in @(
+        "-RoutePackedCopy",
         ("-Reuse" + "Verified" + "ModelReceipt"),
         ("-Reuse" + "Verified" + "Iq1SReceipt"))) {
         if (@($controlArgs | Where-Object { $_ -eq $forbiddenArg }).Count -ne 0 -or
@@ -254,7 +255,6 @@ function New-G98Args {
         "-ExpertTierHysteresis", "1.25",
         "-GpuResidentRoutes",
         "-RouteNoDefaultSync",
-        "-RoutePackedCopy",
         "-SplitFused",
         "-ReapPrefetchThreads", "8",
         "-ModelPath", $model,
@@ -408,10 +408,10 @@ function Assert-G98RunContract {
         [UInt64]$Result.gpu_resident_routes_no_default_sync_calls -ne
             [UInt64]$Result.gpu_resident_routes_calls -or
         [UInt64]$Result.gpu_resident_routes_errors -ne 0 -or
-        [bool]$Result.route_packed_copy_requested -ne $true -or
-        [bool]$Result.route_packed_copy_observed -ne $true -or
-        [UInt64]$Result.route_packed_copy_bytes -le 0 -or
-        [UInt64]$Result.route_packed_copy_legacy_submissions -ne 0 -or
+        [bool]$Result.route_packed_copy_requested -ne $false -or
+        [bool]$Result.route_packed_copy_observed -ne $false -or
+        [UInt64]$Result.route_packed_copy_bytes -ne 0 -or
+        [UInt64]$Result.route_packed_copy_legacy_submissions -le 0 -or
         [bool]$Result.split_fused_requested -ne $true -or
         [bool]$Result.split_fused_observed -ne $true -or
         [int]$Result.reap_prefetch_threads_requested -ne 8 -or
@@ -658,7 +658,9 @@ $staticChecks = [pscustomobject]@{
     iq1_s_ram_cache_gib = 1
     expert_cache_n = 320
     gpu_planner_on_both_arms = $true
-    route_packed_copy = $true
+    route_packed_copy = $false
+    route_packed_copy_excluded_reason =
+        "measured heterogeneous gate/down byte layout refusal"
     compose_prefill_mass_open_router = $true
     compose_prefill_mass_reserve_slots = $PromotionSlots
     promotion_control = "open-router reserve16, promotion off"
@@ -814,7 +816,7 @@ $summary = [pscustomobject]@{
     route = [pscustomobject]@{
         gpu_resident_routes = $true
         route_no_default_sync = $true
-        route_packed_copy = $true
+        route_packed_copy = $false
         split_fused = $true
         reap_prefetch_threads = 8
     }

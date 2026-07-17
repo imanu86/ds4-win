@@ -4,6 +4,7 @@
 param(
     [switch]$StaticCheckOnly,
     [switch]$Resume,
+    [switch]$ForceOverwrite,
     [ValidateRange(1.0, 8.0)][double]$Iq1CacheGiB = 4.0,
     [ValidateRange(1, 512)][int]$PromotionSlots = 16
 )
@@ -22,15 +23,19 @@ $sidecar = "D:\ds4-models\DeepSeek-V4-Flash-IQ1_S-XL.gguf"
 $sidecarSha256 = "b049d1eb34c068f19ab007b33c22a7d758b578bf2b10d9276e79654f85d35047"
 $sidecarSource = "https://huggingface.co/persadian/DeepSeek-V4-Flash-IQ1_S-XL/resolve/main/DeepSeek-V4-Flash-IQ1_S-XL.gguf"
 $sidecarSourceRepository = "https://huggingface.co/persadian/DeepSeek-V4-Flash-IQ1_S-XL"
-$prompt = "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document."
-$promptSha256 = "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6"
+$sentinel = "G99_IQ1_PROMOTION_QUALITY_AB_DONE"
+$prompt = "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the complete HTML document, then append exactly this sentinel on its own line after the closing </html>: $sentinel"
+$promptSha256 = "c14268fd7416d64fe8ddf81692a6fd40c1d87e0893d2ae80d7b4dfe1e7a5f5e0"
 $repeatsPerArm = 3
 $maxTokens = 768
 $context = 1024
 $warmupMaxTokens = 64
-$stopSequence = "</html>"
+$stopSequence = $sentinel
 $quiescenceCooldownSec = 90
 $timeoutSec = 7200
+$armDeadlineSec = 7800
+$buildDeadlineSec = 1800
+$globalDeadlineSec = 18000
 $cacheLabel = $Iq1CacheGiB.ToString(
     "0.###", [Globalization.CultureInfo]::InvariantCulture).Replace(".", "p")
 $cacheArgument = $Iq1CacheGiB.ToString(
@@ -110,6 +115,68 @@ function Convert-G99Html {
     [Net.WebUtility]::HtmlEncode($Text)
 }
 
+function Join-G99ProcessArguments {
+    param([Parameter(Mandatory=$true)][string[]]$Arguments)
+    $quoted = @()
+    foreach ($arg in $Arguments) {
+        $quoted += ('"' + (($arg -replace '\\(?=")', '$0\') -replace '"', '\"') + '"')
+    }
+    $quoted -join " "
+}
+
+function Invoke-G99PowerShellWithDeadline {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Arguments,
+        [Parameter(Mandatory=$true)][int]$DeadlineSec,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+    $remainingSec = $DeadlineSec
+    if ($script:globalDeadlineUtc) {
+        $remainingSec = [int][Math]::Floor(
+            ($script:globalDeadlineUtc - [DateTime]::UtcNow).TotalSeconds)
+        $remainingSec = [Math]::Min($remainingSec, $DeadlineSec)
+    }
+    if ($remainingSec -le 0) {
+        throw "G99 global deadline exceeded before launch: context=$Context"
+    }
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = "powershell.exe"
+    $startInfo.Arguments = Join-G99ProcessArguments $Arguments
+    $startInfo.UseShellExecute = $false
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        if (-not $process.WaitForExit($remainingSec * 1000)) {
+            try { $process.Kill() } catch {}
+            throw "G99 deadline exceeded: context=$Context seconds=$remainingSec"
+        }
+        if ($process.ExitCode -ne 0) {
+            throw "G99 subprocess failed: context=$Context exit=$($process.ExitCode)"
+        }
+    } finally {
+        if ($process) { $process.Dispose() }
+    }
+}
+
+function Assert-G99NoOverwrite {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Paths,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+    $existing = @($Paths | Where-Object {
+        Test-Path -LiteralPath $_ -PathType Leaf
+    })
+    if ($existing.Count -eq 0) { return }
+    if (-not $ForceOverwrite) {
+        throw ("G99 refuses to overwrite existing artifact(s) without " +
+            "-Resume or -ForceOverwrite: context=$Context paths=" +
+            ($existing -join ", "))
+    }
+    foreach ($path in $existing) {
+        Remove-Item -LiteralPath $path -Force
+    }
+}
+
 function Assert-G99StaticContract {
     foreach ($path in @($harness, $runtimeMonitor, $buildRunner)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -130,7 +197,9 @@ function Assert-G99StaticContract {
     }
     if ($repeatsPerArm -ne 3 -or $maxTokens -ne 768 -or
         $context -ne 1024 -or $warmupMaxTokens -ne 64 -or
-        $stopSequence -ne "</html>" -or $quiescenceCooldownSec -ne 90) {
+        $stopSequence -ne $sentinel -or $quiescenceCooldownSec -ne 90 -or
+        $timeoutSec -ne 7200 -or $armDeadlineSec -lt $timeoutSec -or
+        $globalDeadlineSec -lt ($buildDeadlineSec + (2 * $armDeadlineSec))) {
         throw "G99 prompt/token/quiescence contract mismatch"
     }
     if ($PromotionSlots -ne 16) {
@@ -219,7 +288,16 @@ function Assert-G99StaticContract {
         '"iq1_s_sidecar_sha256",',
         '"iq1_s_sidecar_hash_method",',
         '"iq1_s_sidecar_receipt_path",',
-        '"iq1_s_sidecar_receipt_sha256",')) {
+        '"iq1_s_sidecar_receipt_sha256",',
+        '$stopSequence = $sentinel',
+        '[switch]$ForceOverwrite',
+        'Assert-G99NoOverwrite',
+        'Invoke-G99PowerShellWithDeadline',
+        'G99 refuses to overwrite existing artifact(s)',
+        'G99 deadline exceeded',
+        'external_stop_sentinel = $sentinel',
+        'html_closing_tag_required = $true',
+        'stop_sentinel_must_not_be_in_output = $true')) {
         if ($selfText -notmatch [regex]::Escape($requiredText)) {
             throw "G99 static matched-pair receipt marker missing: $requiredText"
         }
@@ -261,7 +339,6 @@ function New-G99BaseMeasureArgs([string]$Tag) {
         "-ExpertCachePolicy", "lru",
         "-GpuResidentRoutes",
         "-RouteNoDefaultSync",
-        "-RoutePackedCopy",
         "-SplitFused",
         "-ExpertTiering", "enforce",
         "-ExpertTierPolicy", "mass-lfru",
@@ -299,6 +376,8 @@ function Invoke-G99Arm {
             throw "G99 resume artifact missing for arm=$Arm"
         }
     } else {
+        Assert-G99NoOverwrite -Context $Arm -Paths @(
+            $resultPath, $rawPath, $failurePath)
         $measureArgs = New-G99BaseMeasureArgs $Tag
         if ($Arm -eq "candidate_promotion_slots16") {
             $measureArgs += @(
@@ -307,10 +386,8 @@ function Invoke-G99Arm {
             )
         }
         Write-Host ("[g99] start arm=" + $Arm + " tag=" + $Tag)
-        & powershell.exe @measureArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "G99 harness failed: arm=$Arm exit=$LASTEXITCODE"
-        }
+        Invoke-G99PowerShellWithDeadline -Arguments $measureArgs `
+            -DeadlineSec $armDeadlineSec -Context $Arm
     }
 
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf) -or
@@ -358,8 +435,7 @@ function Assert-G99ArmResult {
         "iq1_promotion_runtime_observed", "iq1_promotion_requests",
         "iq1_promotion_2bit_ssd_seconds",
         "iq1_promotion_2bit_ssd_bytes_per_second",
-        "route_packed_copy_requested", "route_packed_copy_observed",
-        "route_packed_copy_bytes", "route_packed_copy_legacy_submissions",
+        "route_packed_copy_requested",
         "compose_prefill_mass_open_router_requested",
         "compose_prefill_mass_reserve_slots_requested")) {
         Assert-G99Property -Object $Result -Name $name -Context $Arm
@@ -406,10 +482,7 @@ function Assert-G99ArmResult {
         [string]$Result.expert_cache_policy -ne "lru" -or
         -not [bool]$Result.gpu_resident_routes_requested -or
         -not [bool]$Result.route_no_default_sync_requested -or
-        -not [bool]$Result.route_packed_copy_requested -or
-        -not [bool]$Result.route_packed_copy_observed -or
-        [UInt64]$Result.route_packed_copy_bytes -le 0 -or
-        [UInt64]$Result.route_packed_copy_legacy_submissions -ne 0 -or
+        [bool]$Result.route_packed_copy_requested -or
         -not [bool]$Result.split_fused_requested -or
         [string]$Result.expert_tiering_requested -ne "enforce" -or
         [string]$Result.expert_tier_policy_requested -ne "mass-lfru" -or
@@ -470,8 +543,11 @@ function Assert-G99ArmResult {
     }
 
     foreach ($sample in @($Result.results)) {
+        $sampleText = Get-G99SampleText $sample
         if ([int]$sample.completion_tokens -le 0 -or
-            [string]::IsNullOrWhiteSpace((Get-G99SampleText $sample)) -or
+            [string]::IsNullOrWhiteSpace($sampleText) -or
+            $sampleText -notmatch '</html>\s*$' -or
+            $sampleText -match [regex]::Escape($sentinel) -or
             [string]$sample.content_sha256 -notmatch '^[0-9a-fA-F]{64}$') {
             throw "G99 raw output integrity failure: arm=$Arm repeat=$($sample.repeat)"
         }
@@ -721,12 +797,22 @@ $staticChecks = [ordered]@{
     max_tokens = $maxTokens
     context = $context
     stop_sequence = $stopSequence
+    external_stop_sentinel = $sentinel
+    html_closing_tag_required = $true
+    stop_sentinel_must_not_be_in_output = $true
+    force_overwrite = [bool]$ForceOverwrite
+    fail_closed_overwrite_protection = $true
+    harness_timeout_seconds = $timeoutSec
+    build_deadline_seconds = $buildDeadlineSec
+    arm_deadline_seconds = $armDeadlineSec
+    global_deadline_seconds = $globalDeadlineSec
     temperature = 0
     think = $false
     quiescence_required = $true
     quiescence_cooldown_seconds = $quiescenceCooldownSec
     skip_system_quiescence = $false
-    route_packed_copy = $true
+    route_packed_copy = $false
+    route_packed_copy_policy = "disabled for G99 IQ1 promotion path; G98 observed incompatible gate/down layout bytes"
     model_hash_method_required = "full_file_sha256"
     iq1_s_sidecar_hash_method_required = "full_file_sha256"
     model_receipt_path_and_hash_required_empty = $true
@@ -746,9 +832,14 @@ if ($StaticCheckOnly) {
     return
 }
 
+$script:globalDeadlineUtc = [DateTime]::UtcNow.AddSeconds($globalDeadlineSec)
+
 if (-not $Resume) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $buildRunner
-    if ($LASTEXITCODE -ne 0) { throw "G99 provenance build failed" }
+    Assert-G99NoOverwrite -Context "summary" -Paths @(
+        $summaryPath, $gradingPath, $sideBySidePath)
+    Invoke-G99PowerShellWithDeadline -Arguments @(
+        "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $buildRunner) `
+        -DeadlineSec $buildDeadlineSec -Context "provenance-build"
 }
 
 $control = Invoke-G99Arm -Arm "control_promotion_off" -Tag $controlTag
@@ -825,7 +916,16 @@ $summary = [ordered]@{
     max_tokens = $maxTokens
     context = $context
     stop_sequence = $stopSequence
+    external_stop_sentinel = $sentinel
+    html_closing_tag_required = $true
+    stop_sentinel_must_not_be_in_output = $true
     warmup_max_tokens = $warmupMaxTokens
+    harness_timeout_seconds = $timeoutSec
+    build_deadline_seconds = $buildDeadlineSec
+    arm_deadline_seconds = $armDeadlineSec
+    global_deadline_seconds = $globalDeadlineSec
+    force_overwrite = [bool]$ForceOverwrite
+    fail_closed_overwrite_protection = $true
     non_identical_repeat_outputs_allowed = $true
     system_quiescence_required = $true
     quiescence_cooldown_seconds = $quiescenceCooldownSec
@@ -883,7 +983,8 @@ $summary = [ordered]@{
         expert_tier_hysteresis = 1.25
         gpu_resident_routes = $true
         route_no_default_sync = $true
-        route_packed_copy = $true
+        route_packed_copy = $false
+        route_packed_copy_policy = "disabled for G99 IQ1 promotion path; G98 observed incompatible gate/down layout bytes"
         split_fused = $true
         reap_prefetch_threads = 8
     }
