@@ -1,7 +1,9 @@
 # G101 IQ1_S promotion combined-gate performance B/A (PowerShell 5.1, ASCII).
 param(
     [switch]$StaticCheckOnly,
-    [switch]$Resume
+    [switch]$Resume,
+    [ValidateRange(1, 20)][int]$QuiescenceRetryLimit = 10,
+    [ValidateRange(0, 300)][int]$QuiescenceRetryCooldownSec = 30
 )
 
 $ErrorActionPreference = "Stop"
@@ -683,6 +685,23 @@ function Assert-G101RawBinding {
     }
 }
 
+function Test-G101RetryableQuiescenceFailure {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $preflight = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    return [bool](
+        [string]$preflight.schema -eq "g7_system_quiescence_preflight_v1" -and
+        [bool]$preflight.skipped -eq $false -and
+        [bool]$preflight.ready_to_launch -eq $false -and
+        @($preflight.failures).Count -gt 0)
+}
+
 function Invoke-G101Arm {
     param(
         [Parameter(Mandatory=$true)][object]$Plan,
@@ -692,13 +711,33 @@ function Invoke-G101Arm {
     $resultPath = Join-Path $outdir ("g7_" + $Plan.Tag + "_result.json")
     $rawPath = Join-Path $outdir ("g7_" + $Plan.Tag + "_raw_outputs.json")
     $failurePath = Join-Path $outdir ("g7_" + $Plan.Tag + "_failure.json")
+    $quiescencePath = Join-Path $outdir (
+        "g7_" + $Plan.Tag + "_system_quiescence_preflight.json")
     $args = New-G101Args -Plan $Plan
 
     Write-Host ("[g101] start tag=" + $Plan.Tag +
         " arm=" + $Plan.Arm + " gate=" + $Plan.Description)
-    & powershell.exe @args | ForEach-Object { Write-Host $_ }
-    if ($LASTEXITCODE -ne 0) {
-        throw "G101 arm failed: $($Plan.Tag)"
+    for ($attempt = 1; $attempt -le $QuiescenceRetryLimit; $attempt++) {
+        & powershell.exe @args | ForEach-Object { Write-Host $_ }
+        if ($LASTEXITCODE -eq 0) {
+            break
+        }
+        if (-not (Test-G101RetryableQuiescenceFailure $quiescencePath) -or
+            $attempt -ge $QuiescenceRetryLimit) {
+            throw "G101 arm failed: $($Plan.Tag)"
+        }
+        $attemptPath = Join-Path $outdir (
+            "g7_" + $Plan.Tag + "_system_quiescence_preflight_attempt" +
+            $attempt + ".json")
+        Copy-Item -LiteralPath $quiescencePath -Destination $attemptPath -Force
+        Write-Host ("[g101] quiescence retry tag=" + $Plan.Tag +
+            " attempt=" + ($attempt + 1) + "/" + $QuiescenceRetryLimit)
+        $cooldownIndex = [Array]::IndexOf(
+            [object[]]$args, "-QuiescenceCooldownSec")
+        if ($cooldownIndex -lt 0 -or $cooldownIndex + 1 -ge $args.Count) {
+            throw "G101 cooldown argument missing: $($Plan.Tag)"
+        }
+        $args[$cooldownIndex + 1] = [string]$QuiescenceRetryCooldownSec
     }
 
     if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) {

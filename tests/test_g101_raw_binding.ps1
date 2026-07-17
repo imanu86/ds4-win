@@ -62,4 +62,29 @@ if (-not $failedClosed) {
     throw "G101 raw binding accepted an altered unique output hash"
 }
 
+$tempPreflight = Join-Path ([IO.Path]::GetTempPath()) (
+    "g101_quiescence_" + [Guid]::NewGuid().ToString("n") + ".json")
+try {
+    [IO.File]::WriteAllText($tempPreflight, (@{
+        schema = "g7_system_quiescence_preflight_v1"
+        skipped = $false
+        ready_to_launch = $false
+        failures = @("disk-io-median-above-threshold")
+    } | ConvertTo-Json), [Text.Encoding]::UTF8)
+    if (-not (Test-G101RetryableQuiescenceFailure $tempPreflight)) {
+        throw "G101 rejected a valid retryable quiescence failure"
+    }
+    [IO.File]::WriteAllText($tempPreflight, (@{
+        schema = "g7_system_quiescence_preflight_v1"
+        skipped = $false
+        ready_to_launch = $true
+        failures = @()
+    } | ConvertTo-Json), [Text.Encoding]::UTF8)
+    if (Test-G101RetryableQuiescenceFailure $tempPreflight) {
+        throw "G101 retried an already clean quiescence preflight"
+    }
+} finally {
+    Remove-Item -LiteralPath $tempPreflight -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host "G101 raw binding tests PASS"
