@@ -53,6 +53,8 @@ foreach ($needle in @(
     'tier.ssd_bytes',
     'mixed or missing provenance',
     'contamination_abort_observed',
+    'structural-safety-gate-not-quality-eligible',
+    'repeats-less-than-3-not-quality-eligible',
     'Measurement failed before runtime invariant parsing',
     'arena_wrap_unlock_source_ranges_summary_phases',
     'split_fused_hits')) {

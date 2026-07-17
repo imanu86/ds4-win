@@ -370,13 +370,12 @@ function Assert-G103CommonG73Contract {
         -not [bool]$Result.system_quiescence_preflight.ready_to_launch -or
         [bool]$Result.system_quiescence_preflight.skipped -or
         [bool]$Result.runtime_telemetry.contamination_abort_observed -or
-        [string]$Result.contamination_reason -ne "" -or
         [int]$Result.arena_wrap_unlock_source_ranges_summary_phases -ne 3 -or
         [int]$Result.arena_wrap_unlock_source_ranges_summary_waves -ne 9 -or
         [UInt64]$Result.arena_wrap_unlock_source_ranges_summary_max_wave_bytes -gt
             [UInt64](4GB) -or
         [UInt64]$Result.arena_wrap_unlock_source_ranges_summary_failed -ne 0 -or
-        [double]$Result.contamination_runtime_minimum_available_gib -ne
+        [double]$Result.runtime_telemetry.contamination_runtime_minimum_available_gib -ne
             $runtimeMinimumAvailableGiB) {
         throw "G103 common G73 static32_split_fused contract mismatch: tag=$($Result.tag)"
     }
@@ -389,6 +388,15 @@ function Assert-G103Result {
         [Parameter(Mandatory=$true)][bool]$Safety
     )
     Assert-G103CommonG73Contract -Result $Result
+    $expectedEligibilityReason = if ($Safety) {
+        "structural-safety-gate-not-quality-eligible"
+    } else {
+        "repeats-less-than-3-not-quality-eligible"
+    }
+    if ([bool]$Result.quality_eligible -or [bool]$Result.sota_eligible -or
+        [string]$Result.contamination_reason -ne $expectedEligibilityReason) {
+        throw "G103 member eligibility contract mismatch: tag=$($Result.tag)"
+    }
     if (@($Result.results).Count -ne 1) {
         throw "G103 requires one repeat per independent process"
     }

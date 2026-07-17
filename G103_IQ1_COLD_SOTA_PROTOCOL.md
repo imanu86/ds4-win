@@ -87,6 +87,13 @@ The runner must not enable:
 
 Safety `n=1` is structural only and can never support a quality or SOTA claim.
 
+Each benchmark arm is also one independent `Repeats=1` process. Its member
+receipt must remain individually non-eligible with reason
+`repeats-less-than-3-not-quality-eligible`; only this runner's interleaved
+aggregate of at least three independent processes per arm may support a
+performance comparison. The safety member must use the exact reason
+`structural-safety-gate-not-quality-eligible`.
+
 ## Gates
 
 Candidate gate requires:
