@@ -1,7 +1,9 @@
-# G101 IQ1_S promotion combined-gate performance B/A (PowerShell 5.1, ASCII).
+# G101 IQ1_S promotion combined/legacy counterbalanced member (PowerShell 5.1, ASCII).
 param(
     [switch]$StaticCheckOnly,
     [switch]$Resume,
+    [ValidateSet("combined-then-legacy", "legacy-then-combined")]
+    [string]$ExecutionOrder = "combined-then-legacy",
     [ValidateRange(1, 20)][int]$QuiescenceRetryLimit = 10,
     [ValidateRange(0, 300)][int]$QuiescenceRetryCooldownSec = 30
 )
@@ -27,17 +29,17 @@ $prompt = "Create a complete single-file HTML landing page for a cyberpunk AI pr
 $expectedPromptSHA256 =
     "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6"
 
-$summaryPath = Join-Path $outdir "g101_iq1_promotion_combined_ba_result.json"
-$suiteReceiptPath = Join-Path $outdir "g101_model_iq1_suite.receipt.json"
-$script:g101SuiteReceiptPath = $suiteReceiptPath
-$script:g101SuiteReceiptSHA256 =
-    "0000000000000000000000000000000000000000000000000000000000000000"
-$promotionSlots = 16
-$armPlan = @(
-    [pscustomobject]@{
-        Order = 1
+function Get-G101ExecutionDefinition {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("combined-then-legacy", "legacy-then-combined")]
+        [string]$Order
+    )
+
+    $combined = [pscustomobject]@{
+        Order = 0
         Arm = "candidate-combined-gate"
-        Tag = "g101_iq1_promotion_combined_gate_n3"
+        Tag = ""
         MinTouches = 2
         MinWeight = 0.02
         MinMass = 0.0
@@ -45,11 +47,11 @@ $armPlan = @(
         WindowCalls = 40
         WindowBudget = 1
         Description = "combined: touch2 minWeight.02 request-budget16 window40 budget1"
-    },
-    [pscustomobject]@{
-        Order = 2
+    }
+    $legacy = [pscustomobject]@{
+        Order = 0
         Arm = "control-legacy-gate"
-        Tag = "g101_iq1_promotion_legacy_gate_n3"
+        Tag = ""
         MinTouches = 1
         MinWeight = 0.0
         MinMass = 0.0
@@ -58,7 +60,55 @@ $armPlan = @(
         WindowBudget = 0
         Description = "legacy: touch1 no thresholds unlimited"
     }
-)
+
+    if ($Order -eq "combined-then-legacy") {
+        $combined.Order = 1
+        $combined.Tag = "g101_iq1_promotion_combined_gate_n3"
+        $legacy.Order = 2
+        $legacy.Tag = "g101_iq1_promotion_legacy_gate_n3"
+        return [pscustomobject]@{
+            execution_order = $Order
+            arm_order_label = "combined-then-legacy-fixed-BA"
+            pair_member = "BA"
+            opposite_execution_order = "legacy-then-combined"
+            opposite_order_to_g98 = $true
+            summary_file = "g101_iq1_promotion_combined_ba_result.json"
+            suite_receipt_file = "g101_model_iq1_suite.receipt.json"
+            execution_receipt_file =
+                "g101_iq1_promotion_combined_ba.execution.receipt.json"
+            arms = @($combined, $legacy)
+        }
+    }
+
+    $legacy.Order = 1
+    $legacy.Tag = "g101_iq1_promotion_legacy_gate_counter_ab_n3"
+    $combined.Order = 2
+    $combined.Tag = "g101_iq1_promotion_combined_gate_counter_ab_n3"
+    [pscustomobject]@{
+        execution_order = $Order
+        arm_order_label = "legacy-then-combined-fixed-AB"
+        pair_member = "AB"
+        opposite_execution_order = "combined-then-legacy"
+        opposite_order_to_g98 = $false
+        summary_file = "g101_iq1_promotion_legacy_ab_result.json"
+        suite_receipt_file = "g101_model_iq1_suite_counter_ab.receipt.json"
+        execution_receipt_file =
+            "g101_iq1_promotion_legacy_ab.execution.receipt.json"
+        arms = @($legacy, $combined)
+    }
+}
+
+$executionDefinition = Get-G101ExecutionDefinition -Order $ExecutionOrder
+$summaryPath = Join-Path $outdir $executionDefinition.summary_file
+$suiteReceiptPath = Join-Path $outdir $executionDefinition.suite_receipt_file
+$executionReceiptPath =
+    Join-Path $outdir $executionDefinition.execution_receipt_file
+$script:g101SuiteReceiptPath = $suiteReceiptPath
+$script:g101SuiteReceiptSHA256 =
+    "0000000000000000000000000000000000000000000000000000000000000000"
+$promotionSlots = 16
+$armPlan = @($executionDefinition.arms)
+$counterbalancedPairId = "g101_combined_legacy_counterbalanced_pair_v1"
 
 function Get-G101SHA256 {
     param([Parameter(Mandatory=$true)][string]$Path)
@@ -66,6 +116,53 @@ function Get-G101SHA256 {
         throw "G101 provenance file missing: $Path"
     }
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function New-G101ExecutionReceipt {
+    param(
+        [Parameter(Mandatory=$true)][string]$RunnerSHA256,
+        [Parameter(Mandatory=$true)][object]$SuiteReceipt
+    )
+
+    $receipt = [pscustomobject]@{
+        schema = "g101_counterbalanced_execution_receipt_v1"
+        purpose =
+            "Bind one fixed-order G101 member intended for a counterbalanced BA/AB pair."
+        pair_id = $counterbalancedPairId
+        counterbalanced_pair_intent = $true
+        pair_member = [string]$executionDefinition.pair_member
+        execution_order = [string]$executionDefinition.execution_order
+        opposite_execution_order =
+            [string]$executionDefinition.opposite_execution_order
+        order_counterbalanced_within_this_run = $false
+        pair_complete_within_this_run = $false
+        standalone_performance_verdict =
+            "withheld_single_order_counterbalanced_pair_member"
+        summary_path = [IO.Path]::GetFullPath($summaryPath)
+        model_iq1_suite_receipt_path = [string]$SuiteReceipt.path
+        model_iq1_suite_receipt_sha256 = [string]$SuiteReceipt.sha256
+        model_iq1_suite_receipt_schema = [string]$SuiteReceipt.schema
+        runner_sha256 = $RunnerSHA256
+        arms = @($armPlan | ForEach-Object {
+            [pscustomobject]@{
+                order = [int]$_.Order
+                arm = [string]$_.Arm
+                tag = [string]$_.Tag
+                description = [string]$_.Description
+                config = Get-G101ExpectedGateConfig -Plan $_
+            }
+        })
+    }
+    $receipt | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath $executionReceiptPath -Encoding UTF8
+    [pscustomobject]@{
+        path = [IO.Path]::GetFullPath($executionReceiptPath)
+        sha256 = Get-G101SHA256 $executionReceiptPath
+        schema = [string]$receipt.schema
+        execution_order = [string]$receipt.execution_order
+        pair_id = [string]$receipt.pair_id
+        pair_member = [string]$receipt.pair_member
+    }
 }
 
 function Open-G101ReadDenyWriteDeleteLock {
@@ -361,35 +458,70 @@ function Assert-G101StaticContract {
         throw "G101 AST parse failed: $($parseErrors[0].Message)"
     }
 
-    $firstArgs = @(New-G101Args -Plan $armPlan[0])
-    $secondArgs = @(New-G101Args -Plan $armPlan[1])
-    $firstComparable = @(Get-G101ComparableArgs -Args $firstArgs)
-    $secondComparable = @(Get-G101ComparableArgs -Args $secondArgs)
-    if (($firstComparable -join "`n") -ne ($secondComparable -join "`n")) {
-        throw "G101 static diff failed: arms differ outside tag/gate values."
-    }
-    foreach ($args in @($firstArgs, $secondArgs)) {
-        foreach ($requiredArg in @(
-            "-Iq1Promotion", "-Iq1PromotionProbationSlots",
-            "-Iq1PromotionMinTouches", "-Iq1PromotionMinWeight",
-            "-Iq1PromotionMinMass", "-Iq1PromotionRequestBudget",
-            "-Iq1PromotionWindowCalls", "-Iq1PromotionWindowBudget",
-            "-ComposePrefillMassOpenRouter",
-            "-ComposePrefillMassReserveSlots",
-            "-ModelIq1SuiteReceiptPath",
-            "-ExpectedModelIq1SuiteReceiptSHA256",
-            "-ReuseVerifiedSuiteReceipt")) {
-            if (@($args | Where-Object { $_ -eq $requiredArg }).Count -ne 1) {
-                throw "G101 required arg missing or duplicated: $requiredArg"
+    $definitions = @(
+        (Get-G101ExecutionDefinition -Order "combined-then-legacy"),
+        (Get-G101ExecutionDefinition -Order "legacy-then-combined")
+    )
+    foreach ($definition in $definitions) {
+        $plans = @($definition.arms)
+        if ($plans.Count -ne 2 -or
+            [int]$plans[0].Order -ne 1 -or [int]$plans[1].Order -ne 2) {
+            throw "G101 execution plan must contain exactly two ordered arms."
+        }
+        $planArmOrder = @($plans | ForEach-Object { [string]$_.Arm })
+        $expectedArmOrder = if ($definition.execution_order -eq
+            "combined-then-legacy") {
+            @("candidate-combined-gate", "control-legacy-gate")
+        } else {
+            @("control-legacy-gate", "candidate-combined-gate")
+        }
+        if (($planArmOrder -join "|") -ne ($expectedArmOrder -join "|")) {
+            throw "G101 execution plan order mismatch: $($definition.execution_order)"
+        }
+
+        $firstArgs = @(New-G101Args -Plan $plans[0])
+        $secondArgs = @(New-G101Args -Plan $plans[1])
+        $firstComparable = @(Get-G101ComparableArgs -Args $firstArgs)
+        $secondComparable = @(Get-G101ComparableArgs -Args $secondArgs)
+        if (($firstComparable -join "`n") -ne ($secondComparable -join "`n")) {
+            throw "G101 static diff failed: arms differ outside tag/gate values."
+        }
+        foreach ($args in @($firstArgs, $secondArgs)) {
+            foreach ($requiredArg in @(
+                "-Iq1Promotion", "-Iq1PromotionProbationSlots",
+                "-Iq1PromotionMinTouches", "-Iq1PromotionMinWeight",
+                "-Iq1PromotionMinMass", "-Iq1PromotionRequestBudget",
+                "-Iq1PromotionWindowCalls", "-Iq1PromotionWindowBudget",
+                "-ComposePrefillMassOpenRouter",
+                "-ComposePrefillMassReserveSlots",
+                "-ModelIq1SuiteReceiptPath",
+                "-ExpectedModelIq1SuiteReceiptSHA256",
+                "-ReuseVerifiedSuiteReceipt")) {
+                if (@($args | Where-Object { $_ -eq $requiredArg }).Count -ne 1) {
+                    throw "G101 required arg missing or duplicated: $requiredArg"
+                }
+            }
+            foreach ($forbiddenArg in @(
+                "-RoutePackedCopy",
+                ("-Reuse" + "Verified" + "ModelReceipt"),
+                ("-Reuse" + "Verified" + "Iq1SReceipt"))) {
+                if (@($args | Where-Object { $_ -eq $forbiddenArg }).Count -ne 0) {
+                    throw "G101 benchmark must not use $forbiddenArg."
+                }
             }
         }
-        foreach ($forbiddenArg in @(
-            "-RoutePackedCopy",
-            ("-Reuse" + "Verified" + "ModelReceipt"),
-            ("-Reuse" + "Verified" + "Iq1SReceipt"))) {
-            if (@($args | Where-Object { $_ -eq $forbiddenArg }).Count -ne 0) {
-                throw "G101 benchmark must not use $forbiddenArg."
-            }
+    }
+
+    $allTags = @($definitions | ForEach-Object { $_.arms } |
+        ForEach-Object { [string]$_.Tag })
+    if (@($allTags | Select-Object -Unique).Count -ne $allTags.Count) {
+        throw "G101 default/reverse arm tags must be unique."
+    }
+    foreach ($field in @(
+        "summary_file", "suite_receipt_file", "execution_receipt_file")) {
+        $paths = @($definitions | ForEach-Object { [string]($_.$field) })
+        if (@($paths | Select-Object -Unique).Count -ne $paths.Count) {
+            throw "G101 default/reverse artifact path collision: $field"
         }
     }
 
@@ -883,15 +1015,20 @@ New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 Assert-G101StaticContract
 
 if ($Resume -and -not $StaticCheckOnly) {
-    throw "G101 -Resume is intentionally unsupported for the immutable one-hash BA suite; rerun the complete suite."
+    throw "G101 -Resume is intentionally unsupported for an immutable fixed-order member; rerun the complete member."
 }
 
 $selfSha = Get-G101SHA256 $MyInvocation.MyCommand.Path
+$staticExecutionDefinitions = @(
+    (Get-G101ExecutionDefinition -Order "combined-then-legacy"),
+    (Get-G101ExecutionDefinition -Order "legacy-then-combined")
+)
 $staticChecks = [pscustomobject]@{
-    schema = "g101_iq1_promotion_combined_ba_static_v1"
+    schema = "g101_iq1_promotion_combined_ba_static_v2"
     script_parse_ok = $true
     ast_parse_ok = $true
     static_diff_ok = $true
+    both_execution_orders_static_checked = $true
     harness_present = (Test-Path -LiteralPath $harness -PathType Leaf)
     runtime_monitor_present =
         (Test-Path -LiteralPath $runtimeMonitor -PathType Leaf)
@@ -916,13 +1053,24 @@ $staticChecks = [pscustomobject]@{
     iq1_sidecar = $iq1Sidecar
     iq1_sidecar_cache_gib = 1
     promotion_enabled_both_arms = $true
-    arm_order = "combined-then-legacy-fixed-BA"
-    opposite_order_to_g98 = $true
+    execution_order = [string]$executionDefinition.execution_order
+    arm_order = [string]$executionDefinition.arm_order_label
+    pair_member = [string]$executionDefinition.pair_member
+    opposite_execution_order =
+        [string]$executionDefinition.opposite_execution_order
+    opposite_order_to_g98 = [bool]$executionDefinition.opposite_order_to_g98
+    summary_path = [IO.Path]::GetFullPath($summaryPath)
+    suite_receipt_path = [IO.Path]::GetFullPath($suiteReceiptPath)
+    execution_receipt_path = [IO.Path]::GetFullPath($executionReceiptPath)
+    counterbalanced_pair_id = $counterbalancedPairId
+    counterbalanced_pair_intent = $true
+    pair_complete_within_this_run = $false
     order_counterbalanced = $false
-    fixed_ba_order_limitation_recorded = $true
-    final_performance_verdict = "withheld_fixed_BA_order_limitation"
+    single_order_limitation_recorded = $true
+    final_performance_verdict =
+        "withheld_single_order_counterbalanced_pair_member"
     performance_claim_label =
-        "clean n=3 timing may be recorded, but final claim withheld due fixed BA order"
+        "clean n=3 timing may be recorded, but this single-order member cannot support a final claim"
     quality_claim = "none"
     long_form_l0_l3_claim = "none"
     quiescence_required = $true
@@ -930,7 +1078,7 @@ $staticChecks = [pscustomobject]@{
     contamination_abort_fail_closed = $true
     model_hash_method_required = "verified_suite_receipt_reuse"
     iq1_s_sidecar_hash_method_required = "verified_suite_receipt_reuse"
-    one_suite_hash_per_ba_suite_required = $true
+    one_suite_hash_per_fixed_order_member_required = $true
     parent_held_deny_write_delete_locks_required = $true
     metadata_only_receipt_reuse_for_benchmark_forbidden = $true
     raw_json_preserved = $true
@@ -942,6 +1090,18 @@ $staticChecks = [pscustomobject]@{
             tag = $_.Tag
             description = $_.Description
             config = Get-G101ExpectedGateConfig -Plan $_
+        }
+    })
+    execution_plans = @($staticExecutionDefinitions | ForEach-Object {
+        $definition = $_
+        [pscustomobject]@{
+            execution_order = [string]$definition.execution_order
+            arm_order = [string]$definition.arm_order_label
+            pair_member = [string]$definition.pair_member
+            summary_file = [string]$definition.summary_file
+            suite_receipt_file = [string]$definition.suite_receipt_file
+            execution_receipt_file = [string]$definition.execution_receipt_file
+            tags = @($definition.arms | ForEach-Object { [string]$_.Tag })
         }
     })
     runner_sha256 = $selfSha
@@ -970,6 +1130,7 @@ $provenance = [pscustomobject]@{
 
 $runs = @()
 $suiteReceipt = $null
+$executionReceipt = $null
 $modelSuiteLock = $null
 $iq1SuiteLock = $null
 try {
@@ -978,6 +1139,8 @@ try {
     $iq1SuiteLock = Open-G101ReadDenyWriteDeleteLock -Path $iq1Sidecar `
         -Kind "IQ1_S sidecar"
     $suiteReceipt = New-G101LockedSuiteReceipt
+    $executionReceipt = New-G101ExecutionReceipt -RunnerSHA256 $selfSha `
+        -SuiteReceipt $suiteReceipt
     foreach ($plan in $armPlan) {
         $runs += Invoke-G101Arm -Plan $plan -Provenance $provenance
     }
@@ -1041,19 +1204,22 @@ $harnessDeltaPercent = if ($timingValid -and
 } else { $null }
 $crossArmEqual = ([string]$combined.deterministic_content_sha256 -eq
     [string]$legacy.deterministic_content_sha256)
+$singleOrderLimitation =
+    "This run executes only $($executionDefinition.execution_order); pair it with $($executionDefinition.opposite_execution_order) before any final performance verdict."
 
 $summary = [pscustomobject]@{
-    schema = "g101_iq1_promotion_combined_ba_v1"
-    question = "Combined IQ1 promotion gate versus legacy gate, promotion enabled in both arms, fixed B/A order."
+    schema = "g101_iq1_promotion_counterbalanced_member_v2"
+    question =
+        "Combined IQ1 promotion gate versus legacy gate, promotion enabled in both arms, one fixed-order counterbalanced-pair member."
     gate_kind = "benchmark"
     quality_claim = "none"
     general_sota_claim = "none"
     long_form_l0_l3_claim = "none"
     performance_claim =
-        "withheld: fixed combined-then-legacy BA order is exploratory only"
-    final_performance_verdict = "withheld_fixed_BA_order_limitation"
-    fixed_ba_order_limitation =
-        "Combined gate always runs before legacy gate; order is not counterbalanced."
+        "withheld: one fixed execution order cannot support a final verdict"
+    final_performance_verdict =
+        "withheld_single_order_counterbalanced_pair_member"
+    single_order_limitation = $singleOrderLimitation
     prompt = $prompt
     prompt_sha256 = $expectedPromptSHA256
     temperature = 0
@@ -1071,9 +1237,25 @@ $summary = [pscustomobject]@{
     promotion_slots = $promotionSlots
     compose_prefill_mass_open_router = $true
     compose_prefill_mass_reserve_slots = $promotionSlots
-    arm_order = "combined-then-legacy-fixed-BA"
+    execution_order = [string]$executionDefinition.execution_order
+    arm_order = [string]$executionDefinition.arm_order_label
+    pair_member = [string]$executionDefinition.pair_member
+    opposite_execution_order =
+        [string]$executionDefinition.opposite_execution_order
     order_counterbalanced = $false
-    opposite_order_to_g98 = $true
+    opposite_order_to_g98 = [bool]$executionDefinition.opposite_order_to_g98
+    counterbalanced_pair = [pscustomobject]@{
+        pair_id = $counterbalancedPairId
+        intent =
+            "Combine this fixed-order member with its opposite-order member before analysis."
+        pair_member = [string]$executionDefinition.pair_member
+        execution_order = [string]$executionDefinition.execution_order
+        opposite_execution_order =
+            [string]$executionDefinition.opposite_execution_order
+        complete_within_this_run = $false
+        standalone_performance_verdict_withheld = $true
+    }
+    execution_receipt = $executionReceipt
     quiescence = [pscustomobject]@{
         skipped = $false
         cooldown_seconds = 90
@@ -1092,7 +1274,10 @@ $summary = [pscustomobject]@{
         suite_receipt_reuse = $true
         suite_receipt_path = $suiteReceipt.path
         suite_receipt_sha256 = $suiteReceipt.sha256
-        one_suite_hash_per_ba_suite = $true
+        one_suite_hash_per_fixed_order_member = $true
+        execution_receipt_path = $executionReceipt.path
+        execution_receipt_sha256 = $executionReceipt.sha256
+        execution_receipt_schema = $executionReceipt.schema
         parent_held_deny_write_delete_locks =
             ($combined.model_iq1_suite_lock_proof_observed -and
             $legacy.model_iq1_suite_lock_proof_observed)
@@ -1124,9 +1309,21 @@ $summary = [pscustomobject]@{
         intra_arm_determinism = $true
         cross_arm_equal_recorded_not_required = $crossArmEqual
         promotion_enabled_both_arms = $true
-        combined_gate_first = $true
-        legacy_gate_second = $true
-        fixed_ba_order_limitation_recorded = $true
+        selected_execution_order_matches_runs =
+            ((@($runs | ForEach-Object { $_.arm }) -join "|") -eq
+            (@($armPlan | ForEach-Object { $_.Arm }) -join "|"))
+        combined_gate_first =
+            ([string]$armPlan[0].Arm -eq "candidate-combined-gate")
+        legacy_gate_second =
+            ([string]$armPlan[1].Arm -eq "control-legacy-gate")
+        legacy_gate_first =
+            ([string]$armPlan[0].Arm -eq "control-legacy-gate")
+        combined_gate_second =
+            ([string]$armPlan[1].Arm -eq "candidate-combined-gate")
+        counterbalanced_pair_intent_recorded = $true
+        pair_complete_within_this_run = $false
+        single_order_limitation_recorded = $true
+        standalone_performance_verdict_withheld = $true
         suite_receipt_reuse_for_benchmark = $true
         metadata_only_receipt_reuse_for_benchmark_forbidden = $true
         one_suite_hash_reused_by_both_arms =
@@ -1146,8 +1343,7 @@ $summary = [pscustomobject]@{
         timing_contract_satisfied = $timingValid
         performance_claim_allowed = $false
         long_form_l0_l3_claim_allowed = $false
-        performance_verdict_blocked_reason =
-            "fixed combined-then-legacy BA order; no counterbalanced AB/BA pair"
+        performance_verdict_blocked_reason = $singleOrderLimitation
     }
     runs = $runs
     deltas = [pscustomobject]@{
@@ -1167,4 +1363,5 @@ $summary = [pscustomobject]@{
 
 $summary | ConvertTo-Json -Depth 10 |
     Set-Content -LiteralPath $summaryPath -Encoding UTF8
-Write-Host ("[g101] B/A complete: " + $summaryPath)
+Write-Host ("[g101] fixed-order member complete order=" +
+    $executionDefinition.execution_order + " path=" + $summaryPath)
