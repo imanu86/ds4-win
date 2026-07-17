@@ -122,6 +122,8 @@ param(
     [ValidateRange(0, 1000000)][int]$Iq1PromotionWindowCalls = 0,
     [ValidateRange(0, 1000000)][int]$Iq1PromotionWindowBudget = 0,
     [ValidateRange(0.0, 48.0)][double]$Iq1SRamCacheGiB = 0.0,
+    [switch]$Iq1SRamCachePageable,
+    [switch]$Iq1SRamCachePreloadAll,
     [switch]$Iq1SMixedDebug,
     [switch]$Iq1SProfile,
     [switch]$Iq1SNoMainSync,
@@ -667,6 +669,19 @@ if ($ComposePrefillMassReserveSlots -gt 0 -and -not $ComposePrefillMassOpenRoute
 if ($Iq1SRamCacheGiB -gt 0.0 -and -not $Iq1SExpertSidecar) {
     throw "Iq1SRamCacheGiB requires Iq1SExpertSidecar"
 }
+if ($Iq1SRamCachePageable -and $Iq1SRamCacheGiB -le 0.0) {
+    throw "Iq1SRamCachePageable requires Iq1SRamCacheGiB > 0"
+}
+if ($Iq1SRamCachePreloadAll -and -not $Iq1SRamCachePageable) {
+    throw "Iq1SRamCachePreloadAll requires Iq1SRamCachePageable"
+}
+if ($Iq1SRamCachePageable -and -not $Iq1SRamCachePreloadAll) {
+    throw "Iq1SRamCachePageable currently requires Iq1SRamCachePreloadAll"
+}
+if ($Iq1SRamCachePreloadAll -and
+    [math]::Abs($Iq1SRamCacheGiB - 46.875) -gt 0.0005) {
+    throw "Iq1SRamCachePreloadAll requires exactly 46.875 GiB (10240 routed experts)"
+}
 if ($Iq1SProfile -and -not $Iq1SExpertSidecar) {
     throw "Iq1SProfile requires Iq1SExpertSidecar"
 }
@@ -850,6 +865,16 @@ if ($Iq1SRamCacheGiB -gt 0.0) {
         "0.###", [Globalization.CultureInfo]::InvariantCulture)
 } else {
     Remove-Item Env:\DS4_IQ1_S_RAM_CACHE_GB -ErrorAction SilentlyContinue
+}
+if ($Iq1SRamCachePageable) {
+    $env:DS4_IQ1_S_RAM_CACHE_PAGEABLE = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_RAM_CACHE_PAGEABLE -ErrorAction SilentlyContinue
+}
+if ($Iq1SRamCachePreloadAll) {
+    $env:DS4_IQ1_S_RAM_CACHE_PRELOAD_ALL = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_RAM_CACHE_PRELOAD_ALL -ErrorAction SilentlyContinue
 }
 if ($Iq1SMixedDebug) {
     $env:DS4_IQ1_MIXED_DEBUG = "1"
@@ -3399,12 +3424,26 @@ $iq1SRamCacheFailures = [UInt64]0
 $iq1SRamCacheHitRate = 0.0
 $iq1SRamCacheSsdAvoidedBytes = [UInt64]0
 $iq1SRamCacheRuntimeObserved = $false
+$iq1SRamCachePreloadFrozen = $false
+$iq1SRamCachePreloadLayers = [UInt32]0
+$iq1SRamCachePreloadEntries = [UInt64]0
+$iq1SRamCachePreloadSsdBytes = [UInt64]0
+$iq1SRamCachePreloadReadCalls = [UInt64]0
+$iq1SRamCachePreloadMs = 0.0
+$iq1SRamCacheReadyPattern = if ($Iq1SRamCachePreloadAll) {
+    '\[iq1-s-ram-cache\] result=ready requested_gib=([0-9.]+) allocated_gib=([0-9.]+) capacity=(\d+) slot_bytes=(\d+) pinned=0 pageable=1 mapped=0 policy=frozen-full preload_all=1'
+} else {
+    '\[iq1-s-ram-cache\] result=ready requested_gib=([0-9.]+) allocated_gib=([0-9.]+) capacity=(\d+) slot_bytes=(\d+) pinned=1 mapped=0 policy=lru'
+}
+$iq1SRamCacheSummaryPattern = if ($Iq1SRamCachePreloadAll) {
+    '\[iq1-s-ram-cache\] result=summary requested_bytes=(\d+) allocated_bytes=(\d+) capacity=(\d+) count=(\d+) slot_bytes=(\d+) hits=(\d+) misses=(\d+) evictions=(\d+) ssd_bytes=(\d+) h2d_bytes=(\d+) failures=(\d+) pinned=0 pageable=1 mapped=0 policy=frozen-full preload_all=1 frozen=(\d+) preload_layers=(\d+) preload_entries=(\d+) preload_ssd_bytes=(\d+) preload_read_calls=(\d+) preload_ms=([0-9.]+)'
+} else {
+    '\[iq1-s-ram-cache\] result=summary requested_bytes=(\d+) allocated_bytes=(\d+) capacity=(\d+) count=(\d+) slot_bytes=(\d+) hits=(\d+) misses=(\d+) evictions=(\d+) ssd_bytes=(\d+) h2d_bytes=(\d+) failures=(\d+) pinned=1 mapped=0'
+}
 $iq1SRamCacheReadyMatches = [regex]::Matches(
-    $iq1SSidecarLogText,
-    '\[iq1-s-ram-cache\] result=ready requested_gib=([0-9.]+) allocated_gib=([0-9.]+) capacity=(\d+) slot_bytes=(\d+) pinned=1 mapped=0 policy=lru')
+    $iq1SSidecarLogText, $iq1SRamCacheReadyPattern)
 $iq1SRamCacheSummaryMatches = [regex]::Matches(
-    $iq1SSidecarLogText,
-    '\[iq1-s-ram-cache\] result=summary requested_bytes=(\d+) allocated_bytes=(\d+) capacity=(\d+) count=(\d+) slot_bytes=(\d+) hits=(\d+) misses=(\d+) evictions=(\d+) ssd_bytes=(\d+) h2d_bytes=(\d+) failures=(\d+) pinned=1 mapped=0')
+    $iq1SSidecarLogText, $iq1SRamCacheSummaryPattern)
 if ($Iq1SRamCacheGiB -gt 0.0) {
     if ($iq1SRamCacheReadyMatches.Count -ne 1 -or
         $iq1SRamCacheSummaryMatches.Count -ne 1) {
@@ -3422,19 +3461,52 @@ if ($Iq1SRamCacheGiB -gt 0.0) {
     $iq1SRamCacheSsdBytes = [UInt64]$iq1SRamCacheSummary.Groups[9].Value
     $iq1SRamCacheH2dBytes = [UInt64]$iq1SRamCacheSummary.Groups[10].Value
     $iq1SRamCacheFailures = [UInt64]$iq1SRamCacheSummary.Groups[11].Value
+    if ($Iq1SRamCachePreloadAll) {
+        $iq1SRamCachePreloadFrozen =
+            [UInt32]$iq1SRamCacheSummary.Groups[12].Value -eq 1
+        $iq1SRamCachePreloadLayers =
+            [UInt32]$iq1SRamCacheSummary.Groups[13].Value
+        $iq1SRamCachePreloadEntries =
+            [UInt64]$iq1SRamCacheSummary.Groups[14].Value
+        $iq1SRamCachePreloadSsdBytes =
+            [UInt64]$iq1SRamCacheSummary.Groups[15].Value
+        $iq1SRamCachePreloadReadCalls =
+            [UInt64]$iq1SRamCacheSummary.Groups[16].Value
+        $iq1SRamCachePreloadMs = [double]::Parse(
+            $iq1SRamCacheSummary.Groups[17].Value,
+            [Globalization.CultureInfo]::InvariantCulture)
+    }
     $iq1SRamCacheExpectedSsdBytes = [UInt64]($iq1SRamCacheMisses * $iq1SRamCacheSlotBytes)
     $iq1SRamCacheExpectedH2dBytes = [UInt64](
         ($iq1SRamCacheHits + $iq1SRamCacheMisses) * $iq1SRamCacheSlotBytes)
-    if ($iq1SRamCacheRequestedBytes -eq 0 -or
+    $iq1SRamCacheCommonInvalid =
+        $iq1SRamCacheRequestedBytes -eq 0 -or
         $iq1SRamCacheAllocatedBytes -eq 0 -or
         $iq1SRamCacheCapacity -eq 0 -or
         $iq1SRamCacheCount -gt $iq1SRamCacheCapacity -or
         $iq1SRamCacheSlotBytes -eq 0 -or
         ($iq1SRamCacheHits + $iq1SRamCacheMisses) -eq 0 -or
-        ($iq1SRamCacheCount + $iq1SRamCacheEvictions) -ne $iq1SRamCacheMisses -or
-        $iq1SRamCacheSsdBytes -ne $iq1SRamCacheExpectedSsdBytes -or
         $iq1SRamCacheH2dBytes -ne $iq1SRamCacheExpectedH2dBytes -or
-        $iq1SRamCacheFailures -ne 0) {
+        $iq1SRamCacheFailures -ne 0
+    $iq1SRamCachePolicyInvalid = if ($Iq1SRamCachePreloadAll) {
+        $iq1SRamCacheCapacity -ne 10240 -or
+        $iq1SRamCacheCount -ne 10240 -or
+        $iq1SRamCacheMisses -ne 0 -or
+        $iq1SRamCacheEvictions -ne 0 -or
+        $iq1SRamCacheSsdBytes -ne 0 -or
+        -not $iq1SRamCachePreloadFrozen -or
+        $iq1SRamCachePreloadLayers -ne 40 -or
+        $iq1SRamCachePreloadEntries -ne 10240 -or
+        $iq1SRamCachePreloadSsdBytes -ne
+            ([UInt64]10240 * $iq1SRamCacheSlotBytes) -or
+        $iq1SRamCachePreloadReadCalls -ne ([UInt64]10240 * 3) -or
+        $iq1SRamCachePreloadMs -le 0.0
+    } else {
+        ($iq1SRamCacheCount + $iq1SRamCacheEvictions) -ne
+            $iq1SRamCacheMisses -or
+        $iq1SRamCacheSsdBytes -ne $iq1SRamCacheExpectedSsdBytes
+    }
+    if ($iq1SRamCacheCommonInvalid -or $iq1SRamCachePolicyInvalid) {
         throw "IQ1_S RAM cache runtime counters are inconsistent"
     }
     $iq1SRamCacheAccesses = [UInt64]($iq1SRamCacheHits + $iq1SRamCacheMisses)
@@ -4889,6 +4961,8 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
     iq1_s_ram_cache_requested_gib = $Iq1SRamCacheGiB
+    iq1_s_ram_cache_pageable_requested = [bool]$Iq1SRamCachePageable
+    iq1_s_ram_cache_preload_all_requested = [bool]$Iq1SRamCachePreloadAll
     iq1_s_ram_cache_runtime_observed = $iq1SRamCacheRuntimeObserved
     iq1_s_ram_cache_requested_bytes = $iq1SRamCacheRequestedBytes
     iq1_s_ram_cache_allocated_bytes = $iq1SRamCacheAllocatedBytes
@@ -4903,6 +4977,12 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_ram_cache_failures = $iq1SRamCacheFailures
     iq1_s_ram_cache_hit_rate = $iq1SRamCacheHitRate
     iq1_s_ram_cache_ssd_avoided_bytes = $iq1SRamCacheSsdAvoidedBytes
+    iq1_s_ram_cache_preload_frozen = $iq1SRamCachePreloadFrozen
+    iq1_s_ram_cache_preload_layers = $iq1SRamCachePreloadLayers
+    iq1_s_ram_cache_preload_entries = $iq1SRamCachePreloadEntries
+    iq1_s_ram_cache_preload_ssd_bytes = $iq1SRamCachePreloadSsdBytes
+    iq1_s_ram_cache_preload_read_calls = $iq1SRamCachePreloadReadCalls
+    iq1_s_ram_cache_preload_ms = $iq1SRamCachePreloadMs
     iq1_s_vram_cache_per_layer_requested = $Iq1SVramCachePerLayer
     iq1_s_vram_cache_runtime_observed = $iq1SVramCacheRuntimeObserved
     iq1_s_vram_cache_capacity = $iq1SVramCacheCapacity
@@ -5077,6 +5157,8 @@ $summary = [pscustomobject]@{
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
     iq1_s_ram_cache_requested_gib = $Iq1SRamCacheGiB
+    iq1_s_ram_cache_pageable_requested = [bool]$Iq1SRamCachePageable
+    iq1_s_ram_cache_preload_all_requested = [bool]$Iq1SRamCachePreloadAll
     iq1_s_ram_cache_runtime_observed = $iq1SRamCacheRuntimeObserved
     iq1_s_ram_cache_requested_bytes = $iq1SRamCacheRequestedBytes
     iq1_s_ram_cache_allocated_bytes = $iq1SRamCacheAllocatedBytes
@@ -5091,6 +5173,12 @@ $summary = [pscustomobject]@{
     iq1_s_ram_cache_failures = $iq1SRamCacheFailures
     iq1_s_ram_cache_hit_rate = $iq1SRamCacheHitRate
     iq1_s_ram_cache_ssd_avoided_bytes = $iq1SRamCacheSsdAvoidedBytes
+    iq1_s_ram_cache_preload_frozen = $iq1SRamCachePreloadFrozen
+    iq1_s_ram_cache_preload_layers = $iq1SRamCachePreloadLayers
+    iq1_s_ram_cache_preload_entries = $iq1SRamCachePreloadEntries
+    iq1_s_ram_cache_preload_ssd_bytes = $iq1SRamCachePreloadSsdBytes
+    iq1_s_ram_cache_preload_read_calls = $iq1SRamCachePreloadReadCalls
+    iq1_s_ram_cache_preload_ms = $iq1SRamCachePreloadMs
     iq1_s_vram_cache_per_layer_requested = $Iq1SVramCachePerLayer
     iq1_s_vram_cache_runtime_observed = $iq1SVramCacheRuntimeObserved
     iq1_s_vram_cache_capacity = $iq1SVramCacheCapacity
@@ -5841,6 +5929,7 @@ Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitM
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
 Write-Host ("IQ1_S RAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
 Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math]::Round($iq1SRamCacheHitRate, 4) + " / " + [math]::Round($iq1SRamCacheSsdBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheH2dBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheSsdAvoidedBytes / 1GB, 3))
+Write-Host ("IQ1_S full preload pageable/frozen/layers/entries/SSD GiB/read-calls/ms: " + [bool]$Iq1SRamCachePageable + " / " + $iq1SRamCachePreloadFrozen + " / " + $iq1SRamCachePreloadLayers + " / " + $iq1SRamCachePreloadEntries + " / " + [math]::Round($iq1SRamCachePreloadSsdBytes / 1GB, 3) + " / " + $iq1SRamCachePreloadReadCalls + " / " + $iq1SRamCachePreloadMs)
 Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SVramCachePerLayer + " / " + $iq1SVramCacheRuntimeObserved + " / " + $iq1SVramCacheCapacity + " / " + $iq1SVramCacheCount + " / " + $iq1SVramCacheHits + " / " + $iq1SVramCacheMisses + " / " + $iq1SVramCacheEvictions + " / " + $iq1SVramCacheFailures)
 Write-Host ("IQ1_S VRAM cache hit-rate/H2D GiB: " + $(if (($iq1SVramCacheHits + $iq1SVramCacheMisses) -gt 0) { [math]::Round([double]$iq1SVramCacheHits / [double]($iq1SVramCacheHits + $iq1SVramCacheMisses), 4) } else { 0 }) + " / " + [math]::Round($iq1SVramCacheH2dBytes / 1GB, 3))
 Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures: " + $iq1MixedCalls + " / " + $iq1MixedHotMain + " / " + $iq1MixedColdIq1 + " / " + $iq1MixedPrimaryColdAvoided + " / " + $iq1MixedJoins + " / " + $iq1MixedFailures)

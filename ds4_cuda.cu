@@ -209,6 +209,9 @@ struct cuda_iq1_s_ram_cache_slot {
     uint8_t valid;
 };
 static const uint32_t CUDA_IQ1_S_LAYER_COUNT = 43u;
+static const uint32_t CUDA_IQ1_S_ROUTED_LAYER_FIRST = 3u;
+static const uint32_t CUDA_IQ1_S_ROUTED_LAYER_COUNT = 40u;
+static const uint32_t CUDA_IQ1_S_EXPERTS_PER_LAYER = 256u;
 struct cuda_iq1_s_ram_cache {
     char *host_base;
     uint64_t requested_bytes;
@@ -229,10 +232,19 @@ struct cuda_iq1_s_ram_cache {
     double ssd_read_seconds;
     double h2d_enqueue_seconds;
     double h2d_sync_seconds;
+    uint64_t preload_entries;
+    uint64_t preload_ssd_bytes;
+    uint64_t preload_read_calls;
+    double preload_seconds;
     uint64_t failures;
     uint32_t capacity;
     uint32_t count;
+    uint32_t preload_layers;
     uint8_t attempted;
+    uint8_t pageable;
+    uint8_t preload_all;
+    uint8_t frozen;
+    uint8_t layer_preloaded[CUDA_IQ1_S_LAYER_COUNT];
     std::vector<cuda_iq1_s_ram_cache_slot> slots;
     std::vector<int32_t> slot_by_layer_expert;
 };
@@ -1761,24 +1773,59 @@ static uint64_t cuda_iq1_s_ram_cache_requested_bytes(void) {
     return (uint64_t)bytes;
 }
 
+static int cuda_iq1_s_env_flag(const char *name) {
+    const char *env = getenv(name);
+    if (!env || !env[0] || strcmp(env, "0") == 0) return 0;
+    if (strcmp(env, "1") == 0) return 1;
+    fprintf(stderr, "ds4: invalid %s=%s (expected 0 or 1)\n", name, env);
+    return -1;
+}
+
 static void cuda_iq1_s_ram_cache_release(void) {
     cuda_iq1_s_ram_cache &cache = g_iq1_s_ram_cache;
     if (cache.attempted || cache.hits || cache.misses || cache.failures) {
-        fprintf(stderr,
-                "ds4: [iq1-s-ram-cache] result=summary requested_bytes=%llu "
-                "allocated_bytes=%llu capacity=%u count=%u slot_bytes=%llu "
-                "hits=%llu misses=%llu evictions=%llu ssd_bytes=%llu "
-                "h2d_bytes=%llu failures=%llu pinned=1 mapped=0\n",
-                (unsigned long long)cache.requested_bytes,
-                (unsigned long long)cache.allocated_bytes,
-                cache.capacity, cache.count,
-                (unsigned long long)cache.slot_bytes,
-                (unsigned long long)cache.hits,
-                (unsigned long long)cache.misses,
-                (unsigned long long)cache.evictions,
-                (unsigned long long)cache.ssd_bytes,
-                (unsigned long long)cache.h2d_bytes,
-                (unsigned long long)cache.failures);
+        if (cache.pageable || cache.preload_all) {
+            fprintf(stderr,
+                    "ds4: [iq1-s-ram-cache] result=summary requested_bytes=%llu "
+                    "allocated_bytes=%llu capacity=%u count=%u slot_bytes=%llu "
+                    "hits=%llu misses=%llu evictions=%llu ssd_bytes=%llu "
+                    "h2d_bytes=%llu failures=%llu pinned=0 pageable=1 mapped=0 "
+                    "policy=frozen-full preload_all=1 frozen=%u "
+                    "preload_layers=%u preload_entries=%llu "
+                    "preload_ssd_bytes=%llu preload_read_calls=%llu "
+                    "preload_ms=%.3f\n",
+                    (unsigned long long)cache.requested_bytes,
+                    (unsigned long long)cache.allocated_bytes,
+                    cache.capacity, cache.count,
+                    (unsigned long long)cache.slot_bytes,
+                    (unsigned long long)cache.hits,
+                    (unsigned long long)cache.misses,
+                    (unsigned long long)cache.evictions,
+                    (unsigned long long)cache.ssd_bytes,
+                    (unsigned long long)cache.h2d_bytes,
+                    (unsigned long long)cache.failures,
+                    cache.frozen, cache.preload_layers,
+                    (unsigned long long)cache.preload_entries,
+                    (unsigned long long)cache.preload_ssd_bytes,
+                    (unsigned long long)cache.preload_read_calls,
+                    cache.preload_seconds * 1000.0);
+        } else {
+            fprintf(stderr,
+                    "ds4: [iq1-s-ram-cache] result=summary requested_bytes=%llu "
+                    "allocated_bytes=%llu capacity=%u count=%u slot_bytes=%llu "
+                    "hits=%llu misses=%llu evictions=%llu ssd_bytes=%llu "
+                    "h2d_bytes=%llu failures=%llu pinned=1 mapped=0\n",
+                    (unsigned long long)cache.requested_bytes,
+                    (unsigned long long)cache.allocated_bytes,
+                    cache.capacity, cache.count,
+                    (unsigned long long)cache.slot_bytes,
+                    (unsigned long long)cache.hits,
+                    (unsigned long long)cache.misses,
+                    (unsigned long long)cache.evictions,
+                    (unsigned long long)cache.ssd_bytes,
+                    (unsigned long long)cache.h2d_bytes,
+                    (unsigned long long)cache.failures);
+        }
     }
     if (getenv("DS4_IQ1_S_PROFILE") != NULL &&
         (cache.ssd_read_calls || cache.h2d_batches || cache.h2d_syncs)) {
@@ -1796,7 +1843,16 @@ static void cuda_iq1_s_ram_cache_release(void) {
                 cache.h2d_sync_seconds * 1000.0,
                 (unsigned long long)cache.h2d_bytes);
     }
-    if (cache.host_base) (void)cudaFreeHost(cache.host_base);
+    if (cache.host_base) {
+#ifdef _WIN32
+        if (cache.pageable) {
+            (void)VirtualFree(cache.host_base, 0, MEM_RELEASE);
+        } else
+#endif
+        {
+            (void)cudaFreeHost(cache.host_base);
+        }
+    }
     cache.host_base = NULL;
     cache.requested_bytes = 0;
     cache.allocated_bytes = 0;
@@ -1816,10 +1872,19 @@ static void cuda_iq1_s_ram_cache_release(void) {
     cache.ssd_read_seconds = 0.0;
     cache.h2d_enqueue_seconds = 0.0;
     cache.h2d_sync_seconds = 0.0;
+    cache.preload_entries = 0;
+    cache.preload_ssd_bytes = 0;
+    cache.preload_read_calls = 0;
+    cache.preload_seconds = 0.0;
     cache.failures = 0;
     cache.capacity = 0;
     cache.count = 0;
+    cache.preload_layers = 0;
     cache.attempted = 0;
+    cache.pageable = 0;
+    cache.preload_all = 0;
+    cache.frozen = 0;
+    memset(cache.layer_preloaded, 0, sizeof(cache.layer_preloaded));
     cache.slots.clear();
     cache.slot_by_layer_expert.clear();
 }
@@ -1830,10 +1895,19 @@ static int cuda_iq1_s_ram_cache_prepare(
         uint64_t down_expert_bytes) {
     cuda_iq1_s_ram_cache &cache = g_iq1_s_ram_cache;
     const uint64_t requested = cuda_iq1_s_ram_cache_requested_bytes();
-    if (requested == 0) return 0;
-    if (requested == UINT64_MAX || gate_expert_bytes == 0 ||
+    const int pageable = cuda_iq1_s_env_flag("DS4_IQ1_S_RAM_CACHE_PAGEABLE");
+    const int preload_all = cuda_iq1_s_env_flag("DS4_IQ1_S_RAM_CACHE_PRELOAD_ALL");
+    if (requested == 0) {
+        if (!pageable && !preload_all) return 0;
+        cache.attempted = 1;
+        cache.failures++;
+        return -1;
+    }
+    if (requested == UINT64_MAX || pageable < 0 || preload_all < 0 ||
+        gate_expert_bytes == 0 ||
         down_expert_bytes == 0 ||
-        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull ||
+        (pageable != preload_all)) {
         cache.attempted = 1;
         cache.failures++;
         return -1;
@@ -1843,7 +1917,9 @@ static int cuda_iq1_s_ram_cache_prepare(
         return cache.requested_bytes == requested &&
                cache.slot_bytes == slot_bytes &&
                cache.gate_expert_bytes == gate_expert_bytes &&
-               cache.down_expert_bytes == down_expert_bytes ? 1 : -1;
+               cache.down_expert_bytes == down_expert_bytes &&
+               cache.pageable == (uint8_t)pageable &&
+               cache.preload_all == (uint8_t)preload_all ? 1 : -1;
     }
     if (cache.attempted) return -1;
     cache.attempted = 1;
@@ -1851,6 +1927,8 @@ static int cuda_iq1_s_ram_cache_prepare(
     cache.slot_bytes = slot_bytes;
     cache.gate_expert_bytes = gate_expert_bytes;
     cache.down_expert_bytes = down_expert_bytes;
+    cache.pageable = (uint8_t)pageable;
+    cache.preload_all = (uint8_t)preload_all;
     const uint64_t max_entries = (uint64_t)CUDA_IQ1_S_LAYER_COUNT * 256ull;
     uint64_t capacity = requested / slot_bytes;
     if (capacity > max_entries) capacity = max_entries;
@@ -1858,42 +1936,186 @@ static int cuda_iq1_s_ram_cache_prepare(
         cache.failures++;
         return -1;
     }
-    cache.capacity = (uint32_t)capacity;
-    cache.allocated_bytes = capacity * slot_bytes;
-    cudaError_t err = cudaHostAlloc(
-        (void **)&cache.host_base,
-        (size_t)cache.allocated_bytes,
-        cudaHostAllocDefault);
-    if (err != cudaSuccess) {
+    const uint64_t preload_entries =
+        (uint64_t)CUDA_IQ1_S_ROUTED_LAYER_COUNT *
+        CUDA_IQ1_S_EXPERTS_PER_LAYER;
+    if (preload_all && capacity != preload_entries) {
         fprintf(stderr,
-                "ds4: IQ1_S pinned RAM cache allocation failed: %s "
-                "requested=%.3f GiB\n",
-                cudaGetErrorString(err),
-                (double)cache.allocated_bytes / 1073741824.0);
-        (void)cudaGetLastError();
-        cache.host_base = NULL;
+                "ds4: IQ1_S full preload requires exactly %llu slots; got %llu\n",
+                (unsigned long long)preload_entries,
+                (unsigned long long)capacity);
         cache.failures++;
         return -1;
+    }
+    cache.capacity = (uint32_t)capacity;
+    cache.allocated_bytes = capacity * slot_bytes;
+#ifdef _WIN32
+    if (pageable) {
+        cache.host_base = (char *)VirtualAlloc(
+            NULL, (SIZE_T)cache.allocated_bytes,
+            MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!cache.host_base) {
+            fprintf(stderr,
+                    "ds4: IQ1_S pageable RAM cache allocation failed: winerr=%lu "
+                    "requested=%.3f GiB\n",
+                    (unsigned long)GetLastError(),
+                    (double)cache.allocated_bytes / 1073741824.0);
+            cache.failures++;
+            return -1;
+        }
+    } else
+#endif
+    {
+        cudaError_t err = cudaHostAlloc(
+            (void **)&cache.host_base,
+            (size_t)cache.allocated_bytes,
+            cudaHostAllocDefault);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: IQ1_S pinned RAM cache allocation failed: %s "
+                    "requested=%.3f GiB\n",
+                    cudaGetErrorString(err),
+                    (double)cache.allocated_bytes / 1073741824.0);
+            (void)cudaGetLastError();
+            cache.host_base = NULL;
+            cache.failures++;
+            return -1;
+        }
     }
     try {
         cache.slots.resize(cache.capacity);
         cache.slot_by_layer_expert.assign(
             (size_t)CUDA_IQ1_S_LAYER_COUNT * 256u, -1);
     } catch (...) {
-        (void)cudaFreeHost(cache.host_base);
+#ifdef _WIN32
+        if (cache.pageable) {
+            (void)VirtualFree(cache.host_base, 0, MEM_RELEASE);
+        } else
+#endif
+        {
+            (void)cudaFreeHost(cache.host_base);
+        }
         cache.host_base = NULL;
         cache.slots.clear();
         cache.slot_by_layer_expert.clear();
         cache.failures++;
         return -1;
     }
-    fprintf(stderr,
-            "ds4: [iq1-s-ram-cache] result=ready requested_gib=%.3f "
-            "allocated_gib=%.3f capacity=%u slot_bytes=%llu "
-            "pinned=1 mapped=0 policy=lru\n",
-            (double)requested / 1073741824.0,
-            (double)cache.allocated_bytes / 1073741824.0,
-            cache.capacity, (unsigned long long)slot_bytes);
+    if (preload_all) {
+        fprintf(stderr,
+                "ds4: [iq1-s-ram-cache] result=ready requested_gib=%.3f "
+                "allocated_gib=%.3f capacity=%u slot_bytes=%llu "
+                "pinned=0 pageable=1 mapped=0 policy=frozen-full "
+                "preload_all=1\n",
+                (double)requested / 1073741824.0,
+                (double)cache.allocated_bytes / 1073741824.0,
+                cache.capacity, (unsigned long long)slot_bytes);
+    } else {
+        fprintf(stderr,
+                "ds4: [iq1-s-ram-cache] result=ready requested_gib=%.3f "
+                "allocated_gib=%.3f capacity=%u slot_bytes=%llu "
+                "pinned=1 mapped=0 policy=lru\n",
+                (double)requested / 1073741824.0,
+                (double)cache.allocated_bytes / 1073741824.0,
+                cache.capacity, (unsigned long long)slot_bytes);
+    }
+    return 1;
+}
+
+static int cuda_iq1_s_ram_cache_preload_layer(
+        uint32_t layer_index,
+        uint32_t requested_expert,
+        uint64_t gate_src,
+        uint64_t up_src,
+        uint64_t down_src) {
+    cuda_iq1_s_ram_cache &cache = g_iq1_s_ram_cache;
+    if (!cache.preload_all || !cache.pageable ||
+        layer_index < CUDA_IQ1_S_ROUTED_LAYER_FIRST ||
+        layer_index >= CUDA_IQ1_S_ROUTED_LAYER_FIRST +
+            CUDA_IQ1_S_ROUTED_LAYER_COUNT ||
+        requested_expert >= CUDA_IQ1_S_EXPERTS_PER_LAYER ||
+        cache.capacity != CUDA_IQ1_S_ROUTED_LAYER_COUNT *
+            CUDA_IQ1_S_EXPERTS_PER_LAYER ||
+        gate_src < (uint64_t)requested_expert * cache.gate_expert_bytes ||
+        up_src < (uint64_t)requested_expert * cache.gate_expert_bytes ||
+        down_src < (uint64_t)requested_expert * cache.down_expert_bytes) {
+        cache.failures++;
+        return 0;
+    }
+    if (cache.layer_preloaded[layer_index]) return 1;
+
+    const uint64_t gate_base = gate_src -
+        (uint64_t)requested_expert * cache.gate_expert_bytes;
+    const uint64_t up_base = up_src -
+        (uint64_t)requested_expert * cache.gate_expert_bytes;
+    const uint64_t down_base = down_src -
+        (uint64_t)requested_expert * cache.down_expert_bytes;
+    const uint64_t gate_span =
+        (uint64_t)CUDA_IQ1_S_EXPERTS_PER_LAYER * cache.gate_expert_bytes;
+    const uint64_t down_span =
+        (uint64_t)CUDA_IQ1_S_EXPERTS_PER_LAYER * cache.down_expert_bytes;
+    if (!g_iq1_s_sidecar_file_valid ||
+        gate_base > g_iq1_s_sidecar_size ||
+        gate_span > g_iq1_s_sidecar_size - gate_base ||
+        up_base > g_iq1_s_sidecar_size ||
+        gate_span > g_iq1_s_sidecar_size - up_base ||
+        down_base > g_iq1_s_sidecar_size ||
+        down_span > g_iq1_s_sidecar_size - down_base) {
+        cache.failures++;
+        return 0;
+    }
+
+    const double preload_t0 = cuda_wall_sec();
+    for (uint32_t expert = 0; expert < CUDA_IQ1_S_EXPERTS_PER_LAYER;
+         expert++) {
+        const uint32_t slot_index =
+            (layer_index - CUDA_IQ1_S_ROUTED_LAYER_FIRST) *
+                CUDA_IQ1_S_EXPERTS_PER_LAYER + expert;
+        cuda_iq1_s_ram_cache_slot &slot = cache.slots[slot_index];
+        if (slot.valid) {
+            cache.failures++;
+            return 0;
+        }
+        const uint64_t expert_gate_src = gate_base +
+            (uint64_t)expert * cache.gate_expert_bytes;
+        const uint64_t expert_up_src = up_base +
+            (uint64_t)expert * cache.gate_expert_bytes;
+        const uint64_t expert_down_src = down_base +
+            (uint64_t)expert * cache.down_expert_bytes;
+        char *base = cache.host_base +
+            (uint64_t)slot_index * cache.slot_bytes;
+        if (!cuda_pread_full(&g_iq1_s_sidecar_file, base,
+                             cache.gate_expert_bytes, expert_gate_src) ||
+            !cuda_pread_full(&g_iq1_s_sidecar_file,
+                             base + cache.gate_expert_bytes,
+                             cache.gate_expert_bytes, expert_up_src) ||
+            !cuda_pread_full(&g_iq1_s_sidecar_file,
+                             base + cache.gate_expert_bytes * 2ull,
+                             cache.down_expert_bytes, expert_down_src)) {
+            cache.failures++;
+            cache.preload_seconds += cuda_wall_sec() - preload_t0;
+            return 0;
+        }
+        slot.layer_index = layer_index;
+        slot.expert_id = expert;
+        slot.gate_src = expert_gate_src;
+        slot.up_src = expert_up_src;
+        slot.down_src = expert_down_src;
+        slot.age = ++cache.tick;
+        slot.valid = 1;
+        cache.slot_by_layer_expert[layer_index *
+            CUDA_IQ1_S_EXPERTS_PER_LAYER + expert] = (int32_t)slot_index;
+        cache.count++;
+        cache.preload_entries++;
+        cache.preload_ssd_bytes += cache.slot_bytes;
+        cache.preload_read_calls += 3u;
+    }
+    cache.layer_preloaded[layer_index] = 1;
+    cache.preload_layers++;
+    cache.preload_seconds += cuda_wall_sec() - preload_t0;
+    if (cache.preload_layers == CUDA_IQ1_S_ROUTED_LAYER_COUNT) {
+        cache.frozen = 1;
+    }
     return 1;
 }
 
@@ -1917,6 +2139,11 @@ static int cuda_iq1_s_ram_cache_resolve(
         gate_expert_bytes, down_expert_bytes);
     if (prepared <= 0) return prepared;
     cuda_iq1_s_ram_cache &cache = g_iq1_s_ram_cache;
+    if (cache.preload_all &&
+        !cuda_iq1_s_ram_cache_preload_layer(
+            layer_index, expert_id, gate_src, up_src, down_src)) {
+        return -1;
+    }
     const uint32_t map_index = layer_index * 256u + expert_id;
     int32_t slot_i = cache.slot_by_layer_expert[map_index];
     if (slot_i >= 0 && (uint32_t)slot_i < cache.capacity) {
@@ -1934,6 +2161,11 @@ static int cuda_iq1_s_ram_cache_resolve(
             return 1;
         }
         cache.slot_by_layer_expert[map_index] = -1;
+    }
+
+    if (cache.preload_all) {
+        cache.failures++;
+        return -1;
     }
 
     cache.misses++;
