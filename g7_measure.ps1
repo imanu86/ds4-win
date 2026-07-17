@@ -1706,7 +1706,7 @@ $expertTieringAdaptiveLastSkipDelta = 0; $expertTieringAdaptiveLastReplacementDe
 $expertTieringCold = 0; $expertTieringRamHits = 0; $expertTieringVramHits = 0
 $expertTieringColdToRam = 0; $expertTieringColdToVram = 0; $expertTieringRamToWarm = 0
 $expertTieringVramPromotions = 0; $expertTieringVramDemotions = 0; $expertTieringRamEvictions = 0
-$expertTieringRamAdmitSkips = 0; $expertTieringTransient = 0; $expertTieringFailures = 0
+$expertTieringRamAdmitSkips = 0; $expertTieringGeneralBackingReclaims = 0; $expertTieringTransient = 0; $expertTieringFailures = 0
 $expertTieringSsdBytes = 0; $expertTieringRamH2DBytes = 0
 $expertTieringStatesSsd = 0; $expertTieringStatesProbation = 0
 $expertTieringStatesWarm = 0; $expertTieringStatesVram = 0
@@ -2138,8 +2138,8 @@ if (Test-Path $stderrLog) {
     if ($expertTieringFinalLineCount -gt 0) {
         $expertTieringFinalLine = $expertTieringFinalLines | Select-Object -Last 1
         $numberPattern = "([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
-        $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
-        $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) compose_router_open=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
+        $expertTieringFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) general_backing_reclaims=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
+        $expertTieringComposeFinalPattern = "^ds4: \[expert-tiering\] final mode=(off|observe|enforce) policy=(second-touch|mass-lfru) compose_prefill_mass_tiering=(\d+) compose_router_open=(\d+) snapshot_generation=(\d+) snapshot_backing_entries=(\d+) snapshot_backing_hits=(\d+) snapshot_backing_misses=(\d+) snapshot_to_vram_bytes=(\d+) forbidden_cold_ssd_to_vram=(\d+) general_backing_reclaims=(\d+) clock_calls=(\d+) replacement_budget=(\d+) min_frequency=(\d+) hysteresis=" + $numberPattern + " calls=(\d+) selected=(\d+) cold=(\d+) ram_hits=(\d+) vram_hits=(\d+) cold_to_ram=(\d+) cold_to_vram=(\d+) ram_to_warm=(\d+) vram_promotions=(\d+) vram_demotions=(\d+) ram_evictions=(\d+) ram_admit_skips=(\d+) transient=(\d+) failures=(\d+) ssd_bytes=(\d+) ram_h2d_bytes=(\d+) policy_epochs=(\d+) policy_free_promotions=(\d+) policy_replacements=(\d+) policy_min_frequency_skips=(\d+) policy_budget_skips=(\d+) policy_score_skips=(\d+) states_ssd=(\d+) states_probation=(\d+) states_warm=(\d+) states_vram=(\d+) mass_sum=" + $numberPattern + " lfru_top=" + $numberPattern + "$"
         if ($expertTieringFinalLine -match " adaptive_budget=") {
             $expertTieringFields = @{}
             foreach ($fieldMatch in [regex]::Matches($expertTieringFinalLine, " ([a-z0-9_]+)=([^ ]+)")) {
@@ -2155,6 +2155,7 @@ if (Test-Path $stderrLog) {
                 "calls", "selected", "cold", "ram_hits", "vram_hits",
                 "cold_to_ram", "cold_to_vram", "ram_to_warm", "vram_promotions",
                 "vram_demotions", "ram_evictions", "ram_admit_skips",
+                "general_backing_reclaims",
                 "transient", "failures", "ssd_bytes", "ram_h2d_bytes",
                 "policy_epochs", "policy_free_promotions", "policy_replacements",
                 "policy_min_frequency_skips", "policy_budget_skips",
@@ -2212,6 +2213,7 @@ if (Test-Path $stderrLog) {
             $expertTieringColdToVram = [uint64]$expertTieringFields["cold_to_vram"]; $expertTieringRamToWarm = [uint64]$expertTieringFields["ram_to_warm"]
             $expertTieringVramPromotions = [uint64]$expertTieringFields["vram_promotions"]; $expertTieringVramDemotions = [uint64]$expertTieringFields["vram_demotions"]
             $expertTieringRamEvictions = [uint64]$expertTieringFields["ram_evictions"]; $expertTieringRamAdmitSkips = [uint64]$expertTieringFields["ram_admit_skips"]
+            $expertTieringGeneralBackingReclaims = [uint64]$expertTieringFields["general_backing_reclaims"]
             $expertTieringTransient = [uint64]$expertTieringFields["transient"]; $expertTieringFailures = [uint64]$expertTieringFields["failures"]
             $expertTieringSsdBytes = [uint64]$expertTieringFields["ssd_bytes"]; $expertTieringRamH2DBytes = [uint64]$expertTieringFields["ram_h2d_bytes"]
             $expertTieringPolicyEpochs = [uint64]$expertTieringFields["policy_epochs"]
@@ -2237,27 +2239,28 @@ if (Test-Path $stderrLog) {
             $expertTieringSnapshotBackingMisses = [uint64]$Matches[8]
             $expertTieringSnapshotToVramBytes = [uint64]$Matches[9]
             $expertTieringForbiddenColdSsdToVram = [uint64]$Matches[10]
-            $expertTieringClockCalls = [uint32]$Matches[11]; $expertTieringReplacementBudget = [uint32]$Matches[12]
-            $expertTieringMinFrequency = [uint32]$Matches[13]
-            $expertTieringHysteresis = [double]::Parse($Matches[14], [Globalization.CultureInfo]::InvariantCulture)
-            $expertTieringCalls = [uint64]$Matches[15]; $expertTieringSelected = [uint64]$Matches[16]
-            $expertTieringCold = [uint64]$Matches[17]; $expertTieringRamHits = [uint64]$Matches[18]
-            $expertTieringVramHits = [uint64]$Matches[19]; $expertTieringColdToRam = [uint64]$Matches[20]
-            $expertTieringColdToVram = [uint64]$Matches[21]; $expertTieringRamToWarm = [uint64]$Matches[22]
-            $expertTieringVramPromotions = [uint64]$Matches[23]; $expertTieringVramDemotions = [uint64]$Matches[24]
-            $expertTieringRamEvictions = [uint64]$Matches[25]; $expertTieringRamAdmitSkips = [uint64]$Matches[26]
-            $expertTieringTransient = [uint64]$Matches[27]; $expertTieringFailures = [uint64]$Matches[28]
-            $expertTieringSsdBytes = [uint64]$Matches[29]; $expertTieringRamH2DBytes = [uint64]$Matches[30]
-            $expertTieringPolicyEpochs = [uint64]$Matches[31]
-            $expertTieringPolicyFreePromotions = [uint64]$Matches[32]
-            $expertTieringPolicyReplacements = [uint64]$Matches[33]
-            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[34]
-            $expertTieringPolicyBudgetSkips = [uint64]$Matches[35]
-            $expertTieringPolicyScoreSkips = [uint64]$Matches[36]
-            $expertTieringStatesSsd = [uint32]$Matches[37]; $expertTieringStatesProbation = [uint32]$Matches[38]
-            $expertTieringStatesWarm = [uint32]$Matches[39]; $expertTieringStatesVram = [uint32]$Matches[40]
-            $expertTieringMassSum = [double]::Parse($Matches[41], [Globalization.CultureInfo]::InvariantCulture)
-            $expertTieringLfruTop = [double]::Parse($Matches[42], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringGeneralBackingReclaims = [uint64]$Matches[11]
+            $expertTieringClockCalls = [uint32]$Matches[12]; $expertTieringReplacementBudget = [uint32]$Matches[13]
+            $expertTieringMinFrequency = [uint32]$Matches[14]
+            $expertTieringHysteresis = [double]::Parse($Matches[15], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringCalls = [uint64]$Matches[16]; $expertTieringSelected = [uint64]$Matches[17]
+            $expertTieringCold = [uint64]$Matches[18]; $expertTieringRamHits = [uint64]$Matches[19]
+            $expertTieringVramHits = [uint64]$Matches[20]; $expertTieringColdToRam = [uint64]$Matches[21]
+            $expertTieringColdToVram = [uint64]$Matches[22]; $expertTieringRamToWarm = [uint64]$Matches[23]
+            $expertTieringVramPromotions = [uint64]$Matches[24]; $expertTieringVramDemotions = [uint64]$Matches[25]
+            $expertTieringRamEvictions = [uint64]$Matches[26]; $expertTieringRamAdmitSkips = [uint64]$Matches[27]
+            $expertTieringTransient = [uint64]$Matches[28]; $expertTieringFailures = [uint64]$Matches[29]
+            $expertTieringSsdBytes = [uint64]$Matches[30]; $expertTieringRamH2DBytes = [uint64]$Matches[31]
+            $expertTieringPolicyEpochs = [uint64]$Matches[32]
+            $expertTieringPolicyFreePromotions = [uint64]$Matches[33]
+            $expertTieringPolicyReplacements = [uint64]$Matches[34]
+            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[35]
+            $expertTieringPolicyBudgetSkips = [uint64]$Matches[36]
+            $expertTieringPolicyScoreSkips = [uint64]$Matches[37]
+            $expertTieringStatesSsd = [uint32]$Matches[38]; $expertTieringStatesProbation = [uint32]$Matches[39]
+            $expertTieringStatesWarm = [uint32]$Matches[40]; $expertTieringStatesVram = [uint32]$Matches[41]
+            $expertTieringMassSum = [double]::Parse($Matches[42], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringLfruTop = [double]::Parse($Matches[43], [Globalization.CultureInfo]::InvariantCulture)
         } elseif ($expertTieringFinalLine -notmatch $expertTieringFinalPattern) {
             throw "Expert tiering measurement failed: final line format mismatch"
         } else {
@@ -2273,18 +2276,19 @@ if (Test-Path $stderrLog) {
             $expertTieringColdToVram = [uint64]$Matches[13]; $expertTieringRamToWarm = [uint64]$Matches[14]
             $expertTieringVramPromotions = [uint64]$Matches[15]; $expertTieringVramDemotions = [uint64]$Matches[16]
             $expertTieringRamEvictions = [uint64]$Matches[17]; $expertTieringRamAdmitSkips = [uint64]$Matches[18]
-            $expertTieringTransient = [uint64]$Matches[19]; $expertTieringFailures = [uint64]$Matches[20]
-            $expertTieringSsdBytes = [uint64]$Matches[21]; $expertTieringRamH2DBytes = [uint64]$Matches[22]
-            $expertTieringPolicyEpochs = [uint64]$Matches[23]
-            $expertTieringPolicyFreePromotions = [uint64]$Matches[24]
-            $expertTieringPolicyReplacements = [uint64]$Matches[25]
-            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[26]
-            $expertTieringPolicyBudgetSkips = [uint64]$Matches[27]
-            $expertTieringPolicyScoreSkips = [uint64]$Matches[28]
-            $expertTieringStatesSsd = [uint32]$Matches[29]; $expertTieringStatesProbation = [uint32]$Matches[30]
-            $expertTieringStatesWarm = [uint32]$Matches[31]; $expertTieringStatesVram = [uint32]$Matches[32]
-            $expertTieringMassSum = [double]::Parse($Matches[33], [Globalization.CultureInfo]::InvariantCulture)
-            $expertTieringLfruTop = [double]::Parse($Matches[34], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringGeneralBackingReclaims = [uint64]$Matches[19]
+            $expertTieringTransient = [uint64]$Matches[20]; $expertTieringFailures = [uint64]$Matches[21]
+            $expertTieringSsdBytes = [uint64]$Matches[22]; $expertTieringRamH2DBytes = [uint64]$Matches[23]
+            $expertTieringPolicyEpochs = [uint64]$Matches[24]
+            $expertTieringPolicyFreePromotions = [uint64]$Matches[25]
+            $expertTieringPolicyReplacements = [uint64]$Matches[26]
+            $expertTieringPolicyMinFrequencySkips = [uint64]$Matches[27]
+            $expertTieringPolicyBudgetSkips = [uint64]$Matches[28]
+            $expertTieringPolicyScoreSkips = [uint64]$Matches[29]
+            $expertTieringStatesSsd = [uint32]$Matches[30]; $expertTieringStatesProbation = [uint32]$Matches[31]
+            $expertTieringStatesWarm = [uint32]$Matches[32]; $expertTieringStatesVram = [uint32]$Matches[33]
+            $expertTieringMassSum = [double]::Parse($Matches[34], [Globalization.CultureInfo]::InvariantCulture)
+            $expertTieringLfruTop = [double]::Parse($Matches[35], [Globalization.CultureInfo]::InvariantCulture)
         }
     }
     $prefillVramSeedLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[prefill-vram-seed\] " })
@@ -3428,6 +3432,7 @@ if ($ExpertTiering -eq "off") {
         foreach ($aggregateField in @(
                 "snapshot_backing_hits", "snapshot_backing_misses",
                 "snapshot_to_vram_bytes", "forbidden_cold_ssd_to_vram",
+                "general_backing_reclaims",
                 "calls", "selected", "cold", "ram_hits", "vram_hits",
                 "cold_to_ram", "cold_to_vram", "ram_to_warm",
                 "vram_promotions", "vram_demotions", "ram_evictions",
@@ -3449,7 +3454,7 @@ if ($ExpertTiering -eq "off") {
                     "compose_router_open",
                     "snapshot_backing_entries", "snapshot_backing_hits",
                     "snapshot_backing_misses", "snapshot_to_vram_bytes",
-                    "forbidden_cold_ssd_to_vram", "cold_to_vram",
+                    "forbidden_cold_ssd_to_vram", "general_backing_reclaims", "cold_to_vram",
                     "failures", "ssd_bytes")) {
                 if (-not $tierFields.ContainsKey($requiredTierField)) {
                     throw "Expert tiering compose failed: final line $tierLineIndex missing $requiredTierField"
@@ -3503,6 +3508,7 @@ if ($ExpertTiering -eq "off") {
         $expertTieringSnapshotBackingMisses = $tierAggregate["snapshot_backing_misses"]
         $expertTieringSnapshotToVramBytes = $tierAggregate["snapshot_to_vram_bytes"]
         $expertTieringForbiddenColdSsdToVram = $tierAggregate["forbidden_cold_ssd_to_vram"]
+        $expertTieringGeneralBackingReclaims = $tierAggregate["general_backing_reclaims"]
         $expertTieringCalls = $tierAggregate["calls"]
         $expertTieringSelected = $tierAggregate["selected"]
         $expertTieringCold = $tierAggregate["cold"]
@@ -4313,6 +4319,7 @@ $expertTieringResult = [pscustomobject]@{
     vram_demotions = $expertTieringVramDemotions
     ram_evictions = $expertTieringRamEvictions
     ram_admit_skips = $expertTieringRamAdmitSkips
+    general_backing_reclaims = $expertTieringGeneralBackingReclaims
     transient = $expertTieringTransient
     failures = $expertTieringFailures
     ssd_bytes = $expertTieringSsdBytes

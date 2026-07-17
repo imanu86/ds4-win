@@ -17269,6 +17269,7 @@ struct cuda_moe_tiering {
     uint32_t policy_adaptive_pressure_threshold;
     uint32_t policy_min_frequency;
     uint32_t snapshot_backing_entries;
+    uint32_t open_router_reserve_slots;
     uint64_t policy_epoch;
     uint64_t snapshot_generation;
     double policy_hysteresis;
@@ -17307,7 +17308,9 @@ struct cuda_moe_tiering {
     uint64_t snapshot_backing_misses;
     uint64_t snapshot_to_vram_bytes;
     uint64_t forbidden_cold_ssd_to_vram;
+    uint64_t general_backing_reclaims;
     std::vector<cuda_moe_tier_entry> entries;
+    std::vector<uint8_t> open_router_pool_slot;
 };
 static cuda_moe_tiering g_moe_tiering;
 
@@ -17325,7 +17328,6 @@ struct cuda_iq1_promotion {
     uint64_t direct_ssd_to_vram_rejected;
     uint64_t probation_backing_reclaims;
     uint64_t failures;
-    std::vector<uint8_t> probation_pool_slot;
 };
 static cuda_iq1_promotion g_iq1_promotion;
 
@@ -17677,7 +17679,7 @@ static void cuda_moe_tiering_report_and_reset(void) {
         }
         if (g_moe_tiering.compose_prefill_mass_tiering) {
             fprintf(stderr,
-                "ds4: [expert-tiering] final mode=%s policy=%s compose_prefill_mass_tiering=%u compose_router_open=%u snapshot_generation=%llu snapshot_backing_entries=%u snapshot_backing_hits=%llu snapshot_backing_misses=%llu snapshot_to_vram_bytes=%llu forbidden_cold_ssd_to_vram=%llu clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
+                "ds4: [expert-tiering] final mode=%s policy=%s compose_prefill_mass_tiering=%u compose_router_open=%u snapshot_generation=%llu snapshot_backing_entries=%u snapshot_backing_hits=%llu snapshot_backing_misses=%llu snapshot_to_vram_bytes=%llu forbidden_cold_ssd_to_vram=%llu general_backing_reclaims=%llu clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
                 cuda_moe_tiering_mode_name(g_moe_tiering.mode),
                 cuda_moe_tiering_policy_name(g_moe_tiering.policy),
                 g_moe_tiering.compose_prefill_mass_tiering ? 1u : 0u,
@@ -17688,6 +17690,7 @@ static void cuda_moe_tiering_report_and_reset(void) {
                 (unsigned long long)g_moe_tiering.snapshot_backing_misses,
                 (unsigned long long)g_moe_tiering.snapshot_to_vram_bytes,
                 (unsigned long long)g_moe_tiering.forbidden_cold_ssd_to_vram,
+                (unsigned long long)g_moe_tiering.general_backing_reclaims,
                 g_moe_tiering.policy_clock_calls,
                 g_moe_tiering.policy_replacement_budget,
                 g_moe_tiering.policy_replacement_budget_base,
@@ -17734,7 +17737,7 @@ static void cuda_moe_tiering_report_and_reset(void) {
                 mass_sum, lfru_top);
         } else {
             fprintf(stderr,
-                "ds4: [expert-tiering] final mode=%s policy=%s clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
+                "ds4: [expert-tiering] final mode=%s policy=%s clock_calls=%u replacement_budget=%u replacement_budget_base=%u adaptive_budget=%u adaptive_current_budget=%u adaptive_min=%u adaptive_max=%u adaptive_step=%u adaptive_pressure_threshold=%u adaptive_ups=%llu adaptive_downs=%llu adaptive_pressure_epochs=%llu adaptive_quiet_epochs=%llu adaptive_last_budget_skips_delta=%llu adaptive_last_replacements_delta=%llu min_frequency=%u hysteresis=%.9g calls=%llu selected=%llu cold=%llu ram_hits=%llu vram_hits=%llu cold_to_ram=%llu cold_to_vram=%llu ram_to_warm=%llu vram_promotions=%llu vram_demotions=%llu ram_evictions=%llu ram_admit_skips=%llu general_backing_reclaims=%llu transient=%llu failures=%llu ssd_bytes=%llu ram_h2d_bytes=%llu policy_epochs=%llu policy_free_promotions=%llu policy_replacements=%llu policy_min_frequency_skips=%llu policy_budget_skips=%llu policy_score_skips=%llu states_ssd=%u states_probation=%u states_warm=%u states_vram=%u mass_sum=%.9g lfru_top=%.9g\n",
                 cuda_moe_tiering_mode_name(g_moe_tiering.mode),
                 cuda_moe_tiering_policy_name(g_moe_tiering.policy),
                 g_moe_tiering.policy_clock_calls,
@@ -17766,6 +17769,7 @@ static void cuda_moe_tiering_report_and_reset(void) {
                 (unsigned long long)g_moe_tiering.vram_demotions,
                 (unsigned long long)g_moe_tiering.ram_evictions,
                 (unsigned long long)g_moe_tiering.ram_admit_skips,
+                (unsigned long long)g_moe_tiering.general_backing_reclaims,
                 (unsigned long long)g_moe_tiering.transient,
                 (unsigned long long)g_moe_tiering.failures,
                 (unsigned long long)g_moe_tiering.ssd_bytes,
@@ -17821,22 +17825,22 @@ static void cuda_moe_tiering_request_boundary_reset(void) {
     }
 }
 
-static int cuda_iq1_promotion_reserve_probation_slots(uint32_t requested) {
+static int cuda_moe_tiering_reserve_open_router_slots(uint32_t requested) {
     if (requested == 0u) return 1;
     if (!g_moe_tiering.compose_prefill_mass_tiering ||
         !g_moe_tiering.compose_router_open ||
         requested >= g_moe_tiering.snapshot_backing_entries) {
         fprintf(stderr,
-                "ds4: IQ1 promotion probation reserve refused requested=%u backing=%u\n",
+                "ds4: open-router backing reserve refused requested=%u backing=%u\n",
                 requested, g_moe_tiering.snapshot_backing_entries);
         return 0;
     }
     try {
-        g_iq1_promotion.probation_pool_slot.assign(
+        g_moe_tiering.open_router_pool_slot.assign(
             g_dynamic_arena.slots.size(), 0u);
     } catch (...) {
         fprintf(stderr,
-                "ds4: IQ1 promotion probation reserve metadata allocation failed\n");
+                "ds4: open-router backing reserve metadata allocation failed\n");
         return 0;
     }
     uint32_t free_slots = 0u;
@@ -17848,23 +17852,26 @@ static int cuda_iq1_promotion_reserve_probation_slots(uint32_t requested) {
         }
         free_slots++;
         if (reserved_slots < requested) {
-            g_iq1_promotion.probation_pool_slot[slot] = 1u;
+            g_moe_tiering.open_router_pool_slot[slot] = 1u;
             reserved_slots++;
         }
     }
     if (reserved_slots < requested) {
         fprintf(stderr,
-                "ds4: IQ1 promotion probation reserve short requested=%u free=%u\n",
+                "ds4: open-router backing reserve short requested=%u free=%u\n",
                 requested, free_slots);
-        g_iq1_promotion.probation_pool_slot.clear();
+        g_moe_tiering.open_router_pool_slot.clear();
         return 0;
     }
-    g_iq1_promotion.reserved_slots = reserved_slots;
+    g_moe_tiering.open_router_reserve_slots = reserved_slots;
+    if (g_iq1_promotion.requested_slots != 0u) {
+        g_iq1_promotion.reserved_slots = reserved_slots;
+    }
     fprintf(stderr,
-            "ds4: [iq1-promotion] probation ready requested_slots=%u "
+            "ds4: [expert-tiering] open-router backing ready requested_slots=%u "
             "reserved_slots=%u remaining_snapshot=%u free_slots=%u "
             "strategy=pre-reserved-open-router\n",
-            requested, g_iq1_promotion.reserved_slots,
+            requested, g_moe_tiering.open_router_reserve_slots,
             g_moe_tiering.snapshot_backing_entries,
             free_slots);
     return 1;
@@ -17991,6 +17998,8 @@ static int cuda_moe_tiering_prepare(void) {
         g_moe_tiering.policy_hysteresis == hysteresis &&
         g_iq1_promotion.requested_slots ==
             (uint32_t)iq1_probation_slots &&
+        g_moe_tiering.open_router_reserve_slots ==
+            (uint32_t)configured_reserve_slots &&
         g_moe_tiering.compose_prefill_mass_tiering == compose_requested &&
         g_moe_tiering.compose_router_open == compose_router_open &&
         (!compose_requested ||
@@ -18096,8 +18105,8 @@ static int cuda_moe_tiering_prepare(void) {
             g_iq1_promotion = cuda_iq1_promotion();
             return 0;
         }
-        if (!cuda_iq1_promotion_reserve_probation_slots(
-                (uint32_t)iq1_probation_slots)) {
+        if (!cuda_moe_tiering_reserve_open_router_slots(
+                (uint32_t)configured_reserve_slots)) {
             g_moe_tiering = cuda_moe_tiering();
             g_iq1_promotion = cuda_iq1_promotion();
             return 0;
@@ -18185,19 +18194,41 @@ static int cuda_moe_tiering_ram_ptrs(
     return 1;
 }
 
+static int cuda_moe_tiering_has_exact_vram(
+        uint32_t layer, uint32_t expert) {
+    if (layer >= CUDA_MOE_LAYER_COUNT || expert >= 256u ||
+        g_moe_expert_cache.host_slot_by_layer_expert.empty()) {
+        return 0;
+    }
+    const uint32_t map_index = layer * 256u + expert;
+    if (map_index >= g_moe_expert_cache.host_slot_by_layer_expert.size()) {
+        return 0;
+    }
+    const int32_t slot_i =
+        g_moe_expert_cache.host_slot_by_layer_expert[map_index];
+    if (slot_i < 0 || (uint32_t)slot_i >= g_moe_expert_cache.slots.size()) {
+        return 0;
+    }
+    const cuda_moe_cache_slot &slot =
+        g_moe_expert_cache.slots[(uint32_t)slot_i];
+    return slot.state == CUDA_MOE_CACHE_VALID &&
+        slot.layer_index == layer &&
+        slot.expert_id == expert;
+}
+
 static int cuda_moe_tiering_pick_ram_slot(
         uint32_t current_layer, uint32_t current_expert,
         size_t *victim_entry_out) {
     if (!victim_entry_out) return -1;
     *victim_entry_out = SIZE_MAX;
-    const int probation_pool_active =
+    const int open_router_pool_active =
         g_moe_tiering.compose_prefill_mass_tiering &&
         g_moe_tiering.compose_router_open &&
-        g_iq1_promotion.requested_slots > 0u;
-    const auto slot_allowed = [probation_pool_active](uint32_t slot) -> bool {
-        if (!probation_pool_active) return true;
-        return slot < g_iq1_promotion.probation_pool_slot.size() &&
-            g_iq1_promotion.probation_pool_slot[slot] != 0u;
+        g_moe_tiering.open_router_reserve_slots > 0u;
+    const auto slot_allowed = [open_router_pool_active](uint32_t slot) -> bool {
+        if (!open_router_pool_active) return true;
+        return slot < g_moe_tiering.open_router_pool_slot.size() &&
+            g_moe_tiering.open_router_pool_slot[slot] != 0u;
     };
     for (uint32_t slot = 0; slot < g_dynamic_arena.slots.size(); slot++) {
         if (!slot_allowed(slot)) continue;
@@ -18210,9 +18241,11 @@ static int cuda_moe_tiering_pick_ram_slot(
     double best_score = 1.0e300;
     for (size_t index = 0; index < g_moe_tiering.entries.size(); index++) {
         const cuda_moe_tier_entry &entry = g_moe_tiering.entries[index];
+        const uint32_t entry_layer = (uint32_t)(index / 256u);
+        const uint32_t entry_expert = (uint32_t)(index % 256u);
         const int reclaimable_vram_backing =
-            probation_pool_active &&
-            entry.state == CUDA_MOE_TIER_VRAM_PROTECTED;
+            entry.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
+            cuda_moe_tiering_has_exact_vram(entry_layer, entry_expert);
         if (entry.ram_slot >= g_dynamic_arena.slots.size() ||
             !slot_allowed(entry.ram_slot) ||
             (entry.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
@@ -18315,17 +18348,26 @@ static int cuda_moe_tiering_load_to_ram(
             return 0;
         }
         const int victim_stays_in_vram =
-            victim.state == CUDA_MOE_TIER_VRAM_PROTECTED;
+            victim.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
+            cuda_moe_tiering_has_exact_vram(victim_layer, victim_expert);
+        if (victim.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
+            !victim_stays_in_vram) {
+            g_moe_tiering.failures++;
+            return 0;
+        }
         victim.ram_slot = UINT32_MAX;
         victim.ram_generation = 0;
         victim.has_2bit_ram = 0;
         if (victim_stays_in_vram) {
             /* The exact device copy remains authoritative. Reclaim only the
-             * duplicate probation backing; a later VRAM demotion will fall
+             * duplicate RAM backing; a later VRAM demotion will fall
              * back to snapshot backing or SSD as appropriate. */
             victim.vram_eligible_after_call = 0;
             victim.promoted_from_iq1_cold = 0;
-            g_iq1_promotion.probation_backing_reclaims++;
+            g_moe_tiering.general_backing_reclaims++;
+            if (g_iq1_promotion.requested_slots != 0u) {
+                g_iq1_promotion.probation_backing_reclaims++;
+            }
         } else {
             victim.vram_eligible_after_call = 0;
             victim.promoted_from_iq1_cold = 0;
