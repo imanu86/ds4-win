@@ -1,6 +1,7 @@
 # G103 IQ1_S cold SOTA A/B preregistered runner (PowerShell 5.1, ASCII).
 param(
     [switch]$StaticCheckOnly,
+    [switch]$SafetyOnly,
     [switch]$Resume,
     [ValidateRange(600, 86400)][int]$TimeoutSec = 7200
 )
@@ -12,6 +13,7 @@ $root = Split-Path -Parent $runnerPath
 $harness = Join-Path $root "g7_measure.ps1"
 $outdir = Join-Path $root "g7_runs"
 $summaryPath = Join-Path $outdir "g103_iq1_cold_sota_ab_result.json"
+$safetySummaryPath = Join-Path $outdir "g103_iq1_cold_sota_safety_result.json"
 
 $model = "C:\ds4-models\ds4-2bit.gguf"
 $expectedModelSHA256 =
@@ -131,6 +133,7 @@ function New-G103StaticReceipt {
         static_check_only = [bool]$StaticCheckOnly
         no_model_presence_required = [bool]$StaticCheckOnly
         no_build_gpu_or_ds4_launch_in_static_check = [bool]$StaticCheckOnly
+        safety_only_supported = $true
         runnable = $true
         protocol = [ordered]@{
             preregistered = $true
@@ -530,6 +533,22 @@ $rows = @()
 $rows += Invoke-G103Arm -Arm "candidate" `
     -Tag "g103_safety_candidate_iq1_cold_n1" `
     -GateKind "structural-safety" -Safety $true
+
+if ($SafetyOnly) {
+    $safetySummary = [ordered]@{
+        schema = "g103_iq1_cold_sota_safety_v1"
+        measured_utc = [DateTime]::UtcNow.ToString("o")
+        structural_only = $true
+        performance_claim_allowed = $false
+        quality_claim_allowed = $false
+        matrix_started = $false
+        result = $rows[0]
+    }
+    $safetySummary | ConvertTo-Json -Depth 10 |
+        Set-Content -LiteralPath $safetySummaryPath -Encoding UTF8
+    $safetySummary | ConvertTo-Json -Depth 10
+    exit 0
+}
 
 for ($i = 1; $i -le $processesPerArm; $i++) {
     $rows += Invoke-G103Arm -Arm "control" `

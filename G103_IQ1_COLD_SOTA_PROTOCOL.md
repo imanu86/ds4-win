@@ -68,6 +68,8 @@ The runner must not enable:
 ## Execution Plan
 
 1. Run candidate safety `n=1` with `GateKind structural-safety`.
+   Use `g103_iq1_cold_sota_ab.ps1 -SafetyOnly`; this writes a structural
+   summary and exits before the matrix. Continue later with `-Resume`.
 2. Run 3 independent processes per arm, interleaved:
    control 1, candidate 1, control 2, candidate 2, control 3, candidate 3.
 3. If either arm has a max/min outlier ratio greater than `20%` on primary

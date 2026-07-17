@@ -143,6 +143,7 @@ if ($receipt.schema -ne "g103_iq1_cold_sota_ab_static_v1" -or
     [bool]$receipt.static_check_only -ne $true -or
     [bool]$receipt.no_model_presence_required -ne $true -or
     [bool]$receipt.no_build_gpu_or_ds4_launch_in_static_check -ne $true -or
+    [bool]$receipt.safety_only_supported -ne $true -or
     [int]$receipt.protocol.independent_processes_per_arm -ne 3 -or
     [string]$receipt.protocol.control_expected_content_sha256 -ne
         "31cbc6504dcb57d42aeff9dbceb3aed943bcb32dae19a2edbf552e9fd2f52eb8" -or
