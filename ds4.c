@@ -2701,7 +2701,6 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_IQ1_S ||
            type == DS4_TENSOR_Q2_K ||
-           type == DS4_TENSOR_Q1_0 ||
            type == DS4_TENSOR_Q4_K;
 }
 
@@ -3305,8 +3304,10 @@ static void q1_0_sidecar_bind(
     config_validate_model(model);
     iq1_s_sidecar_validate_checkpoint_identity(model, primary_model);
 
-    uint32_t first_layer = 0;
-    uint32_t last_layer = DS4_N_LAYER - 1;
+    const uint32_t routed_first_layer = 3u;
+    const uint32_t routed_last_layer = DS4_N_LAYER - 1u;
+    uint32_t first_layer = routed_first_layer;
+    uint32_t last_layer = routed_last_layer;
     const char *first_env = getenv("DS4_Q1_0_LAYER_FIRST");
     const char *last_env = getenv("DS4_Q1_0_LAYER_LAST");
     if ((first_env && first_env[0]) || (last_env && last_env[0])) {
@@ -3314,18 +3315,22 @@ static void q1_0_sidecar_bind(
         char *last_end = NULL;
         errno = 0;
         const unsigned long first = first_env && first_env[0]
-            ? strtoul(first_env, &first_end, 10) : 0ul;
+            ? strtoul(first_env, &first_end, 10)
+            : (unsigned long)routed_first_layer;
         const int first_errno = errno;
         errno = 0;
         const unsigned long last = last_env && last_env[0]
-            ? strtoul(last_env, &last_end, 10) : (unsigned long)(DS4_N_LAYER - 1);
+            ? strtoul(last_env, &last_end, 10)
+            : (unsigned long)routed_last_layer;
         const int last_errno = errno;
         if (first_errno != 0 || last_errno != 0 ||
             (first_env && first_env[0] &&
              (first_end == first_env || *first_end != '\0')) ||
             (last_env && last_env[0] &&
              (last_end == last_env || *last_end != '\0')) ||
-            first >= DS4_N_LAYER || last >= DS4_N_LAYER || first > last) {
+            first < routed_first_layer || first > routed_last_layer ||
+            last < routed_first_layer || last > routed_last_layer ||
+            first > last) {
             ds4_die("invalid Q1_0 sidecar layer range");
         }
         first_layer = (uint32_t)first;
@@ -3333,7 +3338,7 @@ static void q1_0_sidecar_bind(
     }
 
     uint64_t routed_bytes = 0;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+    for (uint32_t il = first_layer; il <= last_layer; il++) {
         ds4_tensor *gate = required_tensorf(
             model, "blk.%u.ffn_gate_exps.weight", il);
         ds4_tensor *up = required_tensorf(
@@ -3380,7 +3385,7 @@ static void q1_0_sidecar_bind(
     g_q1_0_sidecar.ready = true;
     fprintf(stderr,
             "ds4: Q1_0 routed-expert sidecar validated: "
-            "layers=%u active=%u..%u gate_up_down=q1_0 block=128/18B "
+            "layers=%u active=%u..%u gate_up_down=q1_0 routed-only block=128/18B "
             "routed_bytes=%llu dispatch=fail-closed\n",
             DS4_N_LAYER,
             first_layer,
@@ -19311,6 +19316,13 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
         e->iq1_s_sidecar_ready = true;
         fprintf(stderr, "ds4: IQ1_S expert sidecar source: %s\n",
                 iq1_s_sidecar_path);
+    }
+    if (e->q1_0_sidecar_ready && iq1_s_mixed_cold_one_requested()) {
+        fprintf(stderr,
+                "ds4: Q1_0 expert sidecar is not compatible with DS4_IQ1_S_MIXED_COLD_K=1 in this smoke\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
     }
     if (iq1_s_mixed_cold_one_requested() && !e->iq1_s_sidecar_ready) {
         fprintf(stderr,

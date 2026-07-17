@@ -14661,7 +14661,6 @@ __device__ static float dev_dot_q1_0_q8_K_half128(
         const cuda_block_q1_0 *x,
         const cuda_block_q8_K *y,
         uint32_t half) {
-    const uint32_t byte_base = half * 16u;
     const uint32_t q8_base = half * 128u;
     int32_t positive_sum = 0;
     int32_t sum_all = 0;
@@ -14673,7 +14672,7 @@ __device__ static float dev_dot_q1_0_q8_K_half128(
 
 #pragma unroll
     for (uint32_t byte = 0; byte < 16u; byte++) {
-        const uint32_t bits = (uint32_t)x->qs[byte_base + byte];
+        const uint32_t bits = (uint32_t)x->qs[byte];
 #pragma unroll
         for (uint32_t lane = 0; lane < 8u; lane++) {
             if ((bits >> lane) & 1u) {
