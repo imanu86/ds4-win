@@ -302,6 +302,14 @@ function Assert-G99StaticContract {
             throw "G99 static matched-pair receipt marker missing: $requiredText"
         }
     }
+    foreach ($requiredText in @(
+        'Assert-G99Property -Object $Result -Name "expert_tiering"',
+        'Assert-G99Property -Object $tier -Name "general_backing_reclaims"',
+        '[UInt64]$tier.general_backing_reclaims -le 0')) {
+        if ($selfText -notmatch [regex]::Escape($requiredText)) {
+            throw "G99 static tier reclaim marker missing: $requiredText"
+        }
+    }
 }
 
 function New-G99BaseMeasureArgs([string]$Tag) {
@@ -531,15 +539,17 @@ function Assert-G99ArmResult {
         [UInt64]$Result.iq1_s_mixed_gpu_plan_failures -ne 0) {
         throw "G99 common mixed-IQ1/G95 quality contract mismatch: arm=$Arm"
     }
-    if ($Result.PSObject.Properties["expert_tiering"]) {
-        $tier = $Result.expert_tiering
-        if ([UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
-            [UInt64]$tier.cold_to_vram -ne 0 -or
-            [UInt64]$tier.failures -ne 0 -or
-            [UInt64]$tier.snapshot_backing_entries -ne
-                [UInt64]$Result.prefill_mass_wrap_candidate_entries) {
-            throw "G99 open-router tier contract mismatch: arm=$Arm"
-        }
+    Assert-G99Property -Object $Result -Name "expert_tiering" -Context $Arm
+    $tier = $Result.expert_tiering
+    Assert-G99Property -Object $tier -Name "general_backing_reclaims" `
+        -Context "$Arm.expert_tiering"
+    if ([UInt64]$tier.general_backing_reclaims -le 0 -or
+        [UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
+        [UInt64]$tier.cold_to_vram -ne 0 -or
+        [UInt64]$tier.failures -ne 0 -or
+        [UInt64]$tier.snapshot_backing_entries -ne
+            [UInt64]$Result.prefill_mass_wrap_candidate_entries) {
+        throw "G99 open-router tier contract mismatch: arm=$Arm"
     }
 
     foreach ($sample in @($Result.results)) {

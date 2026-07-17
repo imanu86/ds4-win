@@ -58,6 +58,60 @@ function Assert-G98Property {
     }
 }
 
+function Get-G98EffectiveEnvironmentMap {
+    param(
+        [Parameter(Mandatory=$true)][object]$Environment,
+        [switch]$DropIq1PromotionProbationSlots
+    )
+    if ($null -eq $Environment) {
+        throw "G98 effective environment missing."
+    }
+    $map = @{}
+    foreach ($property in $Environment.PSObject.Properties) {
+        if ($DropIq1PromotionProbationSlots -and
+            $property.Name -eq "DS4_IQ1_PROMOTION_PROBATION_SLOTS") {
+            continue
+        }
+        $map[$property.Name] = [string]$property.Value
+    }
+    return ,$map
+}
+
+function Assert-G98EffectiveEnvironmentMatch {
+    param(
+        [Parameter(Mandatory=$true)][object]$ControlEnvironment,
+        [Parameter(Mandatory=$true)][object]$CandidateEnvironment
+    )
+    if ($null -ne
+        $ControlEnvironment.PSObject.Properties[
+            "DS4_IQ1_PROMOTION_PROBATION_SLOTS"]) {
+        throw "G98 control promotion probation environment key present."
+    }
+    if ($null -eq
+        $CandidateEnvironment.PSObject.Properties[
+            "DS4_IQ1_PROMOTION_PROBATION_SLOTS"] -or
+        [string]$CandidateEnvironment.DS4_IQ1_PROMOTION_PROBATION_SLOTS -ne
+            ([string]$PromotionSlots)) {
+        throw "G98 candidate promotion probation environment key mismatch."
+    }
+
+    $controlMap = Get-G98EffectiveEnvironmentMap `
+        -Environment $ControlEnvironment
+    $candidateMap = Get-G98EffectiveEnvironmentMap `
+        -Environment $CandidateEnvironment `
+        -DropIq1PromotionProbationSlots
+    $controlKeys = @($controlMap.Keys | Sort-Object)
+    $candidateKeys = @($candidateMap.Keys | Sort-Object)
+    if (($controlKeys -join "`n") -ne ($candidateKeys -join "`n")) {
+        throw "G98 effective environment key mismatch outside promotion slot key."
+    }
+    foreach ($key in $controlKeys) {
+        if ([string]$controlMap[$key] -ne [string]$candidateMap[$key]) {
+            throw "G98 effective environment value mismatch outside promotion slot key: $key"
+        }
+    }
+}
+
 function Convert-G98BytesToGiB {
     param([object]$Value)
     if ($null -eq $Value) { return $null }
@@ -138,6 +192,7 @@ function Assert-G98StaticContract {
         "iq1-promotion",
         "promotion_2bit_ssd_seconds",
         "iq1_promotion_runtime_observed",
+        "general_backing_reclaims",
         "route_packed_copy_requested")) {
         if ($harnessText -notmatch [regex]::Escape($requiredText)) {
             throw "G98 harness static marker missing: $requiredText"
@@ -306,6 +361,7 @@ function Assert-G98RunContract {
         "iq1_promotion_2bit_ssd_bytes_per_second",
         "iq1_promotion_direct_ssd_to_vram_rejected",
         "iq1_promotion_failures",
+        "effective_ds4_environment",
         "compose_prefill_mass_open_router_requested",
         "compose_prefill_mass_reserve_slots_requested",
         "route_packed_copy_requested",
@@ -319,6 +375,8 @@ function Assert-G98RunContract {
     $tier = $Result.expert_tiering
     $rt = $Result.runtime_telemetry
     $sys = $Result.system_quiescence_preflight
+    Assert-G98Property -Object $tier -Name "general_backing_reclaims" `
+        -Tag $Tag
     $contentHashes = @($Result.results | ForEach-Object {
         [string]$_.content_sha256
     })
@@ -399,6 +457,7 @@ function Assert-G98RunContract {
         [UInt64]$tier.failures -ne 0 -or
         [UInt64]$tier.forbidden_cold_ssd_to_vram -ne 0 -or
         [UInt64]$tier.cold_to_vram -ne 0 -or
+        [UInt64]$tier.general_backing_reclaims -le 0 -or
         [UInt64]$tier.snapshot_backing_entries -ne
             [UInt64]$Result.prefill_mass_wrap_candidate_entries -or
         [bool]$Result.gpu_resident_routes_requested -ne $true -or
@@ -476,7 +535,7 @@ function Assert-G98RunContract {
                 [UInt64]$Result.prefill_mass_wrap_candidate_entries -or
             [UInt64]$Result.iq1_promotion_snapshot_evictions -ne 0 -or
             [UInt64]$Result.iq1_promotion_reserved_slots -ne
-                ([string]$PromotionSlots)) {
+                ([UInt64]$PromotionSlots * [UInt64]$expectedRequests)) {
             throw "G98 candidate promotion aggregate contract mismatch"
         }
         if (@($Result.iq1_promotion_requests).Count -ne $expectedRequests) {
@@ -554,6 +613,7 @@ function Invoke-G98Arm {
         promotion_slots = $(if ($Promotion) { $PromotionSlots } else { 0 })
         result_path = $resultPath
         raw_outputs_path = $rawPath
+        effective_ds4_environment = $result.effective_ds4_environment
         head = $result.head
         executable_sha256 = $result.executable_sha256
         ds4_cuda_sha256 = $result.ds4_cuda_sha256
@@ -611,6 +671,8 @@ function Invoke-G98Arm {
         tier_forbidden_cold_ssd_to_vram =
             [UInt64]$tier.forbidden_cold_ssd_to_vram
         tier_cold_to_vram = [UInt64]$tier.cold_to_vram
+        tier_general_backing_reclaims =
+            [UInt64]$tier.general_backing_reclaims
         tier_ram_h2d_gib = Convert-G98BytesToGiB $tier.ram_h2d_bytes
         promotion_line_count = [int]$result.iq1_promotion_line_count
         promotion_cold_to_2bit_ram =
@@ -663,6 +725,16 @@ $staticChecks = [pscustomobject]@{
         "measured heterogeneous gate/down byte layout refusal"
     compose_prefill_mass_open_router = $true
     compose_prefill_mass_reserve_slots = $PromotionSlots
+    shared_open_router_reclaim_pool_requires_general_backing_reclaims =
+        $true
+    effective_ds4_environment_equal_except_candidate_iq1_slot = $true
+    control_iq1_promotion_probation_slot_key_required_absent = $true
+    candidate_iq1_promotion_probation_slots_required = $PromotionSlots
+    arm_order = "control-then-candidate-fixed"
+    order_counterbalanced = $false
+    final_performance_verdict = "withheld_pending_BA_confirmation"
+    performance_claim_label =
+        "fixed-order exploratory only pending BA confirmation"
     promotion_control = "open-router reserve16, promotion off"
     promotion_candidate = "open-router reserve16, -Iq1Promotion slots16"
     quiescence_required = $true
@@ -733,6 +805,9 @@ if ($control.promotion_line_count -ne 0 -or
     $candidate.promotion_line_count -ne $candidate.request_count_expected) {
     throw "G98 promotion isolation/request coverage failed."
 }
+Assert-G98EffectiveEnvironmentMatch `
+    -ControlEnvironment $control.effective_ds4_environment `
+    -CandidateEnvironment $candidate.effective_ds4_environment
 
 $crossArmEqual = ([string]$control.deterministic_content_sha256 -eq
     [string]$candidate.deterministic_content_sha256)
@@ -754,11 +829,13 @@ $harnessDeltaPercent = if ($timingValid -and
         [double]$control.mean_tokens_per_second) /
         [double]$control.mean_tokens_per_second, 6)
 } else { $null }
-$performanceClaim = if ($timingValid) {
-    "valid only for this clean n=3 timing A/B"
+$performanceTimingLabel = if ($timingValid) {
+    "clean n=3 timing captured"
 } else {
     "withheld: clean n=3 timing contract not satisfied"
 }
+$performanceClaim =
+    "fixed-order exploratory only pending BA confirmation; no final performance verdict"
 
 $summary = [pscustomobject]@{
     schema = "g98_iq1_promotion_perf_ab_v1"
@@ -767,6 +844,8 @@ $summary = [pscustomobject]@{
     quality_claim = "none"
     general_sota_claim = "none"
     performance_claim = $performanceClaim
+    performance_timing_label = $performanceTimingLabel
+    final_performance_verdict = "withheld_pending_BA_confirmation"
     prompt = $prompt
     prompt_sha256 = $expectedPromptSHA256
     temperature = 0
@@ -784,6 +863,8 @@ $summary = [pscustomobject]@{
     promotion_candidate_slots = $PromotionSlots
     compose_prefill_mass_open_router = $true
     compose_prefill_mass_reserve_slots = $PromotionSlots
+    arm_order = "control-then-candidate-fixed"
+    order_counterbalanced = $false
     quiescence = [pscustomobject]@{
         skipped = $false
         cooldown_seconds = 90
@@ -844,6 +925,10 @@ $summary = [pscustomobject]@{
         n3_each_arm = $true
         intra_arm_determinism = $true
         cross_arm_equal_recorded_not_required = $crossArmEqual
+        effective_ds4_environment_equal_except_candidate_iq1_slot = $true
+        control_iq1_promotion_probation_slot_key_absent = $true
+        candidate_iq1_promotion_probation_slots =
+            [int]$candidate.effective_ds4_environment.DS4_IQ1_PROMOTION_PROBATION_SLOTS
         gpu_planner_on_both_arms = $true
         promotion_off_control = $true
         promotion_candidate_all_requests = $true
@@ -855,7 +940,13 @@ $summary = [pscustomobject]@{
             $candidate.promotion_2bit_ssd_bytes_per_second -gt 0.0)
         direct_reject_failures_snapshot_misses_forbidden_cold_to_vram_zero =
             $true
-        performance_claim_allowed = $timingValid
+        shared_open_router_reclaim_pool_general_backing_reclaims_positive =
+            ($control.tier_general_backing_reclaims -gt 0 -and
+            $candidate.tier_general_backing_reclaims -gt 0)
+        timing_contract_satisfied = $timingValid
+        performance_claim_allowed = $false
+        performance_verdict_blocked_reason =
+            "fixed-order exploratory pending BA confirmation"
     }
     runs = $runs
     deltas = [pscustomobject]@{
