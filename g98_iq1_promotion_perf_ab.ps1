@@ -389,7 +389,7 @@ function Assert-G98RunContract {
         [bool]$sys.ready_to_launch -ne $true -or
         [bool]$rt.contamination_abort_observed -ne $false -or
         [string]$Result.contamination_reason -ne "" -or
-        [double]$rt.contamination_runtime_minimum_available_gib -ne 2.0 -or
+        [double]$rt.contamination_runtime_minimum_available_gib -ne 4.0 -or
         [double]$rt.contamination_runtime_maximum_disk_queue_length -ne 8.0 -or
         [int]$rt.contamination_runtime_consecutive_samples -ne 3 -or
         $Result.executable_sha256 -ne $Provenance.executable_sha256 -or
