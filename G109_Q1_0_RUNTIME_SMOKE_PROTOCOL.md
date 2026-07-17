@@ -1,6 +1,6 @@
 # G109 Q1_0 runtime smoke protocol
 
-Status: preregistered structural protocol. No run or claim yet.
+Status: runtime and runner implemented; structural runs not started. No claim yet.
 
 Date: 2026-07-17
 
@@ -29,6 +29,25 @@ Before starting DS4, record and verify:
 
 Any source, shape, type, offset, range or hash mismatch aborts before CUDA
 dispatch.
+
+Frozen artifacts for the first run:
+
+- native branch/commit: `feature/q1-0-resident-base` / `1f661f0`;
+- resident-arena implementation: `c6fbb2b`;
+- Q1_0 runner gate: `1f661f0`;
+- sidecar: `C:\ds4-models\ds4-q1-layer42-derived-iq2-84b4ffb.gguf`;
+- sidecar bytes/SHA-256: `907428832` /
+  `58d537738ac80df504d9954a694703c37cc5f9ee236ca8c06ce94cea1ab8ef26`;
+- receipt SHA-256:
+  `6a36ae77c20e60f2e8a6be57b64f1f8eb524def9d9d119201c81e92c56312462`;
+- converter/helper commits: `84b4ffb` / `2dd1b0a`;
+- helper SHA-256:
+  `71df7699bb4189ecd18bd33858cb0877c34fcfa1535f833d88fcc1eac38e282a`;
+- active routed layer: `42`; full resident bootstrap: `256` experts;
+- Q1_0 resident payload: `907419648` bytes (`865.383 MiB`).
+
+The Release build manifest must be regenerated after the final protocol commit
+so its HEAD and executable provenance match the exact run state.
 
 ## Ordered gates
 
@@ -84,6 +103,26 @@ conditions plus:
 If the sidecar covers only one layer, the result validates only that layer and
 cannot be extrapolated to full-domain residency.
 
+For this first single-layer smoke, `DS4_CUDA_DYNAMIC_ARENA_GB=1` is sufficient:
+the required 256 slots occupy 864 MiB. The bootstrap accepts exactly 256 cold
+loads, or exactly zero loads when a later session republishes an already-full
+snapshot. Any partial count fails closed.
+
+## Current composition boundary
+
+The resident Q1_0 mode owns the single native host arena in this patch. It
+therefore disables the IQ2 host arena, dynamic mass masks and mixed-host
+resolver instead of pretending to compose them. G46/G73 expert tiering and
+prefill-mass composition must not be enabled in gate D.
+
+Consequently, gate D is only evidence that selected Q1_0 experts are served
+from pinned host RAM with zero routed `pread`. It is not a comparison with the
+current G73 throughput stack. Before a SOTA A/B, implement and gate one of:
+
+1. disjoint Q1_0 and IQ2 host arenas with a representation-neutral resolver;
+2. a unified arena whose entries carry backing/source identity; or
+3. a full routed-layer Q1_0 sidecar that removes the mixed-backing boundary.
+
 ## Promotion to measurement
 
 Only after A through D pass may a performance comparison run. It must use at
@@ -95,4 +134,3 @@ host-resident transport. Report server decode, TTFT, route H2D bytes, copy
 submissions, wait time, GPU utilization, host residency and all Q1_0 counters.
 Outliers trigger a complete three-process rerun. Quality requires separately
 retained outputs and L0-L3 grading; no repeat flag or `n=1` result is a verdict.
-
