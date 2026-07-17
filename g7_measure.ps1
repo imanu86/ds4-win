@@ -105,6 +105,8 @@ param(
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [switch]$Iq1SMixedColdOne,
     [switch]$Iq1SMixedGpuPlan,
+    [switch]$Iq1Promotion,
+    [ValidateRange(1, 512)][int]$Iq1PromotionProbationSlots = 16,
     [ValidateRange(0.0, 48.0)][double]$Iq1SRamCacheGiB = 0.0,
     [switch]$Iq1SMixedDebug,
     [switch]$Iq1SProfile,
@@ -322,6 +324,13 @@ if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar) {
 if ($Iq1SMixedGpuPlan -and -not $Iq1SMixedColdOne) {
     throw "Iq1SMixedGpuPlan requires Iq1SMixedColdOne"
 }
+if ($Iq1Promotion) {
+    if (-not $Iq1SExpertSidecar) { throw "Iq1Promotion requires Iq1SExpertSidecar" }
+    if (-not $Iq1SMixedColdOne) { throw "Iq1Promotion requires Iq1SMixedColdOne" }
+    if (-not $Iq1SMixedGpuPlan) { throw "Iq1Promotion requires Iq1SMixedGpuPlan" }
+    if (-not $ComposePrefillMassTiering) { throw "Iq1Promotion requires ComposePrefillMassTiering" }
+    if ($ExpertTiering -ne "enforce") { throw "Iq1Promotion requires ExpertTiering enforce" }
+}
 if ($Iq1SRamCacheGiB -gt 0.0 -and -not $Iq1SExpertSidecar) {
     throw "Iq1SRamCacheGiB requires Iq1SExpertSidecar"
 }
@@ -472,6 +481,11 @@ if ($Iq1SMixedGpuPlan) {
     $env:DS4_IQ1_MIXED_GPU_PLAN = "1"
 } else {
     Remove-Item Env:\DS4_IQ1_MIXED_GPU_PLAN -ErrorAction SilentlyContinue
+}
+if ($Iq1Promotion) {
+    $env:DS4_IQ1_PROMOTION_PROBATION_SLOTS = "$Iq1PromotionProbationSlots"
+} else {
+    Remove-Item Env:\DS4_IQ1_PROMOTION_PROBATION_SLOTS -ErrorAction SilentlyContinue
 }
 if ($Iq1SRamCacheGiB -gt 0.0) {
     $env:DS4_IQ1_S_RAM_CACHE_GB = $Iq1SRamCacheGiB.ToString(
@@ -2995,6 +3009,22 @@ $iq1MixedGpuPlanRuntimeObserved = $false
 $iq1MixedGpuPlanCalls = [UInt64]0
 $iq1MixedGpuPlanWaitMs = 0.0
 $iq1MixedGpuPlanFailures = [UInt64]0
+$iq1PromotionRuntimeObserved = $false
+$iq1PromotionLineCount = 0
+$iq1PromotionRows = @()
+$iq1PromotionRequestedSlots = [UInt64]0
+$iq1PromotionReservedSlots = [UInt64]0
+$iq1PromotionSnapshotEvictions = [UInt64]0
+$iq1PromotionColdObserved = [UInt64]0
+$iq1PromotionColdExisting2Bit = [UInt64]0
+$iq1PromotionColdTo2BitRam = [UInt64]0
+$iq1PromotionProbationRamHits = [UInt64]0
+$iq1PromotionNextTokenWaits = [UInt64]0
+$iq1Promotion2BitSsdBytes = [UInt64]0
+$iq1Promotion2BitSsdSeconds = 0.0
+$iq1Promotion2BitSsdBytesPerSecond = 0.0
+$iq1PromotionDirectSsdToVramRejected = [UInt64]0
+$iq1PromotionFailures = [UInt64]0
 $iq1MixedSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
     '\[iq1-mixed\] result=summary calls=(\d+) hot_main=(\d+) cold_iq1=(\d+) primary_cold_avoided=(\d+) joins=(\d+) failures=(\d+) last_layer=(\d+) last_slot=(\d+) last_expert=(-?\d+)')
@@ -3049,6 +3079,78 @@ if ($Iq1SMixedGpuPlan) {
 } elseif ($iq1MixedGpuPlanReadyMatches.Count -ne 0 -or
           $iq1MixedGpuPlanSummaryMatches.Count -ne 0) {
     throw "IQ1_S mixed GPU plan telemetry appeared while GPU plan was disabled"
+}
+
+$iq1PromotionMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    '(?m)^(?:ds4: )?\[iq1-promotion\] final requested_slots=(\d+) reserved_slots=(\d+) snapshot_evictions=(\d+) cold_observed=(\d+) cold_existing_2bit=(\d+) cold_to_2bit_ram=(\d+) probation_ram_hits=(\d+) next_token_waits=(\d+) promotion_2bit_ssd_bytes=(\d+) promotion_2bit_ssd_seconds=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) direct_ssd_to_vram_rejected=(\d+) failures=(\d+)$')
+$iq1PromotionLineCount = $iq1PromotionMatches.Count
+if ($Iq1Promotion) {
+    if ($iq1PromotionLineCount -ne $requestCountExpected) {
+        throw "IQ1 promotion requires one final line per request; expected $requestCountExpected observed $iq1PromotionLineCount"
+    }
+    for ($iq1PromotionIndex = 0; $iq1PromotionIndex -lt $iq1PromotionMatches.Count; $iq1PromotionIndex++) {
+        $iq1PromotionMatch = $iq1PromotionMatches[$iq1PromotionIndex]
+        $iq1PromotionRow = [pscustomobject]@{
+            request_index = ($iq1PromotionIndex + 1)
+            repeat = $(if ($Warmup -and $iq1PromotionIndex -eq 0) { 0 } else { $iq1PromotionIndex + $(if ($Warmup) { 0 } else { 1 }) })
+            warmup = [bool]($Warmup -and $iq1PromotionIndex -eq 0)
+            requested_slots = [UInt64]$iq1PromotionMatch.Groups[1].Value
+            reserved_slots = [UInt64]$iq1PromotionMatch.Groups[2].Value
+            snapshot_evictions = [UInt64]$iq1PromotionMatch.Groups[3].Value
+            cold_observed = [UInt64]$iq1PromotionMatch.Groups[4].Value
+            cold_existing_2bit = [UInt64]$iq1PromotionMatch.Groups[5].Value
+            cold_to_2bit_ram = [UInt64]$iq1PromotionMatch.Groups[6].Value
+            probation_ram_hits = [UInt64]$iq1PromotionMatch.Groups[7].Value
+            next_token_waits = [UInt64]$iq1PromotionMatch.Groups[8].Value
+            promotion_2bit_ssd_bytes = [UInt64]$iq1PromotionMatch.Groups[9].Value
+            promotion_2bit_ssd_seconds = [double]::Parse(
+                $iq1PromotionMatch.Groups[10].Value,
+                [Globalization.CultureInfo]::InvariantCulture)
+            direct_ssd_to_vram_rejected = [UInt64]$iq1PromotionMatch.Groups[11].Value
+            failures = [UInt64]$iq1PromotionMatch.Groups[12].Value
+        }
+        if ([double]::IsNaN($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
+            [double]::IsInfinity($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
+            $iq1PromotionRow.promotion_2bit_ssd_seconds -lt 0.0) {
+            throw "IQ1 promotion SSD seconds are invalid at request $($iq1PromotionIndex + 1)"
+        }
+        if ($iq1PromotionRow.requested_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
+            $iq1PromotionRow.reserved_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
+            $iq1PromotionRow.snapshot_evictions -ne [UInt64]$Iq1PromotionProbationSlots -or
+            $iq1PromotionRow.cold_observed -le 0 -or
+            ($iq1PromotionRow.cold_to_2bit_ram + $iq1PromotionRow.cold_existing_2bit) -le 0 -or
+            $iq1PromotionRow.direct_ssd_to_vram_rejected -ne 0 -or
+            $iq1PromotionRow.failures -ne 0) {
+            throw "IQ1 promotion final counters are inconsistent at request $($iq1PromotionIndex + 1)"
+        }
+        $iq1PromotionRows += $iq1PromotionRow
+        $iq1PromotionRequestedSlots += $iq1PromotionRow.requested_slots
+        $iq1PromotionReservedSlots += $iq1PromotionRow.reserved_slots
+        $iq1PromotionSnapshotEvictions += $iq1PromotionRow.snapshot_evictions
+        $iq1PromotionColdObserved += $iq1PromotionRow.cold_observed
+        $iq1PromotionColdExisting2Bit += $iq1PromotionRow.cold_existing_2bit
+        $iq1PromotionColdTo2BitRam += $iq1PromotionRow.cold_to_2bit_ram
+        $iq1PromotionProbationRamHits += $iq1PromotionRow.probation_ram_hits
+        $iq1PromotionNextTokenWaits += $iq1PromotionRow.next_token_waits
+        $iq1Promotion2BitSsdBytes += $iq1PromotionRow.promotion_2bit_ssd_bytes
+        $iq1Promotion2BitSsdSeconds += $iq1PromotionRow.promotion_2bit_ssd_seconds
+        $iq1PromotionDirectSsdToVramRejected += $iq1PromotionRow.direct_ssd_to_vram_rejected
+        $iq1PromotionFailures += $iq1PromotionRow.failures
+    }
+    if ($iq1Promotion2BitSsdSeconds -gt 0.0) {
+        $iq1Promotion2BitSsdBytesPerSecond =
+            [double]$iq1Promotion2BitSsdBytes / $iq1Promotion2BitSsdSeconds
+    }
+    if ($iq1PromotionColdTo2BitRam -le 0 -or
+        $iq1Promotion2BitSsdBytes -le 0 -or
+        $iq1Promotion2BitSsdSeconds -le 0.0 -or
+        $iq1Promotion2BitSsdBytesPerSecond -le 0.0) {
+        throw "IQ1 promotion did not exercise a timed IQ2 SSD-to-probation-RAM stage"
+    }
+    $iq1PromotionRuntimeObserved = $true
+} elseif ($iq1PromotionLineCount -ne 0) {
+    throw "IQ1 promotion telemetry appeared while promotion was disabled"
 }
 
 $iq1ProfileSsdReadCalls = [UInt64]0
@@ -3187,9 +3289,18 @@ if ($ExpertTiering -eq "off") {
                 }
             }
             $matchingWrap = $prefillMassWrapParsedEvents[$tierLineIndex]
+            $matchingPromotion = if ($Iq1Promotion) { $iq1PromotionRows[$tierLineIndex] } else { $null }
+            $expectedSnapshotBackingEntries = [uint32]$matchingWrap.candidate
+            if ($Iq1Promotion) {
+                if ([UInt64]$matchingPromotion.reserved_slots -gt [UInt64]$matchingWrap.candidate) {
+                    throw "Expert tiering compose failed: IQ1 promotion reserved more slots than the candidate snapshot at request $($tierLineIndex + 1)"
+                }
+                $expectedSnapshotBackingEntries =
+                    [uint32]([UInt64]$matchingWrap.candidate - [UInt64]$matchingPromotion.reserved_slots)
+            }
             if ([uint32]$tierFields["compose_prefill_mass_tiering"] -ne 1 -or
                 [uint64]$tierFields["snapshot_generation"] -ne [uint64]$matchingWrap.generation -or
-                [uint32]$tierFields["snapshot_backing_entries"] -ne [uint32]$matchingWrap.candidate -or
+                [uint32]$tierFields["snapshot_backing_entries"] -ne $expectedSnapshotBackingEntries -or
                 [uint64]$tierFields["snapshot_backing_hits"] -le 0 -or
                 [uint64]$tierFields["snapshot_backing_misses"] -ne 0 -or
                 [uint64]$tierFields["snapshot_to_vram_bytes"] -le 0 -or
@@ -3258,8 +3369,19 @@ if ($ExpertTiering -eq "off") {
         if ($expertTieringColdToVram -ne 0) { throw "Expert tiering compose failed: cold_to_vram must remain zero" }
         if ($expertTieringFailures -ne 0) { throw "Expert tiering compose failed: runtime failures observed" }
         if ($prefillMassWrapGeneration -le 0 -or $expertTieringSnapshotGeneration -ne $prefillMassWrapGeneration) { throw "Expert tiering compose failed: snapshot generation differs from prefill publish" }
-        if ($expertTieringSnapshotBackingEntries -ne $prefillMassWrapResidentAfter -or
-            $expertTieringSnapshotBackingEntries -ne $prefillMassWrapCandidate) {
+        if ($Iq1Promotion) {
+            if ([UInt64]$iq1PromotionReservedSlots -gt
+                [UInt64]$prefillMassWrapCandidate) {
+                throw "Expert tiering compose failed: aggregate IQ1 promotion slots exceed published candidates"
+            }
+            $expectedFinalSnapshotBackingEntries =
+                [uint32]([UInt64]$prefillMassWrapCandidate -
+                    [UInt64]$iq1PromotionReservedSlots)
+            if ($expertTieringSnapshotBackingEntries -ne $expectedFinalSnapshotBackingEntries) {
+                throw "Expert tiering compose failed: snapshot backing does not account for IQ1 promotion probation slots"
+            }
+        } elseif ($expertTieringSnapshotBackingEntries -ne $prefillMassWrapResidentAfter -or
+                  $expertTieringSnapshotBackingEntries -ne $prefillMassWrapCandidate) {
             throw "Expert tiering compose failed: snapshot backing differs from prefill publication"
         }
     } elseif ($expertTieringComposeObserved) {
@@ -3937,6 +4059,15 @@ $expertTieringResult = [pscustomobject]@{
     prefill_vram_seed_failures = $prefillVramSeedFailures
     prefill_vram_seed_prior_mass = $prefillVramSeedPriorMass
     prefill_vram_seed_semantics = $prefillVramSeedSemantics
+    iq1_promotion_requested = [bool]$Iq1Promotion
+    iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
+    iq1_promotion_line_count = $iq1PromotionLineCount
+    iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
+    iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
+    iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
+    iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
+    iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
     compose_prefill_mass_tiering_observed = $expertTieringComposeObserved
     compose_prefill_mass_tiering_flag = $expertTieringComposeFlag
     snapshot_generation = $expertTieringSnapshotGeneration
@@ -4088,6 +4219,24 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls
     iq1_s_mixed_gpu_plan_wait_ms = $iq1MixedGpuPlanWaitMs
     iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
+    iq1_promotion_requested = [bool]$Iq1Promotion
+    iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
+    iq1_promotion_line_count = $iq1PromotionLineCount
+    iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
+    iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
+    iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
+    iq1_promotion_cold_observed = $iq1PromotionColdObserved
+    iq1_promotion_cold_existing_2bit = $iq1PromotionColdExisting2Bit
+    iq1_promotion_cold_to_2bit_ram = $iq1PromotionColdTo2BitRam
+    iq1_promotion_probation_ram_hits = $iq1PromotionProbationRamHits
+    iq1_promotion_next_token_waits = $iq1PromotionNextTokenWaits
+    iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
+    iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
+    iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
+    iq1_promotion_direct_ssd_to_vram_rejected = $iq1PromotionDirectSsdToVramRejected
+    iq1_promotion_failures = $iq1PromotionFailures
+    iq1_promotion_requests = $iq1PromotionRows
     iq1_s_profile_requested = [bool]$Iq1SProfile
     iq1_s_no_main_sync_requested = [bool]$Iq1SNoMainSync
     iq1_s_packed_h2d_requested = [bool]$Iq1SPackedH2D
@@ -4216,6 +4365,24 @@ $summary = [pscustomobject]@{
     iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls
     iq1_s_mixed_gpu_plan_wait_ms = $iq1MixedGpuPlanWaitMs
     iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
+    iq1_promotion_requested = [bool]$Iq1Promotion
+    iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
+    iq1_promotion_line_count = $iq1PromotionLineCount
+    iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
+    iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
+    iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
+    iq1_promotion_cold_observed = $iq1PromotionColdObserved
+    iq1_promotion_cold_existing_2bit = $iq1PromotionColdExisting2Bit
+    iq1_promotion_cold_to_2bit_ram = $iq1PromotionColdTo2BitRam
+    iq1_promotion_probation_ram_hits = $iq1PromotionProbationRamHits
+    iq1_promotion_next_token_waits = $iq1PromotionNextTokenWaits
+    iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
+    iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
+    iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
+    iq1_promotion_direct_ssd_to_vram_rejected = $iq1PromotionDirectSsdToVramRejected
+    iq1_promotion_failures = $iq1PromotionFailures
+    iq1_promotion_requests = $iq1PromotionRows
     iq1_s_profile_requested = [bool]$Iq1SProfile
     iq1_s_no_main_sync_requested = [bool]$Iq1SNoMainSync
     iq1_s_packed_h2d_requested = [bool]$Iq1SPackedH2D
@@ -4891,6 +5058,7 @@ Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/
 Write-Host ("IQ1_S VRAM cache hit-rate/H2D GiB: " + $(if (($iq1SVramCacheHits + $iq1SVramCacheMisses) -gt 0) { [math]::Round([double]$iq1SVramCacheHits / [double]($iq1SVramCacheHits + $iq1SVramCacheMisses), 4) } else { 0 }) + " / " + [math]::Round($iq1SVramCacheH2dBytes / 1GB, 3))
 Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures: " + $iq1MixedCalls + " / " + $iq1MixedHotMain + " / " + $iq1MixedColdIq1 + " / " + $iq1MixedPrimaryColdAvoided + " / " + $iq1MixedJoins + " / " + $iq1MixedFailures)
 Write-Host ("IQ1_S mixed GPU plan requested/observed/calls/wait-ms/failures: " + [bool]$Iq1SMixedGpuPlan + " / " + $iq1MixedGpuPlanRuntimeObserved + " / " + $iq1MixedGpuPlanCalls + " / " + $iq1MixedGpuPlanWaitMs + " / " + $iq1MixedGpuPlanFailures)
+Write-Host ("IQ1 promotion requested/observed/lines/slots/cold/existing2bit/to2bitram/ssd-GiB/ssd-sec/ssd-Bps/direct-rejected/failures: " + [bool]$Iq1Promotion + " / " + $iq1PromotionRuntimeObserved + " / " + $iq1PromotionLineCount + " / " + $Iq1PromotionProbationSlots + " / " + $iq1PromotionColdObserved + " / " + $iq1PromotionColdExisting2Bit + " / " + $iq1PromotionColdTo2BitRam + " / " + [math]::Round($iq1Promotion2BitSsdBytes / 1GB, 3) + " / " + $iq1Promotion2BitSsdSeconds + " / " + [math]::Round($iq1Promotion2BitSsdBytesPerSecond, 3) + " / " + $iq1PromotionDirectSsdToVramRejected + " / " + $iq1PromotionFailures)
 Write-Host ("IQ1_S profile/no-main-sync/packed-H2D: " + [bool]$Iq1SProfile + " / " + [bool]$Iq1SNoMainSync + " / " + [bool]$Iq1SPackedH2D)
 Write-Host ("IQ1_S profile SSD reads/ms H2D batches/copies/enqueue-ms/syncs/sync-ms: " + $iq1ProfileSsdReadCalls + " / " + $iq1ProfileSsdReadMs + " / " + $iq1ProfileH2dBatches + " / " + $iq1ProfileH2dCopies + " / " + $iq1ProfileH2dEnqueueMs + " / " + $iq1ProfileH2dSyncs + " / " + $iq1ProfileH2dSyncMs)
 Write-Host ("IQ1_S mixed profile calls/router-D2H/meta-H2D/main-submit/main-sync/cold-submit/join ms: " + $iq1MixedProfileCalls + " / " + $iq1MixedProfileRouterD2hMs + " / " + $iq1MixedProfileMetadataH2dMs + " / " + $iq1MixedProfileMainSubmitMs + " / " + $iq1MixedProfileMainSyncMs + " / " + $iq1MixedProfileColdSubmitMs + " / " + $iq1MixedProfileJoinSubmitMs)
