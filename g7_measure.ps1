@@ -153,6 +153,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "g7_process_isolation.ps1")
 function Get-G7PreflightMedian([double[]]$Values) {
     if ($null -eq $Values -or $Values.Count -eq 0) { return $null }
     $sorted = @($Values | Sort-Object)
@@ -671,13 +672,17 @@ try {
 }
 if (-not $measurementLockAcquired) {
     [pscustomobject]@{
-        schema = "g7_process_isolation_preflight_v1"
+        schema = "g7_process_isolation_preflight_v2"
         checked_utc = (Get-Date).ToUniversalTime().ToString("o")
         mutex_name = $measurementMutexName
         mutex_acquired = $false
         current_harness_pid = $PID
+        gate_kind = $GateKind
         conflict_count = $null
         conflicts = @()
+        blocked_maintenance_process_names = @("Defrag.exe")
+        maintenance_conflict_count = $null
+        maintenance_conflicts = @()
         ready_to_launch = $false
         refusal_reason = "measurement-lock-owned"
     } | ConvertTo-Json -Depth 5 |
@@ -735,23 +740,33 @@ $processConflicts = @($processesAtPreflight | Where-Object {
         name = [string]$_.Name
         executable_path = [string]$_.ExecutablePath
         command_line = [string]$_.CommandLine
+        created_utc = ""
+        conflict_type = "ds4-or-harness"
+        refusal_reason = "conflicting-ds4-or-g7-process"
     }
 })
+$maintenanceProcessConflicts = @(Get-G7MaintenanceProcessConflicts `
+    -Processes $processesAtPreflight -GateKind $GateKind)
+$allProcessConflicts = @($processConflicts) + @($maintenanceProcessConflicts)
 $processIsolationPreflight = [pscustomobject]@{
-    schema = "g7_process_isolation_preflight_v1"
+    schema = "g7_process_isolation_preflight_v2"
     checked_utc = (Get-Date).ToUniversalTime().ToString("o")
     mutex_name = $measurementMutexName
     mutex_acquired = $measurementLockAcquired
     current_harness_pid = $PID
+    gate_kind = $GateKind
     ancestor_process_ids = $ancestorProcessIds
-    conflict_count = $processConflicts.Count
-    conflicts = $processConflicts
-    ready_to_launch = ($processConflicts.Count -eq 0)
+    conflict_count = $allProcessConflicts.Count
+    conflicts = $allProcessConflicts
+    blocked_maintenance_process_names = @("Defrag.exe")
+    maintenance_conflict_count = $maintenanceProcessConflicts.Count
+    maintenance_conflicts = $maintenanceProcessConflicts
+    ready_to_launch = ($allProcessConflicts.Count -eq 0)
 }
 $processIsolationPreflight | ConvertTo-Json -Depth 5 |
     Set-Content -LiteralPath $processIsolationLog -Encoding UTF8
-if ($processConflicts.Count -ne 0) {
-    $conflictText = @($processConflicts | ForEach-Object {
+if ($allProcessConflicts.Count -ne 0) {
+    $conflictText = @($allProcessConflicts | ForEach-Object {
         $_.name + " pid=" + $_.pid
     }) -join ", "
     throw ("Process isolation preflight refused launch: " + $conflictText)
