@@ -107,6 +107,8 @@ param(
     [string]$ModelIq1SuiteReceiptPath = "",
     [string]$ExpectedModelIq1SuiteReceiptSHA256 = "",
     [switch]$ReuseVerifiedSuiteReceipt,
+    [switch]$AllowQualityVerifiedSuiteReceipt,
+    [ValidateRange(0, 64)][int]$OuterQualityProcessCount = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [switch]$Iq1SMixedColdOne,
@@ -395,7 +397,7 @@ if (($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt) -and
     throw "Verified receipt reuse is restricted to structural-safety diagnostics"
 }
 if ($ReuseVerifiedSuiteReceipt) {
-    if ($GateKind -eq "quality") {
+    if ($GateKind -eq "quality" -and -not $AllowQualityVerifiedSuiteReceipt) {
         throw "Verified suite receipt reuse is restricted to benchmark and structural-safety gates"
     }
     if ($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt) {
@@ -412,6 +414,25 @@ if ($ReuseVerifiedSuiteReceipt) {
         $ExpectedIq1SExpertSidecarBytes -eq 0) {
         throw "ReuseVerifiedSuiteReceipt requires IQ1_S sidecar path, SHA-256, and byte count"
     }
+}
+if ($AllowQualityVerifiedSuiteReceipt) {
+    if ($GateKind -ne "quality") {
+        throw "AllowQualityVerifiedSuiteReceipt requires GateKind=quality"
+    }
+    if (-not $ReuseVerifiedSuiteReceipt) {
+        throw "AllowQualityVerifiedSuiteReceipt requires ReuseVerifiedSuiteReceipt"
+    }
+    if ($Repeats -ne 1) {
+        throw "Outer quality suite members require Repeats=1"
+    }
+    if ($OuterQualityProcessCount -lt 3) {
+        throw "Outer quality suite members require OuterQualityProcessCount >= 3"
+    }
+    if ($SkipSystemQuiescencePreflight) {
+        throw "Outer quality suite members require system quiescence preflight"
+    }
+} elseif ($OuterQualityProcessCount -ne 0) {
+    throw "OuterQualityProcessCount requires AllowQualityVerifiedSuiteReceipt"
 }
 if ((-not $ReuseVerifiedSuiteReceipt) -and
     ($ModelIq1SuiteReceiptPath -or $ExpectedModelIq1SuiteReceiptSHA256)) {
@@ -612,7 +633,8 @@ if (-not $Iq1Promotion -and
      $Iq1PromotionWindowBudget -ne 0)) {
     throw "Non-default IQ1 promotion knobs require -Iq1Promotion"
 }
-if ($ReuseVerifiedSuiteReceipt -and $GateKind -eq "benchmark") {
+if ($ReuseVerifiedSuiteReceipt -and
+    ($GateKind -eq "benchmark" -or $AllowQualityVerifiedSuiteReceipt)) {
     $modelIq1SuiteLockProofRequired = $true
     $modelLockProof = Test-G7SharingViolationProof -Path $model `
         -Kind "Model"
@@ -628,7 +650,10 @@ if ($ReuseVerifiedSuiteReceipt -and $GateKind -eq "benchmark") {
         iq1_s_sidecar = $sidecarLockProof
     }
     if (-not $modelIq1SuiteLockProofObserved) {
-        throw "Benchmark suite receipt reuse requires active parent-held deny-write/delete locks"
+        if ($GateKind -eq "benchmark") {
+            throw "Benchmark suite receipt reuse requires active parent-held deny-write/delete locks"
+        }
+        throw "Quality suite receipt reuse requires active parent-held deny-write/delete locks"
     }
 }
 if ($ComposePrefillMassOpenRouter) {
@@ -1404,7 +1429,8 @@ if ($ReuseVerifiedSuiteReceipt) {
         -ExpectedFileSHA256 $ExpectedIq1SExpertSidecarSHA256 `
         -ExpectedBytes $ExpectedIq1SExpertSidecarBytes `
         -Kind "IQ1_S sidecar"
-    $modelIq1SuiteLockProofRequired = [bool]($GateKind -eq "benchmark")
+    $modelIq1SuiteLockProofRequired = [bool](
+        $GateKind -eq "benchmark" -or $AllowQualityVerifiedSuiteReceipt)
     if ($modelIq1SuiteLockProofRequired -and
         $null -eq $modelIq1SuiteLockProof) {
         $modelLockProof = Test-G7SharingViolationProof -Path $model `
@@ -1421,7 +1447,10 @@ if ($ReuseVerifiedSuiteReceipt) {
             iq1_s_sidecar = $sidecarLockProof
         }
         if (-not $modelIq1SuiteLockProofObserved) {
-            throw "Benchmark suite receipt reuse requires active parent-held deny-write/delete locks"
+            if ($GateKind -eq "benchmark") {
+                throw "Benchmark suite receipt reuse requires active parent-held deny-write/delete locks"
+            }
+            throw "Quality suite receipt reuse requires active parent-held deny-write/delete locks"
         }
     } elseif (-not $modelIq1SuiteLockProofRequired) {
         $modelIq1SuiteLockProof = [pscustomobject]@{
@@ -4773,12 +4802,22 @@ $expertTieringResult = [pscustomobject]@{
     mass_sum = $expertTieringMassSum
     lfru_top = $expertTieringLfruTop
 }
-$qualityEligible = [bool]($GateKind -ne "structural-safety" -and $Repeats -ge 3)
+$outerQualitySuiteMember = [bool](
+    $GateKind -eq "quality" -and
+    $AllowQualityVerifiedSuiteReceipt -and
+    $OuterQualityProcessCount -ge 3 -and
+    $Repeats -eq 1)
+$qualityEligible = [bool](
+    $GateKind -ne "structural-safety" -and
+    $Repeats -ge 3 -and
+    -not $outerQualitySuiteMember)
 $sotaEligible = [bool]($qualityEligible -and -not $SkipSystemQuiescencePreflight)
 $contaminationReason = ""
 if (-not $qualityEligible) {
     if ($GateKind -eq "structural-safety") {
         $contaminationReason = "structural-safety-gate-not-quality-eligible"
+    } elseif ($outerQualitySuiteMember) {
+        $contaminationReason = "outer-quality-suite-member-pending-aggregate"
     } elseif ($Repeats -lt 3) {
         $contaminationReason = "repeats-less-than-3-not-quality-eligible"
     } else {
@@ -4794,6 +4833,12 @@ $rawOutputs = [pscustomobject]@{
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
     contamination_reason = $contaminationReason
+    allow_quality_verified_suite_receipt_requested =
+        [bool]$AllowQualityVerifiedSuiteReceipt
+    outer_quality_process_count_requested = $OuterQualityProcessCount
+    outer_quality_suite_member = $outerQualitySuiteMember
+    outer_quality_member_contract_valid = $outerQualitySuiteMember
+    outer_quality_aggregate_required = $outerQualitySuiteMember
     head = $headAtStart
     executable_sha256 = $exeHashAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
@@ -4959,6 +5004,12 @@ $summary = [pscustomobject]@{
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
     contamination_reason = $contaminationReason
+    allow_quality_verified_suite_receipt_requested =
+        [bool]$AllowQualityVerifiedSuiteReceipt
+    outer_quality_process_count_requested = $OuterQualityProcessCount
+    outer_quality_suite_member = $outerQualitySuiteMember
+    outer_quality_member_contract_valid = $outerQualitySuiteMember
+    outer_quality_aggregate_required = $outerQualitySuiteMember
     head = $headAtStart
     worktree_dirty = $worktreeDirtyAtStart
     ds4_cuda_sha256 = $sourceHashAtStart
