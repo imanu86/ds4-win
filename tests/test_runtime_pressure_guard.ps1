@@ -2,6 +2,7 @@ $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
 $monitor = Join-Path $root "g7_runtime_monitor.ps1"
+$harness = Join-Path $root "g7_measure.ps1"
 $output = Join-Path $env:TEMP ("ds4_runtime_pressure_guard_" + [guid]::NewGuid().ToString("N") + ".jsonl")
 $child = $null
 
@@ -36,6 +37,10 @@ try {
     }
     if ($null -eq $abort.system_memory_pressure.pages_output_per_second) {
         throw "Runtime monitor page-output counter is missing"
+    }
+    if ((Get-Content -LiteralPath $harness -Raw) -notmatch
+        'runtime-monitor-abort reasons=') {
+        throw "Measurement harness does not report monitor aborts during HTTP failures"
     }
     Write-Host "runtime pressure guard test: PASS"
 } finally {

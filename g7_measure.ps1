@@ -2303,6 +2303,23 @@ if (Test-Path $stderrLog) {
         $runtimeFailureEvidence = @($lines | Where-Object {
             $_ -match 'allocation failed|failed closed|finish=error|cuda decode failed'
         } | Select-Object -Last 4)
+        if (Test-Path -LiteralPath $runtimeTelemetryLog) {
+            $runtimeAbortSample = $null
+            foreach ($runtimeLine in Get-Content -LiteralPath $runtimeTelemetryLog) {
+                if (-not $runtimeLine.Trim()) { continue }
+                try {
+                    $runtimeCandidate = $runtimeLine | ConvertFrom-Json
+                    if ($runtimeCandidate.contamination_abort) {
+                        $runtimeAbortSample = $runtimeCandidate
+                    }
+                } catch {}
+            }
+            if ($runtimeAbortSample) {
+                $runtimeAbortReasons = @($runtimeAbortSample.contamination_reasons) -join ","
+                $runtimeFailureEvidence +=
+                    "runtime-monitor-abort reasons=$runtimeAbortReasons"
+            }
+        }
         $runtimeFailureSuffix = if ($runtimeFailureEvidence.Count -gt 0) {
             "; runtime=" + ($runtimeFailureEvidence -join " | ")
         } else { "" }
