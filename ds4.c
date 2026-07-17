@@ -19547,12 +19547,15 @@ static bool dynamic_arena_tensor_geometry(
         const ds4_tensor *tensor,
         uint32_t          layer,
         const char       *part,
+        bool              require_q1_0,
         uint64_t         *offset,
         uint64_t         *expert_bytes) {
+    const bool type_valid = tensor && (require_q1_0
+        ? tensor->type == DS4_TENSOR_Q1_0
+        : tensor_is_routed_expert_type(tensor->type));
     if (!model || !model->map || !tensor || !offset || !expert_bytes ||
         tensor->ndim != 3 || tensor->dim[0] == 0 || tensor->dim[1] == 0 ||
-        tensor->dim[2] != DS4_N_EXPERT ||
-        !tensor_is_routed_expert_type(tensor->type)) {
+        tensor->dim[2] != DS4_N_EXPERT || !type_valid) {
         fprintf(stderr,
                 "ds4: CUDA dynamic arena rejected layer %u %s tensor geometry\n",
                 layer, part);
@@ -19603,12 +19606,15 @@ static bool dynamic_arena_build_layers(
         ds4_gpu_dynamic_arena_layer *geometry = &layers[il];
         if (!dynamic_arena_tensor_geometry(
                 model, layer->ffn_gate_exps, il, "gate",
+                false,
                 &geometry->gate_offset, &geometry->gate_expert_bytes) ||
             !dynamic_arena_tensor_geometry(
                 model, layer->ffn_up_exps, il, "up",
+                false,
                 &geometry->up_offset, &geometry->up_expert_bytes) ||
             !dynamic_arena_tensor_geometry(
                 model, layer->ffn_down_exps, il, "down",
+                false,
                 &geometry->down_offset, &geometry->down_expert_bytes) ||
             geometry->gate_expert_bytes > UINT64_MAX - geometry->up_expert_bytes ||
             geometry->gate_expert_bytes + geometry->up_expert_bytes >
@@ -19634,12 +19640,15 @@ static bool dynamic_arena_build_q1_0_layers(
         ds4_gpu_dynamic_arena_layer *geometry = &layers[il];
         if (!dynamic_arena_tensor_geometry(
                 model, g_q1_0_sidecar.gate[il], il, "Q1_0 gate",
+                true,
                 &geometry->gate_offset, &geometry->gate_expert_bytes) ||
             !dynamic_arena_tensor_geometry(
                 model, g_q1_0_sidecar.up[il], il, "Q1_0 up",
+                true,
                 &geometry->up_offset, &geometry->up_expert_bytes) ||
             !dynamic_arena_tensor_geometry(
                 model, g_q1_0_sidecar.down[il], il, "Q1_0 down",
+                true,
                 &geometry->down_offset, &geometry->down_expert_bytes) ||
             geometry->gate_expert_bytes > UINT64_MAX - geometry->up_expert_bytes ||
             geometry->gate_expert_bytes + geometry->up_expert_bytes >

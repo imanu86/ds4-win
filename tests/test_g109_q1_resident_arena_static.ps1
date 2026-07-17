@@ -82,6 +82,13 @@ foreach ($needle in @(
     'g_q1_0_sidecar.down[il]')) {
     Require-Text $geometry $needle "active-range-only geometry"
 }
+foreach ($needle in @(
+    '? tensor->type == DS4_TENSOR_Q1_0',
+    ': tensor_is_routed_expert_type(tensor->type)',
+    'g_q1_0_sidecar.gate[il], il, "Q1_0 gate",',
+    'true,')) {
+    Require-Text $coreText $needle "Q1-only geometry type gate"
+}
 Forbid-Text $geometry 'for (uint32_t il = 0; il < DS4_N_LAYER; il++)' `
     "active-range-only geometry"
 
