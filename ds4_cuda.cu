@@ -18141,7 +18141,10 @@ static int cuda_moe_tiering_ram_ptrs(
 }
 
 static int cuda_moe_tiering_pick_ram_slot(
-        uint32_t current_layer, uint32_t current_expert) {
+        uint32_t current_layer, uint32_t current_expert,
+        size_t *victim_entry_out) {
+    if (!victim_entry_out) return -1;
+    *victim_entry_out = SIZE_MAX;
     for (uint32_t slot = 0; slot < g_dynamic_arena.slots.size(); slot++) {
         if (g_dynamic_arena.slots[slot].state == DS4_GPU_ARENA_FREE) {
             return (int)slot;
@@ -18166,22 +18169,7 @@ static int cuda_moe_tiering_pick_ram_slot(
             best_entry = index;
         }
     }
-    if (best_slot >= 0) {
-        cuda_moe_tier_entry &victim = g_moe_tiering.entries[best_entry];
-        victim.ram_slot = UINT32_MAX;
-        victim.ram_generation = 0;
-        victim.vram_eligible_after_call = 0;
-        victim.has_2bit_ram = 0;
-        victim.promoted_from_iq1_cold = 0;
-        victim.state = CUDA_MOE_TIER_SSD_COLD;
-        cuda_dynamic_arena_slot &slot =
-            g_dynamic_arena.slots[(uint32_t)best_slot];
-        slot.state = DS4_GPU_ARENA_FREE;
-        slot.layer = UINT32_MAX;
-        slot.expert = UINT32_MAX;
-        slot.checksum = 0;
-        g_moe_tiering.ram_evictions++;
-    }
+    if (best_slot >= 0) *victim_entry_out = best_entry;
     return best_slot;
 }
 
@@ -18194,17 +18182,35 @@ static int cuda_moe_tiering_load_to_ram(
             request.gate_expert_bytes * 2ull + request.down_expert_bytes) {
         return 0;
     }
-    const int slot_i = cuda_moe_tiering_pick_ram_slot(layer, expert);
+    size_t victim_entry_index = SIZE_MAX;
+    const int slot_i = cuda_moe_tiering_pick_ram_slot(
+        layer, expert, &victim_entry_index);
     if (slot_i < 0) {
         g_moe_tiering.ram_admit_skips++;
         return 0;
     }
     cuda_dynamic_arena_slot &slot = g_dynamic_arena.slots[(uint32_t)slot_i];
-    slot.state = DS4_GPU_ARENA_LOADING;
-    slot.layer = layer;
-    slot.expert = expert;
-    slot.content_generation = ++g_dynamic_arena.next_generation;
-    char *host_gate = slot.host_ptr;
+    const int replacing = victim_entry_index != SIZE_MAX;
+    static thread_local std::vector<char> replacement_scratch;
+    char *read_base = slot.host_ptr;
+    if (replacing) {
+        try {
+            replacement_scratch.resize((size_t)g_dynamic_arena.slot_bytes);
+        } catch (...) {
+            g_moe_tiering.ram_admit_skips++;
+            g_moe_tiering.failures++;
+            return 0;
+        }
+        read_base = replacement_scratch.data();
+    } else {
+        slot.state = DS4_GPU_ARENA_LOADING;
+        slot.layer = layer;
+        slot.expert = expert;
+        slot.content_generation = ++g_dynamic_arena.next_generation;
+        slot.checksum = 0;
+        slot.last_dma_sequence = 0;
+    }
+    char *host_gate = read_base;
     char *host_up = host_gate + request.gate_expert_bytes;
     char *host_down = host_up + request.gate_expert_bytes;
     const uint64_t gate_src = request.gate_offset +
@@ -18220,11 +18226,49 @@ static int cuda_moe_tiering_load_to_ram(
                          request.gate_expert_bytes, up_src) ||
         !cuda_pread_full(&g_model_file, host_down,
                          request.down_expert_bytes, down_src)) {
-        slot.state = DS4_GPU_ARENA_FREE;
-        slot.layer = UINT32_MAX;
-        slot.expert = UINT32_MAX;
+        if (!replacing) {
+            slot.state = DS4_GPU_ARENA_FREE;
+            slot.layer = UINT32_MAX;
+            slot.expert = UINT32_MAX;
+            slot.checksum = 0;
+        }
         g_moe_tiering.failures++;
         return 0;
+    }
+    if (replacing) {
+        if (victim_entry_index >= g_moe_tiering.entries.size()) {
+            g_moe_tiering.failures++;
+            return 0;
+        }
+        cuda_moe_tier_entry &victim =
+            g_moe_tiering.entries[victim_entry_index];
+        const uint32_t victim_layer =
+            (uint32_t)(victim_entry_index / 256u);
+        const uint32_t victim_expert =
+            (uint32_t)(victim_entry_index % 256u);
+        if (victim.ram_slot != (uint32_t)slot_i ||
+            victim.ram_generation != slot.content_generation ||
+            slot.layer != victim_layer || slot.expert != victim_expert ||
+            (slot.state != DS4_GPU_ARENA_READY &&
+             slot.state != DS4_GPU_ARENA_STAGED)) {
+            g_moe_tiering.failures++;
+            return 0;
+        }
+        victim.ram_slot = UINT32_MAX;
+        victim.ram_generation = 0;
+        victim.vram_eligible_after_call = 0;
+        victim.has_2bit_ram = 0;
+        victim.promoted_from_iq1_cold = 0;
+        victim.state = CUDA_MOE_TIER_SSD_COLD;
+        slot.state = DS4_GPU_ARENA_LOADING;
+        slot.layer = layer;
+        slot.expert = expert;
+        slot.content_generation = ++g_dynamic_arena.next_generation;
+        slot.checksum = 0;
+        slot.last_dma_sequence = 0;
+        memcpy(slot.host_ptr, replacement_scratch.data(),
+               (size_t)g_dynamic_arena.slot_bytes);
+        g_moe_tiering.ram_evictions++;
     }
     slot.checksum = cuda_dynamic_arena_fnv1a64(
         (const uint8_t *)slot.host_ptr, g_dynamic_arena.slot_bytes);
