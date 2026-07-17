@@ -110,6 +110,12 @@ param(
     [switch]$Iq1SMixedGpuPlan,
     [switch]$Iq1Promotion,
     [ValidateRange(1, 512)][int]$Iq1PromotionProbationSlots = 16,
+    [ValidateRange(1, 1000000)][int]$Iq1PromotionMinTouches = 1,
+    [ValidateRange(0.0, 1000000.0)][double]$Iq1PromotionMinWeight = 0.0,
+    [ValidateRange(0.0, 1000000.0)][double]$Iq1PromotionMinMass = 0.0,
+    [ValidateRange(0, 1000000)][int]$Iq1PromotionRequestBudget = 0,
+    [ValidateRange(0, 1000000)][int]$Iq1PromotionWindowCalls = 0,
+    [ValidateRange(0, 1000000)][int]$Iq1PromotionWindowBudget = 0,
     [ValidateRange(0.0, 48.0)][double]$Iq1SRamCacheGiB = 0.0,
     [switch]$Iq1SMixedDebug,
     [switch]$Iq1SProfile,
@@ -435,6 +441,18 @@ if ($Iq1Promotion) {
     if (-not $ComposePrefillMassTiering) { throw "Iq1Promotion requires ComposePrefillMassTiering" }
     if ($ExpertTiering -ne "enforce") { throw "Iq1Promotion requires ExpertTiering enforce" }
 }
+if (($Iq1PromotionWindowCalls -eq 0) -ne ($Iq1PromotionWindowBudget -eq 0)) {
+    throw "Iq1PromotionWindowCalls and Iq1PromotionWindowBudget must both be zero or both be greater than zero"
+}
+if (-not $Iq1Promotion -and
+    ($Iq1PromotionMinTouches -ne 1 -or
+     $Iq1PromotionMinWeight -ne 0.0 -or
+     $Iq1PromotionMinMass -ne 0.0 -or
+     $Iq1PromotionRequestBudget -ne 0 -or
+     $Iq1PromotionWindowCalls -ne 0 -or
+     $Iq1PromotionWindowBudget -ne 0)) {
+    throw "Non-default IQ1 promotion knobs require -Iq1Promotion"
+}
 if ($ComposePrefillMassOpenRouter) {
     if (-not $ComposePrefillMassTiering) { throw "ComposePrefillMassOpenRouter requires ComposePrefillMassTiering" }
     if (-not $PrefillMassWrap) { throw "ComposePrefillMassOpenRouter requires PrefillMassWrap" }
@@ -593,8 +611,22 @@ if ($Iq1SMixedGpuPlan) {
 }
 if ($Iq1Promotion) {
     $env:DS4_IQ1_PROMOTION_PROBATION_SLOTS = "$Iq1PromotionProbationSlots"
+    $env:DS4_IQ1_PROMOTION_MIN_TOUCHES = "$Iq1PromotionMinTouches"
+    $env:DS4_IQ1_PROMOTION_MIN_WEIGHT =
+        $Iq1PromotionMinWeight.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+    $env:DS4_IQ1_PROMOTION_MIN_MASS =
+        $Iq1PromotionMinMass.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+    $env:DS4_IQ1_PROMOTION_REQUEST_BUDGET = "$Iq1PromotionRequestBudget"
+    $env:DS4_IQ1_PROMOTION_WINDOW_CALLS = "$Iq1PromotionWindowCalls"
+    $env:DS4_IQ1_PROMOTION_WINDOW_BUDGET = "$Iq1PromotionWindowBudget"
 } else {
     Remove-Item Env:\DS4_IQ1_PROMOTION_PROBATION_SLOTS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_PROMOTION_MIN_TOUCHES -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_PROMOTION_MIN_WEIGHT -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_PROMOTION_MIN_MASS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_PROMOTION_REQUEST_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_PROMOTION_WINDOW_CALLS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_IQ1_PROMOTION_WINDOW_BUDGET -ErrorAction SilentlyContinue
 }
 if ($Iq1SRamCacheGiB -gt 0.0) {
     $env:DS4_IQ1_S_RAM_CACHE_GB = $Iq1SRamCacheGiB.ToString(
@@ -3178,9 +3210,25 @@ $iq1PromotionRequestedSlots = [UInt64]0
 $iq1PromotionReservedSlots = [UInt64]0
 $iq1PromotionSnapshotEvictions = [UInt64]0
 $iq1PromotionReserveStrategies = @()
+$iq1PromotionObservedMinTouches = 0
+$iq1PromotionObservedMinWeight = 0.0
+$iq1PromotionObservedMinMass = 0.0
+$iq1PromotionObservedRequestBudget = 0
+$iq1PromotionObservedWindowCalls = 0
+$iq1PromotionObservedWindowBudget = 0
 $iq1PromotionColdObserved = [UInt64]0
 $iq1PromotionColdExisting2Bit = [UInt64]0
 $iq1PromotionColdTo2BitRam = [UInt64]0
+$iq1PromotionColdGateCandidates = [UInt64]0
+$iq1PromotionWeightGe001 = [UInt64]0
+$iq1PromotionWeightGe002 = [UInt64]0
+$iq1PromotionWeightGe005 = [UInt64]0
+$iq1PromotionWeightGe010 = [UInt64]0
+$iq1PromotionSkipsTouches = [UInt64]0
+$iq1PromotionSkipsWeight = [UInt64]0
+$iq1PromotionSkipsMass = [UInt64]0
+$iq1PromotionSkipsRequestBudget = [UInt64]0
+$iq1PromotionSkipsWindowBudget = [UInt64]0
 $iq1PromotionProbationRamHits = [UInt64]0
 $iq1PromotionNextTokenWaits = [UInt64]0
 $iq1Promotion2BitSsdBytes = [UInt64]0
@@ -3247,47 +3295,122 @@ if ($Iq1SMixedGpuPlan) {
 
 $iq1PromotionMatches = [regex]::Matches(
     $iq1SSidecarLogText,
-    '(?m)^(?:ds4: )?\[iq1-promotion\] final requested_slots=(\d+) reserved_slots=(\d+)(?: strategy=([a-z0-9-]+))? snapshot_evictions=(\d+) cold_observed=(\d+) cold_existing_2bit=(\d+) cold_to_2bit_ram=(\d+) probation_ram_hits=(\d+) next_token_waits=(\d+) promotion_2bit_ssd_bytes=(\d+) promotion_2bit_ssd_seconds=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?) direct_ssd_to_vram_rejected=(\d+) probation_backing_reclaims=(\d+) failures=(\d+)\r?$')
+    '(?m)^(?:ds4: )?\[iq1-promotion\] final (?<kv>.+?)\r?$')
 $iq1PromotionLineCount = $iq1PromotionMatches.Count
 if ($Iq1Promotion) {
     if ($iq1PromotionLineCount -ne $requestCountExpected) {
         throw "IQ1 promotion requires one final line per request; expected $requestCountExpected observed $iq1PromotionLineCount"
     }
+    $iq1PromotionRequiredFields = @(
+        "requested_slots", "reserved_slots", "snapshot_evictions",
+        "min_touches", "min_weight", "min_mass", "request_budget",
+        "window_calls", "window_budget", "cold_gate_candidates",
+        "weight_ge_001", "weight_ge_002", "weight_ge_005",
+        "weight_ge_010", "skips_touches", "skips_weight",
+        "skips_mass", "skips_request_budget", "skips_window_budget",
+        "cold_observed", "cold_existing_2bit", "cold_to_2bit_ram",
+        "probation_ram_hits", "next_token_waits",
+        "promotion_2bit_ssd_bytes", "promotion_2bit_ssd_seconds",
+        "direct_ssd_to_vram_rejected", "probation_backing_reclaims",
+        "failures")
     for ($iq1PromotionIndex = 0; $iq1PromotionIndex -lt $iq1PromotionMatches.Count; $iq1PromotionIndex++) {
         $iq1PromotionMatch = $iq1PromotionMatches[$iq1PromotionIndex]
+        $iq1PromotionFields = @{}
+        foreach ($iq1PromotionPart in @($iq1PromotionMatch.Groups["kv"].Value -split " ")) {
+            if ([string]::IsNullOrWhiteSpace($iq1PromotionPart)) { continue }
+            $iq1PromotionSeparator = $iq1PromotionPart.IndexOf("=")
+            if ($iq1PromotionSeparator -le 0) {
+                throw "IQ1 promotion malformed key/value token at request $($iq1PromotionIndex + 1): $iq1PromotionPart"
+            }
+            $iq1PromotionKey = $iq1PromotionPart.Substring(0, $iq1PromotionSeparator)
+            $iq1PromotionValue = $iq1PromotionPart.Substring($iq1PromotionSeparator + 1)
+            if ($iq1PromotionFields.ContainsKey($iq1PromotionKey)) {
+                throw "IQ1 promotion duplicate telemetry key at request $($iq1PromotionIndex + 1): $iq1PromotionKey"
+            }
+            $iq1PromotionFields[$iq1PromotionKey] = $iq1PromotionValue
+        }
+        foreach ($iq1PromotionKey in @($iq1PromotionFields.Keys)) {
+            if ($iq1PromotionKey -ne "strategy" -and
+                $iq1PromotionRequiredFields -notcontains $iq1PromotionKey) {
+                throw "IQ1 promotion unexpected telemetry key at request $($iq1PromotionIndex + 1): $iq1PromotionKey"
+            }
+        }
+        foreach ($iq1PromotionRequiredField in $iq1PromotionRequiredFields) {
+            if (-not $iq1PromotionFields.ContainsKey($iq1PromotionRequiredField)) {
+                throw "IQ1 promotion final telemetry omitted $iq1PromotionRequiredField at request $($iq1PromotionIndex + 1)"
+            }
+        }
         $iq1PromotionRow = [pscustomobject]@{
             request_index = ($iq1PromotionIndex + 1)
             repeat = $(if ($Warmup -and $iq1PromotionIndex -eq 0) { 0 } else { $iq1PromotionIndex + $(if ($Warmup) { 0 } else { 1 }) })
             warmup = [bool]($Warmup -and $iq1PromotionIndex -eq 0)
-            requested_slots = [UInt64]$iq1PromotionMatch.Groups[1].Value
-            reserved_slots = [UInt64]$iq1PromotionMatch.Groups[2].Value
-            reserve_strategy = $(if ($iq1PromotionMatch.Groups[3].Success) { $iq1PromotionMatch.Groups[3].Value } else { "snapshot-evict" })
-            snapshot_evictions = [UInt64]$iq1PromotionMatch.Groups[4].Value
-            cold_observed = [UInt64]$iq1PromotionMatch.Groups[5].Value
-            cold_existing_2bit = [UInt64]$iq1PromotionMatch.Groups[6].Value
-            cold_to_2bit_ram = [UInt64]$iq1PromotionMatch.Groups[7].Value
-            probation_ram_hits = [UInt64]$iq1PromotionMatch.Groups[8].Value
-            next_token_waits = [UInt64]$iq1PromotionMatch.Groups[9].Value
-            promotion_2bit_ssd_bytes = [UInt64]$iq1PromotionMatch.Groups[10].Value
+            requested_slots = [UInt64]$iq1PromotionFields["requested_slots"]
+            reserved_slots = [UInt64]$iq1PromotionFields["reserved_slots"]
+            reserve_strategy = $(if ($iq1PromotionFields.ContainsKey("strategy")) { $iq1PromotionFields["strategy"] } else { "snapshot-evict" })
+            snapshot_evictions = [UInt64]$iq1PromotionFields["snapshot_evictions"]
+            min_touches = [int]$iq1PromotionFields["min_touches"]
+            min_weight = [double]::Parse($iq1PromotionFields["min_weight"], [Globalization.CultureInfo]::InvariantCulture)
+            min_mass = [double]::Parse($iq1PromotionFields["min_mass"], [Globalization.CultureInfo]::InvariantCulture)
+            request_budget = [int]$iq1PromotionFields["request_budget"]
+            window_calls = [int]$iq1PromotionFields["window_calls"]
+            window_budget = [int]$iq1PromotionFields["window_budget"]
+            cold_gate_candidates = [UInt64]$iq1PromotionFields["cold_gate_candidates"]
+            weight_ge_001 = [UInt64]$iq1PromotionFields["weight_ge_001"]
+            weight_ge_002 = [UInt64]$iq1PromotionFields["weight_ge_002"]
+            weight_ge_005 = [UInt64]$iq1PromotionFields["weight_ge_005"]
+            weight_ge_010 = [UInt64]$iq1PromotionFields["weight_ge_010"]
+            skips_touches = [UInt64]$iq1PromotionFields["skips_touches"]
+            skips_weight = [UInt64]$iq1PromotionFields["skips_weight"]
+            skips_mass = [UInt64]$iq1PromotionFields["skips_mass"]
+            skips_request_budget = [UInt64]$iq1PromotionFields["skips_request_budget"]
+            skips_window_budget = [UInt64]$iq1PromotionFields["skips_window_budget"]
+            cold_observed = [UInt64]$iq1PromotionFields["cold_observed"]
+            cold_existing_2bit = [UInt64]$iq1PromotionFields["cold_existing_2bit"]
+            cold_to_2bit_ram = [UInt64]$iq1PromotionFields["cold_to_2bit_ram"]
+            probation_ram_hits = [UInt64]$iq1PromotionFields["probation_ram_hits"]
+            next_token_waits = [UInt64]$iq1PromotionFields["next_token_waits"]
+            promotion_2bit_ssd_bytes = [UInt64]$iq1PromotionFields["promotion_2bit_ssd_bytes"]
             promotion_2bit_ssd_seconds = [double]::Parse(
-                $iq1PromotionMatch.Groups[11].Value,
+                $iq1PromotionFields["promotion_2bit_ssd_seconds"],
                 [Globalization.CultureInfo]::InvariantCulture)
-            direct_ssd_to_vram_rejected = [UInt64]$iq1PromotionMatch.Groups[12].Value
-            probation_backing_reclaims = [UInt64]$iq1PromotionMatch.Groups[13].Value
-            failures = [UInt64]$iq1PromotionMatch.Groups[14].Value
+            direct_ssd_to_vram_rejected = [UInt64]$iq1PromotionFields["direct_ssd_to_vram_rejected"]
+            probation_backing_reclaims = [UInt64]$iq1PromotionFields["probation_backing_reclaims"]
+            failures = [UInt64]$iq1PromotionFields["failures"]
         }
-        if ([double]::IsNaN($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
+        if ([double]::IsNaN($iq1PromotionRow.min_weight) -or
+            [double]::IsInfinity($iq1PromotionRow.min_weight) -or
+            $iq1PromotionRow.min_weight -lt 0.0 -or
+            [double]::IsNaN($iq1PromotionRow.min_mass) -or
+            [double]::IsInfinity($iq1PromotionRow.min_mass) -or
+            $iq1PromotionRow.min_mass -lt 0.0 -or
+            [double]::IsNaN($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
             [double]::IsInfinity($iq1PromotionRow.promotion_2bit_ssd_seconds) -or
             $iq1PromotionRow.promotion_2bit_ssd_seconds -lt 0.0) {
-            throw "IQ1 promotion SSD seconds are invalid at request $($iq1PromotionIndex + 1)"
+            throw "IQ1 promotion numeric telemetry is invalid at request $($iq1PromotionIndex + 1)"
         }
         $expectedPromotionSnapshotEvictions = if ($ComposePrefillMassOpenRouter) { [UInt64]0 } else { [UInt64]$Iq1PromotionProbationSlots }
+        [UInt64]$iq1PromotionSuppressed =
+            $iq1PromotionRow.skips_touches +
+            $iq1PromotionRow.skips_weight +
+            $iq1PromotionRow.skips_mass +
+            $iq1PromotionRow.skips_request_budget +
+            $iq1PromotionRow.skips_window_budget
         if ($iq1PromotionRow.requested_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
             $iq1PromotionRow.reserved_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
+            $iq1PromotionRow.min_touches -ne $Iq1PromotionMinTouches -or
+            [math]::Abs($iq1PromotionRow.min_weight - $Iq1PromotionMinWeight) -gt 0.000000000001 -or
+            [math]::Abs($iq1PromotionRow.min_mass - $Iq1PromotionMinMass) -gt 0.000000000001 -or
+            $iq1PromotionRow.request_budget -ne $Iq1PromotionRequestBudget -or
+            $iq1PromotionRow.window_calls -ne $Iq1PromotionWindowCalls -or
+            $iq1PromotionRow.window_budget -ne $Iq1PromotionWindowBudget -or
             ($ComposePrefillMassOpenRouter -and $iq1PromotionRow.reserve_strategy -ne "pre-reserved-open-router") -or
             $iq1PromotionRow.snapshot_evictions -ne $expectedPromotionSnapshotEvictions -or
             $iq1PromotionRow.cold_observed -le 0 -or
-            ($iq1PromotionRow.cold_to_2bit_ram + $iq1PromotionRow.cold_existing_2bit) -le 0 -or
+            ($iq1PromotionRow.cold_existing_2bit +
+                $iq1PromotionRow.cold_gate_candidates) -le 0 -or
+            $iq1PromotionRow.cold_gate_candidates -ne
+                ($iq1PromotionRow.cold_to_2bit_ram +
+                 $iq1PromotionSuppressed) -or
             $iq1PromotionRow.direct_ssd_to_vram_rejected -ne 0 -or
             $iq1PromotionRow.failures -ne 0) {
             throw "IQ1 promotion final counters are inconsistent at request $($iq1PromotionIndex + 1)"
@@ -3297,9 +3420,25 @@ if ($Iq1Promotion) {
         $iq1PromotionReservedSlots += $iq1PromotionRow.reserved_slots
         $iq1PromotionSnapshotEvictions += $iq1PromotionRow.snapshot_evictions
         $iq1PromotionReserveStrategies += $iq1PromotionRow.reserve_strategy
+        $iq1PromotionObservedMinTouches = $iq1PromotionRow.min_touches
+        $iq1PromotionObservedMinWeight = $iq1PromotionRow.min_weight
+        $iq1PromotionObservedMinMass = $iq1PromotionRow.min_mass
+        $iq1PromotionObservedRequestBudget = $iq1PromotionRow.request_budget
+        $iq1PromotionObservedWindowCalls = $iq1PromotionRow.window_calls
+        $iq1PromotionObservedWindowBudget = $iq1PromotionRow.window_budget
         $iq1PromotionColdObserved += $iq1PromotionRow.cold_observed
         $iq1PromotionColdExisting2Bit += $iq1PromotionRow.cold_existing_2bit
         $iq1PromotionColdTo2BitRam += $iq1PromotionRow.cold_to_2bit_ram
+        $iq1PromotionColdGateCandidates += $iq1PromotionRow.cold_gate_candidates
+        $iq1PromotionWeightGe001 += $iq1PromotionRow.weight_ge_001
+        $iq1PromotionWeightGe002 += $iq1PromotionRow.weight_ge_002
+        $iq1PromotionWeightGe005 += $iq1PromotionRow.weight_ge_005
+        $iq1PromotionWeightGe010 += $iq1PromotionRow.weight_ge_010
+        $iq1PromotionSkipsTouches += $iq1PromotionRow.skips_touches
+        $iq1PromotionSkipsWeight += $iq1PromotionRow.skips_weight
+        $iq1PromotionSkipsMass += $iq1PromotionRow.skips_mass
+        $iq1PromotionSkipsRequestBudget += $iq1PromotionRow.skips_request_budget
+        $iq1PromotionSkipsWindowBudget += $iq1PromotionRow.skips_window_budget
         $iq1PromotionProbationRamHits += $iq1PromotionRow.probation_ram_hits
         $iq1PromotionNextTokenWaits += $iq1PromotionRow.next_token_waits
         $iq1Promotion2BitSsdBytes += $iq1PromotionRow.promotion_2bit_ssd_bytes
@@ -4263,11 +4402,33 @@ $expertTieringResult = [pscustomobject]@{
     prefill_vram_seed_semantics = $prefillVramSeedSemantics
     iq1_promotion_requested = [bool]$Iq1Promotion
     iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_min_touches_requested = $Iq1PromotionMinTouches
+    iq1_promotion_min_weight_requested = $Iq1PromotionMinWeight
+    iq1_promotion_min_mass_requested = $Iq1PromotionMinMass
+    iq1_promotion_request_budget_requested = $Iq1PromotionRequestBudget
+    iq1_promotion_window_calls_requested = $Iq1PromotionWindowCalls
+    iq1_promotion_window_budget_requested = $Iq1PromotionWindowBudget
     iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
     iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
     iq1_promotion_reserve_strategies = $iq1PromotionReserveStrategies
+    iq1_promotion_min_touches = $iq1PromotionObservedMinTouches
+    iq1_promotion_min_weight = $iq1PromotionObservedMinWeight
+    iq1_promotion_min_mass = $iq1PromotionObservedMinMass
+    iq1_promotion_request_budget = $iq1PromotionObservedRequestBudget
+    iq1_promotion_window_calls = $iq1PromotionObservedWindowCalls
+    iq1_promotion_window_budget = $iq1PromotionObservedWindowBudget
+    iq1_promotion_cold_gate_candidates = $iq1PromotionColdGateCandidates
+    iq1_promotion_weight_ge_001 = $iq1PromotionWeightGe001
+    iq1_promotion_weight_ge_002 = $iq1PromotionWeightGe002
+    iq1_promotion_weight_ge_005 = $iq1PromotionWeightGe005
+    iq1_promotion_weight_ge_010 = $iq1PromotionWeightGe010
+    iq1_promotion_skips_touches = $iq1PromotionSkipsTouches
+    iq1_promotion_skips_weight = $iq1PromotionSkipsWeight
+    iq1_promotion_skips_mass = $iq1PromotionSkipsMass
+    iq1_promotion_skips_request_budget = $iq1PromotionSkipsRequestBudget
+    iq1_promotion_skips_window_budget = $iq1PromotionSkipsWindowBudget
     iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
     iq1_promotion_2bit_ssd_seconds = $iq1Promotion2BitSsdSeconds
     iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
@@ -4429,15 +4590,37 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
     iq1_promotion_requested = [bool]$Iq1Promotion
     iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_min_touches_requested = $Iq1PromotionMinTouches
+    iq1_promotion_min_weight_requested = $Iq1PromotionMinWeight
+    iq1_promotion_min_mass_requested = $Iq1PromotionMinMass
+    iq1_promotion_request_budget_requested = $Iq1PromotionRequestBudget
+    iq1_promotion_window_calls_requested = $Iq1PromotionWindowCalls
+    iq1_promotion_window_budget_requested = $Iq1PromotionWindowBudget
     iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
     iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
     iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
     iq1_promotion_reserve_strategies = $iq1PromotionReserveStrategies
+    iq1_promotion_min_touches = $iq1PromotionObservedMinTouches
+    iq1_promotion_min_weight = $iq1PromotionObservedMinWeight
+    iq1_promotion_min_mass = $iq1PromotionObservedMinMass
+    iq1_promotion_request_budget = $iq1PromotionObservedRequestBudget
+    iq1_promotion_window_calls = $iq1PromotionObservedWindowCalls
+    iq1_promotion_window_budget = $iq1PromotionObservedWindowBudget
     iq1_promotion_cold_observed = $iq1PromotionColdObserved
     iq1_promotion_cold_existing_2bit = $iq1PromotionColdExisting2Bit
     iq1_promotion_cold_to_2bit_ram = $iq1PromotionColdTo2BitRam
+    iq1_promotion_cold_gate_candidates = $iq1PromotionColdGateCandidates
+    iq1_promotion_weight_ge_001 = $iq1PromotionWeightGe001
+    iq1_promotion_weight_ge_002 = $iq1PromotionWeightGe002
+    iq1_promotion_weight_ge_005 = $iq1PromotionWeightGe005
+    iq1_promotion_weight_ge_010 = $iq1PromotionWeightGe010
+    iq1_promotion_skips_touches = $iq1PromotionSkipsTouches
+    iq1_promotion_skips_weight = $iq1PromotionSkipsWeight
+    iq1_promotion_skips_mass = $iq1PromotionSkipsMass
+    iq1_promotion_skips_request_budget = $iq1PromotionSkipsRequestBudget
+    iq1_promotion_skips_window_budget = $iq1PromotionSkipsWindowBudget
     iq1_promotion_probation_ram_hits = $iq1PromotionProbationRamHits
     iq1_promotion_next_token_waits = $iq1PromotionNextTokenWaits
     iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
@@ -4580,14 +4763,45 @@ $summary = [pscustomobject]@{
     iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
     iq1_promotion_requested = [bool]$Iq1Promotion
     iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_requested_config = [pscustomobject]@{
+        probation_slots = $Iq1PromotionProbationSlots
+        min_touches = $Iq1PromotionMinTouches
+        min_weight = $Iq1PromotionMinWeight
+        min_mass = $Iq1PromotionMinMass
+        request_budget = $Iq1PromotionRequestBudget
+        window_calls = $Iq1PromotionWindowCalls
+        window_budget = $Iq1PromotionWindowBudget
+    }
+    iq1_promotion_min_touches_requested = $Iq1PromotionMinTouches
+    iq1_promotion_min_weight_requested = $Iq1PromotionMinWeight
+    iq1_promotion_min_mass_requested = $Iq1PromotionMinMass
+    iq1_promotion_request_budget_requested = $Iq1PromotionRequestBudget
+    iq1_promotion_window_calls_requested = $Iq1PromotionWindowCalls
+    iq1_promotion_window_budget_requested = $Iq1PromotionWindowBudget
     iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
     iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
     iq1_promotion_snapshot_evictions = $iq1PromotionSnapshotEvictions
+    iq1_promotion_min_touches = $iq1PromotionObservedMinTouches
+    iq1_promotion_min_weight = $iq1PromotionObservedMinWeight
+    iq1_promotion_min_mass = $iq1PromotionObservedMinMass
+    iq1_promotion_request_budget = $iq1PromotionObservedRequestBudget
+    iq1_promotion_window_calls = $iq1PromotionObservedWindowCalls
+    iq1_promotion_window_budget = $iq1PromotionObservedWindowBudget
     iq1_promotion_cold_observed = $iq1PromotionColdObserved
     iq1_promotion_cold_existing_2bit = $iq1PromotionColdExisting2Bit
     iq1_promotion_cold_to_2bit_ram = $iq1PromotionColdTo2BitRam
+    iq1_promotion_cold_gate_candidates = $iq1PromotionColdGateCandidates
+    iq1_promotion_weight_ge_001 = $iq1PromotionWeightGe001
+    iq1_promotion_weight_ge_002 = $iq1PromotionWeightGe002
+    iq1_promotion_weight_ge_005 = $iq1PromotionWeightGe005
+    iq1_promotion_weight_ge_010 = $iq1PromotionWeightGe010
+    iq1_promotion_skips_touches = $iq1PromotionSkipsTouches
+    iq1_promotion_skips_weight = $iq1PromotionSkipsWeight
+    iq1_promotion_skips_mass = $iq1PromotionSkipsMass
+    iq1_promotion_skips_request_budget = $iq1PromotionSkipsRequestBudget
+    iq1_promotion_skips_window_budget = $iq1PromotionSkipsWindowBudget
     iq1_promotion_probation_ram_hits = $iq1PromotionProbationRamHits
     iq1_promotion_next_token_waits = $iq1PromotionNextTokenWaits
     iq1_promotion_2bit_ssd_bytes = $iq1Promotion2BitSsdBytes
@@ -5275,6 +5489,8 @@ Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/
 Write-Host ("IQ1_S VRAM cache hit-rate/H2D GiB: " + $(if (($iq1SVramCacheHits + $iq1SVramCacheMisses) -gt 0) { [math]::Round([double]$iq1SVramCacheHits / [double]($iq1SVramCacheHits + $iq1SVramCacheMisses), 4) } else { 0 }) + " / " + [math]::Round($iq1SVramCacheH2dBytes / 1GB, 3))
 Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures: " + $iq1MixedCalls + " / " + $iq1MixedHotMain + " / " + $iq1MixedColdIq1 + " / " + $iq1MixedPrimaryColdAvoided + " / " + $iq1MixedJoins + " / " + $iq1MixedFailures)
 Write-Host ("IQ1_S mixed GPU plan requested/observed/calls/wait-ms/failures: " + [bool]$Iq1SMixedGpuPlan + " / " + $iq1MixedGpuPlanRuntimeObserved + " / " + $iq1MixedGpuPlanCalls + " / " + $iq1MixedGpuPlanWaitMs + " / " + $iq1MixedGpuPlanFailures)
+Write-Host ("IQ1 promotion gate config min-touches/min-weight/min-mass/request-budget/window-calls/window-budget: " + $iq1PromotionObservedMinTouches + " / " + $iq1PromotionObservedMinWeight + " / " + $iq1PromotionObservedMinMass + " / " + $iq1PromotionObservedRequestBudget + " / " + $iq1PromotionObservedWindowCalls + " / " + $iq1PromotionObservedWindowBudget)
+Write-Host ("IQ1 promotion gate candidates weight>=.001/.002/.005/.010 skips touches/weight/mass/request/window: " + $iq1PromotionColdGateCandidates + " / " + $iq1PromotionWeightGe001 + " / " + $iq1PromotionWeightGe002 + " / " + $iq1PromotionWeightGe005 + " / " + $iq1PromotionWeightGe010 + " / " + $iq1PromotionSkipsTouches + " / " + $iq1PromotionSkipsWeight + " / " + $iq1PromotionSkipsMass + " / " + $iq1PromotionSkipsRequestBudget + " / " + $iq1PromotionSkipsWindowBudget)
 Write-Host ("IQ1 promotion requested/observed/lines/slots/cold/existing2bit/to2bitram/ssd-GiB/ssd-sec/ssd-Bps/direct-rejected/backing-reclaims/failures: " + [bool]$Iq1Promotion + " / " + $iq1PromotionRuntimeObserved + " / " + $iq1PromotionLineCount + " / " + $Iq1PromotionProbationSlots + " / " + $iq1PromotionColdObserved + " / " + $iq1PromotionColdExisting2Bit + " / " + $iq1PromotionColdTo2BitRam + " / " + [math]::Round($iq1Promotion2BitSsdBytes / 1GB, 3) + " / " + $iq1Promotion2BitSsdSeconds + " / " + [math]::Round($iq1Promotion2BitSsdBytesPerSecond, 3) + " / " + $iq1PromotionDirectSsdToVramRejected + " / " + $iq1PromotionProbationBackingReclaims + " / " + $iq1PromotionFailures)
 Write-Host ("IQ1_S profile/no-main-sync/packed-H2D: " + [bool]$Iq1SProfile + " / " + [bool]$Iq1SNoMainSync + " / " + [bool]$Iq1SPackedH2D)
 Write-Host ("IQ1_S profile SSD reads/ms H2D batches/copies/enqueue-ms/syncs/sync-ms: " + $iq1ProfileSsdReadCalls + " / " + $iq1ProfileSsdReadMs + " / " + $iq1ProfileH2dBatches + " / " + $iq1ProfileH2dCopies + " / " + $iq1ProfileH2dEnqueueMs + " / " + $iq1ProfileH2dSyncs + " / " + $iq1ProfileH2dSyncMs)
