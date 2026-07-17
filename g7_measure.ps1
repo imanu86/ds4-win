@@ -112,6 +112,7 @@ param(
     [ValidateRange(0, 42)][int]$Iq1SLayerFirst = 0,
     [ValidateRange(0, 42)][int]$Iq1SLayerLast = 42,
     [switch]$Iq1SMixedColdOne,
+    [switch]$Iq1SColdOnly,
     [switch]$Iq1SMixedGpuPlan,
     [switch]$Iq1Promotion,
     [ValidateRange(1, 512)][int]$Iq1PromotionProbationSlots = 16,
@@ -614,11 +615,17 @@ if (($ReuseVerifiedIq1SReceipt -or $ReuseVerifiedSuiteReceipt) -and
     -not $Iq1SExpertSidecar) {
     throw "ReuseVerifiedIq1SReceipt requires Iq1SExpertSidecar"
 }
-if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar) {
+if ($Iq1SMixedColdOne -and -not $Iq1SExpertSidecar -and -not $Iq1SColdOnly) {
     throw "Iq1SMixedColdOne requires Iq1SExpertSidecar"
 }
 if ($Iq1SMixedGpuPlan -and -not $Iq1SMixedColdOne) {
     throw "Iq1SMixedGpuPlan requires Iq1SMixedColdOne"
+}
+if ($Iq1SColdOnly) {
+    if (-not $Iq1SMixedColdOne) { throw "Iq1SColdOnly requires Iq1SMixedColdOne" }
+    if (-not $Iq1SExpertSidecar) { throw "Iq1SColdOnly requires Iq1SExpertSidecar" }
+    if ($ExpertTiering -ne "enforce") { throw "Iq1SColdOnly requires ExpertTiering enforce" }
+    if ($Iq1SMixedGpuPlan) { throw "Iq1SColdOnly is incompatible with Iq1SMixedGpuPlan" }
 }
 if ($Iq1Promotion) {
     if (-not $Iq1SExpertSidecar) { throw "Iq1Promotion requires Iq1SExpertSidecar" }
@@ -741,6 +748,7 @@ $memoryPreflightLog = Join-Path $outdir ("g7_" + $Tag + "_memory_preflight.json"
 $runtimeTelemetryLog = Join-Path $outdir ("g7_" + $Tag + "_runtime_telemetry.jsonl")
 $failurePath = Join-Path $outdir ("g7_" + $Tag + "_failure.json")
 $rawOutputsPath = Join-Path $outdir ("g7_" + $Tag + "_raw_outputs.json")
+$rawHttpCheckpointPath = Join-Path $outdir ("g7_" + $Tag + "_raw_http_checkpoint.json")
 $resultPath = Join-Path $outdir ("g7_" + $Tag + "_result.json")
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
@@ -750,6 +758,7 @@ if (Test-Path $systemQuiescenceLog) { Remove-Item $systemQuiescenceLog -Force }
 if (Test-Path $runtimeTelemetryLog) { Remove-Item $runtimeTelemetryLog -Force }
 if (Test-Path $failurePath) { Remove-Item $failurePath -Force }
 if (Test-Path $rawOutputsPath) { Remove-Item $rawOutputsPath -Force }
+if (Test-Path $rawHttpCheckpointPath) { Remove-Item $rawHttpCheckpointPath -Force }
 if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
 
 try {
@@ -839,6 +848,11 @@ if ($Iq1SMixedColdOne) {
     $env:DS4_IQ1_S_MIXED_COLD_K = "1"
 } else {
     Remove-Item Env:\DS4_IQ1_S_MIXED_COLD_K -ErrorAction SilentlyContinue
+}
+if ($Iq1SColdOnly) {
+    $env:DS4_IQ1_S_COLD_ONLY = "1"
+} else {
+    Remove-Item Env:\DS4_IQ1_S_COLD_ONLY -ErrorAction SilentlyContinue
 }
 if ($Iq1SMixedGpuPlan) {
     $env:DS4_IQ1_MIXED_GPU_PLAN = "1"
@@ -1933,6 +1947,16 @@ try {
     }
     Write-Host ("[g7] request FAILED: " + $_.Exception.Message + $(if ($responseBody) { " body=" + $responseBody } else { "" }))
 }
+
+# Preserve response bytes and hashes before runtime-log validation. A later
+# telemetry/parser failure must not erase the exactness evidence from the run.
+[pscustomobject]@{
+    schema = "g7_raw_http_checkpoint_v1"
+    tag = $Tag
+    http_ok = $httpOk
+    warmup = $warmupResult
+    results = @($results)
+} | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $rawHttpCheckpointPath
 
 if (-not $httpOk -and -not $proc.HasExited) { $proc.Kill() }
 $stopped = $proc.WaitForExit(120000)
@@ -3422,6 +3446,15 @@ if (Test-Path -LiteralPath $stdoutLog) {
 $iq1SSidecarSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
     '\[iq1-s-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)')
+$iq1ColdOnlySummaryPattern =
+    '\[iq1-cold-only\] result=summary calls=(\d+) routes=(\d+) main_vram=(\d+) main_snapshot_ram=(\d+) main_tier_ram=(\d+) main_ssd_cold=(\d+) iq1_ram_hits=(\d+) eligible=(\d+) substitutions=(\d+) fallback_all_main=(\d+) skipped_iq1_miss=(\d+) uncertain=(\d+) failures=(\d+)'
+$iq1ColdOnlyEarlyMatches = [regex]::Matches(
+    $iq1SSidecarLogText, $iq1ColdOnlySummaryPattern)
+$iq1ColdOnlyZeroUse = $false
+if ($Iq1SColdOnly -and $iq1ColdOnlyEarlyMatches.Count -eq 1) {
+    $iq1ColdOnlyZeroUse =
+        [UInt64]$iq1ColdOnlyEarlyMatches[0].Groups[9].Value -eq 0
+}
 if ($Iq1SExpertSidecar) {
     foreach ($marker in @(
             "validated concatenated split GGUF",
@@ -3440,9 +3473,14 @@ if ($Iq1SExpertSidecar) {
     $iq1SSidecarSlots = [UInt64]$iq1SSidecarSummary.Groups[2].Value
     $iq1SSidecarSelectedLoads = [UInt64]$iq1SSidecarSummary.Groups[3].Value
     $iq1SSidecarFailures = [UInt64]$iq1SSidecarSummary.Groups[4].Value
-    if ($iq1SSidecarCalls -eq 0 -or
-        $iq1SSidecarSlots -lt $iq1SSidecarCalls -or
-        $iq1SSidecarSelectedLoads -ne $iq1SSidecarCalls -or
+    $iq1SSidecarZeroUse =
+        $iq1SSidecarCalls -eq 0 -and
+        $iq1SSidecarSlots -eq 0 -and
+        $iq1SSidecarSelectedLoads -eq 0
+    if ((-not ($iq1ColdOnlyZeroUse -and $iq1SSidecarZeroUse) -and
+            ($iq1SSidecarCalls -eq 0 -or
+             $iq1SSidecarSlots -lt $iq1SSidecarCalls -or
+             $iq1SSidecarSelectedLoads -ne $iq1SSidecarCalls)) -or
         $iq1SSidecarFailures -ne 0) {
         throw "IQ1_S sidecar runtime counters are inconsistent"
     }
@@ -3465,6 +3503,7 @@ $iq1SRamCacheFailures = [UInt64]0
 $iq1SRamCacheHitRate = 0.0
 $iq1SRamCacheSsdAvoidedBytes = [UInt64]0
 $iq1SRamCacheRuntimeObserved = $false
+$iq1SRamCacheDeferredUnused = $false
 $iq1SRamCachePreloadFrozen = $false
 $iq1SRamCachePreloadLayers = [UInt32]0
 $iq1SRamCachePreloadEntries = [UInt64]0
@@ -3486,10 +3525,15 @@ $iq1SRamCacheReadyMatches = [regex]::Matches(
 $iq1SRamCacheSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText, $iq1SRamCacheSummaryPattern)
 if ($Iq1SRamCacheGiB -gt 0.0) {
-    if ($iq1SRamCacheReadyMatches.Count -ne 1 -or
+    if ($iq1ColdOnlyZeroUse -and
+        $iq1SRamCacheReadyMatches.Count -eq 0 -and
+        $iq1SRamCacheSummaryMatches.Count -eq 0) {
+        $iq1SRamCacheDeferredUnused = $true
+    } elseif ($iq1SRamCacheReadyMatches.Count -ne 1 -or
         $iq1SRamCacheSummaryMatches.Count -ne 1) {
         throw "IQ1_S RAM cache requires exactly one ready marker and one summary; observed ready=$($iq1SRamCacheReadyMatches.Count) summary=$($iq1SRamCacheSummaryMatches.Count)"
     }
+    if (-not $iq1SRamCacheDeferredUnused) {
     $iq1SRamCacheSummary = $iq1SRamCacheSummaryMatches[0]
     $iq1SRamCacheRequestedBytes = [UInt64]$iq1SRamCacheSummary.Groups[1].Value
     $iq1SRamCacheAllocatedBytes = [UInt64]$iq1SRamCacheSummary.Groups[2].Value
@@ -3554,6 +3598,7 @@ if ($Iq1SRamCacheGiB -gt 0.0) {
     $iq1SRamCacheHitRate = [double]$iq1SRamCacheHits / [double]$iq1SRamCacheAccesses
     $iq1SRamCacheSsdAvoidedBytes = [UInt64]($iq1SRamCacheHits * $iq1SRamCacheSlotBytes)
     $iq1SRamCacheRuntimeObserved = $true
+    }
 } elseif ($iq1SRamCacheReadyMatches.Count -ne 0 -or
           $iq1SRamCacheSummaryMatches.Count -ne 0) {
     throw "IQ1_S RAM cache telemetry appeared while the cache was disabled"
@@ -3632,6 +3677,20 @@ $iq1MixedGpuPlanRuntimeObserved = $false
 $iq1MixedGpuPlanCalls = [UInt64]0
 $iq1MixedGpuPlanWaitMs = 0.0
 $iq1MixedGpuPlanFailures = [UInt64]0
+$iq1ColdOnlyRuntimeObserved = $false
+$iq1ColdOnlyCalls = [UInt64]0
+$iq1ColdOnlyRoutes = [UInt64]0
+$iq1ColdOnlyMainVram = [UInt64]0
+$iq1ColdOnlyMainSnapshotRam = [UInt64]0
+$iq1ColdOnlyMainTierRam = [UInt64]0
+$iq1ColdOnlyMainSsdCold = [UInt64]0
+$iq1ColdOnlyRamHits = [UInt64]0
+$iq1ColdOnlyEligible = [UInt64]0
+$iq1ColdOnlySubstitutions = [UInt64]0
+$iq1ColdOnlyFallbackAllMain = [UInt64]0
+$iq1ColdOnlySkippedIq1Miss = [UInt64]0
+$iq1ColdOnlyUncertain = [UInt64]0
+$iq1ColdOnlyFailures = [UInt64]0
 $iq1PromotionRuntimeObserved = $false
 $iq1PromotionLineCount = 0
 $iq1PromotionRows = @()
@@ -3675,6 +3734,38 @@ $iq1MixedGpuPlanReadyMatches = [regex]::Matches(
 $iq1MixedGpuPlanSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
     '\[iq1-mixed-gpu-plan\] result=summary calls=(\d+) wait_ms=([0-9.]+) failures=(\d+)')
+$iq1ColdOnlySummaryMatches = [regex]::Matches(
+    $iq1SSidecarLogText,
+    $iq1ColdOnlySummaryPattern)
+if ($Iq1SColdOnly) {
+    if ($iq1ColdOnlySummaryMatches.Count -ne 1) {
+        throw "IQ1_S cold-only requires exactly one runtime summary; observed $($iq1ColdOnlySummaryMatches.Count)"
+    }
+    $iq1ColdOnlySummary = $iq1ColdOnlySummaryMatches[0]
+    $iq1ColdOnlyCalls = [UInt64]$iq1ColdOnlySummary.Groups[1].Value
+    $iq1ColdOnlyRoutes = [UInt64]$iq1ColdOnlySummary.Groups[2].Value
+    $iq1ColdOnlyMainVram = [UInt64]$iq1ColdOnlySummary.Groups[3].Value
+    $iq1ColdOnlyMainSnapshotRam = [UInt64]$iq1ColdOnlySummary.Groups[4].Value
+    $iq1ColdOnlyMainTierRam = [UInt64]$iq1ColdOnlySummary.Groups[5].Value
+    $iq1ColdOnlyMainSsdCold = [UInt64]$iq1ColdOnlySummary.Groups[6].Value
+    $iq1ColdOnlyRamHits = [UInt64]$iq1ColdOnlySummary.Groups[7].Value
+    $iq1ColdOnlyEligible = [UInt64]$iq1ColdOnlySummary.Groups[8].Value
+    $iq1ColdOnlySubstitutions = [UInt64]$iq1ColdOnlySummary.Groups[9].Value
+    $iq1ColdOnlyFallbackAllMain = [UInt64]$iq1ColdOnlySummary.Groups[10].Value
+    $iq1ColdOnlySkippedIq1Miss = [UInt64]$iq1ColdOnlySummary.Groups[11].Value
+    $iq1ColdOnlyUncertain = [UInt64]$iq1ColdOnlySummary.Groups[12].Value
+    $iq1ColdOnlyFailures = [UInt64]$iq1ColdOnlySummary.Groups[13].Value
+    if ($iq1ColdOnlyCalls -eq 0 -or
+        $iq1ColdOnlyRoutes -gt (6 * $iq1ColdOnlyCalls) -or
+        $iq1ColdOnlyEligible -lt $iq1ColdOnlySubstitutions -or
+        ($iq1ColdOnlySubstitutions + $iq1ColdOnlyFallbackAllMain) -ne $iq1ColdOnlyCalls -or
+        $iq1ColdOnlyFailures -ne 0) {
+        throw "IQ1_S cold-only runtime invariants failed"
+    }
+    $iq1ColdOnlyRuntimeObserved = $true
+} elseif ($iq1ColdOnlySummaryMatches.Count -ne 0) {
+    throw "IQ1_S cold-only telemetry appeared while cold-only was disabled"
+}
 if ($Iq1SMixedColdOne) {
     if ($iq1MixedSummaryMatches.Count -ne 1) {
         throw "IQ1_S mixed decode requires exactly one runtime summary; observed $($iq1MixedSummaryMatches.Count)"
@@ -3689,14 +3780,28 @@ if ($Iq1SMixedColdOne) {
     $iq1MixedLastLayer = [UInt32]$iq1MixedSummary.Groups[7].Value
     $iq1MixedLastSlot = [UInt32]$iq1MixedSummary.Groups[8].Value
     $iq1MixedLastExpert = [int]$iq1MixedSummary.Groups[9].Value
-    if ($iq1MixedCalls -eq 0 -or
+    $iq1MixedShapeInvalid = if ($Iq1SColdOnly) {
+        $iq1MixedHotMain + $iq1MixedColdIq1 -ne (6 * $iq1MixedCalls) -or
+        $iq1MixedColdIq1 -ne $iq1ColdOnlySubstitutions -or
+        $iq1MixedPrimaryColdAvoided -ne $iq1ColdOnlySubstitutions -or
+        $iq1MixedJoins -ne $iq1ColdOnlySubstitutions
+    } else {
         $iq1MixedHotMain -ne (5 * $iq1MixedCalls) -or
         $iq1MixedColdIq1 -ne $iq1MixedCalls -or
         $iq1MixedPrimaryColdAvoided -ne $iq1MixedCalls -or
-        $iq1MixedJoins -ne $iq1MixedCalls -or
+        $iq1MixedJoins -ne $iq1MixedCalls
+    }
+    $iq1MixedLastSelectionInvalid = if ($Iq1SColdOnly -and
+        $iq1MixedColdIq1 -eq 0) {
+        $iq1MixedLastLayer -ne [UInt32]::MaxValue -or
+        $iq1MixedLastSlot -ne [UInt32]::MaxValue -or
+        $iq1MixedLastExpert -ne -1
+    } else {
+        $iq1MixedLastSlot -ge 6 -or $iq1MixedLastExpert -lt 0
+    }
+    if ($iq1MixedCalls -eq 0 -or $iq1MixedShapeInvalid -or
         $iq1MixedFailures -ne 0 -or
-        $iq1MixedLastSlot -ge 6 -or
-        $iq1MixedLastExpert -lt 0) {
+        $iq1MixedLastSelectionInvalid) {
         throw "IQ1_S mixed decode runtime counters are inconsistent"
     }
     $iq1MixedRuntimeObserved = $true
@@ -5002,6 +5107,7 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
     iq1_s_ram_cache_requested_gib = $Iq1SRamCacheGiB
+    iq1_s_ram_cache_deferred_unused = $iq1SRamCacheDeferredUnused
     iq1_s_ram_cache_pageable_requested = [bool]$Iq1SRamCachePageable
     iq1_s_ram_cache_preload_all_requested = [bool]$Iq1SRamCachePreloadAll
     iq1_s_ram_cache_runtime_observed = $iq1SRamCacheRuntimeObserved
@@ -5035,6 +5141,21 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_vram_cache_h2d_bytes = $iq1SVramCacheH2dBytes
     iq1_s_vram_cache_failures = $iq1SVramCacheFailures
     iq1_s_mixed_cold_one = [bool]$Iq1SMixedColdOne
+    iq1_s_cold_only_requested = [bool]$Iq1SColdOnly
+    iq1_s_cold_only_runtime_observed = $iq1ColdOnlyRuntimeObserved
+    iq1_s_cold_only_calls = $iq1ColdOnlyCalls
+    iq1_s_cold_only_routes = $iq1ColdOnlyRoutes
+    iq1_s_cold_only_main_vram = $iq1ColdOnlyMainVram
+    iq1_s_cold_only_main_snapshot_ram = $iq1ColdOnlyMainSnapshotRam
+    iq1_s_cold_only_main_tier_ram = $iq1ColdOnlyMainTierRam
+    iq1_s_cold_only_main_ssd_cold = $iq1ColdOnlyMainSsdCold
+    iq1_s_cold_only_ram_hits = $iq1ColdOnlyRamHits
+    iq1_s_cold_only_eligible = $iq1ColdOnlyEligible
+    iq1_s_cold_only_substitutions = $iq1ColdOnlySubstitutions
+    iq1_s_cold_only_fallback_all_main = $iq1ColdOnlyFallbackAllMain
+    iq1_s_cold_only_skipped_iq1_miss = $iq1ColdOnlySkippedIq1Miss
+    iq1_s_cold_only_uncertain = $iq1ColdOnlyUncertain
+    iq1_s_cold_only_failures = $iq1ColdOnlyFailures
     iq1_s_mixed_runtime_observed = $iq1MixedRuntimeObserved
     iq1_s_mixed_calls = $iq1MixedCalls
     iq1_s_mixed_hot_main = $iq1MixedHotMain
@@ -5198,6 +5319,7 @@ $summary = [pscustomobject]@{
     iq1_s_sidecar_selected_loads = $iq1SSidecarSelectedLoads
     iq1_s_sidecar_failures = $iq1SSidecarFailures
     iq1_s_ram_cache_requested_gib = $Iq1SRamCacheGiB
+    iq1_s_ram_cache_deferred_unused = $iq1SRamCacheDeferredUnused
     iq1_s_ram_cache_pageable_requested = [bool]$Iq1SRamCachePageable
     iq1_s_ram_cache_preload_all_requested = [bool]$Iq1SRamCachePreloadAll
     iq1_s_ram_cache_runtime_observed = $iq1SRamCacheRuntimeObserved
@@ -5231,6 +5353,21 @@ $summary = [pscustomobject]@{
     iq1_s_vram_cache_h2d_bytes = $iq1SVramCacheH2dBytes
     iq1_s_vram_cache_failures = $iq1SVramCacheFailures
     iq1_s_mixed_cold_one = [bool]$Iq1SMixedColdOne
+    iq1_s_cold_only_requested = [bool]$Iq1SColdOnly
+    iq1_s_cold_only_runtime_observed = $iq1ColdOnlyRuntimeObserved
+    iq1_s_cold_only_calls = $iq1ColdOnlyCalls
+    iq1_s_cold_only_routes = $iq1ColdOnlyRoutes
+    iq1_s_cold_only_main_vram = $iq1ColdOnlyMainVram
+    iq1_s_cold_only_main_snapshot_ram = $iq1ColdOnlyMainSnapshotRam
+    iq1_s_cold_only_main_tier_ram = $iq1ColdOnlyMainTierRam
+    iq1_s_cold_only_main_ssd_cold = $iq1ColdOnlyMainSsdCold
+    iq1_s_cold_only_ram_hits = $iq1ColdOnlyRamHits
+    iq1_s_cold_only_eligible = $iq1ColdOnlyEligible
+    iq1_s_cold_only_substitutions = $iq1ColdOnlySubstitutions
+    iq1_s_cold_only_fallback_all_main = $iq1ColdOnlyFallbackAllMain
+    iq1_s_cold_only_skipped_iq1_miss = $iq1ColdOnlySkippedIq1Miss
+    iq1_s_cold_only_uncertain = $iq1ColdOnlyUncertain
+    iq1_s_cold_only_failures = $iq1ColdOnlyFailures
     iq1_s_mixed_runtime_observed = $iq1MixedRuntimeObserved
     iq1_s_mixed_calls = $iq1MixedCalls
     iq1_s_mixed_hot_main = $iq1MixedHotMain
@@ -5968,7 +6105,7 @@ Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLat
 Write-Host ("spex cpu probe req/observed/submitted/dropped/completed/predicted/matched/ready/useful/failures: " + $SpexCpuProbeK + " / " + $spexCpuProbeKObserved + " / " + $spexCpuProbeSubmitted + " / " + $spexCpuProbeDropped + " / " + $spexCpuProbeCompleted + " / " + $spexCpuProbePredicted + " / " + $spexCpuProbeMatched + " / " + $spexCpuProbeReadyAtTransport + " / " + $spexCpuProbeUsefulReady + " / " + $spexCpuProbeFailures)
 Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitMs + " / " + $spexCpuProbeCpuMs + " / " + $spexCpuProbeQueueMs + " / " + $spexCpuProbeChecksum)
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
-Write-Host ("IQ1_S RAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
+Write-Host ("IQ1_S RAM cache req/observed/deferred-unused/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheDeferredUnused + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
 Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math]::Round($iq1SRamCacheHitRate, 4) + " / " + [math]::Round($iq1SRamCacheSsdBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheH2dBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheSsdAvoidedBytes / 1GB, 3))
 Write-Host ("IQ1_S full preload pageable/frozen/layers/entries/SSD GiB/read-calls/ms: " + [bool]$Iq1SRamCachePageable + " / " + $iq1SRamCachePreloadFrozen + " / " + $iq1SRamCachePreloadLayers + " / " + $iq1SRamCachePreloadEntries + " / " + [math]::Round($iq1SRamCachePreloadSsdBytes / 1GB, 3) + " / " + $iq1SRamCachePreloadReadCalls + " / " + $iq1SRamCachePreloadMs)
 Write-Host ("IQ1_S VRAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SVramCachePerLayer + " / " + $iq1SVramCacheRuntimeObserved + " / " + $iq1SVramCacheCapacity + " / " + $iq1SVramCacheCount + " / " + $iq1SVramCacheHits + " / " + $iq1SVramCacheMisses + " / " + $iq1SVramCacheEvictions + " / " + $iq1SVramCacheFailures)
