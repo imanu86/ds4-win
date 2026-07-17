@@ -19425,6 +19425,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
+        if (e->q1_0_sidecar_ready &&
+            !ds4_gpu_set_q1_0_sidecar(
+                &e->q1_0_sidecar_model.mmap.file,
+                e->q1_0_sidecar_model.map,
+                e->q1_0_sidecar_model.size)) {
+            fprintf(stderr,
+                    "ds4: failed to install Q1_0 expert sidecar in CUDA\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (!ds4_gpu_set_model_map_range(e->model.map,
                                            e->model.size,
                                            e->model.tensor_data_pos,

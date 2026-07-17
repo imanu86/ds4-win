@@ -98,6 +98,9 @@ int ds4_gpu_set_model_file(const os_file_t *file);
 int ds4_gpu_set_iq1_s_sidecar(const os_file_t *file,
                               const void *model_map,
                               uint64_t model_size);
+int ds4_gpu_set_q1_0_sidecar(const os_file_t *file,
+                             const void *model_map,
+                             uint64_t model_size);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 
 /* Native host-pinned expert arena. The arena is an explicit-copy DMA source;
