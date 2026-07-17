@@ -1,0 +1,62 @@
+{
+  "schema": "g105_iq1_full_resident_abort_v1",
+  "status": "aborted_physical_residency_failure",
+  "source_commit": "8580241",
+  "build": {
+    "executable_sha256": "97084c7f6bebc325410fff66092692d777b8186046e716fc0a9e4dfcc8492171",
+    "manifest_sha256": "0276b45ed9d6e25d63bb4686fa3e5f20cbcffbf9e3c4b0019987b3d57a792a3b",
+    "input_fingerprint_sha256": "42c9ba5007901d5f18ce4581a9493d61ce67ab43ceefa55415f850d9b7be6ffa"
+  },
+  "inputs": {
+    "model_sha256": "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668",
+    "iq1_sidecar_sha256": "b049d1eb34c068f19ab007b33c22a7d758b578bf2b10d9276e79654f85d35047",
+    "requested_iq1_resident_bytes": 50331648000,
+    "requested_iq1_resident_gib": 46.875,
+    "requested_slots": 10240
+  },
+  "execution": {
+    "structural_only": true,
+    "elapsed_seconds": 535.754,
+    "preload_reached_layer_42": true,
+    "decode_started_after_preload": true,
+    "manual_stop_reason": "working_set_collapse_and_system_paging",
+    "final_runtime_summary_available": false,
+    "content_hash_available": false,
+    "performance_claim_allowed": false,
+    "exactness_claim_allowed": false,
+    "quality_claim_allowed": false
+  },
+  "measured_os_telemetry": {
+    "samples": 418,
+    "working_set_peak_bytes": 53342937088,
+    "working_set_last_bytes": 33461399552,
+    "private_bytes_peak": 63297142784,
+    "available_bytes_min": 4020531200,
+    "available_bytes_last": 16965144576,
+    "process_read_transfer_delta_bytes": 150741854757,
+    "process_page_fault_delta": 38454456,
+    "disk_queue_peak": 25,
+    "system_disk_write_bytes_per_second_peak": 682677263,
+    "system_disk_read_bytes_per_second_peak": 1719828058,
+    "vram_used_mib_peak": 11673,
+    "gpu_utilization_percent_peak": 99
+  },
+  "raw_artifacts": {
+    "stderr": {
+      "path": "g7_runs\\g7_g105_iq1_full_resident_n1_stderr.log",
+      "bytes": 1719111,
+      "sha256": "94f8a7ab75a745b2f1683bcb562aa68ac68756479e8fe680f3b4f4e9d993ac59"
+    },
+    "runtime_telemetry": {
+      "path": "g7_runs\\g7_g105_iq1_full_resident_n1_runtime_telemetry.jsonl",
+      "bytes": 343344,
+      "sha256": "4fde0c835ff8d555cfb70bfd2419174410830896eb1ea9a106a254567cf33a80"
+    },
+    "memory_preflight": {
+      "path": "g7_runs\\g7_g105_iq1_full_resident_n1_memory_preflight.json",
+      "bytes": 3611,
+      "sha256": "0f18511fb608dcaf3260916b5110041bd00f412a009657a6ab2b6a98d1a53841"
+    }
+  },
+  "conclusion": "Full 46.875 GiB IQ1 pageable residency is not physically sustainable with the main IQ2 runtime on this 64 GiB Windows host. Use a smaller measured resident IQ1 arena and preserve IQ2 hot placement."
+}

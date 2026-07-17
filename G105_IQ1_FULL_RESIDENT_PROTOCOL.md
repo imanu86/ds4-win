@@ -130,3 +130,29 @@ Any missing marker, counter mismatch, allocation failure, preload failure,
 miss, eviction, decode SSD byte, nonzero failure counter, unexpected paging or
 disk contamination, hash mismatch, or env-off G74 change fails the gate closed.
 No partial pass may be reinterpreted as performance evidence.
+
+## Measured Attempt: Aborted On Physical Residency Failure
+
+The first G105 attempt ran from commit `8580241` on 2026-07-17. It reached
+layer 42, entered decode, and was manually stopped after 535.754 seconds when
+Windows telemetry proved that the 46.875 GiB pageable IQ1 arena was not staying
+physically resident alongside the main IQ2 runtime.
+
+The process working set peaked at 53,342,937,088 bytes and then fell to
+33,461,399,552 bytes while private committed bytes remained near
+63,297,142,784. Available RAM reached a minimum of 4,020,531,200 bytes. The
+system disk queue peaked at 25, system disk writes peaked at 682,677,263 B/s,
+and process page faults increased by 38,454,456. Process reads increased by
+150,741,854,757 bytes. These observations reject the claim that the complete
+IQ1 routed payload remained resident.
+
+No final runtime summary or content hash exists because the process was stopped
+before completion. This attempt supports no throughput, exactness or quality
+claim. The compact receipt is
+`G105_IQ1_FULL_RESIDENT_ABORT_RECEIPT.json`; raw local telemetry remains under
+`g7_runs\g7_g105_iq1_full_resident_n1_*` and is bound by hashes in that receipt.
+
+The existing runtime contamination rule did not abort because it requires low
+available RAM and a high disk queue in the same consecutive samples. Paging
+raised available RAM again, so that conjunction missed the failure. A later
+gate must monitor physical-residency loss or paging independently.
