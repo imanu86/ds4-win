@@ -5275,6 +5275,12 @@ Write-Host ("IQ1_S mixed profile calls/router-D2H/meta-H2D/main-submit/main-sync
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="
 } finally {
+    if ($null -ne $modelLockStream) {
+        try { $modelLockStream.Dispose() } catch {}
+    }
+    if ($null -ne $iq1SSidecarLockStream) {
+        try { $iq1SSidecarLockStream.Dispose() } catch {}
+    }
     if ($measurementLockAcquired) {
         try { $measurementMutex.ReleaseMutex() } catch {}
     }
