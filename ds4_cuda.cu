@@ -169,8 +169,15 @@ typedef struct {
     uint16_t qh[CUDA_QK_K / 32];
 } cuda_block_iq1_s;
 
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[128 / 8];
+} cuda_block_q1_0;
+
 static_assert(sizeof(cuda_block_iq1_s) == 50,
               "IQ1_S must be 50 bytes per 256 weights");
+static_assert(sizeof(cuda_block_q1_0) == 18,
+              "Q1_0 must be 18 bytes per 128 weights");
 
 #include "ds4_iq2_tables_cuda.inc"
 #include "ds4_iq1_tables_cuda.inc"
@@ -14643,6 +14650,53 @@ __device__ static float dev_dot_iq1_s_q8_K_block(
     return d * sum;
 }
 
+__device__ static float dev_dequant_q1_0_value(
+        const cuda_block_q1_0 *x,
+        uint32_t i) {
+    const uint32_t bit = (uint32_t)((x->qs[i >> 3u] >> (i & 7u)) & 1u);
+    return dev_f16_to_f32(x->d) * (float)(2 * (int32_t)bit - 1);
+}
+
+__device__ static float dev_dot_q1_0_q8_K_half128(
+        const cuda_block_q1_0 *x,
+        const cuda_block_q8_K *y,
+        uint32_t half) {
+    const uint32_t byte_base = half * 16u;
+    const uint32_t q8_base = half * 128u;
+    int32_t positive_sum = 0;
+    int32_t sum_all = 0;
+
+#pragma unroll
+    for (uint32_t i = 0; i < 8u; i++) {
+        sum_all += (int32_t)y->bsums[half * 8u + i];
+    }
+
+#pragma unroll
+    for (uint32_t byte = 0; byte < 16u; byte++) {
+        const uint32_t bits = (uint32_t)x->qs[byte_base + byte];
+#pragma unroll
+        for (uint32_t lane = 0; lane < 8u; lane++) {
+            if ((bits >> lane) & 1u) {
+                positive_sum += (int32_t)y->qs[q8_base + byte * 8u + lane];
+            }
+        }
+    }
+
+    /* Upstream Q1_0 CUDA dequant polarity is bit 1 => +d, bit 0 => -d.
+     * Dot(Q1_0, Q8_K) therefore equals d1*d8*(2*sum(q8 where bit=1) - sum(q8)).
+     */
+    const int32_t signed_sum = 2 * positive_sum - sum_all;
+    return dev_f16_to_f32(x->d) * y->d * (float)signed_sum;
+}
+
+__device__ static float dev_dot_q1_0_q8_K_pair(
+        const cuda_block_q1_0 *x0,
+        const cuda_block_q1_0 *x1,
+        const cuda_block_q8_K *y) {
+    return dev_dot_q1_0_q8_K_half128(x0, y, 0u) +
+           dev_dot_q1_0_q8_K_half128(x1, y, 1u);
+}
+
 __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
         const cuda_block_iq2_xxs *x,
         const cuda_block_q8_K *y0,
@@ -15112,6 +15166,112 @@ __global__ static void moe_down_iq1_s_qwarp32_kernel(
     float acc = 0.0f;
     for (uint32_t b = lane; b < midq_blocks; b += 32u) {
         acc += dev_dot_iq1_s_q8_K_block(wr + b, xq + b);
+    }
+    acc = warp_sum_f32(acc);
+    if (lane == 0u) {
+        down_out[(uint64_t)pair * out_dim + row] = acc;
+    }
+}
+
+__global__ static void moe_gate_up_mid_q1_0_qwarp32_kernel(
+        float *gate_out,
+        float *up_out,
+        float *mid_out,
+        const char *gate_base,
+        const char *up_base,
+        const uint64_t *route_ptrs,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_expert,
+        uint32_t route_ptr_slots,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = blockIdx.y;
+    if (row >= expert_mid_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const char *gate_ptr = NULL;
+    const char *up_ptr = NULL;
+    if (route_ptrs) {
+        gate_ptr = (const char *)(uintptr_t)route_ptrs[pair];
+        up_ptr = (const char *)(uintptr_t)route_ptrs[route_ptr_slots + pair];
+    } else {
+        int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+        if (expert_i < 0) expert_i = 0;
+        const uint64_t expert_byte =
+            (uint64_t)(uint32_t)expert_i * gate_expert_bytes;
+        gate_ptr = gate_base + expert_byte;
+        up_ptr = up_base + expert_byte;
+    }
+    if (!gate_ptr || !up_ptr) return;
+    const cuda_block_q1_0 *gr = (const cuda_block_q1_0 *)(
+        gate_ptr + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q1_0 *ur = (const cuda_block_q1_0 *)(
+        up_ptr + (uint64_t)row * gate_row_bytes);
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+    float gate = 0.0f;
+    float up = 0.0f;
+    for (uint32_t b = lane; b < xq_blocks; b += 32u) {
+        gate += dev_dot_q1_0_q8_K_pair(gr + 2u * b, gr + 2u * b + 1u, xqb + b);
+        up += dev_dot_q1_0_q8_K_pair(ur + 2u * b, ur + 2u * b + 1u, xqb + b);
+    }
+    gate = warp_sum_f32(gate);
+    up = warp_sum_f32(up);
+    if (lane == 0u) {
+        if (clamp > 1.0e-6f) {
+            if (gate > clamp) gate = clamp;
+            if (up > clamp) up = clamp;
+            if (up < -clamp) up = -clamp;
+        }
+        const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+        gate_out[off] = gate;
+        up_out[off] = up;
+        mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+    }
+}
+
+__global__ static void moe_down_q1_0_qwarp32_kernel(
+        float *down_out,
+        const char *down_base,
+        const uint64_t *route_ptrs,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t route_ptr_slots) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t row = blockIdx.x * 8u + warp;
+    const uint32_t pair = blockIdx.y;
+    if (row >= out_dim) return;
+    const uint32_t tok = pair / n_expert;
+    const uint32_t slot = pair - tok * n_expert;
+    const char *down_ptr = NULL;
+    if (route_ptrs) {
+        down_ptr = (const char *)(uintptr_t)route_ptrs[2u * route_ptr_slots + pair];
+    } else {
+        int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+        if (expert_i < 0) expert_i = 0;
+        down_ptr = down_base +
+            (uint64_t)(uint32_t)expert_i * down_expert_bytes;
+    }
+    if (!down_ptr) return;
+    const cuda_block_q1_0 *wr = (const cuda_block_q1_0 *)(
+        down_ptr + (uint64_t)row * down_row_bytes);
+    const cuda_block_q8_K *xq = midq + (uint64_t)pair * midq_blocks;
+    float acc = 0.0f;
+    for (uint32_t b = lane; b < midq_blocks; b += 32u) {
+        acc += dev_dot_q1_0_q8_K_pair(wr + 2u * b, wr + 2u * b + 1u, xq + b);
     }
     acc = warp_sum_f32(acc);
     if (lane == 0u) {
@@ -23309,7 +23469,9 @@ static int routed_moe_launch(
     const uint32_t route_iq2_q2 = gate_type == 16u && down_type == 10u;
     const uint32_t route_iq1_s =
         gate_type == 19u && (down_type == 19u || down_type == 10u);
-    if (!route_iq2_q2 && !route_iq1_s) return 0;
+    const uint32_t route_q1_0 =
+        gate_type == 41u && (down_type == 41u || down_type == 10u);
+    if (!route_iq2_q2 && !route_iq1_s && !route_q1_0) return 0;
     if (route_iq1_s) {
         g_iq1_s_route_calls++;
         g_iq1_s_route_slots += (uint64_t)n_tokens * n_expert;
@@ -23320,6 +23482,14 @@ static int routed_moe_launch(
                     layer_index);
             return 0;
         }
+    }
+    if (route_q1_0) {
+        fprintf(stderr,
+                "ds4: Q1_0 routed expert dispatch recognized at layer=%u but "
+                "fail-closed in DS4 Q1_0 runtime step 1; Q1_0 gate/up/down kernels "
+                "and selected-expert binder are not enabled yet\n",
+                layer_index);
+        return 0;
     }
     const uint32_t n_total_expert = 256u;
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;

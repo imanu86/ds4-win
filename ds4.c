@@ -188,12 +188,18 @@ typedef struct {
     uint16_t qh[QK_K / 32];
 } block_iq1_s;
 
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[128 / 8];
+} block_q1_0;
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_iq1_s_size, sizeof(block_iq1_s) == 50);
+DS4_STATIC_ASSERT(ds4_block_q1_0_size, sizeof(block_q1_0) == 18);
 
 typedef struct {
     uint32_t ctx_size;
@@ -929,6 +935,7 @@ static const gguf_type_info gguf_types[] = {
     [28] = {"f64",      1,   8},
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
+    [41] = {"q1_0",   128,  18},
 };
 
 enum {
@@ -939,6 +946,7 @@ enum {
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_IQ1_S    = 19,
+    DS4_TENSOR_Q1_0     = 41,
     DS4_TENSOR_I32      = 26,
 };
 
@@ -2422,6 +2430,21 @@ typedef struct {
 
 typedef struct {
     const ds4_model *model;
+    const ds4_model *primary_model;
+    ds4_tensor *gate[DS4_N_LAYER];
+    ds4_tensor *up[DS4_N_LAYER];
+    ds4_tensor *down[DS4_N_LAYER];
+    uint64_t gate_row_bytes[DS4_N_LAYER];
+    uint64_t gate_expert_bytes[DS4_N_LAYER];
+    uint64_t down_row_bytes[DS4_N_LAYER];
+    uint64_t down_expert_bytes[DS4_N_LAYER];
+    uint32_t first_layer;
+    uint32_t last_layer;
+    bool ready;
+} ds4_q1_0_sidecar;
+
+typedef struct {
+    const ds4_model *model;
     const ds4_tensor *gate;
     const ds4_tensor *up;
     const ds4_tensor *down;
@@ -2429,6 +2452,7 @@ typedef struct {
 } ds4_routed_expert_source;
 
 static ds4_iq1_s_sidecar g_iq1_s_sidecar;
+static ds4_q1_0_sidecar g_q1_0_sidecar;
 
 static bool iq1_s_mixed_cold_one_requested(void) {
     const char *value = getenv("DS4_IQ1_S_MIXED_COLD_K");
@@ -2445,6 +2469,16 @@ static bool iq1_s_sidecar_layer_active(
            layer_index < DS4_N_LAYER;
 }
 
+static bool q1_0_sidecar_layer_active(
+        const ds4_model *model,
+        uint32_t layer_index) {
+    return g_q1_0_sidecar.ready &&
+           model == g_q1_0_sidecar.primary_model &&
+           layer_index >= g_q1_0_sidecar.first_layer &&
+           layer_index <= g_q1_0_sidecar.last_layer &&
+           layer_index < DS4_N_LAYER;
+}
+
 static ds4_routed_expert_source routed_expert_source(
         const ds4_model *model,
         const ds4_layer_weights *layer,
@@ -2456,6 +2490,14 @@ static ds4_routed_expert_source routed_expert_source(
         layer ? layer->ffn_down_exps : NULL,
         false,
     };
+    if (q1_0_sidecar_layer_active(model, layer_index)) {
+        source.model = g_q1_0_sidecar.model;
+        source.gate = g_q1_0_sidecar.gate[layer_index];
+        source.up = g_q1_0_sidecar.up[layer_index];
+        source.down = g_q1_0_sidecar.down[layer_index];
+        source.sidecar = true;
+        return source;
+    }
     if (!iq1_s_mixed_cold_one_requested() &&
         iq1_s_sidecar_layer_active(model, layer_index)) {
         source.model = g_iq1_s_sidecar.model;
@@ -2659,6 +2701,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_IQ1_S ||
            type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_Q1_0 ||
            type == DS4_TENSOR_Q4_K;
 }
 
@@ -2667,15 +2710,26 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_IQ1_S:   return sizeof(block_iq1_s);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+    case DS4_TENSOR_Q1_0:    return sizeof(block_q1_0);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
 }
 
+static DS4_MAYBE_UNUSED uint64_t routed_expert_block_elems(uint32_t type) {
+    switch (type) {
+    case DS4_TENSOR_Q1_0: return 128u;
+    default:              return QK_K;
+    }
+}
+
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
-    if ((t->dim[0] % QK_K) != 0) ds4_die("routed expert row is not QK_K aligned");
-    return (t->dim[0] / QK_K) * routed_expert_block_bytes(t->type);
+    const uint64_t block_elems = routed_expert_block_elems(t->type);
+    if ((t->dim[0] % block_elems) != 0) {
+        ds4_die("routed expert row is not aligned to tensor block size");
+    }
+    return (t->dim[0] / block_elems) * routed_expert_block_bytes(t->type);
 }
 
 static void tensor_expect_routed_expert(
@@ -3241,6 +3295,97 @@ static void iq1_s_sidecar_bind(
             "layers=%u active=%u..%u gate_up=iq1_s "
             "down=q2_k[0..2]+iq1_s[3..42]\n",
             DS4_N_LAYER, first_layer, last_layer);
+}
+
+static void q1_0_sidecar_bind(
+        ds4_model *model,
+        const ds4_model *primary_model) {
+    if (!model || !primary_model) ds4_die("missing Q1_0 sidecar model");
+    memset(&g_q1_0_sidecar, 0, sizeof(g_q1_0_sidecar));
+    config_validate_model(model);
+    iq1_s_sidecar_validate_checkpoint_identity(model, primary_model);
+
+    uint32_t first_layer = 0;
+    uint32_t last_layer = DS4_N_LAYER - 1;
+    const char *first_env = getenv("DS4_Q1_0_LAYER_FIRST");
+    const char *last_env = getenv("DS4_Q1_0_LAYER_LAST");
+    if ((first_env && first_env[0]) || (last_env && last_env[0])) {
+        char *first_end = NULL;
+        char *last_end = NULL;
+        errno = 0;
+        const unsigned long first = first_env && first_env[0]
+            ? strtoul(first_env, &first_end, 10) : 0ul;
+        const int first_errno = errno;
+        errno = 0;
+        const unsigned long last = last_env && last_env[0]
+            ? strtoul(last_env, &last_end, 10) : (unsigned long)(DS4_N_LAYER - 1);
+        const int last_errno = errno;
+        if (first_errno != 0 || last_errno != 0 ||
+            (first_env && first_env[0] &&
+             (first_end == first_env || *first_end != '\0')) ||
+            (last_env && last_env[0] &&
+             (last_end == last_env || *last_end != '\0')) ||
+            first >= DS4_N_LAYER || last >= DS4_N_LAYER || first > last) {
+            ds4_die("invalid Q1_0 sidecar layer range");
+        }
+        first_layer = (uint32_t)first;
+        last_layer = (uint32_t)last;
+    }
+
+    uint64_t routed_bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_tensor *gate = required_tensorf(
+            model, "blk.%u.ffn_gate_exps.weight", il);
+        ds4_tensor *up = required_tensorf(
+            model, "blk.%u.ffn_up_exps.weight", il);
+        ds4_tensor *down = required_tensorf(
+            model, "blk.%u.ffn_down_exps.weight", il);
+        tensor_expect_layout(gate, DS4_TENSOR_Q1_0, 3,
+                             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(up, DS4_TENSOR_Q1_0, 3,
+                             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_layout(down, DS4_TENSOR_Q1_0, 3,
+                             DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(gate);
+        const uint64_t gate_expert_bytes =
+            (uint64_t)DS4_N_FF_EXP * gate_row_bytes;
+        const uint64_t down_row_bytes = routed_expert_row_bytes(down);
+        const uint64_t down_expert_bytes =
+            (uint64_t)DS4_N_EMBD * down_row_bytes;
+        if (gate->abs_offset > model->size ||
+            gate_expert_bytes > (model->size - gate->abs_offset) / DS4_N_EXPERT ||
+            up->abs_offset > model->size ||
+            gate_expert_bytes > (model->size - up->abs_offset) / DS4_N_EXPERT ||
+            down->abs_offset > model->size ||
+            down_expert_bytes > (model->size - down->abs_offset) / DS4_N_EXPERT) {
+            ds4_die("Q1_0 sidecar routed expert tensor extends past file end");
+        }
+
+        g_q1_0_sidecar.gate[il] = gate;
+        g_q1_0_sidecar.up[il] = up;
+        g_q1_0_sidecar.down[il] = down;
+        g_q1_0_sidecar.gate_row_bytes[il] = gate_row_bytes;
+        g_q1_0_sidecar.gate_expert_bytes[il] = gate_expert_bytes;
+        g_q1_0_sidecar.down_row_bytes[il] = down_row_bytes;
+        g_q1_0_sidecar.down_expert_bytes[il] = down_expert_bytes;
+        routed_bytes += 2u * DS4_N_EXPERT * gate_expert_bytes;
+        routed_bytes += DS4_N_EXPERT * down_expert_bytes;
+    }
+
+    g_q1_0_sidecar.model = model;
+    g_q1_0_sidecar.primary_model = primary_model;
+    g_q1_0_sidecar.first_layer = first_layer;
+    g_q1_0_sidecar.last_layer = last_layer;
+    g_q1_0_sidecar.ready = true;
+    fprintf(stderr,
+            "ds4: Q1_0 routed-expert sidecar validated: "
+            "layers=%u active=%u..%u gate_up_down=q1_0 block=128/18B "
+            "routed_bytes=%llu dispatch=fail-closed\n",
+            DS4_N_LAYER,
+            first_layer,
+            last_layer,
+            (unsigned long long)routed_bytes);
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -16221,6 +16366,7 @@ struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
     ds4_model iq1_s_sidecar_model;
+    ds4_model q1_0_sidecar_model;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -16235,6 +16381,7 @@ struct ds4_engine {
     bool metal_ready;
     bool mtp_ready;
     bool iq1_s_sidecar_ready;
+    bool q1_0_sidecar_ready;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -19097,6 +19244,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     os_mmap_init(&e->model.mmap);
     os_mmap_init(&e->mtp_model.mmap);
     os_mmap_init(&e->iq1_s_sidecar_model.mmap);
+    os_mmap_init(&e->q1_0_sidecar_model.mmap);
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
@@ -19128,6 +19276,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     ds4_reap_mask_install_bake(&e->model, &e->weights);
+    const char *q1_0_sidecar_path = getenv("DS4_Q1_0_EXPERT_SIDECAR");
+    if (q1_0_sidecar_path && q1_0_sidecar_path[0]) {
+        if (e->backend != DS4_BACKEND_CUDA || e->model.bake_embedded) {
+            fprintf(stderr,
+                    "ds4: Q1_0 expert sidecar requires CUDA and a non-baked primary model\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        model_open(&e->q1_0_sidecar_model,
+                   q1_0_sidecar_path,
+                   graph_backend,
+                   false);
+        q1_0_sidecar_bind(&e->q1_0_sidecar_model, &e->model);
+        e->q1_0_sidecar_ready = true;
+        fprintf(stderr, "ds4: Q1_0 expert sidecar source: %s\n",
+                q1_0_sidecar_path);
+    }
     const char *iq1_s_sidecar_path = getenv("DS4_IQ1_S_EXPERT_SIDECAR");
     if (iq1_s_sidecar_path && iq1_s_sidecar_path[0]) {
         if (e->backend != DS4_BACKEND_CUDA || e->model.bake_embedded) {
@@ -19319,6 +19485,8 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
     ds4_reap_mask_host_reset();
     memset(&g_iq1_s_sidecar, 0, sizeof(g_iq1_s_sidecar));
+    memset(&g_q1_0_sidecar, 0, sizeof(g_q1_0_sidecar));
+    if (e->q1_0_sidecar_ready) model_close(&e->q1_0_sidecar_model);
     if (e->iq1_s_sidecar_ready) model_close(&e->iq1_s_sidecar_model);
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
