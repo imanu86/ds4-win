@@ -2464,6 +2464,16 @@ static int q1_0_resident_arena_requested(void) {
     return -1;
 }
 
+static int q1_0_dual_arena_requested(void) {
+    const char *value = getenv("DS4_Q1_0_DUAL_ARENA");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_Q1_0_DUAL_ARENA=%s; expected 0 or 1\n",
+            value);
+    return -1;
+}
+
 static bool iq1_s_mixed_cold_one_requested(void) {
     const char *value = getenv("DS4_IQ1_S_MIXED_COLD_K");
     return value && strcmp(value, "1") == 0;
@@ -19310,13 +19320,15 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                 q1_0_sidecar_path);
     }
     const int q1_0_resident_arena = q1_0_resident_arena_requested();
+    const int q1_0_dual_arena = q1_0_dual_arena_requested();
     const char *q1_0_selected_load = getenv("DS4_Q1_0_SELECTED_LOAD");
-    if (q1_0_resident_arena < 0 ||
+    if (q1_0_resident_arena < 0 || q1_0_dual_arena < 0 ||
+        (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0) ||
         (q1_0_resident_arena > 0 &&
          (!e->q1_0_sidecar_ready || !q1_0_selected_load ||
           strcmp(q1_0_selected_load, "1") != 0))) {
         fprintf(stderr,
-                "ds4: Q1_0 resident arena requires a valid Q1_0 sidecar and DS4_Q1_0_SELECTED_LOAD=1\n");
+                "ds4: Q1_0 resident/dual arena requires DS4_Q1_0_RESIDENT_ARENA=1, a valid Q1_0 sidecar and DS4_Q1_0_SELECTED_LOAD=1\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -19737,67 +19749,6 @@ static bool dynamic_arena_copy_load(
     return true;
 }
 
-static bool q1_0_resident_arena_bootstrap(
-        const ds4_model                    *model,
-        const ds4_gpu_dynamic_arena_layer  layers[DS4_N_LAYER],
-        uint32_t                            first_layer,
-        uint32_t                            last_layer) {
-    if (!model || first_layer < 3u || first_layer > last_layer ||
-        last_layer >= DS4_N_LAYER) {
-        return false;
-    }
-    const uint32_t entry_count = DS4_N_LAYER * DS4_N_EXPERT;
-    uint8_t target[DS4_N_LAYER * DS4_N_EXPERT];
-    memset(target, 0, sizeof(target));
-    for (uint32_t layer = first_layer; layer <= last_layer; layer++) {
-        memset(target + layer * DS4_N_EXPERT, 1, DS4_N_EXPERT);
-    }
-    const uint32_t bootstrap_entries =
-        (last_layer - first_layer + 1u) * DS4_N_EXPERT;
-
-    ds4_gpu_dynamic_arena_txn *txn = NULL;
-    const ds4_gpu_dynamic_arena_load *loads = NULL;
-    uint32_t load_count = 0;
-    if (!ds4_gpu_dynamic_arena_begin(
-            target, entry_count, &txn, &loads, &load_count) ||
-        !txn || (load_count != 0 && !loads) ||
-        (load_count != 0 && load_count != bootstrap_entries)) {
-        if (txn) ds4_gpu_dynamic_arena_abort(txn);
-        fprintf(stderr,
-                "ds4: [q1-0-resident-arena] result=failed reason=bootstrap-capacity entries=%u loads=%u\n",
-                bootstrap_entries, load_count);
-        return false;
-    }
-
-    for (uint32_t i = 0; i < load_count; i++) {
-        uint64_t checksum = 0;
-        const bool copied = dynamic_arena_copy_load(
-            model, layers, &loads[i], &checksum);
-        const bool finished = ds4_gpu_dynamic_arena_finish_load(
-            txn, i, checksum, copied ? 1 : 0) != 0;
-        if (!copied || !finished) {
-            ds4_gpu_dynamic_arena_abort(txn);
-            fprintf(stderr,
-                    "ds4: [q1-0-resident-arena] result=failed reason=bootstrap-copy load=%u entries=%u\n",
-                    i, bootstrap_entries);
-            return false;
-        }
-    }
-
-    uint64_t snapshot_generation = 0;
-    if (!ds4_gpu_dynamic_arena_publish(txn, &snapshot_generation)) {
-        ds4_gpu_dynamic_arena_abort(txn);
-        fprintf(stderr,
-                "ds4: [q1-0-resident-arena] result=failed reason=bootstrap-publish entries=%u\n",
-                bootstrap_entries);
-        return false;
-    }
-    fprintf(stderr,
-            "ds4: [q1-0-resident-arena] result=bootstrapped entries=%u layers=%u..%u generation=%" PRIu64 " source=sidecar-mmap route_pread=disabled iq2_host_arena=disabled mixed_host_backing=not-implemented\n",
-            bootstrap_entries, first_layer, last_layer, snapshot_generation);
-    return true;
-}
-
 static uint32_t dynamic_arena_test_keep(void) {
     const char *env = getenv("DS4_CUDA_DYNAMIC_ARENA_TEST_KEEP");
     if (!env || !env[0]) return 0;
@@ -19963,10 +19914,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     }
     if (e->backend == DS4_BACKEND_CUDA) {
         const int q1_0_resident_arena = q1_0_resident_arena_requested();
+        const int q1_0_dual_arena = q1_0_dual_arena_requested();
         const char *arena_gb_env = getenv("DS4_CUDA_DYNAMIC_ARENA_GB");
         const double arena_gb = arena_gb_env && arena_gb_env[0]
             ? strtod(arena_gb_env, NULL) : 0.0;
-        if (q1_0_resident_arena < 0) {
+        if (q1_0_resident_arena < 0 || q1_0_dual_arena < 0 ||
+            (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0)) {
             metal_graph_free(&s->graph);
             free(s);
             return 1;
@@ -19980,50 +19933,25 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         if (arena_gb > 0.0) {
             ds4_gpu_dynamic_arena_layer layers[DS4_N_LAYER];
-            uint64_t allocated = 0;
-            uint32_t slots = 0;
             const uint64_t requested = arena_gb >= (double)UINT64_MAX / 1073741824.0
                 ? UINT64_MAX : (uint64_t)(arena_gb * 1073741824.0);
-            const bool geometry_ready = q1_0_resident_arena > 0
-                ? dynamic_arena_build_q1_0_layers(
-                    layers, &e->q1_0_sidecar_model)
-                : dynamic_arena_build_layers(layers, &e->model, &e->weights);
-            const int bound = geometry_ready && (q1_0_resident_arena > 0
-                ? ds4_gpu_dynamic_arena_bind_q1_0(
-                    e->q1_0_sidecar_model.map,
-                    e->q1_0_sidecar_model.size,
-                    layers, DS4_N_LAYER, DS4_N_EXPERT,
-                    g_q1_0_sidecar.first_layer,
-                    g_q1_0_sidecar.last_layer)
-                : ds4_gpu_dynamic_arena_bind(
-                    e->model.map, e->model.size, layers,
-                    DS4_N_LAYER, DS4_N_EXPERT));
-            if (!bound ||
-                !ds4_gpu_dynamic_arena_prepare(requested, &allocated, &slots)) {
-                fprintf(stderr,
-                        "ds4: CUDA dynamic arena requested but unavailable%s\n",
-                        q1_0_resident_arena > 0
-                            ? "; Q1_0 resident mode failed closed"
-                            : "; continuing with pageable fallback");
-                if (q1_0_resident_arena > 0) {
-                    ds4_gpu_dynamic_arena_release();
-                    metal_graph_free(&s->graph);
-                    free(s);
-                    return 1;
-                }
-            } else {
-                if (q1_0_resident_arena > 0) {
-                    const uint32_t required_slots =
-                        (g_q1_0_sidecar.last_layer -
-                         g_q1_0_sidecar.first_layer + 1u) * DS4_N_EXPERT;
-                    if (slots < required_slots ||
-                        !q1_0_resident_arena_bootstrap(
-                            &e->q1_0_sidecar_model, layers,
-                            g_q1_0_sidecar.first_layer,
-                            g_q1_0_sidecar.last_layer)) {
-                        fprintf(stderr,
-                                "ds4: Q1_0 resident arena bootstrap requires %u slots but has %u; failed closed\n",
-                                required_slots, slots);
+            if (q1_0_resident_arena <= 0 || q1_0_dual_arena > 0) {
+                uint64_t allocated = 0;
+                uint32_t slots = 0;
+                const bool primary_ready =
+                    dynamic_arena_build_layers(layers, &e->model, &e->weights);
+                const int primary_bound = primary_ready &&
+                    ds4_gpu_dynamic_arena_bind(
+                        e->model.map, e->model.size, layers,
+                        DS4_N_LAYER, DS4_N_EXPERT);
+                if (!primary_bound || !ds4_gpu_dynamic_arena_prepare(
+                        requested, &allocated, &slots)) {
+                    fprintf(stderr,
+                            "ds4: CUDA primary dynamic arena requested but unavailable%s\n",
+                            q1_0_dual_arena > 0
+                                ? "; Q1_0 dual mode failed closed"
+                                : "; continuing with pageable fallback");
+                    if (q1_0_dual_arena > 0) {
                         ds4_gpu_dynamic_arena_release();
                         metal_graph_free(&s->graph);
                         free(s);
@@ -20040,6 +19968,43 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                                 &e->model, layers, keep);
                         }
                     }
+                }
+            }
+            if (q1_0_resident_arena > 0) {
+                uint64_t q1_allocated = 0;
+                uint32_t q1_slots = 0;
+                uint64_t q1_generation = 0;
+                const bool q1_geometry_ready =
+                    dynamic_arena_build_q1_0_layers(
+                        layers, &e->q1_0_sidecar_model);
+                const int q1_bound = q1_geometry_ready &&
+                    ds4_gpu_dynamic_arena_bind_q1_0(
+                        e->q1_0_sidecar_model.map,
+                        e->q1_0_sidecar_model.size,
+                        layers, DS4_N_LAYER, DS4_N_EXPERT,
+                        g_q1_0_sidecar.first_layer,
+                        g_q1_0_sidecar.last_layer);
+                if (!q1_bound || !ds4_gpu_dynamic_arena_prepare_q1_0(
+                        requested, &q1_allocated, &q1_slots,
+                        &q1_generation)) {
+                    fprintf(stderr,
+                            "ds4: Q1_0 resident arena unavailable; failed closed\n");
+                    ds4_gpu_dynamic_arena_release();
+                    metal_graph_free(&s->graph);
+                    free(s);
+                    return 1;
+                }
+                const uint32_t required_slots =
+                    (g_q1_0_sidecar.last_layer -
+                     g_q1_0_sidecar.first_layer + 1u) * DS4_N_EXPERT;
+                if (q1_slots != required_slots || q1_generation == 0) {
+                    fprintf(stderr,
+                            "ds4: Q1_0 resident arena published invalid snapshot slots=%u required=%u generation=%" PRIu64 "; failed closed\n",
+                            q1_slots, required_slots, q1_generation);
+                    ds4_gpu_dynamic_arena_release();
+                    metal_graph_free(&s->graph);
+                    free(s);
+                    return 1;
                 }
             }
         }

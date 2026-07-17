@@ -114,6 +114,11 @@ int ds4_gpu_dynamic_arena_bind_q1_0(
         const ds4_gpu_dynamic_arena_layer *layers,
         uint32_t n_layer, uint32_t n_expert,
         uint32_t active_layer_first, uint32_t active_layer_last);
+int ds4_gpu_dynamic_arena_prepare_q1_0(
+        uint64_t requested_bytes,
+        uint64_t *allocated_bytes,
+        uint32_t *slot_count,
+        uint64_t *snapshot_generation);
 int ds4_gpu_dynamic_arena_prepare(
         uint64_t requested_bytes,
         uint64_t *allocated_bytes,
