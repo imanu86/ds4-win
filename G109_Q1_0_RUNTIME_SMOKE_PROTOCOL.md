@@ -1,6 +1,7 @@
 # G109 Q1_0 runtime smoke protocol
 
-Status: runtime and runner implemented; structural runs not started. No claim yet.
+Status: gates A-D and the isolated C/D transport matrix completed. Mixed
+IQ2/Q1_0 composition and the SOTA A/B remain pending.
 
 Date: 2026-07-17
 
@@ -32,9 +33,10 @@ dispatch.
 
 Frozen artifacts for the first run:
 
-- native branch/commit: `feature/q1-0-resident-base` / `1f661f0`;
+- native branch/runtime commit: `feature/q1-0-resident-base` / `eabf03c`;
 - resident-arena implementation: `c6fbb2b`;
 - Q1_0 runner gate: `1f661f0`;
+- Q1_0 arena geometry fix: `eabf03c`;
 - sidecar: `C:\ds4-models\ds4-q1-layer42-derived-iq2-84b4ffb.gguf`;
 - sidecar bytes/SHA-256: `907428832` /
   `58d537738ac80df504d9954a694703c37cc5f9ee236ca8c06ce94cea1ab8ef26`;
@@ -134,3 +136,9 @@ host-resident transport. Report server decode, TTFT, route H2D bytes, copy
 submissions, wait time, GPU utilization, host residency and all Q1_0 counters.
 Outliers trigger a complete three-process rerun. Quality requires separately
 retained outputs and L0-L3 grading; no repeat flag or `n=1` result is a verdict.
+
+An intermediate direct-file versus resident-arena matrix may isolate the Q1_0
+transport mechanism after A-D. Such a matrix must also use at least three clean
+independent processes per arm, retain exact outputs and use a balanced order.
+It cannot be called a SOTA comparison because both arms execute Q1_0 at only the
+active sidecar layers and omit the complete G46/G73 IQ2 composition.
