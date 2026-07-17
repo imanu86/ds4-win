@@ -1,0 +1,99 @@
+{
+  "schema": "g106_iq1_pinned_cap_receipt_v1",
+  "date": "2026-07-17",
+  "status": "complete",
+  "scope": "structural_capacity_only",
+  "runtime_binary_sha256": "97084c7f6bebc325410fff66092692d777b8186046e716fc0a9e4dfcc8492171",
+  "main_model_sha256": "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668",
+  "iq1_sidecar_sha256": "b049d1eb34c068f19ab007b33c22a7d758b578bf2b10d9276e79654f85d35047",
+  "fixed": {
+    "iq2_dynamic_arena_gib": 20,
+    "requested_vram_expert_cache_slots": 320,
+    "runtime_hard_minimum_available_gib": 4,
+    "runtime_maximum_pages_output_per_second": 512,
+    "runtime_minimum_private_working_set_ratio": 0.70,
+    "runtime_private_working_set_minimum_gib": 40,
+    "runtime_contamination_samples": 3,
+    "processes_per_arm": 1,
+    "quality_or_performance_claim_allowed": false
+  },
+  "runs": [
+    {
+      "tag": "g106_iq1_cache6_arena20_residency_retry_n1",
+      "result": "pass",
+      "max_tokens": 16,
+      "iq1_requested_gib": 6,
+      "iq1_slots_used": 488,
+      "iq1_slot_capacity": 1310,
+      "minimum_available_gib": 26.867,
+      "peak_shared_wddm_gib": 26.373,
+      "peak_pages_output_per_second": 0,
+      "vram_expert_cache_slots": 320,
+      "result_sha256": "d24dff85384dc47fa57a585f4f956392174617ba0c906aa8ecf95a386e73b269",
+      "telemetry_sha256": "e340b28b8b1dd43127adb46ec3579381f553c30c0d6225293c7e258ccdd39585"
+    },
+    {
+      "tag": "g106_iq1_cache6_arena20_fullfill_n1",
+      "result": "pass_near_full",
+      "max_tokens": 64,
+      "iq1_requested_gib": 6,
+      "iq1_slots_used": 1259,
+      "iq1_slot_capacity": 1310,
+      "minimum_available_gib": 26.236,
+      "peak_shared_wddm_gib": 26.373,
+      "peak_pages_output_per_second": 0,
+      "vram_expert_cache_slots": 320,
+      "result_sha256": "31a9611f5e9b5fd43df3c7f643d3272eba93e98d6b2801a28cabe6e469c3181f",
+      "telemetry_sha256": "2db9e929ea550f1da19e7840f340d7d54f1bccff492c6855af59006fafa258ca"
+    },
+    {
+      "tag": "g106_iq1_cache8_arena20_residency_n1",
+      "result": "pass",
+      "max_tokens": 16,
+      "iq1_requested_gib": 8,
+      "iq1_slots_used": 488,
+      "iq1_slot_capacity": 1747,
+      "minimum_available_gib": 24.891,
+      "peak_shared_wddm_gib": 28.373,
+      "peak_pages_output_per_second": 0,
+      "vram_expert_cache_slots": 296,
+      "result_sha256": "46a6c14254ac3b861b914e82eadd61b664802c5786857afda8756a7d29c58083",
+      "telemetry_sha256": "9468255089a1d0a0b6994527581a75729bb2d2f0bb3b100706b5820f58ac90c6"
+    },
+    {
+      "tag": "g106_iq1_cache10_arena20_residency_n1",
+      "result": "pass_boundary",
+      "max_tokens": 16,
+      "iq1_requested_gib": 10,
+      "iq1_slots_used": 488,
+      "iq1_slot_capacity": 2184,
+      "minimum_available_gib": 22.923,
+      "peak_shared_wddm_gib": 30.373,
+      "peak_pages_output_per_second": 0,
+      "vram_expert_cache_slots": 296,
+      "result_sha256": "f3f984e7eee73b0ff0e75b302286c1a6fd292d615eb390bfcc70eb7538c8e2b9",
+      "telemetry_sha256": "f71bfce42d2952b8ed43e99cb457364b9b548bd1d883ff5cda51cc4f5b0d9d5b"
+    },
+    {
+      "tag": "g106_iq1_cache11_arena20_boundary_n1",
+      "result": "fail_closed_cuda_host_alloc_oom",
+      "max_tokens_requested": 8,
+      "iq1_requested_gib": 11,
+      "observed_requested_allocation_gib": 10.995,
+      "stderr_sha256": "f65b1ced425442835c1807a5204fb26c711cad277e1dea2ee53964daacc3e662",
+      "telemetry_sha256": "0975a2ed8d2f8756891433c8371c8f95f45d821c72dbbdfff85ce0c728b75570"
+    }
+  ],
+  "excluded_calibration_run": {
+    "tag": "g106_iq1_cache6_arena20_residency_n1",
+    "reason": "residency threshold was too aggressive during normal CUDA startup",
+    "stderr_sha256": "cb623986f68bb743ed92cc600fa4cb88c74bd1181b4543029942b0f04c107874",
+    "telemetry_sha256": "806e36c5780311cd7de4897281edccc82d5d8ebf246fbbcd188fd53f60afb130"
+  },
+  "decision": {
+    "largest_passing_iq1_pinned_gib": 10,
+    "first_failing_iq1_pinned_gib": 11,
+    "initial_dynamic_policy_candidate_gib": 6,
+    "reason": "6 GiB preserves 320 VRAM expert slots; 8 and 10 GiB measured 296"
+  }
+}
