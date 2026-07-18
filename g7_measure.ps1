@@ -40,10 +40,13 @@ param(
     [switch]$PrefillMassWrap,
     [switch]$ComposePrefillMassTiering,
     [switch]$ComposePrefillMassOpenRouter,
+    [switch]$ForceOpenRouter,
     [ValidateRange(0, 512)][int]$ComposePrefillMassReserveSlots = 0,
     [ValidateRange(0, 40)][int]$PrefillMassLayerFullEvery = 0,
     [ValidateRange(0, 39)][int]$PrefillMassLayerFullPhase = 0,
     [ValidateRange(0, 32)][int]$PrefillVramSeedPerLayer = 0,
+    [ValidateRange(0, 512)][int]$PrefillVramSeedTotal = 0,
+    [ValidateRange(0, 32)][int]$PrefillVramSeedFloorPerLayer = 0,
     [switch]$ReapMassObserve,
     [switch]$ReapMassWrap,
     [string]$ReapMaskFile = "",
@@ -104,11 +107,33 @@ param(
     [string]$ExpectedQ1_0ExpertSidecarSHA256 = "",
     [UInt64]$ExpectedQ1_0ExpertSidecarBytes = 0,
     [switch]$ReuseVerifiedQ1_0Receipt,
-    [ValidateRange(3, 42)][int]$Q1_0LayerFirst = 3,
-    [ValidateRange(3, 42)][int]$Q1_0LayerLast = 42,
+    [switch]$AllowBenchmarkVerifiedReceiptReuse,
+    [ValidateRange(0, 42)][int]$Q1_0LayerFirst = 3,
+    [ValidateRange(0, 42)][int]$Q1_0LayerLast = 42,
     [switch]$Q1_0SelectedLoad,
     [switch]$Q1_0ResidentArena,
     [switch]$Q1_0DualArena,
+    [switch]$Q1_0DualSparseCompanion,
+    [switch]$Q1_0MixedColdOne,
+    [switch]$Q1_0SnapshotBacking,
+    [switch]$Q1_0PageableOverflow,
+    [switch]$Q1_0PureResident,
+    [ValidateRange(0, 11008)][int]$ExpectedQ1_0SnapshotEntries = 0,
+    [switch]$Q1_0MixedTrace,
+    [string]$NestedResidualSidecar = "",
+    [string]$ExpectedNestedResidualSidecarSHA256 = "",
+    [string]$ExpectedNestedResidualSourceSHA256 = "",
+    [string]$ExpectedNestedResidualPayloadSHA256 = "",
+    [switch]$NestedResidualVerifyReconstruction,
+    [switch]$NestedResidualProfile,
+    [ValidateRange(1, 64)][int]$NestedResidualCacheExperts = 6,
+    [switch]$NestedResidualStructuralN1,
+    [switch]$NestedResidualGpuCache,
+    [switch]$NestedResidualGpuJoin,
+    [string]$NestedResidualGpuJoinSafetyReceipt = "",
+    [string]$ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 = "",
+    [switch]$AllowNestedResidualBenchmarkSuite,
+    [ValidateRange(0, 64)][int]$OuterNestedResidualBenchmarkProcessCount = 0,
     [string]$Iq1SExpertSidecar = "",
     [string]$ExpectedIq1SExpertSidecarSHA256 = "",
     [UInt64]$ExpectedIq1SExpertSidecarBytes = 0,
@@ -170,13 +195,23 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$effectiveProcessPath = [Environment]::GetEnvironmentVariable(
+    "Path", [EnvironmentVariableTarget]::Process)
+[Environment]::SetEnvironmentVariable(
+    "PATH", $null, [EnvironmentVariableTarget]::Process)
+[Environment]::SetEnvironmentVariable(
+    "Path", $effectiveProcessPath, [EnvironmentVariableTarget]::Process)
 . (Join-Path $PSScriptRoot "g7_process_isolation.ps1")
+. (Join-Path $PSScriptRoot "g7_system_counters.ps1")
 function Read-G7Q1_0SidecarTelemetry {
     param(
         [AllowEmptyString()][string]$LogText,
         [bool]$SidecarConfigured,
         [bool]$SelectedLoadRequested,
         [bool]$ResidentArenaRequested,
+        [bool]$SnapshotBackingRequested,
+        [bool]$DualSparseRequested,
+        [UInt64]$ExpectedSnapshotEntries,
         [AllowEmptyString()][string]$SidecarPath
     )
 
@@ -199,6 +234,7 @@ function Read-G7Q1_0SidecarTelemetry {
             selected_loads = [UInt64]0
             failures = [UInt64]0
             resident_arena_requested = $false
+            snapshot_backing_requested = $false
             resident_mode = 0
             resident_hits = [UInt64]0
             resident_misses = [UInt64]0
@@ -273,7 +309,13 @@ function Read-G7Q1_0SidecarTelemetry {
         if ($ResidentArenaRequested) {
             if ($residentMode -ne 1 -or $residentHits -eq 0 -or
                 $residentMisses -ne 0 -or $directPreadFallbacks -ne 0 -or
-                $directPreadBytes -ne 0 -or $bootstrapEntries -ne 256) {
+                $directPreadBytes -ne 0 -or
+                ($SnapshotBackingRequested -and
+                 ($ExpectedSnapshotEntries -eq 0 -or
+                  $bootstrapEntries -ne $ExpectedSnapshotEntries)) -or
+                (-not $SnapshotBackingRequested -and
+                 -not $DualSparseRequested -and
+                 $bootstrapEntries -ne 256)) {
                 throw "Q1_0 resident arena structural counters are inconsistent"
             }
         } else {
@@ -297,6 +339,7 @@ function Read-G7Q1_0SidecarTelemetry {
         selected_loads = $selectedLoads
         failures = $failures
         resident_arena_requested = $ResidentArenaRequested
+        snapshot_backing_requested = $SnapshotBackingRequested
         resident_mode = $residentMode
         resident_hits = $residentHits
         resident_misses = $residentMisses
@@ -307,6 +350,74 @@ function Read-G7Q1_0SidecarTelemetry {
         runtime_contract_valid = $true
         fail_closed_observed = $failClosedObserved
     }
+}
+function Read-G7Q1_0MixedTelemetry {
+    param(
+        [AllowEmptyString()][string]$LogText,
+        [bool]$Required
+    )
+
+    $matches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-mixed\] result=summary calls=(\d+) all_iq2=(\d+) iq2_vram=(\d+) iq2_snapshot_ram=(\d+) iq2_tier_ram=(\d+) q1_resident=(\d+) joins=(\d+) trace_rows=(\d+) iq2_ssd_bytes=(\d+) iq2_ssd_violations=(\d+) failures=(\d+)(?: cold_one_calls=(\d+) cold_one_hot_routes=(\d+) cold_one_q1_routes=(\d+) cold_one_invariant_failures=(\d+))? router=([^ \x0d\x0a]+) promotion=([^ \x0d\x0a]+)\x0d?$')
+    if ($matches.Count -eq 0) {
+        if ($Required) {
+            throw "Q1_0 mixed resolver summary is required but missing"
+        }
+        return [pscustomobject]@{
+            observed = $false
+            calls = [UInt64]0
+            all_iq2 = [UInt64]0
+            iq2_vram = [UInt64]0
+            iq2_snapshot_ram = [UInt64]0
+            iq2_tier_ram = [UInt64]0
+            q1_resident = [UInt64]0
+            joins = [UInt64]0
+            trace_rows = [UInt64]0
+            iq2_ssd_bytes = [UInt64]0
+            iq2_ssd_violations = [UInt64]0
+            failures = [UInt64]0
+            cold_one_calls = [UInt64]0
+            cold_one_hot_routes = [UInt64]0
+            cold_one_q1_routes = [UInt64]0
+            cold_one_invariant_failures = [UInt64]0
+            router = "not_observed"
+            promotion = "not_observed"
+        }
+    }
+    if ($matches.Count -ne 1) {
+        throw "Q1_0 mixed resolver requires exactly one summary; observed $($matches.Count)"
+    }
+
+    $match = $matches[0]
+    $telemetry = [pscustomobject]@{
+        observed = $true
+        calls = [UInt64]$match.Groups[1].Value
+        all_iq2 = [UInt64]$match.Groups[2].Value
+        iq2_vram = [UInt64]$match.Groups[3].Value
+        iq2_snapshot_ram = [UInt64]$match.Groups[4].Value
+        iq2_tier_ram = [UInt64]$match.Groups[5].Value
+        q1_resident = [UInt64]$match.Groups[6].Value
+        joins = [UInt64]$match.Groups[7].Value
+        trace_rows = [UInt64]$match.Groups[8].Value
+        iq2_ssd_bytes = [UInt64]$match.Groups[9].Value
+        iq2_ssd_violations = [UInt64]$match.Groups[10].Value
+        failures = [UInt64]$match.Groups[11].Value
+        cold_one_calls = $(if ($match.Groups[12].Success) { [UInt64]$match.Groups[12].Value } else { [UInt64]0 })
+        cold_one_hot_routes = $(if ($match.Groups[13].Success) { [UInt64]$match.Groups[13].Value } else { [UInt64]0 })
+        cold_one_q1_routes = $(if ($match.Groups[14].Success) { [UInt64]$match.Groups[14].Value } else { [UInt64]0 })
+        cold_one_invariant_failures = $(if ($match.Groups[15].Success) { [UInt64]$match.Groups[15].Value } else { [UInt64]0 })
+        router = [string]$match.Groups[16].Value
+        promotion = [string]$match.Groups[17].Value
+    }
+    if ($Required -and
+        ($telemetry.calls -eq 0 -or $telemetry.q1_resident -eq 0 -or
+         $telemetry.failures -ne 0 -or $telemetry.iq2_ssd_bytes -ne 0 -or
+         $telemetry.iq2_ssd_violations -ne 0 -or
+         $telemetry.router -ne "unchanged")) {
+        throw "Q1_0 mixed resolver counters violate the snapshot contract"
+    }
+    return $telemetry
 }
 function Get-G7PreflightMedian([double[]]$Values) {
     if ($null -eq $Values -or $Values.Count -eq 0) { return $null }
@@ -345,7 +456,16 @@ function Read-G7ReceiptSnapshot([string]$Path, [string]$Kind) {
         if ($null -ne $stream) { $stream.Dispose() }
     }
     try {
-        $receipt = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+        $jsonOffset = 0
+        if ($bytes.Length -ge 3 -and
+            $bytes[0] -eq 0xEF -and
+            $bytes[1] -eq 0xBB -and
+            $bytes[2] -eq 0xBF) {
+            $jsonOffset = 3
+        }
+        $jsonText = [Text.Encoding]::UTF8.GetString(
+            $bytes, $jsonOffset, $bytes.Length - $jsonOffset)
+        $receipt = $jsonText | ConvertFrom-Json
     } catch {
         throw "$Kind verified receipt is invalid JSON"
     }
@@ -541,6 +661,23 @@ if ($ExpectedQ1_0ExpertSidecarSHA256 -and
     $ExpectedQ1_0ExpertSidecarSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedQ1_0ExpertSidecarSHA256 must be a 64-character hexadecimal SHA-256"
 }
+if ($ExpectedNestedResidualSourceSHA256 -and
+    $ExpectedNestedResidualSourceSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedNestedResidualSourceSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($ExpectedNestedResidualSidecarSHA256 -and
+    $ExpectedNestedResidualSidecarSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedNestedResidualSidecarSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($ExpectedNestedResidualPayloadSHA256 -and
+    $ExpectedNestedResidualPayloadSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedNestedResidualPayloadSHA256 must be a 64-character hexadecimal SHA-256"
+}
+if ($ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 -and
+    $ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 -notmatch
+        '^[0-9a-fA-F]{64}$') {
+    throw "ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 must be a 64-character hexadecimal SHA-256"
+}
 if ($ExpectedModelIq1SuiteReceiptSHA256 -and
     $ExpectedModelIq1SuiteReceiptSHA256 -notmatch '^[0-9a-fA-F]{64}$') {
     throw "ExpectedModelIq1SuiteReceiptSHA256 must be a 64-character hexadecimal SHA-256"
@@ -553,8 +690,24 @@ if ($ReuseVerifiedQ1_0Receipt -and -not $ExpectedQ1_0ExpertSidecarSHA256) {
 }
 if (($ReuseVerifiedModelReceipt -or $ReuseVerifiedIq1SReceipt -or
      $ReuseVerifiedQ1_0Receipt) -and
-    $GateKind -ne "structural-safety") {
+    $GateKind -ne "structural-safety" -and
+    -not ($AllowBenchmarkVerifiedReceiptReuse -and
+          $GateKind -eq "benchmark")) {
     throw "Verified receipt reuse is restricted to structural-safety diagnostics"
+}
+if ($AllowBenchmarkVerifiedReceiptReuse) {
+    if ($GateKind -ne "benchmark") {
+        throw "AllowBenchmarkVerifiedReceiptReuse requires GateKind=benchmark"
+    }
+    if (-not $ReuseVerifiedModelReceipt) {
+        throw "Benchmark verified receipt reuse requires the model receipt"
+    }
+    if ($Q1_0ExpertSidecar -and -not $ReuseVerifiedQ1_0Receipt) {
+        throw "Benchmark Q1_0 receipt reuse requires the Q1_0 receipt"
+    }
+    if ($Iq1SExpertSidecar -and -not $ReuseVerifiedIq1SReceipt) {
+        throw "Benchmark IQ1_S receipt reuse requires the IQ1_S receipt"
+    }
 }
 if ($ReuseVerifiedSuiteReceipt) {
     if ($GateKind -eq "quality" -and -not $AllowQualityVerifiedSuiteReceipt) {
@@ -607,6 +760,9 @@ if (-not $AllowEmbeddedBakeMask -and $ExpectedEmbeddedBakeMaskSHA256) {
 }
 if ($AllowEmbeddedBakeMask -and $ReapMaskFile) {
     throw "AllowEmbeddedBakeMask cannot be combined with ReapMaskFile"
+}
+if ($ForceOpenRouter -and ($ReapMaskFile -or $AllowEmbeddedBakeMask)) {
+    throw "ForceOpenRouter cannot be combined with a static or embedded mask"
 }
 if ($WarmupPrompt -and -not $Warmup) {
     throw "WarmupPrompt requires -Warmup"
@@ -715,6 +871,18 @@ $iq1SSidecarReceiptAtStart = $null
 $iq1SSidecarReceiptPath = ""
 $iq1SSidecarReceiptHashAtStart = ""
 $iq1SSidecarLockStream = $null
+$nestedResidualLockStream = $null
+$nestedResidualInfoAtStart = $null
+$nestedResidualHashAtStart = ""
+$nestedResidualGpuJoinSafetyReceiptLockStream = $null
+$nestedResidualGpuJoinSafetyResultLockStream = $null
+$nestedResidualGpuJoinSafetyReceiptAtStart = $null
+$nestedResidualGpuJoinSafetyReceiptPathAtStart = ""
+$nestedResidualGpuJoinSafetyReceiptHashAtStart = ""
+$nestedResidualGpuJoinSafetyResultAtStart = $null
+$nestedResidualGpuJoinSafetyResultPathAtStart = ""
+$nestedResidualGpuJoinSafetyResultHashAtStart = ""
+$nestedResidualGpuJoinSafetyReceiptValidated = $false
 $modelIq1SuiteReceiptAtStart = $null
 $modelIq1SuiteReceiptPathAtStart = ""
 $modelIq1SuiteReceiptHashAtStart = ""
@@ -723,18 +891,135 @@ $modelIq1SuiteFullHashVerified = $false
 $modelIq1SuiteLockProofRequired = $false
 $modelIq1SuiteLockProofObserved = $false
 $modelIq1SuiteLockProof = $null
+$benchmarkVerifiedReceiptLockProofRequired = $false
+$benchmarkVerifiedReceiptLockProofObserved = $false
+$benchmarkVerifiedReceiptLockProof = $null
+$nestedResidualBenchmarkMember = $false
+if ($AllowNestedResidualBenchmarkSuite) {
+    if (-not $NestedResidualSidecar) {
+        throw "AllowNestedResidualBenchmarkSuite requires NestedResidualSidecar"
+    }
+    if ($GateKind -ne "benchmark" -or $Repeats -ne 1 -or $Warmup) {
+        throw "Nested residual outer benchmark members require GateKind=benchmark, Repeats=1, and no warmup"
+    }
+    if ($OuterNestedResidualBenchmarkProcessCount -lt 3) {
+        throw "Nested residual outer benchmark suite requires at least 3 processes"
+    }
+    if (-not $NestedResidualGpuCache) {
+        throw "Nested residual outer benchmark suite requires NestedResidualGpuCache"
+    }
+    $nestedResidualBenchmarkMember = $true
+} elseif ($OuterNestedResidualBenchmarkProcessCount -ne 0) {
+    throw "OuterNestedResidualBenchmarkProcessCount requires AllowNestedResidualBenchmarkSuite"
+}
 if (-not $Q1_0ExpertSidecar -and
     ($Q1_0SelectedLoad -or $ExpectedQ1_0ExpertSidecarSHA256 -or
      $ExpectedQ1_0ExpertSidecarBytes -ne 0 -or $Q1_0ResidentArena -or
-     $Q1_0DualArena -or
-     $ReuseVerifiedQ1_0Receipt)) {
+      $Q1_0DualArena -or $Q1_0DualSparseCompanion -or
+      $Q1_0MixedColdOne -or $Q1_0SnapshotBacking -or
+      $Q1_0PageableOverflow -or
+      $Q1_0PureResident -or
+      $ExpectedQ1_0SnapshotEntries -ne 0 -or
+      $ReuseVerifiedQ1_0Receipt)) {
     throw "Q1_0 selected-load and provenance options require Q1_0ExpertSidecar"
+}
+if ($NestedResidualSidecar) {
+    if (-not (Test-Path -LiteralPath $NestedResidualSidecar -PathType Leaf)) {
+        throw "Nested residual sidecar missing: $NestedResidualSidecar"
+    }
+    if (-not $ExpectedNestedResidualSidecarSHA256 -or
+        -not $ExpectedNestedResidualSourceSHA256 -or
+        -not $ExpectedNestedResidualPayloadSHA256) {
+        throw "NestedResidualSidecar requires sidecar, source, and payload SHA-256"
+    }
+    $nestedResidualStructuralMember = [bool](
+        $GateKind -eq "structural-safety" -and $Repeats -eq 1 -and
+        -not $Warmup)
+    if (-not $nestedResidualStructuralMember -and
+        -not $nestedResidualBenchmarkMember) {
+        throw "NestedResidualSidecar requires one structural-safety run or an explicit outer benchmark n>=3 member"
+    }
+    if ($Q1_0ExpertSidecar -or $Iq1SExpertSidecar -or $ReapMaskFile -or
+        $SpexDryRun -or $SpexPrefetchK -gt 0 -or $SpexCpuProbeK -gt 0) {
+        throw "NestedResidualSidecar must be isolated from Q1_0, IQ1_S, REAP masks, and SPEX"
+    }
+    if (-not $ExpectedModelSHA256 -or
+        $ExpectedNestedResidualSourceSHA256 -ine $ExpectedModelSHA256) {
+        throw "Nested residual source SHA-256 must equal the verified primary model SHA-256"
+    }
+    $NestedResidualSidecar =
+        (Resolve-Path -LiteralPath $NestedResidualSidecar).Path
+    $nestedResidualLockStream = [IO.File]::Open(
+        $NestedResidualSidecar, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $nestedResidualInfoAtStart = Get-Item -LiteralPath $NestedResidualSidecar
+    $nestedResidualHashAtStart = (Get-FileHash -LiteralPath `
+        $NestedResidualSidecar -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($nestedResidualHashAtStart -ine
+        $ExpectedNestedResidualSidecarSHA256) {
+        throw "Nested residual full sidecar SHA-256 mismatch"
+    }
+} elseif ($ExpectedNestedResidualSidecarSHA256 -or
+          $ExpectedNestedResidualSourceSHA256 -or
+          $ExpectedNestedResidualPayloadSHA256 -or
+          $NestedResidualVerifyReconstruction -or
+          $NestedResidualProfile -or
+          $NestedResidualStructuralN1 -or
+          $NestedResidualGpuCache -or
+          $NestedResidualGpuJoin -or
+          $NestedResidualGpuJoinSafetyReceipt -or
+          $ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 -or
+          $AllowNestedResidualBenchmarkSuite -or
+          $OuterNestedResidualBenchmarkProcessCount -ne 0) {
+    throw "Nested residual provenance and verification options require NestedResidualSidecar"
+}
+if ($NestedResidualStructuralN1 -and
+    ($GateKind -ne "structural-safety" -or $Repeats -ne 1 -or $Warmup)) {
+    throw "NestedResidualStructuralN1 requires GateKind=structural-safety, Repeats=1, and no warmup"
+}
+if ($NestedResidualGpuCache) {
+    if (-not $NestedResidualSidecar -or -not $GpuResidentRoutes -or
+        -not $SplitFused -or $NestedResidualCacheExperts -lt 1) {
+        throw "NestedResidualGpuCache requires NestedResidualSidecar, GpuResidentRoutes, SplitFused, and NestedResidualCacheExperts >= 1"
+    }
+}
+if ($NestedResidualGpuJoin) {
+    if (-not $NestedResidualSidecar -or -not $GpuResidentRoutes -or
+        -not $SplitFused) {
+        throw "NestedResidualGpuJoin requires NestedResidualSidecar, GpuResidentRoutes, and SplitFused"
+    }
+    if (-not $NestedResidualVerifyReconstruction) {
+        if (-not $NestedResidualGpuJoinSafetyReceipt -or
+            -not $ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 -or
+            -not $AllowNestedResidualBenchmarkSuite -or
+            $GateKind -ne "benchmark") {
+            throw "NestedResidualGpuJoin without runtime reconstruction verification requires a hash-pinned G125 safety receipt and an explicit outer benchmark suite"
+        }
+    }
+}
+if ($NestedResidualGpuJoinSafetyReceipt) {
+    if (-not $NestedResidualGpuJoin -or $NestedResidualVerifyReconstruction -or
+        -not $AllowNestedResidualBenchmarkSuite -or
+        $GateKind -ne "benchmark") {
+        throw "NestedResidualGpuJoinSafetyReceipt is only valid for an unverified GPU-join outer benchmark member"
+    }
+    if (-not (Test-Path -LiteralPath $NestedResidualGpuJoinSafetyReceipt `
+            -PathType Leaf)) {
+        throw "Nested residual GPU join safety receipt missing: $NestedResidualGpuJoinSafetyReceipt"
+    }
+    $NestedResidualGpuJoinSafetyReceipt =
+        (Resolve-Path -LiteralPath $NestedResidualGpuJoinSafetyReceipt).Path
+    $nestedResidualGpuJoinSafetyReceiptPathAtStart =
+        $NestedResidualGpuJoinSafetyReceipt
+} elseif ($ExpectedNestedResidualGpuJoinSafetyReceiptSHA256) {
+    throw "ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 requires NestedResidualGpuJoinSafetyReceipt"
 }
 if ($Q1_0ExpertSidecar) {
     if ($Q1_0LayerFirst -gt $Q1_0LayerLast) {
         throw "Q1_0LayerFirst must be less than or equal to Q1_0LayerLast"
     }
-    if ($GateKind -ne "structural-safety" -or $Repeats -ne 1 -or $Warmup) {
+    if (-not $Q1_0SnapshotBacking -and
+        ($GateKind -ne "structural-safety" -or $Repeats -ne 1 -or $Warmup)) {
         throw "Q1_0 runtime step3 requires GateKind=structural-safety, Repeats=1, and no warmup"
     }
     if ($Iq1SExpertSidecar) {
@@ -750,12 +1035,50 @@ if ($Q1_0ExpertSidecar) {
     if ($Q1_0DualArena -and -not $Q1_0ResidentArena) {
         throw "Q1_0DualArena requires Q1_0ResidentArena"
     }
+    if ($Q1_0DualSparseCompanion -and
+        (-not $Q1_0ResidentArena -or -not $Q1_0DualArena -or
+         -not $Q1_0MixedColdOne -or -not $PrefillMassWrap -or
+         -not $ComposePrefillMassTiering -or
+         $Q1_0LayerFirst -ne 0 -or $Q1_0LayerLast -ne 42)) {
+        throw "Q1_0DualSparseCompanion requires resident+dual+cold-one, PrefillMassWrap, ComposePrefillMassTiering, and Q1 layers 0..42 so the companion matches the complete prefill candidate mask"
+    }
+    if ($Q1_0MixedColdOne -and -not $Q1_0DualSparseCompanion) {
+        throw "Q1_0MixedColdOne requires Q1_0DualSparseCompanion"
+    }
+    if ($Q1_0SnapshotBacking -and
+        ($Q1_0ResidentArena -or $Q1_0DualArena -or
+         -not $Q1_0SelectedLoad -or $DynamicArenaGiB -le 0.0 -or
+         -not $PrefillMassWrap -or
+         (-not $ComposePrefillMassTiering -and -not $Q1_0PureResident) -or
+         $Q1_0LayerFirst -ne 0 -or $Q1_0LayerLast -ne 42 -or
+         $ExpectedQ1_0SnapshotEntries -le 0 -or
+         -not $ReuseVerifiedQ1_0Receipt -or
+         -not $ExpectedModelSHA256)) {
+        throw "Q1_0SnapshotBacking is exclusive and requires selected load, DynamicArenaGiB > 0, PrefillMassWrap, ComposePrefillMass or Q1_0PureResident, layers 0..42, ExpectedQ1_0SnapshotEntries > 0, and verified model/Q1 receipts"
+    }
+    if ($Q1_0PureResident -and
+        (-not $Q1_0SnapshotBacking -or -not $Q1_0PageableOverflow -or
+         $ComposePrefillMassTiering -or $PrefillVramSeedPerLayer -ne 0 -or
+         $PrefillVramSeedTotal -ne 0 -or
+         $PrefillVramSeedFloorPerLayer -ne 0 -or
+         $ExpertCacheN -ne 0 -or $GpuResidentRoutes -or
+         $ExpertTiering -ne "off")) {
+        throw "Q1_0PureResident requires snapshot backing with pageable overflow and forbids composed tiering, VRAM seed, expert cache, GPU-resident IQ2 routes, and expert tiering"
+    }
+    if ($Q1_0PageableOverflow -and -not $Q1_0SnapshotBacking) {
+        throw "Q1_0PageableOverflow requires Q1_0SnapshotBacking"
+    }
+    if (-not $Q1_0SnapshotBacking -and $ExpectedQ1_0SnapshotEntries -ne 0) {
+        throw "ExpectedQ1_0SnapshotEntries requires Q1_0SnapshotBacking"
+    }
     if (-not (Test-Path -LiteralPath $Q1_0ExpertSidecar -PathType Leaf)) {
         throw "Q1_0 sidecar missing: $Q1_0ExpertSidecar"
     }
-    $q1_0SidecarLockStream = [IO.File]::Open(
-        $Q1_0ExpertSidecar, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    if (-not $AllowBenchmarkVerifiedReceiptReuse) {
+        $q1_0SidecarLockStream = [IO.File]::Open(
+            $Q1_0ExpertSidecar, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    }
     $q1_0SidecarInfoAtStart = Get-Item -LiteralPath $Q1_0ExpertSidecar
     if ($ExpectedQ1_0ExpertSidecarBytes -ne 0 -and
         [UInt64]$q1_0SidecarInfoAtStart.Length -ne
@@ -776,6 +1099,37 @@ if ($Q1_0ExpertSidecar) {
             -Info $q1_0SidecarInfoAtStart `
             -ExpectedSHA256 $ExpectedQ1_0ExpertSidecarSHA256 `
             -Kind "Q1_0 sidecar"
+        if ($Q1_0SnapshotBacking) {
+            foreach ($requiredProperty in @(
+                    "source_model_sha256", "layer_first", "layer_last",
+                    "tensor_type", "derived_from_iq2", "conversion_source",
+                    "manifest_path", "manifest_sha256")) {
+                if ($null -eq $q1_0SidecarReceiptAtStart.PSObject.Properties[$requiredProperty]) {
+                    throw "Q1_0 snapshot receipt missing provenance field: $requiredProperty"
+                }
+            }
+            if ([string]$q1_0SidecarReceiptAtStart.source_model_sha256 -ine
+                    $ExpectedModelSHA256 -or
+                [int]$q1_0SidecarReceiptAtStart.layer_first -ne 0 -or
+                [int]$q1_0SidecarReceiptAtStart.layer_last -ne 42 -or
+                [string]$q1_0SidecarReceiptAtStart.tensor_type -ne "Q1_0" -or
+                -not [bool]$q1_0SidecarReceiptAtStart.derived_from_iq2 -or
+                [string]::IsNullOrWhiteSpace(
+                    [string]$q1_0SidecarReceiptAtStart.conversion_source) -or
+                [string]$q1_0SidecarReceiptAtStart.manifest_sha256 -notmatch
+                    '^[0-9a-fA-F]{64}$') {
+                throw "Q1_0 snapshot receipt provenance does not match the authoritative model/layer/type contract"
+            }
+            $snapshotManifestPath = [string]$q1_0SidecarReceiptAtStart.manifest_path
+            if (-not (Test-Path -LiteralPath $snapshotManifestPath -PathType Leaf)) {
+                throw "Q1_0 snapshot manifest from verified receipt is missing"
+            }
+            $observedManifestSHA256 = (Get-FileHash -LiteralPath $snapshotManifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($observedManifestSHA256 -ine
+                    [string]$q1_0SidecarReceiptAtStart.manifest_sha256) {
+                throw "Q1_0 snapshot manifest hash differs from verified receipt"
+            }
+        }
     }
 }
 if ($Iq1SExpertSidecar) {
@@ -852,6 +1206,35 @@ if (-not $Iq1Promotion -and
      $Iq1PromotionWindowCalls -ne 0 -or
      $Iq1PromotionWindowBudget -ne 0)) {
     throw "Non-default IQ1 promotion knobs require -Iq1Promotion"
+}
+if ($AllowBenchmarkVerifiedReceiptReuse) {
+    $benchmarkVerifiedReceiptLockProofRequired = $true
+    $modelLockProof = Test-G7SharingViolationProof -Path $model `
+        -Kind "Model"
+    $q1LockProof = if ($Q1_0ExpertSidecar) {
+        Test-G7SharingViolationProof -Path $Q1_0ExpertSidecar `
+            -Kind "Q1_0 sidecar"
+    } else { $null }
+    $iq1LockProof = if ($Iq1SExpertSidecar) {
+        Test-G7SharingViolationProof -Path $Iq1SExpertSidecar `
+            -Kind "IQ1_S sidecar"
+    } else { $null }
+    $benchmarkVerifiedReceiptLockProofObserved = [bool](
+        [bool]$modelLockProof.sharing_violation_lock_proof -and
+        ($null -eq $q1LockProof -or
+         [bool]$q1LockProof.sharing_violation_lock_proof) -and
+        ($null -eq $iq1LockProof -or
+         [bool]$iq1LockProof.sharing_violation_lock_proof))
+    $benchmarkVerifiedReceiptLockProof = [pscustomobject]@{
+        required = $true
+        observed = $benchmarkVerifiedReceiptLockProofObserved
+        model = $modelLockProof
+        q1_0_sidecar = $q1LockProof
+        iq1_s_sidecar = $iq1LockProof
+    }
+    if (-not $benchmarkVerifiedReceiptLockProofObserved) {
+        throw "Benchmark verified receipt reuse requires active parent-held deny-write/delete locks"
+    }
 }
 if ($ReuseVerifiedSuiteReceipt -and
     ($GateKind -eq "benchmark" -or $AllowQualityVerifiedSuiteReceipt)) {
@@ -967,7 +1350,8 @@ if (Test-Path $rawOutputsPath) { Remove-Item $rawOutputsPath -Force }
 if (Test-Path $resultPath) { Remove-Item $resultPath -Force }
 
 try {
-    $processesAtPreflight = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    $processSnapshot = Get-G7ProcessSnapshot
+    $processesAtPreflight = @($processSnapshot.processes)
 } catch {
     throw ("Process isolation preflight could not enumerate processes: " + $_.Exception.Message)
 }
@@ -1013,6 +1397,9 @@ $processIsolationPreflight = [pscustomobject]@{
     mutex_acquired = $measurementLockAcquired
     current_harness_pid = $PID
     gate_kind = $GateKind
+    process_enumeration_method = [string]$processSnapshot.method
+    process_command_line_available =
+        [bool]$processSnapshot.command_line_available
     ancestor_process_ids = $ancestorProcessIds
     conflict_count = $allProcessConflicts.Count
     conflicts = $allProcessConflicts
@@ -1059,13 +1446,91 @@ if ($Q1_0ExpertSidecar) {
     } else {
         Remove-Item Env:\DS4_Q1_0_DUAL_ARENA -ErrorAction SilentlyContinue
     }
+    if ($Q1_0DualSparseCompanion) {
+        $env:DS4_Q1_0_DUAL_SPARSE_COMPANION = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_DUAL_SPARSE_COMPANION -ErrorAction SilentlyContinue
+    }
+    if ($Q1_0MixedColdOne) {
+        $env:DS4_Q1_0_MIXED_COLD_ONE = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_MIXED_COLD_ONE -ErrorAction SilentlyContinue
+    }
+    if ($Q1_0SnapshotBacking) {
+        $env:DS4_Q1_0_SNAPSHOT_BACKING = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_SNAPSHOT_BACKING -ErrorAction SilentlyContinue
+    }
+    if ($Q1_0PageableOverflow) {
+        $env:DS4_Q1_0_PAGEABLE_OVERFLOW = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_PAGEABLE_OVERFLOW -ErrorAction SilentlyContinue
+    }
+    if ($Q1_0MixedTrace) {
+        $env:DS4_Q1_0_MIXED_TRACE = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_MIXED_TRACE -ErrorAction SilentlyContinue
+    }
 } else {
     Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_RESIDENT_ARENA -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_DUAL_ARENA -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_DUAL_SPARSE_COMPANION -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_MIXED_COLD_ONE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_SNAPSHOT_BACKING -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PAGEABLE_OVERFLOW -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_MIXED_TRACE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_LAYER_FIRST -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_LAYER_LAST -ErrorAction SilentlyContinue
+}
+if ($NestedResidualSidecar) {
+    $env:DS4_NESTED_RESIDUAL_SIDECAR = $NestedResidualSidecar
+    $env:DS4_NESTED_RESIDUAL_EXACT = "1"
+    $env:DS4_NESTED_RESIDUAL_EXPECTED_SOURCE_SHA256 =
+        $ExpectedNestedResidualSourceSHA256.ToLowerInvariant()
+    $env:DS4_NESTED_RESIDUAL_EXPECTED_PAYLOAD_SHA256 =
+        $ExpectedNestedResidualPayloadSHA256.ToLowerInvariant()
+    $env:DS4_CUDA_PREFILL_TIER_ROUTER = "open"
+    if ($NestedResidualVerifyReconstruction) {
+        $env:DS4_NESTED_RESIDUAL_VERIFY_RECONSTRUCTION = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_VERIFY_RECONSTRUCTION -ErrorAction SilentlyContinue
+    }
+    if ($AllowNestedResidualBenchmarkSuite -and
+        -not $NestedResidualVerifyReconstruction) {
+        $env:DS4_NESTED_RESIDUAL_BENCHMARK_UNVERIFIED = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_BENCHMARK_UNVERIFIED -ErrorAction SilentlyContinue
+    }
+    if ($NestedResidualProfile) {
+        $env:DS4_NESTED_RESIDUAL_PROFILE = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_PROFILE -ErrorAction SilentlyContinue
+    }
+    $env:DS4_NESTED_RESIDUAL_CACHE_EXPERTS =
+        [string]$NestedResidualCacheExperts
+    if ($NestedResidualGpuCache) {
+        $env:DS4_NESTED_RESIDUAL_GPU_CACHE = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_CACHE -ErrorAction SilentlyContinue
+    }
+    if ($NestedResidualGpuJoin) {
+        $env:DS4_NESTED_RESIDUAL_GPU_JOIN = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN -ErrorAction SilentlyContinue
+    }
+} else {
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_SIDECAR -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_EXACT -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_EXPECTED_SOURCE_SHA256 -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_EXPECTED_PAYLOAD_SHA256 -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_VERIFY_RECONSTRUCTION -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_BENCHMARK_UNVERIFIED -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_PROFILE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_CACHE_EXPERTS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_CACHE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN -ErrorAction SilentlyContinue
 }
 if ($Iq1SExpertSidecar) {
     $env:DS4_IQ1_S_EXPERT_SIDECAR = $Iq1SExpertSidecar
@@ -1249,7 +1714,8 @@ if ($ComposePrefillMassTiering) {
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_TIER_COMPOSE -ErrorAction SilentlyContinue
 }
-if ($ComposePrefillMassOpenRouter) {
+if ($ComposePrefillMassOpenRouter -or $ForceOpenRouter -or
+    $NestedResidualSidecar) {
     $env:DS4_CUDA_PREFILL_TIER_ROUTER = "open"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_TIER_ROUTER -ErrorAction SilentlyContinue
@@ -1270,6 +1736,17 @@ if ($PrefillVramSeedPerLayer -gt 0) {
     $env:DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER = "$PrefillVramSeedPerLayer"
 } else {
     Remove-Item Env:\DS4_CUDA_PREFILL_VRAM_SEED_PER_LAYER -ErrorAction SilentlyContinue
+}
+if ($PrefillVramSeedTotal -gt 0) {
+    $env:DS4_CUDA_PREFILL_VRAM_SEED_TOTAL = "$PrefillVramSeedTotal"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_VRAM_SEED_TOTAL -ErrorAction SilentlyContinue
+}
+if ($PrefillVramSeedFloorPerLayer -gt 0) {
+    $env:DS4_CUDA_PREFILL_VRAM_SEED_FLOOR_PER_LAYER =
+        "$PrefillVramSeedFloorPerLayer"
+} else {
+    Remove-Item Env:\DS4_CUDA_PREFILL_VRAM_SEED_FLOOR_PER_LAYER -ErrorAction SilentlyContinue
 }
 if ($ReapMassObserve -or $ReapMassWrap) {
     $env:DS4_CUDA_REAP_MASS_OBSERVE = "1"
@@ -1522,6 +1999,23 @@ if ($PrefillVramSeedPerLayer -gt 0) {
         throw "PrefillVramSeedPerLayer requires at least $prefillVramSeedSlots expert-cache slots"
     }
 }
+if ($PrefillVramSeedTotal -gt 0) {
+    if ($PrefillVramSeedPerLayer -gt 0) {
+        throw "PrefillVramSeedTotal is mutually exclusive with PrefillVramSeedPerLayer"
+    }
+    if (-not $ComposePrefillMassTiering) { throw "PrefillVramSeedTotal requires ComposePrefillMassTiering" }
+    if (-not $PrefillMassWrap) { throw "PrefillVramSeedTotal requires PrefillMassWrap" }
+    if ($ExpertTiering -ne "enforce" -or $ExpertTierPolicy -ne "mass-lfru") { throw "PrefillVramSeedTotal requires enforce mass-lfru tiering" }
+    if (-not $GpuResidentRoutes) { throw "PrefillVramSeedTotal requires GpuResidentRoutes" }
+    if ($PrefillVramSeedFloorPerLayer * 40 -gt $PrefillVramSeedTotal) {
+        throw "PrefillVramSeedFloorPerLayer exceeds the global seed budget"
+    }
+    if ($PrefillVramSeedTotal -gt $ExpertCacheN) {
+        throw "PrefillVramSeedTotal requires at least $PrefillVramSeedTotal expert-cache slots"
+    }
+} elseif ($PrefillVramSeedFloorPerLayer -ne 0) {
+    throw "PrefillVramSeedFloorPerLayer requires PrefillVramSeedTotal"
+}
 if ($ExpertTiering -ne "off") {
     if (-not $GpuResidentRoutes) { throw "ExpertTiering requires GpuResidentRoutes" }
     if ($ExpertCacheN -le 0) { throw "ExpertTiering requires ExpertCacheN > 0" }
@@ -1605,6 +2099,13 @@ if ($effectiveMinimumAvailableGiB -eq 0.0) {
     if ($DynamicArenaGiB -gt 0.0) {
         $effectiveMinimumAvailableGiB = [math]::Max(4.0, $DynamicArenaGiB + 2.0)
     }
+    if ($Q1_0DualSparseCompanion) {
+        # Q1_0 is exactly half the routed-expert bytes of the IQ2 primary
+        # snapshot. Reserve both snapshots plus 2 GiB before committing RAM.
+        $effectiveMinimumAvailableGiB = [math]::Max(
+            $effectiveMinimumAvailableGiB,
+            ($DynamicArenaGiB * 1.5) + 2.0)
+    }
 }
 $memoryPreflight = Invoke-G7MemoryPreflight -Skip:$SkipMemoryPreflight `
     -MinimumAvailableGiB $effectiveMinimumAvailableGiB -Label ("g7:" + $Tag)
@@ -1632,11 +2133,45 @@ $runtimeMonitorHashAtStart = (Get-FileHash -Algorithm SHA256 $runtimeMonitorHelp
 $buildManifestHashAtStart = if (Test-Path -LiteralPath $buildManifestPath) {
     (Get-FileHash -Algorithm SHA256 $buildManifestPath).Hash.ToLowerInvariant()
 } else { "" }
+if ($nestedResidualGpuJoinSafetyReceiptPathAtStart) {
+    $nestedResidualGpuJoinSafetyReceiptLockStream = [IO.File]::Open(
+        $nestedResidualGpuJoinSafetyReceiptPathAtStart,
+        [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $safetyReceiptSnapshot = Read-G7ReceiptSnapshot `
+        -Path $nestedResidualGpuJoinSafetyReceiptPathAtStart `
+        -Kind "Nested residual GPU join safety"
+    $nestedResidualGpuJoinSafetyReceiptAtStart =
+        $safetyReceiptSnapshot.receipt
+    $nestedResidualGpuJoinSafetyReceiptHashAtStart =
+        $safetyReceiptSnapshot.sha256
+    if ($nestedResidualGpuJoinSafetyReceiptHashAtStart -ine
+        $ExpectedNestedResidualGpuJoinSafetyReceiptSHA256) {
+        throw "Nested residual GPU join safety receipt SHA-256 mismatch"
+    }
+    $nestedResidualGpuJoinSafetyResultPathAtStart =
+        [IO.Path]::GetFullPath(
+            [string]$nestedResidualGpuJoinSafetyReceiptAtStart.result_path)
+    if (-not (Test-Path -LiteralPath `
+            $nestedResidualGpuJoinSafetyResultPathAtStart -PathType Leaf)) {
+        throw "Nested residual GPU join safety result is missing"
+    }
+    $nestedResidualGpuJoinSafetyResultLockStream = [IO.File]::Open(
+        $nestedResidualGpuJoinSafetyResultPathAtStart,
+        [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $safetyResultSnapshot = Read-G7ReceiptSnapshot `
+        -Path $nestedResidualGpuJoinSafetyResultPathAtStart `
+        -Kind "Nested residual GPU join safety result"
+    $nestedResidualGpuJoinSafetyResultAtStart = $safetyResultSnapshot.receipt
+    $nestedResidualGpuJoinSafetyResultHashAtStart =
+        $safetyResultSnapshot.sha256
+}
 $spexHashAtStart = if ($SpexDryRun) { (Get-FileHash -Algorithm SHA256 -LiteralPath $SpexFile).Hash.ToLowerInvariant() } else { "" }
 if ($ExpectedSpexSHA256 -and $spexHashAtStart -ine $ExpectedSpexSHA256) {
     throw "SPEX provenance failed: expected $($ExpectedSpexSHA256.ToLowerInvariant()), observed $spexHashAtStart"
 }
-$modelLockStream = if ($ExpectedModelSHA256 -and -not $ReuseVerifiedSuiteReceipt) {
+$modelLockStream = if ($ExpectedModelSHA256 -and
+    -not $ReuseVerifiedSuiteReceipt -and
+    -not $AllowBenchmarkVerifiedReceiptReuse) {
     [IO.File]::Open(
         $model, [IO.FileMode]::Open,
         [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -1830,7 +2365,7 @@ $currentBuildInputPaths = @(
     @(git -C $PSScriptRoot ls-files) +
     @(git -C $PSScriptRoot ls-files --others --exclude-standard) |
     Where-Object {
-        $_ -notmatch '^(build|g7_runs)/' -and
+        $_ -notmatch '^(build[^/]*|g7_runs)/' -and
         ($_ -match '\.(c|cc|cpp|cu|h|hpp|cmake)$' -or
          $_ -match '(^|/)CMakeLists\.txt$')
     } | Sort-Object -Unique
@@ -1848,6 +2383,111 @@ foreach ($input in @($buildManifest.inputs)) {
     if ($currentHash -ne $input.sha256) {
         throw "Build provenance failed closed: input hash changed $($input.path)"
     }
+}
+if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
+    $safetyReceipt = $nestedResidualGpuJoinSafetyReceiptAtStart
+    $safetyResult = $nestedResidualGpuJoinSafetyResultAtStart
+    if ([string]$safetyReceipt.schema -ne
+            "ds4_g125_nested_gpu_join_safety_v1" -or
+        [string]$safetyReceipt.status -ne
+            "pass_structural_n1_no_performance_or_quality_verdict" -or
+        [string]$safetyReceipt.routing_contract -ne
+            "full/open routing preserved; no REAP/static/closed masks" -or
+        [string]$safetyReceipt.tag -ne [string]$safetyResult.tag -or
+        [string]$safetyReceipt.exact_content_sha256 -ine
+            $ExpectedContentSHA256 -or
+        [string]$safetyReceipt.prompt_sha256 -ine $promptHash -or
+        -not [bool]$safetyReceipt.gpu_join.requested -or
+        -not [bool]$safetyReceipt.gpu_join.observed -or
+        [UInt64]$safetyReceipt.gpu_join.calls -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_join.blocks -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_join.base_h2d_bytes -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_join.residual_h2d_bytes -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_join.native_h2d_bytes -ne 0 -or
+        [UInt64]$safetyReceipt.gpu_join.verify_calls -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_join.verify_bytes -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_join.verify_mismatches -ne 0 -or
+        [UInt64]$safetyReceipt.gpu_join.failures -ne 0 -or
+        [UInt64]$safetyReceipt.gpu_join.cpu_reconstruct_calls -ne 0 -or
+        -not [bool]$safetyReceipt.gpu_cache.requested -or
+        -not [bool]$safetyReceipt.gpu_cache.observed -or
+        [UInt64]$safetyReceipt.gpu_cache.route_calls -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_cache.hits -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_cache.misses -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_cache.host_fills -ne 0 -or
+        [UInt64]$safetyReceipt.gpu_cache.host_bytes -ne 0 -or
+        [UInt64]$safetyReceipt.gpu_cache.h2d_bytes -eq 0 -or
+        [UInt64]$safetyReceipt.gpu_cache.failures -ne 0) {
+        throw "Nested residual GPU join safety receipt contract mismatch"
+    }
+    $safetyActualHashes = @($safetyResult.results | ForEach-Object {
+        [string]$_.content_sha256
+    } | Sort-Object -Unique)
+    if ([string]$safetyResult.gate_kind -ne "structural-safety" -or
+        [bool]$safetyResult.quality_eligible -or
+        [bool]$safetyResult.sota_eligible -or
+        [int]$safetyResult.repeats -ne 1 -or
+        [bool]$safetyResult.warmup -or
+        [int]$safetyResult.server_exit_code -ne 0 -or
+        -not [bool]$safetyResult.outputs_identical -or
+        [string]$safetyResult.executable_sha256 -ine $exeHashAtStart -or
+        [string]$safetyResult.build_manifest_sha256 -ine
+            $buildManifestHashAtStart -or
+        [string]$safetyResult.build_manifest_input_fingerprint_sha256 -ine
+            [string]$buildManifest.input_fingerprint_sha256 -or
+        [string]$safetyResult.model_sha256 -ine $modelHashAtStart -or
+        [string]$safetyResult.prompt_sha256 -ine $promptHash -or
+        [string]$safetyResult.expected_content_sha256 -ine
+            $ExpectedContentSHA256 -or
+        $safetyActualHashes.Count -ne 1 -or
+        $safetyActualHashes[0] -ine $ExpectedContentSHA256 -or
+        [string]$safetyResult.nested_residual_sidecar_sha256 -ine
+            $nestedResidualHashAtStart -or
+        [string]$safetyResult.nested_residual_expected_source_sha256 -ine
+            $ExpectedNestedResidualSourceSHA256 -or
+        [string]$safetyResult.nested_residual_expected_payload_sha256 -ine
+            $ExpectedNestedResidualPayloadSHA256 -or
+        -not [bool]$safetyResult.nested_residual_enabled -or
+        -not [bool]$safetyResult.nested_residual_verify_reconstruction -or
+        -not [bool]$safetyResult.nested_residual_gpu_cache_requested -or
+        -not [bool]$safetyResult.nested_residual_gpu_join_requested -or
+        -not [bool]$safetyResult.nested_residual_runtime_observed -or
+        [UInt64]$safetyResult.nested_residual_mismatches -ne 0 -or
+        [UInt64]$safetyResult.nested_residual_failures -ne 0 -or
+        -not [bool]$safetyResult.nested_residual_vram_runtime_observed -or
+        [UInt64]$safetyResult.nested_residual_vram_failures -ne 0 -or
+        -not [bool]$safetyResult.nested_residual_gpu_join_observed -or
+        [int]$safetyResult.nested_residual_gpu_join_requested_runtime -ne 1 -or
+        [int]$safetyResult.nested_residual_gpu_join_observed_runtime -ne 1 -or
+        [UInt64]$safetyResult.nested_residual_gpu_join_calls -eq 0 -or
+        [UInt64]$safetyResult.nested_residual_gpu_join_native_h2d_bytes -ne 0 -or
+        [UInt64]$safetyResult.nested_residual_gpu_join_verify_calls -eq 0 -or
+        [UInt64]$safetyResult.nested_residual_gpu_join_verify_mismatches -ne 0 -or
+        [UInt64]$safetyResult.nested_residual_gpu_join_failures -ne 0 -or
+        [UInt64]$safetyResult.nested_residual_gpu_join_cpu_reconstruct_calls -ne 0 -or
+        -not [bool]$safetyResult.compose_prefill_mass_open_router_requested -or
+        [string]$safetyResult.reap_mask_file_requested -or
+        [bool]$safetyResult.embedded_bake_mask_observed -or
+        [bool]$safetyResult.spex_dry_run_requested -or
+        [bool]$safetyResult.q1_0_sidecar_enabled -or
+        [string]$safetyResult.iq1_s_sidecar -or
+        [int]$safetyResult.context_requested -ne $Context -or
+        [int]$safetyResult.requested_max_tokens -ne $MaxTokens -or
+        [int]$safetyResult.nested_residual_cache_experts_requested -ne
+            $NestedResidualCacheExperts -or
+        [double]$safetyResult.dynamic_arena_gib_requested -ne
+            $DynamicArenaGiB -or
+        [int]$safetyResult.expert_cache_requested -ne $ExpertCacheN -or
+        [double]$safetyResult.expert_cache_reserve_gb -ne
+            $ExpertCacheReserveGB -or
+        [int]$safetyResult.budget_gb -ne $BudgetGB -or
+        [int]$safetyResult.reserve_mb -ne $ReserveMB -or
+        -not [bool]$safetyResult.gpu_resident_routes_requested -or
+        -not [bool]$safetyResult.split_fused_requested -or
+        -not [bool]$safetyResult.route_no_default_sync_requested) {
+        throw "Nested residual GPU join safety result no longer binds to this benchmark configuration"
+    }
+    $nestedResidualGpuJoinSafetyReceiptValidated = $true
 }
 $gpuIdentity = $null
 try {
@@ -1907,13 +2547,30 @@ $quiescenceRows = @()
 $quiescenceFailures = @()
 $quiescenceStartedUtc = [DateTime]::UtcNow
 $quiescenceStopwatch = [Diagnostics.Stopwatch]::StartNew()
+$quiescenceCounterSource = "pdh-english"
+$quiescenceCounterPaths = @(
+    "\Processor(_Total)\% Processor Time",
+    "\PhysicalDisk(_Total)\% Disk Time",
+    "\PhysicalDisk(_Total)\Disk Read Bytes/sec",
+    "\PhysicalDisk(_Total)\Disk Write Bytes/sec"
+)
+$quiescenceSampler = $null
+$quiescencePdhInvalidDataRetries = 0
 if (-not $SkipSystemQuiescencePreflight) {
-    for ($sampleIndex = 0; $sampleIndex -lt $QuiescenceSamples; $sampleIndex++) {
-        try {
-            $cpuSample = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor `
-                -Filter "Name='_Total'" -ErrorAction Stop
-            $diskSample = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfDisk_PhysicalDisk `
-                -Filter "Name='_Total'" -ErrorAction Stop
+    try {
+        $quiescenceSampler = New-G7PdhEnglishSampler -Paths $quiescenceCounterPaths
+        Start-Sleep -Milliseconds 250
+        for ($sampleIndex = 0; $sampleIndex -lt $QuiescenceSamples; $sampleIndex++) {
+            try {
+                $quiescenceSampler.Collect()
+                $cpuPercent = $quiescenceSampler.Read(
+                    "\Processor(_Total)\% Processor Time")
+                $diskPercent = $quiescenceSampler.Read(
+                    "\PhysicalDisk(_Total)\% Disk Time")
+                $diskReadBytesPerSec = $quiescenceSampler.Read(
+                    "\PhysicalDisk(_Total)\Disk Read Bytes/sec")
+                $diskWriteBytesPerSec = $quiescenceSampler.Read(
+                    "\PhysicalDisk(_Total)\Disk Write Bytes/sec")
             $gpuRaw = @(& nvidia-smi --query-gpu=index,utilization.gpu `
                 --format=csv,noheader,nounits 2>$null)
             if ($LASTEXITCODE -ne 0 -or $gpuRaw.Count -eq 0) {
@@ -1934,27 +2591,41 @@ if (-not $SkipSystemQuiescencePreflight) {
             }
             $gpuPercent = [double](($gpuRows | Measure-Object `
                 -Property utilization_percent -Maximum).Maximum)
-            $diskIoMiBps = ([double]$diskSample.DiskReadBytesPerSec +
-                [double]$diskSample.DiskWriteBytesPerSec) / 1MB
+                $diskIoMiBps = ($diskReadBytesPerSec +
+                    $diskWriteBytesPerSec) / 1MB
             $quiescenceRows += [pscustomobject][ordered]@{
                 sample = $sampleIndex + 1
                 timestamp_utc = [DateTime]::UtcNow.ToString(
                     "o", [Globalization.CultureInfo]::InvariantCulture)
                 elapsed_ms = [math]::Round($quiescenceStopwatch.Elapsed.TotalMilliseconds, 3)
-                cpu_percent = [double]$cpuSample.PercentProcessorTime
-                disk_percent = [double]$diskSample.PercentDiskTime
-                disk_read_mib_per_second = [double]$diskSample.DiskReadBytesPerSec / 1MB
-                disk_write_mib_per_second = [double]$diskSample.DiskWriteBytesPerSec / 1MB
+                    cpu_percent = [double]$cpuPercent
+                    disk_percent = [double]$diskPercent
+                    disk_read_mib_per_second = $diskReadBytesPerSec / 1MB
+                    disk_write_mib_per_second = $diskWriteBytesPerSec / 1MB
                 disk_io_mib_per_second = $diskIoMiBps
                 gpu_percent = $gpuPercent
                 gpu_utilization_percent_by_index = $gpuRows
             }
-        } catch {
-            $quiescenceFailures += "sample-error: " + $_.Exception.Message
-            break
+            } catch {
+                if ($_.Exception.Message -match "0x800007D6" -and
+                    $quiescencePdhInvalidDataRetries -lt 3) {
+                    $quiescencePdhInvalidDataRetries++
+                    Start-Sleep -Milliseconds 250
+                    $sampleIndex--
+                    continue
+                }
+                $quiescenceFailures += "sample-error: " + $_.Exception.Message
+                break
+            }
+            if ($sampleIndex + 1 -lt $QuiescenceSamples) {
+                Start-Sleep -Milliseconds $QuiescenceIntervalMs
+            }
         }
-        if ($sampleIndex + 1 -lt $QuiescenceSamples) {
-            Start-Sleep -Milliseconds $QuiescenceIntervalMs
+    } catch {
+        $quiescenceFailures += "counter-init-error: " + $_.Exception.Message
+    } finally {
+        if ($null -ne $quiescenceSampler) {
+            $quiescenceSampler.Dispose()
         }
     }
 }
@@ -2015,6 +2686,7 @@ $systemQuiescencePreflight = [pscustomobject][ordered]@{
     max_tokens = $MaxTokens
     probe_only = [bool]$QuiescenceProbeOnly
     skipped = [bool]$SkipSystemQuiescencePreflight
+    pdh_invalid_data_retries = $quiescencePdhInvalidDataRetries
     requested_samples = $QuiescenceSamples
     completed_samples = $quiescenceRows.Count
     requested_sleep_interval_ms = $QuiescenceIntervalMs
@@ -2027,6 +2699,7 @@ $systemQuiescencePreflight = [pscustomobject][ordered]@{
     observed_interval_median_ms = $observedIntervalMedianMs
     observed_window_ms = [math]::Round($quiescenceStopwatch.Elapsed.TotalMilliseconds, 3)
     gpu_scope = "maximum-utilization-across-visible-gpus"
+    system_counter_source = $quiescenceCounterSource
     thresholds = $quiescenceThresholds
     cpu_median_percent = $cpuMedian
     disk_median_percent = $diskMedian
@@ -2202,6 +2875,16 @@ try {
             content_sha256 = $sha
             content = $content
         }
+        [pscustomobject][ordered]@{
+            schema = "g7_raw_response_checkpoint_v1"
+            tag = $Tag
+            gate_kind = $GateKind
+            captured_utc = [DateTime]::UtcNow.ToString("o")
+            complete = $false
+            warmup_result = $warmupResult
+            results = $results
+        } | ConvertTo-Json -Depth 8 |
+            Set-Content -LiteralPath $rawOutputsPath -Encoding UTF8
         Write-Host ("[g7] repeat " + $i + ": " + $completionTokens + " tokens in " + [math]::Round($genSec, 3) + "s")
     }
     $httpOk = $true
@@ -2473,6 +3156,9 @@ $prefillVramSeedRequestedObserved = 0; $prefillVramSeedLayers = 0
 $prefillVramSeedEntries = 0; $prefillVramSeedBytes = 0
 $prefillVramSeedSeconds = 0.0; $prefillVramSeedFailures = 0
 $prefillVramSeedPriorMass = 0.0; $prefillVramSeedSemantics = "not_observed"
+$prefillVramSeedGlobalObserved = $false; $prefillVramSeedGlobalLineCount = 0
+$prefillVramSeedGlobalRequestedObserved = 0
+$prefillVramSeedGlobalFloorObserved = 0
 $reapMassArmed = $false; $reapMassResultObserved = $false
 $reapMassWindowObserved = 0; $reapMassTopObserved = 0
 $reapMassFirstLayer = 0; $reapMassLastLayer = 0
@@ -2567,11 +3253,17 @@ $prefillWaveOverlapReuseWaits = 0; $prefillWaveOverlapComputeRecords = 0
 $prefillWaveOverlapFailures = 0
 $arenaFinalObserved = $false; $arenaFinalHits = 0; $arenaFinalMisses = 0
 $arenaFinalFatal = 0; $arenaFinalUploadedGiB = 0.0
-$arenaAllocatedBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
+$arenaFinalPinnedHits = 0; $arenaFinalPageableHits = 0
+$arenaFinalPinnedUploadedGiB = 0.0; $arenaFinalPageableUploadedGiB = 0.0
+$arenaAllocatedBytes = 0; $arenaAllocatedPageableBytes = 0
+$arenaAllocatedTotalBytes = 0; $arenaSlotBytes = 0; $arenaAllocatedSlots = 0
+$arenaAllocatedPinnedSlots = 0; $arenaAllocatedPageableSlots = 0
 $arenaCapObserved = $false; $arenaCapRequestedGiB = 0.0
 $arenaCapMinAvailableGiB = 0.0; $arenaCapAvailableBeforeGiB = 0.0
 $arenaCapRequestedBytes = 0; $arenaCapRequestedSlots = 0
 $arenaCapChosenBytes = 0; $arenaCapChosenSlots = 0
+$arenaCapPageableBytes = 0; $arenaCapPageableSlots = 0
+$arenaCapTotalSlots = 0
 $arenaCapCapped = $false; $arenaCapResult = "not_observed"
 $arenaCapReason = "not_observed"
 $requestPhaseObserved = $false; $requestPhaseLineCount = 0
@@ -2992,7 +3684,12 @@ if (Test-Path $stderrLog) {
         }
     }
     $prefillVramSeedLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[prefill-vram-seed\] " })
+    $prefillVramSeedGlobalLines = @($lines | Where-Object { $_ -match "^\s*ds4: \[prefill-vram-seed-global\] " })
     $prefillVramSeedLineCount = $prefillVramSeedLines.Count
+    $prefillVramSeedGlobalLineCount = $prefillVramSeedGlobalLines.Count
+    if ($prefillVramSeedLineCount -gt 0 -and $prefillVramSeedGlobalLineCount -gt 0) {
+        throw "Prefill VRAM seed measurement failed: per-layer and global telemetry both observed"
+    }
     if ($prefillVramSeedLineCount -gt 0) {
         if ($prefillVramSeedLineCount -ne 1) {
             throw "Prefill VRAM seed measurement failed: expected exactly one telemetry line"
@@ -3014,6 +3711,29 @@ if (Test-Path $stderrLog) {
         $prefillVramSeedPriorMass = [double]::Parse($Matches[9], [Globalization.CultureInfo]::InvariantCulture)
         $prefillVramSeedSemantics = $Matches[10]
     }
+    if ($prefillVramSeedGlobalLineCount -gt 0) {
+        if ($prefillVramSeedGlobalLineCount -ne 1) {
+            throw "Prefill global VRAM seed measurement failed: expected exactly one telemetry line"
+        }
+        $prefillVramSeedGlobalPattern = "^ds4: \[prefill-vram-seed-global\] result=(ok|failed) reason=([a-z0-9_-]+) requested_total=(\d+) floor_per_layer=(\d+) layers=(\d+) entries=(\d+) bytes=(\d+) seconds=([0-9.]+) failures=(\d+) prior_mass=([0-9.eE+-]+) semantics=([a-z0-9_-]+)$"
+        $prefillVramSeedGlobalLine = $prefillVramSeedGlobalLines[0].Trim()
+        if ($prefillVramSeedGlobalLine -notmatch $prefillVramSeedGlobalPattern) {
+            throw "Prefill global VRAM seed measurement failed: telemetry format mismatch"
+        }
+        $prefillVramSeedObserved = $true
+        $prefillVramSeedGlobalObserved = $true
+        $prefillVramSeedResult = $Matches[1]
+        $prefillVramSeedReason = $Matches[2]
+        $prefillVramSeedGlobalRequestedObserved = [uint32]$Matches[3]
+        $prefillVramSeedGlobalFloorObserved = [uint32]$Matches[4]
+        $prefillVramSeedLayers = [uint32]$Matches[5]
+        $prefillVramSeedEntries = [uint32]$Matches[6]
+        $prefillVramSeedBytes = [uint64]$Matches[7]
+        $prefillVramSeedSeconds = [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillVramSeedFailures = [uint32]$Matches[9]
+        $prefillVramSeedPriorMass = [double]::Parse($Matches[10], [Globalization.CultureInfo]::InvariantCulture)
+        $prefillVramSeedSemantics = $Matches[11]
+    }
     if ($PrefillVramSeedPerLayer -gt 0) {
         $expectedPrefillVramSeedEntries = 40 * $PrefillVramSeedPerLayer
         if (-not $prefillVramSeedObserved -or $prefillVramSeedResult -ne "ok" -or
@@ -3026,7 +3746,21 @@ if (Test-Path $stderrLog) {
             $prefillVramSeedSemantics -ne "request-scoped-top-per-layer") {
             throw "PrefillVramSeedPerLayer was requested but successful exact seed telemetry was not observed"
         }
-    } elseif ($prefillVramSeedLineCount -ne 0) {
+    } elseif ($PrefillVramSeedTotal -gt 0) {
+        if (-not $prefillVramSeedGlobalObserved -or
+            $prefillVramSeedResult -ne "ok" -or
+            $prefillVramSeedReason -ne "ok" -or
+            $prefillVramSeedGlobalRequestedObserved -ne $PrefillVramSeedTotal -or
+            $prefillVramSeedGlobalFloorObserved -ne $PrefillVramSeedFloorPerLayer -or
+            $prefillVramSeedLayers -ne 40 -or
+            $prefillVramSeedEntries -ne $PrefillVramSeedTotal -or
+            $prefillVramSeedBytes -le 0 -or $prefillVramSeedFailures -ne 0 -or
+            $prefillVramSeedPriorMass -le 0.0 -or
+            $prefillVramSeedSemantics -ne "request-scoped-global-mass") {
+            throw "PrefillVramSeedTotal was requested but successful global seed telemetry was not observed"
+        }
+    } elseif ($prefillVramSeedLineCount -ne 0 -or
+              $prefillVramSeedGlobalLineCount -ne 0) {
         throw "Prefill VRAM seed activated while not requested"
     }
     $mixedDirectLines = $lines | Where-Object { $_ -match "CUDA MoE mixed direct layer=(\d+) cache_routes=(\d+) compact_routes=(\d+)" }
@@ -3128,7 +3862,7 @@ if (Test-Path $stderrLog) {
         $gpuRoutesResolveMs = $gpuRoutesResolveMsWeighted / $gpuRoutesCalls
         $gpuRoutesWaitMs = $gpuRoutesWaitMsWeighted / $gpuRoutesCalls
     }
-    if ($ComposePrefillMassTiering -and
+    if ($ComposePrefillMassTiering -and -not $Q1_0SnapshotBacking -and
         $gpuRoutesLines.Count -ne $requestCountExpected) {
         throw "GPU-resident route summary count differs from request count"
     }
@@ -3176,7 +3910,7 @@ if (Test-Path $stderrLog) {
     }
     $arenaCapLine = $lines | Where-Object { $_ -match "^\s*ds4: \[arena-cap\] " } | Select-Object -Last 1
     if ($arenaCapLine) {
-        $arenaCapPattern = "^ds4: \[arena-cap\] requested_gib=([0-9.]+) min_available_gib=([0-9.]+) available_before_gib=(-?[0-9.]+) requested_bytes=(\d+) requested_slots=(\d+) chosen_bytes=(\d+) chosen_slots=(\d+) capped=(0|1) result=(ready|disabled) reason=([a-z-]+)$"
+        $arenaCapPattern = "^ds4: \[arena-cap\] requested_gib=([0-9.]+) min_available_gib=([0-9.]+) available_before_gib=(-?[0-9.]+) requested_bytes=(\d+) requested_slots=(\d+) chosen_bytes=(\d+) chosen_slots=(\d+) pageable_bytes=(\d+) pageable_slots=(\d+) total_slots=(\d+) capped=(0|1) result=(ready|disabled) reason=([a-z-]+)$"
         if ($arenaCapLine -notmatch $arenaCapPattern) {
             throw "Dynamic arena cap line format mismatch: $arenaCapLine"
         }
@@ -3188,14 +3922,29 @@ if (Test-Path $stderrLog) {
         $arenaCapRequestedSlots = [long]$Matches[5]
         $arenaCapChosenBytes = [long]$Matches[6]
         $arenaCapChosenSlots = [long]$Matches[7]
-        $arenaCapCapped = ($Matches[8] -eq "1")
-        $arenaCapResult = $Matches[9]
-        $arenaCapReason = $Matches[10]
+        $arenaCapPageableBytes = [long]$Matches[8]
+        $arenaCapPageableSlots = [long]$Matches[9]
+        $arenaCapTotalSlots = [long]$Matches[10]
+        $arenaCapCapped = ($Matches[11] -eq "1")
+        $arenaCapResult = $Matches[12]
+        $arenaCapReason = $Matches[13]
     }
     $arenaReadyLine = $lines | Where-Object { $_ -match "CUDA dynamic arena ready" } | Select-Object -Last 1
-    if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready [0-9.]+ GiB, (\d+) slots.*bytes=(\d+) slot_bytes=(\d+)") {
+    if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready pinned=([0-9.]+) GiB pageable=([0-9.]+) GiB total_slots=(\d+) pinned_slots=(\d+) pageable_slots=(\d+).*bytes=(\d+) slot_bytes=(\d+)") {
+        $arenaAllocatedSlots = [long]$Matches[3]
+        $arenaAllocatedPinnedSlots = [long]$Matches[4]
+        $arenaAllocatedPageableSlots = [long]$Matches[5]
+        $arenaAllocatedBytes = [long]$Matches[6]
+        $arenaSlotBytes = [long]$Matches[7]
+        $arenaAllocatedPageableBytes =
+            $arenaAllocatedPageableSlots * $arenaSlotBytes
+        $arenaAllocatedTotalBytes =
+            $arenaAllocatedBytes + $arenaAllocatedPageableBytes
+    } elseif ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready [0-9.]+ GiB, (\d+) slots.*bytes=(\d+) slot_bytes=(\d+)") {
         $arenaAllocatedSlots = [long]$Matches[1]
+        $arenaAllocatedPinnedSlots = $arenaAllocatedSlots
         $arenaAllocatedBytes = [long]$Matches[2]
+        $arenaAllocatedTotalBytes = $arenaAllocatedBytes
         $arenaSlotBytes = [long]$Matches[3]
     }
     $prefillMassArmedLines = @($lines | Where-Object { $_ -match "\[prefill-mass\] armed" })
@@ -3643,7 +4392,17 @@ if (Test-Path $stderrLog) {
         $arenaCarryObserverObserved = $lastArenaCarryEvent.observer
     }
     $arenaFinalLine = $lines | Where-Object { $_ -match "\[arena\] final" } | Select-Object -Last 1
-    if ($arenaFinalLine -and $arenaFinalLine -match "\[arena\] final hits=(\d+) misses=(\d+) fatal=(\d+) uploaded=([0-9.]+) GiB") {
+    if ($arenaFinalLine -and $arenaFinalLine -match "\[arena\] final hits=(\d+) pinned_hits=(\d+) pageable_hits=(\d+) misses=(\d+) fatal=(\d+) uploaded=([0-9.]+) GiB pinned_uploaded=([0-9.]+) GiB pageable_uploaded=([0-9.]+) GiB backing=q1_0") {
+        $arenaFinalObserved = $true
+        $arenaFinalHits = [long]$Matches[1]
+        $arenaFinalPinnedHits = [long]$Matches[2]
+        $arenaFinalPageableHits = [long]$Matches[3]
+        $arenaFinalMisses = [long]$Matches[4]
+        $arenaFinalFatal = [long]$Matches[5]
+        $arenaFinalUploadedGiB = [double]::Parse($Matches[6], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaFinalPinnedUploadedGiB = [double]::Parse($Matches[7], [Globalization.CultureInfo]::InvariantCulture)
+        $arenaFinalPageableUploadedGiB = [double]::Parse($Matches[8], [Globalization.CultureInfo]::InvariantCulture)
+    } elseif ($arenaFinalLine -and $arenaFinalLine -match "\[arena\] final hits=(\d+) misses=(\d+) fatal=(\d+) uploaded=([0-9.]+) GiB") {
         $arenaFinalObserved = $true
         $arenaFinalHits = [long]$Matches[1]; $arenaFinalMisses = [long]$Matches[2]
         $arenaFinalFatal = [long]$Matches[3]
@@ -3700,12 +4459,345 @@ if (Test-Path -LiteralPath $stderrLog) {
 if (Test-Path -LiteralPath $stdoutLog) {
     $q1_0SidecarLogText += "`n" + (Get-Content -LiteralPath $stdoutLog -Raw)
 }
+$nestedResidualRuntimeObserved = $false
+$nestedResidualRouterCalls = [UInt64]0
+$nestedResidualCacheHits = [UInt64]0
+$nestedResidualCacheMisses = [UInt64]0
+$nestedResidualPreads = [UInt64]0
+$nestedResidualBytes = [UInt64]0
+$nestedResidualReconstructed = [UInt64]0
+$nestedResidualMismatches = [UInt64]0
+$nestedResidualH2DBytes = [UInt64]0
+$nestedResidualFailures = [UInt64]0
+$nestedResidualVramRuntimeObserved = $false
+$nestedResidualVramRawSummary = ""
+$nestedResidualVramRouteCalls = [UInt64]0
+$nestedResidualVramHits = [UInt64]0
+$nestedResidualVramMisses = [UInt64]0
+$nestedResidualVramHostFills = [UInt64]0
+$nestedResidualVramHostBytes = [UInt64]0
+$nestedResidualVramH2DBytes = [UInt64]0
+$nestedResidualVramFailures = [UInt64]0
+$nestedResidualGpuJoinObserved = $false
+$nestedResidualGpuJoinRawSummary = ""
+$nestedResidualGpuJoinRequestedRuntime = 0
+$nestedResidualGpuJoinObservedRuntime = 0
+$nestedResidualGpuJoinCalls = [UInt64]0
+$nestedResidualGpuJoinBlocks = [UInt64]0
+$nestedResidualGpuJoinBaseH2DBytes = [UInt64]0
+$nestedResidualGpuJoinResidualH2DBytes = [UInt64]0
+$nestedResidualGpuJoinNativeH2DBytes = [UInt64]0
+$nestedResidualGpuJoinSeconds = [double]0
+$nestedResidualGpuJoinWaitCalls = [UInt64]0
+$nestedResidualGpuJoinWaitSeconds = [double]0
+$nestedResidualGpuJoinVerifyCalls = [UInt64]0
+$nestedResidualGpuJoinVerifyBytes = [UInt64]0
+$nestedResidualGpuJoinVerifySeconds = [double]0
+$nestedResidualGpuJoinVerifyMismatches = [UInt64]0
+$nestedResidualGpuJoinFailures = [UInt64]0
+$nestedResidualGpuJoinCpuReconstructCalls = [UInt64]0
+$nestedResidualProfileObserved = $false
+$nestedResidualProfileRawSummary = ""
+$nestedResidualProfileLookupCalls = [UInt64]0
+$nestedResidualProfileLookupSeconds = [double]0
+$nestedResidualProfilePreadCalls = [UInt64]0
+$nestedResidualProfilePreadSeconds = [double]0
+$nestedResidualProfileReconstructCalls = [UInt64]0
+$nestedResidualProfileReconstructBlocks = [UInt64]0
+$nestedResidualProfileReconstructSeconds = [double]0
+$nestedResidualProfileVerifyCalls = [UInt64]0
+$nestedResidualProfileVerifyBytes = [UInt64]0
+$nestedResidualProfileVerifySeconds = [double]0
+$nestedResidualProfileReuseWaitCalls = [UInt64]0
+$nestedResidualProfileReuseWaitSeconds = [double]0
+$nestedResidualProfileHostCopyCalls = [UInt64]0
+$nestedResidualProfileHostCopySeconds = [double]0
+$nestedResidualProfileH2DEnqueueCalls = [UInt64]0
+$nestedResidualProfileH2DEnqueueSeconds = [double]0
+$nestedResidualProfileH2DSyncCalls = [UInt64]0
+$nestedResidualProfileH2DSyncSeconds = [double]0
+$nestedResidualProfileRouteBeginCalls = [UInt64]0
+$nestedResidualProfileRouteBeginSeconds = [double]0
+$nestedResidualProfileRouteResolveSyncCalls = [UInt64]0
+$nestedResidualProfileRouteResolveSyncSeconds = [double]0
+$nestedResidualProfileRouteReadyWaitCalls = [UInt64]0
+$nestedResidualProfileRouteReadyWaitSeconds = [double]0
+$nestedResidualProfilePackedCopy = 0
+$nestedResidualProfileSplitFused = 0
+$nestedResidualProfileVerify = 0
+$nestedResidualSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual\] result=summary router=open router_calls=(\d+) cache_hits=(\d+) cache_misses=(\d+) residual_preads=(\d+) residual_bytes=(\d+) reconstructed=(\d+) mismatches=(\d+) h2d_bytes=(\d+) failures=(\d+)\r?$')
+$nestedResidualVramSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual-vram\] result=summary route_calls=(\d+) hits=(\d+) misses=(\d+) host_fills=(\d+) host_bytes=(\d+) h2d_bytes=(\d+) failures=(\d+)\r?$')
+$nestedResidualGpuJoinSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[(?:nested-residual-gpu-join|nested-residual)\] result=(?:summary|gpu_join_summary)(?=[^\r\n]*(?:gpu_join|cpu_reconstruct|base_h2d_bytes|residual_h2d_bytes))([^\r\n]*)\r?$')
+$nestedResidualProfileSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual-profile\] result=summary enabled=1 lookup_calls=(\d+) lookup_s=([0-9.]+) pread_calls=(\d+) pread_s=([0-9.]+) reconstruct_calls=(\d+) reconstruct_blocks=(\d+) reconstruct_s=([0-9.]+) verify_calls=(\d+) verify_bytes=(\d+) verify_s=([0-9.]+) reuse_wait_calls=(\d+) reuse_wait_s=([0-9.]+) host_copy_calls=(\d+) host_copy_s=([0-9.]+) h2d_enqueue_calls=(\d+) h2d_enqueue_s=([0-9.]+) h2d_sync_calls=(\d+) h2d_sync_s=([0-9.]+) route_begin_calls=(\d+) route_begin_s=([0-9.]+) route_resolve_sync_calls=(\d+) route_resolve_sync_s=([0-9.]+) route_ready_wait_calls=(\d+) route_ready_wait_s=([0-9.]+) packed_copy=(\d+) split_fused=(\d+) verify=(\d+)\r?$')
+function Get-G7NestedResidualGpuJoinValue {
+    param(
+        [Parameter(Mandatory=$true)][hashtable]$Map,
+        [Parameter(Mandatory=$true)][string[]]$Names,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+
+    foreach ($name in $Names) {
+        foreach ($candidate in @(
+                $name,
+                "gpu_join_$name",
+                "nested_residual_$name",
+                "nested_residual_gpu_join_$name")) {
+            if ($Map.ContainsKey($candidate)) {
+                return [string]$Map[$candidate]
+            }
+        }
+    }
+    throw "Nested residual GPU join summary missing counter: $Kind"
+}
+if ($NestedResidualSidecar) {
+    if ($nestedResidualSummaryMatches.Count -ne 1) {
+        throw "Nested residual runtime requires exactly one summary; observed $($nestedResidualSummaryMatches.Count)"
+    }
+    $nestedResidualSummary = $nestedResidualSummaryMatches[0]
+    $nestedResidualRouterCalls = [UInt64]$nestedResidualSummary.Groups[1].Value
+    $nestedResidualCacheHits = [UInt64]$nestedResidualSummary.Groups[2].Value
+    $nestedResidualCacheMisses = [UInt64]$nestedResidualSummary.Groups[3].Value
+    $nestedResidualPreads = [UInt64]$nestedResidualSummary.Groups[4].Value
+    $nestedResidualBytes = [UInt64]$nestedResidualSummary.Groups[5].Value
+    $nestedResidualReconstructed = [UInt64]$nestedResidualSummary.Groups[6].Value
+    $nestedResidualMismatches = [UInt64]$nestedResidualSummary.Groups[7].Value
+    $nestedResidualH2DBytes = [UInt64]$nestedResidualSummary.Groups[8].Value
+    $nestedResidualFailures = [UInt64]$nestedResidualSummary.Groups[9].Value
+    if ($nestedResidualRouterCalls -eq 0 -or
+        $nestedResidualCacheMisses -eq 0 -or
+        $nestedResidualPreads -ne $nestedResidualCacheMisses -or
+        $nestedResidualReconstructed -ne $nestedResidualCacheMisses -or
+        $nestedResidualBytes -ne
+            $nestedResidualPreads * [UInt64]3145728 -or
+        $nestedResidualH2DBytes -ne
+            ($nestedResidualCacheHits + $nestedResidualCacheMisses) *
+                [UInt64]7077888 -or
+        $nestedResidualMismatches -ne 0 -or
+        $nestedResidualFailures -ne 0) {
+        throw "Nested residual runtime counters are inconsistent"
+    }
+    $nestedResidualRuntimeObserved = $true
+    if ($NestedResidualGpuCache) {
+        if ($nestedResidualVramSummaryMatches.Count -ne 1) {
+            throw "Nested residual GPU-cache requires exactly one VRAM summary; observed $($nestedResidualVramSummaryMatches.Count)"
+        }
+        $nestedResidualVramSummary = $nestedResidualVramSummaryMatches[0]
+        $nestedResidualVramRawSummary = $nestedResidualVramSummary.Value
+        $nestedResidualVramRouteCalls =
+            [UInt64]$nestedResidualVramSummary.Groups[1].Value
+        $nestedResidualVramHits =
+            [UInt64]$nestedResidualVramSummary.Groups[2].Value
+        $nestedResidualVramMisses =
+            [UInt64]$nestedResidualVramSummary.Groups[3].Value
+        $nestedResidualVramHostFills =
+            [UInt64]$nestedResidualVramSummary.Groups[4].Value
+        $nestedResidualVramHostBytes =
+            [UInt64]$nestedResidualVramSummary.Groups[5].Value
+        $nestedResidualVramH2DBytes =
+            [UInt64]$nestedResidualVramSummary.Groups[6].Value
+        $nestedResidualVramFailures =
+            [UInt64]$nestedResidualVramSummary.Groups[7].Value
+        if ($nestedResidualVramRouteCalls -eq 0 -or
+            $nestedResidualVramHits -eq 0 -or
+            $nestedResidualVramMisses -eq 0 -or
+            $nestedResidualVramFailures -ne 0) {
+            throw "Nested residual GPU-cache runtime counters are inconsistent"
+        }
+        if ($NestedResidualGpuJoin) {
+            if ($nestedResidualVramHostFills -ne 0 -or
+                $nestedResidualVramHostBytes -ne 0 -or
+                $nestedResidualVramH2DBytes -ne
+                    $nestedResidualVramMisses * [UInt64]7077888) {
+                throw "Nested residual GPU-cache GPU-join counters are inconsistent"
+            }
+        } elseif ($nestedResidualVramHostFills -ne $nestedResidualVramMisses -or
+                  $nestedResidualVramHostBytes -ne
+                    $nestedResidualVramMisses * [UInt64]7077888 -or
+                  $nestedResidualVramH2DBytes -ne
+                    $nestedResidualVramMisses * [UInt64]7077888) {
+            throw "Nested residual GPU-cache runtime counters are inconsistent"
+        }
+        $nestedResidualVramRuntimeObserved = $true
+    } elseif ($nestedResidualVramSummaryMatches.Count -ne 0 -or
+              $q1_0SidecarLogText -match '\[nested-residual-vram\]') {
+        throw "Nested residual GPU-cache telemetry appeared while NestedResidualGpuCache was disabled"
+    }
+    if ($NestedResidualGpuJoin) {
+        if ($nestedResidualGpuJoinSummaryMatches.Count -ne 1) {
+            throw "Nested residual GPU join requires exactly one summary; observed $($nestedResidualGpuJoinSummaryMatches.Count)"
+        }
+        $gpuJoinSummary = $nestedResidualGpuJoinSummaryMatches[0]
+        $nestedResidualGpuJoinRawSummary = $gpuJoinSummary.Value
+        $gpuJoinCounters = @{}
+        foreach ($counterMatch in [regex]::Matches(
+                $gpuJoinSummary.Groups[1].Value,
+                '([A-Za-z0-9_]+)=([^\s\r\n]+)')) {
+            $gpuJoinCounters[$counterMatch.Groups[1].Value] =
+                $counterMatch.Groups[2].Value
+        }
+        $nestedResidualGpuJoinRequestedRuntime = [int](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("requested") -Kind "requested")
+        $nestedResidualGpuJoinObservedRuntime = [int](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("observed") -Kind "observed")
+        $nestedResidualGpuJoinCalls = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("calls") -Kind "calls")
+        $nestedResidualGpuJoinBlocks = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("blocks") -Kind "blocks")
+        $nestedResidualGpuJoinBaseH2DBytes = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("base_h2d_bytes") -Kind "base_h2d_bytes")
+        $nestedResidualGpuJoinResidualH2DBytes = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("residual_h2d_bytes") -Kind "residual_h2d_bytes")
+        $nestedResidualGpuJoinNativeH2DBytes = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("native_h2d_bytes") -Kind "native_h2d_bytes")
+        $nestedResidualGpuJoinSeconds = [double]::Parse(
+            (Get-G7NestedResidualGpuJoinValue `
+                -Map $gpuJoinCounters -Names @("seconds", "s") -Kind "seconds"),
+            [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualGpuJoinWaitCalls = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("wait_calls", "gpu_join_wait_calls") -Kind "gpu_join_wait_calls")
+        $nestedResidualGpuJoinWaitSeconds = [double]::Parse(
+            (Get-G7NestedResidualGpuJoinValue `
+                -Map $gpuJoinCounters -Names @("wait_seconds", "wait_s", "gpu_join_wait_seconds") -Kind "gpu_join_wait_seconds"),
+            [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualGpuJoinVerifyCalls = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("verify_calls") -Kind "verify_calls")
+        $nestedResidualGpuJoinVerifyBytes = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("verify_bytes") -Kind "verify_bytes")
+        $nestedResidualGpuJoinVerifySeconds = [double]::Parse(
+            (Get-G7NestedResidualGpuJoinValue `
+                -Map $gpuJoinCounters -Names @("verify_seconds", "verify_s", "gpu_join_verify_seconds") -Kind "gpu_join_verify_seconds"),
+            [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualGpuJoinVerifyMismatches = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("verify_mismatches", "mismatches") -Kind "verify_mismatches")
+        $nestedResidualGpuJoinFailures = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("failures") -Kind "failures")
+        $nestedResidualGpuJoinCpuReconstructCalls = [UInt64](Get-G7NestedResidualGpuJoinValue `
+            -Map $gpuJoinCounters -Names @("cpu_reconstruct_calls") -Kind "cpu_reconstruct_calls")
+        if ($nestedResidualGpuJoinRequestedRuntime -ne 1 -or
+            $nestedResidualGpuJoinObservedRuntime -ne 1 -or
+            $nestedResidualGpuJoinCalls -eq 0 -or
+            $nestedResidualGpuJoinBlocks -eq 0 -or
+            $nestedResidualGpuJoinBaseH2DBytes -eq 0 -or
+            $nestedResidualGpuJoinResidualH2DBytes -eq 0 -or
+            $nestedResidualGpuJoinNativeH2DBytes -ne 0 -or
+            $nestedResidualGpuJoinSeconds -lt 0.0 -or
+            $nestedResidualGpuJoinWaitSeconds -lt 0.0 -or
+            $nestedResidualGpuJoinVerifySeconds -lt 0.0 -or
+            $nestedResidualGpuJoinVerifyMismatches -ne 0 -or
+            $nestedResidualGpuJoinFailures -ne 0 -or
+            $nestedResidualGpuJoinCpuReconstructCalls -ne 0 -or
+            ($NestedResidualVerifyReconstruction -and
+             ($nestedResidualGpuJoinVerifyCalls -ne
+                $nestedResidualGpuJoinCalls * [UInt64]3 -or
+              $nestedResidualGpuJoinVerifyBytes -ne
+                $nestedResidualGpuJoinCalls * [UInt64]7077888)) -or
+            ((-not $NestedResidualVerifyReconstruction) -and
+             ($nestedResidualGpuJoinVerifyCalls -ne 0 -or
+              $nestedResidualGpuJoinVerifyBytes -ne 0 -or
+              $nestedResidualGpuJoinVerifySeconds -ne 0.0))) {
+            throw "Nested residual GPU join counters are inconsistent"
+        }
+        $nestedResidualGpuJoinObserved = $true
+    } elseif ($nestedResidualGpuJoinSummaryMatches.Count -ne 0 -or
+              $q1_0SidecarLogText -match '\[(?:nested-residual-gpu-join|nested-residual)\] result=(?:summary|gpu_join_summary)[^\r\n]*(?:gpu_join|cpu_reconstruct|base_h2d_bytes|residual_h2d_bytes)') {
+        throw "Nested residual GPU join telemetry appeared while NestedResidualGpuJoin was disabled"
+    }
+    if ($NestedResidualProfile) {
+        if ($nestedResidualProfileSummaryMatches.Count -ne 1) {
+            throw "Nested residual profile requires exactly one summary; observed $($nestedResidualProfileSummaryMatches.Count)"
+        }
+        $profileSummary = $nestedResidualProfileSummaryMatches[0]
+        $nestedResidualProfileRawSummary = $profileSummary.Value
+        $nestedResidualProfileLookupCalls = [UInt64]$profileSummary.Groups[1].Value
+        $nestedResidualProfileLookupSeconds = [double]::Parse($profileSummary.Groups[2].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfilePreadCalls = [UInt64]$profileSummary.Groups[3].Value
+        $nestedResidualProfilePreadSeconds = [double]::Parse($profileSummary.Groups[4].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileReconstructCalls = [UInt64]$profileSummary.Groups[5].Value
+        $nestedResidualProfileReconstructBlocks = [UInt64]$profileSummary.Groups[6].Value
+        $nestedResidualProfileReconstructSeconds = [double]::Parse($profileSummary.Groups[7].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileVerifyCalls = [UInt64]$profileSummary.Groups[8].Value
+        $nestedResidualProfileVerifyBytes = [UInt64]$profileSummary.Groups[9].Value
+        $nestedResidualProfileVerifySeconds = [double]::Parse($profileSummary.Groups[10].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileReuseWaitCalls = [UInt64]$profileSummary.Groups[11].Value
+        $nestedResidualProfileReuseWaitSeconds = [double]::Parse($profileSummary.Groups[12].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileHostCopyCalls = [UInt64]$profileSummary.Groups[13].Value
+        $nestedResidualProfileHostCopySeconds = [double]::Parse($profileSummary.Groups[14].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileH2DEnqueueCalls = [UInt64]$profileSummary.Groups[15].Value
+        $nestedResidualProfileH2DEnqueueSeconds = [double]::Parse($profileSummary.Groups[16].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileH2DSyncCalls = [UInt64]$profileSummary.Groups[17].Value
+        $nestedResidualProfileH2DSyncSeconds = [double]::Parse($profileSummary.Groups[18].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileRouteBeginCalls = [UInt64]$profileSummary.Groups[19].Value
+        $nestedResidualProfileRouteBeginSeconds = [double]::Parse($profileSummary.Groups[20].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileRouteResolveSyncCalls = [UInt64]$profileSummary.Groups[21].Value
+        $nestedResidualProfileRouteResolveSyncSeconds = [double]::Parse($profileSummary.Groups[22].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfileRouteReadyWaitCalls = [UInt64]$profileSummary.Groups[23].Value
+        $nestedResidualProfileRouteReadyWaitSeconds = [double]::Parse($profileSummary.Groups[24].Value, [Globalization.CultureInfo]::InvariantCulture)
+        $nestedResidualProfilePackedCopy = [int]$profileSummary.Groups[25].Value
+        $nestedResidualProfileSplitFused = [int]$profileSummary.Groups[26].Value
+        $nestedResidualProfileVerify = [int]$profileSummary.Groups[27].Value
+        if ($nestedResidualProfileLookupCalls -ne
+                $nestedResidualCacheHits + $nestedResidualCacheMisses -or
+            $nestedResidualProfilePreadCalls -ne $nestedResidualPreads -or
+            $nestedResidualProfileReconstructCalls -ne
+                $nestedResidualReconstructed -or
+            $nestedResidualProfileReconstructBlocks -eq 0 -or
+            $nestedResidualProfileVerify -ne
+                [int][bool]$NestedResidualVerifyReconstruction -or
+            ($NestedResidualVerifyReconstruction -and
+                ($nestedResidualProfileVerifyCalls -ne
+                    $nestedResidualReconstructed * [UInt64]3 -or
+                 $nestedResidualProfileVerifyBytes -ne
+                    $nestedResidualReconstructed * [UInt64]7077888 -or
+                 $nestedResidualProfileVerifySeconds -lt 0.0)) -or
+            ((-not $NestedResidualVerifyReconstruction) -and
+                ($nestedResidualProfileVerifyCalls -ne 0 -or
+                 $nestedResidualProfileVerifyBytes -ne 0 -or
+                 $nestedResidualProfileVerifySeconds -ne 0.0)) -or
+            $nestedResidualProfileHostCopyCalls -ne
+                $nestedResidualVramHostFills -or
+            $nestedResidualProfileH2DEnqueueCalls -ne
+                $nestedResidualVramHostFills -or
+            $nestedResidualProfileH2DSyncCalls -eq 0 -or
+            $nestedResidualProfileRouteBeginCalls -ne
+                $nestedResidualVramRouteCalls -or
+            $nestedResidualProfileRouteReadyWaitCalls -ne
+                $nestedResidualVramRouteCalls -or
+            $nestedResidualProfilePackedCopy -ne [int][bool]$RoutePackedCopy -or
+            $nestedResidualProfileSplitFused -ne [int][bool]$SplitFused) {
+            throw "Nested residual profile counters are inconsistent"
+        }
+        $nestedResidualProfileObserved = $true
+    } elseif ($nestedResidualProfileSummaryMatches.Count -ne 0 -or
+              $q1_0SidecarLogText -match '\[nested-residual-profile\]') {
+        throw "Nested residual profile telemetry appeared while NestedResidualProfile was disabled"
+    }
+} elseif ($nestedResidualSummaryMatches.Count -ne 0 -or
+          $nestedResidualVramSummaryMatches.Count -ne 0 -or
+          $nestedResidualGpuJoinSummaryMatches.Count -ne 0 -or
+          $nestedResidualProfileSummaryMatches.Count -ne 0 -or
+          $q1_0SidecarLogText -match '\[nested-residual(?:-vram|-gpu-join|-profile)?\]') {
+    throw "Nested residual runtime telemetry appeared while nested residual was disabled"
+}
 $q1_0Telemetry = Read-G7Q1_0SidecarTelemetry `
     -LogText $q1_0SidecarLogText `
     -SidecarConfigured ([bool]$Q1_0ExpertSidecar) `
     -SelectedLoadRequested ([bool]$Q1_0SelectedLoad) `
-    -ResidentArenaRequested ([bool]$Q1_0ResidentArena) `
+    -ResidentArenaRequested ([bool]($Q1_0ResidentArena -or $Q1_0SnapshotBacking)) `
+    -SnapshotBackingRequested ([bool]$Q1_0SnapshotBacking) `
+    -DualSparseRequested ([bool]$Q1_0DualSparseCompanion) `
+    -ExpectedSnapshotEntries ([UInt64]$ExpectedQ1_0SnapshotEntries) `
     -SidecarPath $Q1_0ExpertSidecar
+$q1_0MixedTelemetry = Read-G7Q1_0MixedTelemetry `
+    -LogText $q1_0SidecarLogText `
+    -Required ([bool]($Q1_0SnapshotBacking -or $Q1_0MixedColdOne))
 $q1_0SidecarRuntimeObserved = [bool]$q1_0Telemetry.runtime_observed
 $q1_0SidecarCalls = [UInt64]$q1_0Telemetry.route_calls
 $q1_0SidecarSlots = [UInt64]$q1_0Telemetry.route_slots
@@ -3720,10 +4812,77 @@ $q1_0DirectPreadBytes = [UInt64]$q1_0Telemetry.direct_pread_bytes
 $q1_0BootstrapEntries = [UInt64]$q1_0Telemetry.bootstrap_entries
 $q1_0RuntimeContractValid = [bool]$q1_0Telemetry.runtime_contract_valid
 $q1_0FailClosedObserved = [bool]$q1_0Telemetry.fail_closed_observed
+if ($Q1_0PureResident -and
+    ([UInt64]$q1_0MixedTelemetry.all_iq2 -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.iq2_vram -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.iq2_snapshot_ram -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.iq2_tier_ram -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.q1_resident -eq 0 -or
+     [UInt64]$q1_0MixedTelemetry.q1_resident -ne
+        ([UInt64]$q1_0MixedTelemetry.calls * 6) -or
+     [UInt64]$q1_0MixedTelemetry.joins -ne
+        [UInt64]$q1_0MixedTelemetry.calls -or
+     [UInt64]$q1_0MixedTelemetry.iq2_ssd_bytes -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.iq2_ssd_violations -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.failures -ne 0)) {
+    throw "Q1_0 pure-resident counters show IQ2 routing, incomplete Q1 coverage, SSD access, or a runtime failure"
+}
+$q1_0DualSparseRuntimeObserved = $false
+$q1_0DualSparseEntries = [UInt64]0
+$q1_0DualSparseBytes = [UInt64]0
+$q1_0DualSparseStageSeconds = [double]0
+$q1_0DualSparsePublications = [UInt64]0
+$q1_0DualSparseFailures = [UInt64]0
+$q1_0DualSparseSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[q1-0-dual-sparse\] result=summary entries=(\d+) bytes=(\d+) stage_seconds=([0-9.]+) publications=(\d+) failures=(\d+) ready=(\d+) candidate_fnv1a64=([0-9a-fA-F]+) primary_generation=(\d+) q1_generation=(\d+)\x0d?$')
+if ($q1_0DualSparseSummaryMatches.Count -eq 1) {
+    $m = $q1_0DualSparseSummaryMatches[0]
+    $q1_0DualSparseEntries = [UInt64]$m.Groups[1].Value
+    $q1_0DualSparseBytes = [UInt64]$m.Groups[2].Value
+    $q1_0DualSparseStageSeconds = [double]::Parse(
+        $m.Groups[3].Value, [Globalization.CultureInfo]::InvariantCulture)
+    $q1_0DualSparsePublications = [UInt64]$m.Groups[4].Value
+    $q1_0DualSparseFailures = [UInt64]$m.Groups[5].Value
+    $q1_0DualSparseRuntimeObserved = [bool](
+        [int]$m.Groups[6].Value -eq 1 -and
+        $m.Groups[7].Value -ne '0000000000000000' -and
+        [UInt64]$m.Groups[8].Value -ne 0 -and
+        [UInt64]$m.Groups[8].Value -eq [UInt64]$m.Groups[9].Value)
+}
+if ($Q1_0DualSparseCompanion -and
+    ($q1_0DualSparseSummaryMatches.Count -ne 1 -or
+     -not $q1_0DualSparseRuntimeObserved -or
+     $q1_0DualSparseEntries -eq 0 -or
+     $q1_0DualSparseBytes -eq 0 -or
+     $q1_0DualSparsePublications -ne 1 -or
+     $q1_0DualSparseFailures -ne 0)) {
+    throw "Q1_0 dual sparse companion did not prove one ready, generation-matched, failure-free publication"
+}
+if ($Q1_0MixedColdOne -and
+    ([UInt64]$q1_0MixedTelemetry.calls -eq 0 -or
+     [UInt64]$q1_0MixedTelemetry.cold_one_calls -ne
+        [UInt64]$q1_0MixedTelemetry.calls -or
+     [UInt64]$q1_0MixedTelemetry.cold_one_hot_routes -ne
+        ([UInt64]$q1_0MixedTelemetry.calls * 5) -or
+     [UInt64]$q1_0MixedTelemetry.cold_one_q1_routes -ne
+        [UInt64]$q1_0MixedTelemetry.calls -or
+     [UInt64]$q1_0MixedTelemetry.q1_resident -ne
+        [UInt64]$q1_0MixedTelemetry.calls -or
+     [UInt64]$q1_0MixedTelemetry.joins -ne
+        [UInt64]$q1_0MixedTelemetry.calls -or
+     [UInt64]$q1_0MixedTelemetry.cold_one_invariant_failures -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.iq2_ssd_bytes -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.iq2_ssd_violations -ne 0 -or
+     [UInt64]$q1_0MixedTelemetry.failures -ne 0)) {
+    throw "Q1_0 5+1 counters did not prove exactly five resident IQ2 plus one resident Q1 route per call with zero SSD"
+}
 $q1_0DualArenaRuntimeObserved = [bool](
     $q1_0SidecarLogText -match 'mixed_host_backing=dual-arena' -and
     $q1_0SidecarLogText -match 'CUDA dynamic arena ready .* backing=primary' -and
-    $q1_0SidecarLogText -match '\[q1-0-resident-arena\] result=bootstrapped')
+    (($Q1_0DualSparseCompanion -and $q1_0DualSparseRuntimeObserved) -or
+     (-not $Q1_0DualSparseCompanion -and
+      $q1_0SidecarLogText -match '\[q1-0-resident-arena\] result=bootstrapped')))
 if ($Q1_0DualArena -and -not $q1_0DualArenaRuntimeObserved) {
     throw "Q1_0DualArena was requested but separate primary/Q1 arena markers were not observed"
 }
@@ -4282,11 +5441,18 @@ if ($Iq1SProfile) {
     throw "IQ1_S profile telemetry appeared while profiling was disabled"
 }
 
-$gpuRoutesExpectedPrimarySelected = [UInt64](6 * $gpuRoutesCalls)
-if ($iq1MixedPrimaryColdAvoided -gt $gpuRoutesExpectedPrimarySelected) {
-    throw "IQ1_S mixed decode excluded more primary routes than the GPU resolver observed"
+$q1_0MixedPrimaryColdAvoided = if ($Q1_0MixedColdOne) {
+    [UInt64]$q1_0MixedTelemetry.cold_one_q1_routes
+} else {
+    [UInt64]0
 }
-$gpuRoutesExpectedPrimarySelected -= $iq1MixedPrimaryColdAvoided
+$mixedPrimaryColdAvoided = [UInt64](
+    $iq1MixedPrimaryColdAvoided + $q1_0MixedPrimaryColdAvoided)
+$gpuRoutesExpectedPrimarySelected = [UInt64](6 * $gpuRoutesCalls)
+if ($mixedPrimaryColdAvoided -gt $gpuRoutesExpectedPrimarySelected) {
+    throw "Mixed decode excluded more primary routes than the GPU resolver observed"
+}
+$gpuRoutesExpectedPrimarySelected -= $mixedPrimaryColdAvoided
 if ($SplitFused) {
     if (-not $gpuRoutesObserved -or $gpuRoutesCalls -le 0 -or
         -not $splitFusedObserved -or $splitFusedCalls -ne $gpuRoutesCalls) {
@@ -4632,9 +5798,9 @@ if ($PrefillMassObserve -or $PrefillMassWrap) {
     if (-not $prefillMassArmed -or -not $prefillMassFinalized -or
         $prefillMassArmedEventCount -ne $requestCountExpected -or
         $prefillMassFinalizeEventCount -ne $requestCountExpected -or
-        ($ComposePrefillMassTiering -and
+        (($ComposePrefillMassTiering -or $Q1_0PureResident) -and
          $prefillMassDecodeEventCount -notin @(0, $requestCountExpected)) -or
-        (-not $ComposePrefillMassTiering -and
+        (-not $ComposePrefillMassTiering -and -not $Q1_0PureResident -and
          $prefillMassDecodeEventCount -ne $requestCountExpected)) {
         throw "Prefill mass measurement failed: expected $requestCountExpected complete observer lifecycles; armed=$prefillMassArmedEventCount finalized=$prefillMassFinalizeEventCount decode=$prefillMassDecodeEventCount"
     }
@@ -4865,7 +6031,10 @@ if ($DynamicArenaGiB -gt 0.0) {
     } else {
         if ($arenaCapResult -ne "ready" -or
             $arenaAllocatedBytes -ne $arenaCapChosenBytes -or
-            $arenaAllocatedSlots -ne $arenaCapChosenSlots) {
+            $arenaAllocatedPinnedSlots -ne $arenaCapChosenSlots -or
+            $arenaAllocatedPageableBytes -ne $arenaCapPageableBytes -or
+            $arenaAllocatedPageableSlots -ne $arenaCapPageableSlots -or
+            $arenaAllocatedSlots -ne $arenaCapTotalSlots) {
             throw "Dynamic arena cap measurement failed: ready allocation differs from chosen cap"
         }
     }
@@ -5147,6 +6316,11 @@ $expertTieringResult = [pscustomobject]@{
     compose_prefill_mass_open_router_requested = [bool]$ComposePrefillMassOpenRouter
     compose_prefill_mass_reserve_slots_requested = $ComposePrefillMassReserveSlots
     prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
+    prefill_vram_seed_requested_total = $PrefillVramSeedTotal
+    prefill_vram_seed_floor_per_layer_requested = $PrefillVramSeedFloorPerLayer
+    prefill_vram_seed_global_observed = $prefillVramSeedGlobalObserved
+    prefill_vram_seed_global_requested_observed = $prefillVramSeedGlobalRequestedObserved
+    prefill_vram_seed_global_floor_observed = $prefillVramSeedGlobalFloorObserved
     prefill_vram_seed_observed = $prefillVramSeedObserved
     prefill_vram_seed_line_count = $prefillVramSeedLineCount
     prefill_vram_seed_result = $prefillVramSeedResult
@@ -5313,23 +6487,159 @@ $rawOutputs = [pscustomobject]@{
     model_iq1_suite_lock_proof_observed =
         $modelIq1SuiteLockProofObserved
     model_iq1_suite_lock_proof = $modelIq1SuiteLockProof
+    benchmark_verified_receipt_reuse_allowed =
+        [bool]$AllowBenchmarkVerifiedReceiptReuse
+    benchmark_verified_receipt_lock_proof_required =
+        $benchmarkVerifiedReceiptLockProofRequired
+    benchmark_verified_receipt_lock_proof_observed =
+        $benchmarkVerifiedReceiptLockProofObserved
+    benchmark_verified_receipt_lock_proof =
+        $benchmarkVerifiedReceiptLockProof
     prompt_sha256 = $promptHash
     system_prompt = $SystemPrompt
     system_prompt_sha256 = $systemPromptHash
     warmup_prompt_sha256 = $(if ($Warmup) { $warmupPromptHash } else { "" })
     expected_content_sha256 = if ($ExpectedContentSHA256) { $ExpectedContentSHA256.ToLowerInvariant() } else { "" }
     expected_warmup_content_sha256 = if ($ExpectedWarmupContentSHA256) { $ExpectedWarmupContentSHA256.ToLowerInvariant() } else { "" }
+    nested_residual_enabled = [bool]$NestedResidualSidecar
+    nested_residual_sidecar_path = $(if ($nestedResidualInfoAtStart) { $nestedResidualInfoAtStart.FullName } else { "" })
+    nested_residual_sidecar_bytes = $(if ($nestedResidualInfoAtStart) { [UInt64]$nestedResidualInfoAtStart.Length } else { [UInt64]0 })
+    nested_residual_sidecar_sha256 = $nestedResidualHashAtStart
+    nested_residual_expected_source_sha256 = $(if ($ExpectedNestedResidualSourceSHA256) { $ExpectedNestedResidualSourceSHA256.ToLowerInvariant() } else { "" })
+    nested_residual_expected_payload_sha256 = $(if ($ExpectedNestedResidualPayloadSHA256) { $ExpectedNestedResidualPayloadSHA256.ToLowerInvariant() } else { "" })
+    nested_residual_verify_reconstruction = [bool]$NestedResidualVerifyReconstruction
+    nested_residual_cache_experts_requested = $NestedResidualCacheExperts
+    nested_residual_structural_n1_requested = [bool]$NestedResidualStructuralN1
+    nested_residual_gpu_cache_requested = [bool]$NestedResidualGpuCache
+    nested_residual_gpu_join_requested = [bool]$NestedResidualGpuJoin
+    nested_residual_gpu_join_safety_receipt_path =
+        $nestedResidualGpuJoinSafetyReceiptPathAtStart
+    nested_residual_gpu_join_safety_receipt_sha256 =
+        $nestedResidualGpuJoinSafetyReceiptHashAtStart
+    nested_residual_gpu_join_safety_result_path =
+        $nestedResidualGpuJoinSafetyResultPathAtStart
+    nested_residual_gpu_join_safety_result_sha256 =
+        $nestedResidualGpuJoinSafetyResultHashAtStart
+    nested_residual_gpu_join_safety_receipt_validated =
+        $nestedResidualGpuJoinSafetyReceiptValidated
+    allow_nested_residual_benchmark_suite_requested =
+        [bool]$AllowNestedResidualBenchmarkSuite
+    outer_nested_residual_benchmark_process_count_requested =
+        $OuterNestedResidualBenchmarkProcessCount
+    nested_residual_benchmark_member = $nestedResidualBenchmarkMember
+    nested_residual_runtime_observed = $nestedResidualRuntimeObserved
+    nested_residual_router_calls = $nestedResidualRouterCalls
+    nested_residual_cache_hits = $nestedResidualCacheHits
+    nested_residual_cache_misses = $nestedResidualCacheMisses
+    nested_residual_preads = $nestedResidualPreads
+    nested_residual_bytes = $nestedResidualBytes
+    nested_residual_reconstructed = $nestedResidualReconstructed
+    nested_residual_mismatches = $nestedResidualMismatches
+    nested_residual_h2d_bytes = $nestedResidualH2DBytes
+    nested_residual_failures = $nestedResidualFailures
+    nested_residual_vram_runtime_observed = $nestedResidualVramRuntimeObserved
+    nested_residual_vram_raw_summary = $nestedResidualVramRawSummary
+    nested_residual_vram_route_calls = $nestedResidualVramRouteCalls
+    nested_residual_vram_hits = $nestedResidualVramHits
+    nested_residual_vram_misses = $nestedResidualVramMisses
+    nested_residual_vram_host_fills = $nestedResidualVramHostFills
+    nested_residual_vram_host_bytes = $nestedResidualVramHostBytes
+    nested_residual_vram_h2d_bytes = $nestedResidualVramH2DBytes
+    nested_residual_vram_failures = $nestedResidualVramFailures
+    nested_residual_gpu_join_observed = $nestedResidualGpuJoinObserved
+    nested_residual_gpu_join_raw_summary = $nestedResidualGpuJoinRawSummary
+    nested_residual_gpu_join_requested_runtime =
+        $nestedResidualGpuJoinRequestedRuntime
+    nested_residual_gpu_join_observed_runtime =
+        $nestedResidualGpuJoinObservedRuntime
+    nested_residual_gpu_join_calls = $nestedResidualGpuJoinCalls
+    nested_residual_gpu_join_blocks = $nestedResidualGpuJoinBlocks
+    nested_residual_gpu_join_base_h2d_bytes =
+        $nestedResidualGpuJoinBaseH2DBytes
+    nested_residual_gpu_join_residual_h2d_bytes =
+        $nestedResidualGpuJoinResidualH2DBytes
+    nested_residual_gpu_join_native_h2d_bytes =
+        $nestedResidualGpuJoinNativeH2DBytes
+    nested_residual_gpu_join_seconds = $nestedResidualGpuJoinSeconds
+    nested_residual_gpu_join_wait_calls =
+        $nestedResidualGpuJoinWaitCalls
+    nested_residual_gpu_join_wait_seconds =
+        $nestedResidualGpuJoinWaitSeconds
+    nested_residual_gpu_join_verify_calls =
+        $nestedResidualGpuJoinVerifyCalls
+    nested_residual_gpu_join_verify_bytes =
+        $nestedResidualGpuJoinVerifyBytes
+    nested_residual_gpu_join_verify_seconds =
+        $nestedResidualGpuJoinVerifySeconds
+    nested_residual_gpu_join_verify_mismatches =
+        $nestedResidualGpuJoinVerifyMismatches
+    nested_residual_gpu_join_failures = $nestedResidualGpuJoinFailures
+    nested_residual_gpu_join_cpu_reconstruct_calls =
+        $nestedResidualGpuJoinCpuReconstructCalls
+    nested_residual_profile_requested = [bool]$NestedResidualProfile
+    nested_residual_profile_observed = $nestedResidualProfileObserved
+    nested_residual_profile = [ordered]@{
+        raw_summary = $nestedResidualProfileRawSummary
+        lookup_calls = $nestedResidualProfileLookupCalls
+        lookup_seconds = $nestedResidualProfileLookupSeconds
+        pread_calls = $nestedResidualProfilePreadCalls
+        pread_seconds = $nestedResidualProfilePreadSeconds
+        reconstruct_calls = $nestedResidualProfileReconstructCalls
+        reconstruct_blocks = $nestedResidualProfileReconstructBlocks
+        reconstruct_seconds = $nestedResidualProfileReconstructSeconds
+        verify_calls = $nestedResidualProfileVerifyCalls
+        verify_bytes = $nestedResidualProfileVerifyBytes
+        verify_seconds = $nestedResidualProfileVerifySeconds
+        reuse_wait_calls = $nestedResidualProfileReuseWaitCalls
+        reuse_wait_seconds = $nestedResidualProfileReuseWaitSeconds
+        host_copy_calls = $nestedResidualProfileHostCopyCalls
+        host_copy_seconds = $nestedResidualProfileHostCopySeconds
+        h2d_enqueue_calls = $nestedResidualProfileH2DEnqueueCalls
+        h2d_enqueue_seconds = $nestedResidualProfileH2DEnqueueSeconds
+        h2d_sync_calls = $nestedResidualProfileH2DSyncCalls
+        h2d_sync_seconds = $nestedResidualProfileH2DSyncSeconds
+        route_begin_calls = $nestedResidualProfileRouteBeginCalls
+        route_begin_seconds = $nestedResidualProfileRouteBeginSeconds
+        route_submit_launch_calls = $nestedResidualProfileRouteBeginCalls
+        route_submit_launch_seconds = $nestedResidualProfileRouteBeginSeconds
+        route_resolve_sync_calls =
+            $nestedResidualProfileRouteResolveSyncCalls
+        route_resolve_sync_seconds =
+            $nestedResidualProfileRouteResolveSyncSeconds
+        route_ready_wait_calls = $nestedResidualProfileRouteReadyWaitCalls
+        route_ready_wait_seconds = $nestedResidualProfileRouteReadyWaitSeconds
+        packed_copy = $nestedResidualProfilePackedCopy
+        split_fused = $nestedResidualProfileSplitFused
+        verify = $nestedResidualProfileVerify
+    }
     ds4_q1_0_expert_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
     ds4_q1_0_selected_load = $(if ($Q1_0ExpertSidecar -and $Q1_0SelectedLoad) { "1" } else { "" })
     ds4_q1_0_resident_arena = $(if ($Q1_0ExpertSidecar -and $Q1_0ResidentArena) { "1" } else { "" })
     ds4_q1_0_dual_arena = $(if ($Q1_0ExpertSidecar -and $Q1_0DualArena) { "1" } else { "" })
+    ds4_q1_0_dual_sparse_companion = $(if ($Q1_0ExpertSidecar -and $Q1_0DualSparseCompanion) { "1" } else { "" })
+    ds4_q1_0_mixed_cold_one = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedColdOne) { "1" } else { "" })
+    ds4_q1_0_pageable_overflow = $(if ($Q1_0ExpertSidecar -and $Q1_0PageableOverflow) { "1" } else { "" })
+    ds4_q1_0_mixed_trace = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedTrace) { "1" } else { "" })
     ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
     ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
     q1_0_sidecar_enabled = [bool]$Q1_0ExpertSidecar
     q1_0_selected_load_requested = [bool]$Q1_0SelectedLoad
     q1_0_resident_arena_requested = [bool]$Q1_0ResidentArena
     q1_0_dual_arena_requested = [bool]$Q1_0DualArena
+    q1_0_dual_sparse_companion_requested = [bool]$Q1_0DualSparseCompanion
+    q1_0_mixed_cold_one_requested = [bool]$Q1_0MixedColdOne
+    q1_0_snapshot_backing_requested = [bool]$Q1_0SnapshotBacking
+    q1_0_pageable_overflow_requested = [bool]$Q1_0PageableOverflow
+    q1_0_pure_resident_requested = [bool]$Q1_0PureResident
+    q1_0_snapshot_entries_expected = $ExpectedQ1_0SnapshotEntries
+    q1_0_mixed_trace_requested = [bool]$Q1_0MixedTrace
     q1_0_dual_arena_runtime_observed = $q1_0DualArenaRuntimeObserved
+    q1_0_dual_sparse_runtime_observed = $q1_0DualSparseRuntimeObserved
+    q1_0_dual_sparse_entries = $q1_0DualSparseEntries
+    q1_0_dual_sparse_bytes = $q1_0DualSparseBytes
+    q1_0_dual_sparse_stage_seconds = $q1_0DualSparseStageSeconds
+    q1_0_dual_sparse_publications = $q1_0DualSparsePublications
+    q1_0_dual_sparse_failures = $q1_0DualSparseFailures
     q1_0_layer_first_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerFirst } else { 0 })
     q1_0_layer_last_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerLast } else { 0 })
     q1_0_sidecar_path = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
@@ -5354,6 +6664,7 @@ $rawOutputs = [pscustomobject]@{
     q1_0_direct_pread_fallbacks = $q1_0DirectPreadFallbacks
     q1_0_direct_pread_bytes = $q1_0DirectPreadBytes
     q1_0_bootstrap_entries = $q1_0BootstrapEntries
+    q1_0_mixed = $q1_0MixedTelemetry
     q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
     q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
     q1_0_fail_closed_observed = $q1_0FailClosedObserved
@@ -5552,17 +6863,153 @@ $summary = [pscustomobject]@{
     model_iq1_suite_lock_proof_observed =
         $modelIq1SuiteLockProofObserved
     model_iq1_suite_lock_proof = $modelIq1SuiteLockProof
+    benchmark_verified_receipt_reuse_allowed =
+        [bool]$AllowBenchmarkVerifiedReceiptReuse
+    benchmark_verified_receipt_lock_proof_required =
+        $benchmarkVerifiedReceiptLockProofRequired
+    benchmark_verified_receipt_lock_proof_observed =
+        $benchmarkVerifiedReceiptLockProofObserved
+    benchmark_verified_receipt_lock_proof =
+        $benchmarkVerifiedReceiptLockProof
+    nested_residual_enabled = [bool]$NestedResidualSidecar
+    nested_residual_sidecar = $(if ($nestedResidualInfoAtStart) { $nestedResidualInfoAtStart.FullName } else { "" })
+    nested_residual_sidecar_bytes = $(if ($nestedResidualInfoAtStart) { [UInt64]$nestedResidualInfoAtStart.Length } else { [UInt64]0 })
+    nested_residual_sidecar_sha256 = $nestedResidualHashAtStart
+    nested_residual_expected_source_sha256 = $(if ($ExpectedNestedResidualSourceSHA256) { $ExpectedNestedResidualSourceSHA256.ToLowerInvariant() } else { "" })
+    nested_residual_expected_payload_sha256 = $(if ($ExpectedNestedResidualPayloadSHA256) { $ExpectedNestedResidualPayloadSHA256.ToLowerInvariant() } else { "" })
+    nested_residual_verify_reconstruction = [bool]$NestedResidualVerifyReconstruction
+    nested_residual_cache_experts_requested = $NestedResidualCacheExperts
+    nested_residual_structural_n1_requested = [bool]$NestedResidualStructuralN1
+    nested_residual_gpu_cache_requested = [bool]$NestedResidualGpuCache
+    nested_residual_gpu_join_requested = [bool]$NestedResidualGpuJoin
+    nested_residual_gpu_join_safety_receipt_path =
+        $nestedResidualGpuJoinSafetyReceiptPathAtStart
+    nested_residual_gpu_join_safety_receipt_sha256 =
+        $nestedResidualGpuJoinSafetyReceiptHashAtStart
+    nested_residual_gpu_join_safety_result_path =
+        $nestedResidualGpuJoinSafetyResultPathAtStart
+    nested_residual_gpu_join_safety_result_sha256 =
+        $nestedResidualGpuJoinSafetyResultHashAtStart
+    nested_residual_gpu_join_safety_receipt_validated =
+        $nestedResidualGpuJoinSafetyReceiptValidated
+    allow_nested_residual_benchmark_suite_requested =
+        [bool]$AllowNestedResidualBenchmarkSuite
+    outer_nested_residual_benchmark_process_count_requested =
+        $OuterNestedResidualBenchmarkProcessCount
+    nested_residual_benchmark_member = $nestedResidualBenchmarkMember
+    nested_residual_runtime_observed = $nestedResidualRuntimeObserved
+    nested_residual_router_calls = $nestedResidualRouterCalls
+    nested_residual_cache_hits = $nestedResidualCacheHits
+    nested_residual_cache_misses = $nestedResidualCacheMisses
+    nested_residual_preads = $nestedResidualPreads
+    nested_residual_bytes = $nestedResidualBytes
+    nested_residual_reconstructed = $nestedResidualReconstructed
+    nested_residual_mismatches = $nestedResidualMismatches
+    nested_residual_h2d_bytes = $nestedResidualH2DBytes
+    nested_residual_failures = $nestedResidualFailures
+    nested_residual_vram_runtime_observed = $nestedResidualVramRuntimeObserved
+    nested_residual_vram_raw_summary = $nestedResidualVramRawSummary
+    nested_residual_vram_route_calls = $nestedResidualVramRouteCalls
+    nested_residual_vram_hits = $nestedResidualVramHits
+    nested_residual_vram_misses = $nestedResidualVramMisses
+    nested_residual_vram_host_fills = $nestedResidualVramHostFills
+    nested_residual_vram_host_bytes = $nestedResidualVramHostBytes
+    nested_residual_vram_h2d_bytes = $nestedResidualVramH2DBytes
+    nested_residual_vram_failures = $nestedResidualVramFailures
+    nested_residual_gpu_join_observed = $nestedResidualGpuJoinObserved
+    nested_residual_gpu_join_raw_summary = $nestedResidualGpuJoinRawSummary
+    nested_residual_gpu_join_requested_runtime =
+        $nestedResidualGpuJoinRequestedRuntime
+    nested_residual_gpu_join_observed_runtime =
+        $nestedResidualGpuJoinObservedRuntime
+    nested_residual_gpu_join_calls = $nestedResidualGpuJoinCalls
+    nested_residual_gpu_join_blocks = $nestedResidualGpuJoinBlocks
+    nested_residual_gpu_join_base_h2d_bytes =
+        $nestedResidualGpuJoinBaseH2DBytes
+    nested_residual_gpu_join_residual_h2d_bytes =
+        $nestedResidualGpuJoinResidualH2DBytes
+    nested_residual_gpu_join_native_h2d_bytes =
+        $nestedResidualGpuJoinNativeH2DBytes
+    nested_residual_gpu_join_seconds = $nestedResidualGpuJoinSeconds
+    nested_residual_gpu_join_wait_calls =
+        $nestedResidualGpuJoinWaitCalls
+    nested_residual_gpu_join_wait_seconds =
+        $nestedResidualGpuJoinWaitSeconds
+    nested_residual_gpu_join_verify_calls =
+        $nestedResidualGpuJoinVerifyCalls
+    nested_residual_gpu_join_verify_bytes =
+        $nestedResidualGpuJoinVerifyBytes
+    nested_residual_gpu_join_verify_seconds =
+        $nestedResidualGpuJoinVerifySeconds
+    nested_residual_gpu_join_verify_mismatches =
+        $nestedResidualGpuJoinVerifyMismatches
+    nested_residual_gpu_join_failures = $nestedResidualGpuJoinFailures
+    nested_residual_gpu_join_cpu_reconstruct_calls =
+        $nestedResidualGpuJoinCpuReconstructCalls
+    nested_residual_profile_requested = [bool]$NestedResidualProfile
+    nested_residual_profile_observed = $nestedResidualProfileObserved
+    nested_residual_profile = [ordered]@{
+        raw_summary = $nestedResidualProfileRawSummary
+        lookup_calls = $nestedResidualProfileLookupCalls
+        lookup_seconds = $nestedResidualProfileLookupSeconds
+        pread_calls = $nestedResidualProfilePreadCalls
+        pread_seconds = $nestedResidualProfilePreadSeconds
+        reconstruct_calls = $nestedResidualProfileReconstructCalls
+        reconstruct_blocks = $nestedResidualProfileReconstructBlocks
+        reconstruct_seconds = $nestedResidualProfileReconstructSeconds
+        verify_calls = $nestedResidualProfileVerifyCalls
+        verify_bytes = $nestedResidualProfileVerifyBytes
+        verify_seconds = $nestedResidualProfileVerifySeconds
+        reuse_wait_calls = $nestedResidualProfileReuseWaitCalls
+        reuse_wait_seconds = $nestedResidualProfileReuseWaitSeconds
+        host_copy_calls = $nestedResidualProfileHostCopyCalls
+        host_copy_seconds = $nestedResidualProfileHostCopySeconds
+        h2d_enqueue_calls = $nestedResidualProfileH2DEnqueueCalls
+        h2d_enqueue_seconds = $nestedResidualProfileH2DEnqueueSeconds
+        h2d_sync_calls = $nestedResidualProfileH2DSyncCalls
+        h2d_sync_seconds = $nestedResidualProfileH2DSyncSeconds
+        route_begin_calls = $nestedResidualProfileRouteBeginCalls
+        route_begin_seconds = $nestedResidualProfileRouteBeginSeconds
+        route_submit_launch_calls = $nestedResidualProfileRouteBeginCalls
+        route_submit_launch_seconds = $nestedResidualProfileRouteBeginSeconds
+        route_resolve_sync_calls =
+            $nestedResidualProfileRouteResolveSyncCalls
+        route_resolve_sync_seconds =
+            $nestedResidualProfileRouteResolveSyncSeconds
+        route_ready_wait_calls = $nestedResidualProfileRouteReadyWaitCalls
+        route_ready_wait_seconds = $nestedResidualProfileRouteReadyWaitSeconds
+        packed_copy = $nestedResidualProfilePackedCopy
+        split_fused = $nestedResidualProfileSplitFused
+        verify = $nestedResidualProfileVerify
+    }
     ds4_q1_0_expert_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
     ds4_q1_0_selected_load = $(if ($Q1_0ExpertSidecar -and $Q1_0SelectedLoad) { "1" } else { "" })
     ds4_q1_0_resident_arena = $(if ($Q1_0ExpertSidecar -and $Q1_0ResidentArena) { "1" } else { "" })
     ds4_q1_0_dual_arena = $(if ($Q1_0ExpertSidecar -and $Q1_0DualArena) { "1" } else { "" })
+    ds4_q1_0_dual_sparse_companion = $(if ($Q1_0ExpertSidecar -and $Q1_0DualSparseCompanion) { "1" } else { "" })
+    ds4_q1_0_mixed_cold_one = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedColdOne) { "1" } else { "" })
+    ds4_q1_0_pageable_overflow = $(if ($Q1_0ExpertSidecar -and $Q1_0PageableOverflow) { "1" } else { "" })
+    ds4_q1_0_mixed_trace = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedTrace) { "1" } else { "" })
     ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
     ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
     q1_0_sidecar_enabled = [bool]$Q1_0ExpertSidecar
     q1_0_selected_load_requested = [bool]$Q1_0SelectedLoad
     q1_0_resident_arena_requested = [bool]$Q1_0ResidentArena
     q1_0_dual_arena_requested = [bool]$Q1_0DualArena
+    q1_0_dual_sparse_companion_requested = [bool]$Q1_0DualSparseCompanion
+    q1_0_mixed_cold_one_requested = [bool]$Q1_0MixedColdOne
+    q1_0_snapshot_backing_requested = [bool]$Q1_0SnapshotBacking
+    q1_0_pageable_overflow_requested = [bool]$Q1_0PageableOverflow
+    q1_0_pure_resident_requested = [bool]$Q1_0PureResident
+    q1_0_snapshot_entries_expected = $ExpectedQ1_0SnapshotEntries
+    q1_0_mixed_trace_requested = [bool]$Q1_0MixedTrace
     q1_0_dual_arena_runtime_observed = $q1_0DualArenaRuntimeObserved
+    q1_0_dual_sparse_runtime_observed = $q1_0DualSparseRuntimeObserved
+    q1_0_dual_sparse_entries = $q1_0DualSparseEntries
+    q1_0_dual_sparse_bytes = $q1_0DualSparseBytes
+    q1_0_dual_sparse_stage_seconds = $q1_0DualSparseStageSeconds
+    q1_0_dual_sparse_publications = $q1_0DualSparsePublications
+    q1_0_dual_sparse_failures = $q1_0DualSparseFailures
     q1_0_layer_first_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerFirst } else { 0 })
     q1_0_layer_last_requested = $(if ($Q1_0ExpertSidecar) { $Q1_0LayerLast } else { 0 })
     q1_0_sidecar = $(if ($q1_0SidecarInfoAtStart) { $q1_0SidecarInfoAtStart.FullName } else { "" })
@@ -5588,6 +7035,7 @@ $summary = [pscustomobject]@{
     q1_0_direct_pread_fallbacks = $q1_0DirectPreadFallbacks
     q1_0_direct_pread_bytes = $q1_0DirectPreadBytes
     q1_0_bootstrap_entries = $q1_0BootstrapEntries
+    q1_0_mixed = $q1_0MixedTelemetry
     q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
     q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
     q1_0_fail_closed_observed = $q1_0FailClosedObserved
@@ -5892,6 +7340,11 @@ $summary = [pscustomobject]@{
     prefill_mass_layer_full_every_requested = $PrefillMassLayerFullEvery
     prefill_mass_layer_full_phase_requested = $PrefillMassLayerFullPhase
     prefill_vram_seed_requested_per_layer = $PrefillVramSeedPerLayer
+    prefill_vram_seed_requested_total = $PrefillVramSeedTotal
+    prefill_vram_seed_floor_per_layer_requested = $PrefillVramSeedFloorPerLayer
+    prefill_vram_seed_global_observed = $prefillVramSeedGlobalObserved
+    prefill_vram_seed_global_requested_observed = $prefillVramSeedGlobalRequestedObserved
+    prefill_vram_seed_global_floor_observed = $prefillVramSeedGlobalFloorObserved
     prefill_vram_seed_observed = $prefillVramSeedObserved
     prefill_vram_seed_line_count = $prefillVramSeedLineCount
     prefill_vram_seed_result = $prefillVramSeedResult
@@ -6060,11 +7513,18 @@ $summary = [pscustomobject]@{
     dynamic_arena_cap_requested_slots = $arenaCapRequestedSlots
     dynamic_arena_cap_chosen_bytes = $arenaCapChosenBytes
     dynamic_arena_cap_chosen_slots = $arenaCapChosenSlots
+    dynamic_arena_cap_pageable_bytes = $arenaCapPageableBytes
+    dynamic_arena_cap_pageable_slots = $arenaCapPageableSlots
+    dynamic_arena_cap_total_slots = $arenaCapTotalSlots
     dynamic_arena_cap_capped = $arenaCapCapped
     dynamic_arena_cap_result = $arenaCapResult
     dynamic_arena_cap_reason = $arenaCapReason
     dynamic_arena_allocated_bytes = $arenaAllocatedBytes
+    dynamic_arena_allocated_pageable_bytes = $arenaAllocatedPageableBytes
+    dynamic_arena_allocated_total_bytes = $arenaAllocatedTotalBytes
     dynamic_arena_allocated_slots = $arenaAllocatedSlots
+    dynamic_arena_allocated_pinned_slots = $arenaAllocatedPinnedSlots
+    dynamic_arena_allocated_pageable_slots = $arenaAllocatedPageableSlots
     dynamic_arena_slot_bytes = $arenaSlotBytes
     dynamic_arena_observer_armed = $arenaObserverArmed
     dynamic_arena_observer_window_observed = $arenaObserverWindowObserved
@@ -6077,7 +7537,7 @@ $summary = [pscustomobject]@{
     dynamic_arena_observer_resident_bytes = [long]$arenaObserverResident * [long]$arenaSlotBytes
     dynamic_arena_resident_entries_reported = $arenaReportedResident
     dynamic_arena_resident_bytes_reported = [long]$arenaReportedResident * [long]$arenaSlotBytes
-    dynamic_arena_occupancy_ratio = if ($arenaAllocatedBytes -gt 0) { ([double]$arenaReportedResident * [double]$arenaSlotBytes) / [double]$arenaAllocatedBytes } else { $null }
+    dynamic_arena_occupancy_ratio = if ($arenaAllocatedTotalBytes -gt 0) { ([double]$arenaReportedResident * [double]$arenaSlotBytes) / [double]$arenaAllocatedTotalBytes } else { $null }
     dynamic_arena_wrap_observed = $arenaWrapObserved
     dynamic_arena_wrap_loads = $arenaWrapLoads
     dynamic_arena_wrap_workers = $arenaWrapWorkers
@@ -6096,12 +7556,16 @@ $summary = [pscustomobject]@{
     dynamic_arena_growth_events = $arenaGrowthEvents
     dynamic_arena_final_observed = $arenaFinalObserved
     dynamic_arena_final_hits = $arenaFinalHits
+    dynamic_arena_final_pinned_hits = $arenaFinalPinnedHits
+    dynamic_arena_final_pageable_hits = $arenaFinalPageableHits
     dynamic_arena_final_misses = $arenaFinalMisses
     dynamic_arena_final_fatal = $arenaFinalFatal
     dynamic_arena_hit_rate = if (($arenaFinalHits + $arenaFinalMisses) -gt 0) { [double]$arenaFinalHits / [double]($arenaFinalHits + $arenaFinalMisses) } else { $null }
     dynamic_arena_miss_rate = if (($arenaFinalHits + $arenaFinalMisses) -gt 0) { [double]$arenaFinalMisses / [double]($arenaFinalHits + $arenaFinalMisses) } else { $null }
     dynamic_arena_h2d_uploaded_gib = $arenaFinalUploadedGiB
-    dynamic_arena_h2d_uploaded_semantics = "Pinned host arena to compact VRAM selected-expert tensors; not SSD or mmap read traffic"
+    dynamic_arena_pinned_h2d_uploaded_gib = $arenaFinalPinnedUploadedGiB
+    dynamic_arena_pageable_h2d_uploaded_gib = $arenaFinalPageableUploadedGiB
+    dynamic_arena_h2d_uploaded_semantics = "Pinned/pageable host snapshot to compact VRAM selected-expert tensors; not SSD or mmap read traffic"
     no_selected_load = [bool]$NoSelectedLoad
     diagnostics = [bool]$Diagnostics
     memory_preflight = $memoryPreflight
@@ -6324,7 +7788,7 @@ Write-Host ("prefill mass unique/candidate/capacity/mass coverage/decode hit rat
 Write-Host ("prefill mass WRAP events/result/reason/candidate/loads/workers/sec: " + $prefillMassWrapEventCount + " / " + $prefillMassWrapResult + " / " + $prefillMassWrapReason + " / " + $prefillMassWrapCandidate + " / " + $prefillMassWrapLoads + " / " + $prefillMassWrapWorkers + " / " + $prefillMassWrapSeconds)
 Write-Host ("prefill mass WRAP snapshot before/after, resident before/after, generation: " + $prefillMassWrapSnapshotBefore + " / " + $prefillMassWrapSnapshotAfter + " / " + $prefillMassWrapResidentBefore + " / " + $prefillMassWrapResidentAfter + " / " + $prefillMassWrapGeneration)
 Write-Host ("prefill layer stripe req every/phase, result, layers full/partial, keep full/min/max, candidate/capacity: " + $PrefillMassLayerFullEvery + " / " + $PrefillMassLayerFullPhase + " / " + $prefillMassLayerStripeResult + " / " + $prefillMassLayerStripeFullLayers + " / " + $prefillMassLayerStripePartialLayers + " / " + $prefillMassLayerStripeFullKeep + " / " + $prefillMassLayerStripePartialKeepMin + " / " + $prefillMassLayerStripePartialKeepMax + " / " + $prefillMassLayerStripeTotalCandidate + " / " + $prefillMassLayerStripeCapacity)
-Write-Host ("prefill VRAM seed req/obs/result/layers/entries/GiB/sec/failures: " + $PrefillVramSeedPerLayer + " / " + $prefillVramSeedObserved + " / " + $prefillVramSeedResult + " / " + $prefillVramSeedLayers + " / " + $prefillVramSeedEntries + " / " + [math]::Round($prefillVramSeedBytes / 1GB, 3) + " / " + $prefillVramSeedSeconds + " / " + $prefillVramSeedFailures)
+Write-Host ("prefill VRAM seed per-layer/total/floor/obs/result/layers/entries/GiB/sec/failures: " + $PrefillVramSeedPerLayer + " / " + $PrefillVramSeedTotal + " / " + $PrefillVramSeedFloorPerLayer + " / " + $prefillVramSeedObserved + " / " + $prefillVramSeedResult + " / " + $prefillVramSeedLayers + " / " + $prefillVramSeedEntries + " / " + [math]::Round($prefillVramSeedBytes / 1GB, 3) + " / " + $prefillVramSeedSeconds + " / " + $prefillVramSeedFailures)
 Write-Host ("REAP mass requested/armed/window/top/transport/tokens/slots/unique/top mass/touched: " + [bool]($ReapMassObserve -or $ReapMassWrap) + " / " + $reapMassArmed + " / " + $reapMassWindowObserved + " / " + $reapMassTopObserved + " / " + $reapMassTransport + " / " + $reapMassTokens + " / " + $reapMassObservedSlots + " / " + $reapMassUnique + " / " + $reapMassTopMass + " / " + $reapMassTouched)
 Write-Host ("REAP mass WRAP requested/armed/grow/hysteresis/capacity/router/mask/policy: " + [bool]$ReapMassWrap + " / " + $reapMassWrapArmed + " / " + $reapMassWrapGrowIntervalObserved + " / " + $reapMassWrapHysteresisObserved + " / " + $reapMassWrapCapacity + " / " + $reapMassWrapRouterArmed + " / " + $reapMassWrapMaskArmed + " / " + $reapMassWrapPolicyArmed)
 Write-Host ("REAP mass WRAP events/published/skipped/failed/entrants/victims/loads/sec: " + $reapMassWrapEventCount + " / " + $reapMassWrapPublicationCount + " / " + $reapMassWrapSkippedCount + " / " + $reapMassWrapFailureCount + " / " + $reapMassWrapEntrants + " / " + $reapMassWrapVictims + " / " + $reapMassWrapLoads + " / " + $reapMassWrapSeconds)
@@ -6381,6 +7845,12 @@ Write-Host ("spex ring/late/full/stale: " + $spexRingObserved + " / " + $spexLat
 Write-Host ("spex cpu probe req/observed/submitted/dropped/completed/predicted/matched/ready/useful/failures: " + $SpexCpuProbeK + " / " + $spexCpuProbeKObserved + " / " + $spexCpuProbeSubmitted + " / " + $spexCpuProbeDropped + " / " + $spexCpuProbeCompleted + " / " + $spexCpuProbePredicted + " / " + $spexCpuProbeMatched + " / " + $spexCpuProbeReadyAtTransport + " / " + $spexCpuProbeUsefulReady + " / " + $spexCpuProbeFailures)
 Write-Host ("spex cpu probe d2h/cpu/queue ms checksum: " + $spexCpuProbeD2HWaitMs + " / " + $spexCpuProbeCpuMs + " / " + $spexCpuProbeQueueMs + " / " + $spexCpuProbeChecksum)
 Write-Host ("spex prefetch req/observed/submitted/matched/consumed/late/errors: " + $SpexPrefetchK + " / " + $spexPrefetchKObserved + " / " + $spexPrefetchSubmitted + " / " + $spexPrefetchMatched + " / " + $spexPrefetchHits + " / " + $spexPrefetchLate + " / " + $spexPrefetchErrors)
+Write-Host ("nested residual enabled/observed/router-calls/hits/misses/preads/reconstructed/mismatches/failures: " + [bool]$NestedResidualSidecar + " / " + $nestedResidualRuntimeObserved + " / " + $nestedResidualRouterCalls + " / " + $nestedResidualCacheHits + " / " + $nestedResidualCacheMisses + " / " + $nestedResidualPreads + " / " + $nestedResidualReconstructed + " / " + $nestedResidualMismatches + " / " + $nestedResidualFailures)
+Write-Host ("nested residual exact-cache requested experts: " + $NestedResidualCacheExperts)
+Write-Host ("nested residual gpu-cache requested/observed/route-calls/hits/misses/host-fills/host-bytes/h2d-bytes/failures: " + [bool]$NestedResidualGpuCache + " / " + $nestedResidualVramRuntimeObserved + " / " + $nestedResidualVramRouteCalls + " / " + $nestedResidualVramHits + " / " + $nestedResidualVramMisses + " / " + $nestedResidualVramHostFills + " / " + $nestedResidualVramHostBytes + " / " + $nestedResidualVramH2DBytes + " / " + $nestedResidualVramFailures)
+Write-Host ("nested residual gpu-join safety receipt validated/path/hash: " + $nestedResidualGpuJoinSafetyReceiptValidated + " / " + $nestedResidualGpuJoinSafetyReceiptPathAtStart + " / " + $nestedResidualGpuJoinSafetyReceiptHashAtStart)
+Write-Host ("nested residual gpu-join requested/observed/runtime-requested/runtime-observed/calls/blocks/base-H2D/residual-H2D/native-H2D/sec/wait-calls/wait-sec/verify-calls/verify-bytes/verify-sec/mismatches/failures/cpu-reconstruct-calls: " + [bool]$NestedResidualGpuJoin + " / " + $nestedResidualGpuJoinObserved + " / " + $nestedResidualGpuJoinRequestedRuntime + " / " + $nestedResidualGpuJoinObservedRuntime + " / " + $nestedResidualGpuJoinCalls + " / " + $nestedResidualGpuJoinBlocks + " / " + $nestedResidualGpuJoinBaseH2DBytes + " / " + $nestedResidualGpuJoinResidualH2DBytes + " / " + $nestedResidualGpuJoinNativeH2DBytes + " / " + $nestedResidualGpuJoinSeconds + " / " + $nestedResidualGpuJoinWaitCalls + " / " + $nestedResidualGpuJoinWaitSeconds + " / " + $nestedResidualGpuJoinVerifyCalls + " / " + $nestedResidualGpuJoinVerifyBytes + " / " + $nestedResidualGpuJoinVerifySeconds + " / " + $nestedResidualGpuJoinVerifyMismatches + " / " + $nestedResidualGpuJoinFailures + " / " + $nestedResidualGpuJoinCpuReconstructCalls)
+Write-Host ("nested residual profile requested/observed lookup/pread/reconstruct/verify/host-copy/H2D-enqueue/H2D-sync/submit-launch/ready-wait sec: " + [bool]$NestedResidualProfile + " / " + $nestedResidualProfileObserved + " / " + $nestedResidualProfileLookupSeconds + " / " + $nestedResidualProfilePreadSeconds + " / " + $nestedResidualProfileReconstructSeconds + " / " + $nestedResidualProfileVerifySeconds + " / " + $nestedResidualProfileHostCopySeconds + " / " + $nestedResidualProfileH2DEnqueueSeconds + " / " + $nestedResidualProfileH2DSyncSeconds + " / " + $nestedResidualProfileRouteBeginSeconds + " / " + $nestedResidualProfileRouteReadyWaitSeconds)
 Write-Host ("Q1_0 sidecar enabled/selected-load/resident/dual-requested/dual-observed/observed/calls/slots/loads/failures: " + [bool]$Q1_0ExpertSidecar + " / " + [bool]$Q1_0SelectedLoad + " / " + [bool]$Q1_0ResidentArena + " / " + [bool]$Q1_0DualArena + " / " + $q1_0DualArenaRuntimeObserved + " / " + $q1_0SidecarRuntimeObserved + " / " + $q1_0SidecarCalls + " / " + $q1_0SidecarSlots + " / " + $q1_0SidecarSelectedLoads + " / " + $q1_0SidecarFailures)
 Write-Host ("Q1_0 resident mode/hits/misses/H2D bytes/direct-fallbacks/direct-bytes/bootstrap: " + $q1_0ResidentMode + " / " + $q1_0ResidentHits + " / " + $q1_0ResidentMisses + " / " + $q1_0ResidentH2DBytes + " / " + $q1_0DirectPreadFallbacks + " / " + $q1_0DirectPreadBytes + " / " + $q1_0BootstrapEntries)
 Write-Host ("Q1_0 runtime-contract/fail-closed/structural-eligible/performance-eligible: " + $q1_0RuntimeContractValid + " / " + $q1_0FailClosedObserved + " / " + $q1_0StructuralSmokeEligible + " / False")
@@ -6408,6 +7878,15 @@ Write-Host "=================================================="
     }
     if ($null -ne $q1_0SidecarLockStream) {
         try { $q1_0SidecarLockStream.Dispose() } catch {}
+    }
+    if ($null -ne $nestedResidualLockStream) {
+        try { $nestedResidualLockStream.Dispose() } catch {}
+    }
+    if ($null -ne $nestedResidualGpuJoinSafetyResultLockStream) {
+        try { $nestedResidualGpuJoinSafetyResultLockStream.Dispose() } catch {}
+    }
+    if ($null -ne $nestedResidualGpuJoinSafetyReceiptLockStream) {
+        try { $nestedResidualGpuJoinSafetyReceiptLockStream.Dispose() } catch {}
     }
     if ($measurementLockAcquired) {
         try { $measurementMutex.ReleaseMutex() } catch {}

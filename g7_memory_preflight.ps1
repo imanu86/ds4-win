@@ -22,6 +22,102 @@ function Get-G7MemoryCounterValue {
     return [UInt64]$property.Value
 }
 
+function Initialize-G7NativeMemoryApi {
+    if ("G7NativeMemory" -as [type]) {
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class G7NativeMemory {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORYSTATUSEX {
+        public uint dwLength;
+        public uint dwMemoryLoad;
+        public ulong ullTotalPhys;
+        public ulong ullAvailPhys;
+        public ulong ullTotalPageFile;
+        public ulong ullAvailPageFile;
+        public ulong ullTotalVirtual;
+        public ulong ullAvailVirtual;
+        public ulong ullAvailExtendedVirtual;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PERFORMANCE_INFORMATION {
+        public uint cb;
+        public UIntPtr CommitTotal;
+        public UIntPtr CommitLimit;
+        public UIntPtr CommitPeak;
+        public UIntPtr PhysicalTotal;
+        public UIntPtr PhysicalAvailable;
+        public UIntPtr SystemCache;
+        public UIntPtr KernelTotal;
+        public UIntPtr KernelPaged;
+        public UIntPtr KernelNonpaged;
+        public UIntPtr PageSize;
+        public uint HandleCount;
+        public uint ProcessCount;
+        public uint ThreadCount;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX status);
+
+    [DllImport("psapi.dll", SetLastError = true)]
+    public static extern bool GetPerformanceInfo(
+        out PERFORMANCE_INFORMATION info, uint size);
+
+    [DllImport("kernel32.dll")]
+    public static extern ulong GetTickCount64();
+}
+"@
+}
+
+function Get-G7NativeMemoryCounters {
+    Initialize-G7NativeMemoryApi
+
+    $status = New-Object G7NativeMemory+MEMORYSTATUSEX
+    $status.dwLength = [Runtime.InteropServices.Marshal]::SizeOf($status)
+    if (-not [G7NativeMemory]::GlobalMemoryStatusEx([ref]$status)) {
+        throw "GlobalMemoryStatusEx failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+    }
+
+    $performance = New-Object G7NativeMemory+PERFORMANCE_INFORMATION
+    $performance.cb = [Runtime.InteropServices.Marshal]::SizeOf($performance)
+    if (-not [G7NativeMemory]::GetPerformanceInfo(
+            [ref]$performance, [uint32]$performance.cb)) {
+        throw "GetPerformanceInfo failed with Win32 error $([Runtime.InteropServices.Marshal]::GetLastWin32Error())."
+    }
+
+    $pageSize = [UInt64]$performance.PageSize.ToUInt64()
+    $bootTime = [DateTime]::UtcNow.AddMilliseconds(
+        -[double][G7NativeMemory]::GetTickCount64())
+    return [pscustomobject][ordered]@{
+        source = "win32-globalmemorystatusex-getperformanceinfo"
+        boot_time_utc = $bootTime
+        total_bytes = [UInt64]$status.ullTotalPhys
+        available_bytes = [UInt64]$status.ullAvailPhys
+        committed_bytes = [UInt64]$performance.CommitTotal.ToUInt64() * $pageSize
+        commit_limit_bytes = [UInt64]$performance.CommitLimit.ToUInt64() * $pageSize
+        free_and_zero_bytes = [UInt64]0
+        standby_bytes = [UInt64]0
+        modified_bytes = [UInt64]0
+        paged_pool_bytes = [UInt64]$performance.KernelPaged.ToUInt64() * $pageSize
+        paged_pool_resident_bytes = [UInt64]0
+        nonpaged_pool_bytes = [UInt64]$performance.KernelNonpaged.ToUInt64() * $pageSize
+        system_cache_bytes = [UInt64]$performance.SystemCache.ToUInt64() * $pageSize
+        unavailable_counters = @(
+            "FreeAndZeroPageListBytes",
+            "StandbyCacheBytes",
+            "ModifiedPageListBytes",
+            "PoolPagedResidentBytes"
+        )
+    }
+}
+
 function Get-G7MemorySnapshot {
     [CmdletBinding()]
     param(
@@ -29,11 +125,44 @@ function Get-G7MemorySnapshot {
         [int] $TopProcessCount = 10
     )
 
-    $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-    $memory = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
-    $standbyBytes = (Get-G7MemoryCounterValue $memory "StandbyCacheCoreBytes") +
-        (Get-G7MemoryCounterValue $memory "StandbyCacheNormalPriorityBytes") +
-        (Get-G7MemoryCounterValue $memory "StandbyCacheReserveBytes")
+    try {
+        $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+        $memory = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+        $standbyBytes = (Get-G7MemoryCounterValue $memory "StandbyCacheCoreBytes") +
+            (Get-G7MemoryCounterValue $memory "StandbyCacheNormalPriorityBytes") +
+            (Get-G7MemoryCounterValue $memory "StandbyCacheReserveBytes")
+        $bootTime = $os.LastBootUpTime.ToUniversalTime()
+        $counterSource = "cim-win32-memory"
+        $counterError = $null
+        $unavailableCounters = @()
+        $totalBytes = [UInt64]$os.TotalVisibleMemorySize * 1KB
+        $availableBytes = Get-G7MemoryCounterValue $memory "AvailableBytes"
+        $committedBytes = Get-G7MemoryCounterValue $memory "CommittedBytes"
+        $commitLimitBytes = Get-G7MemoryCounterValue $memory "CommitLimit"
+        $freeAndZeroBytes = Get-G7MemoryCounterValue $memory "FreeAndZeroPageListBytes"
+        $modifiedBytes = Get-G7MemoryCounterValue $memory "ModifiedPageListBytes"
+        $pagedPoolBytes = Get-G7MemoryCounterValue $memory "PoolPagedBytes"
+        $pagedPoolResidentBytes = Get-G7MemoryCounterValue $memory "PoolPagedResidentBytes"
+        $nonpagedPoolBytes = Get-G7MemoryCounterValue $memory "PoolNonpagedBytes"
+        $systemCacheBytes = Get-G7MemoryCounterValue $memory "SystemCacheResidentBytes"
+    } catch {
+        $counterError = $_.Exception.Message
+        $native = Get-G7NativeMemoryCounters
+        $bootTime = [DateTime]$native.boot_time_utc
+        $counterSource = [string]$native.source
+        $unavailableCounters = @($native.unavailable_counters)
+        $totalBytes = [UInt64]$native.total_bytes
+        $availableBytes = [UInt64]$native.available_bytes
+        $committedBytes = [UInt64]$native.committed_bytes
+        $commitLimitBytes = [UInt64]$native.commit_limit_bytes
+        $freeAndZeroBytes = [UInt64]$native.free_and_zero_bytes
+        $standbyBytes = [UInt64]$native.standby_bytes
+        $modifiedBytes = [UInt64]$native.modified_bytes
+        $pagedPoolBytes = [UInt64]$native.paged_pool_bytes
+        $pagedPoolResidentBytes = [UInt64]$native.paged_pool_resident_bytes
+        $nonpagedPoolBytes = [UInt64]$native.nonpaged_pool_bytes
+        $systemCacheBytes = [UInt64]$native.system_cache_bytes
+    }
 
     $workingSets = @()
     foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
@@ -51,21 +180,24 @@ function Get-G7MemorySnapshot {
 
     return [pscustomobject][ordered]@{
         timestamp_utc = [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
-        boot_time_utc = $os.LastBootUpTime.ToUniversalTime().ToString(
+        counter_source = $counterSource
+        counter_fallback_reason = $counterError
+        unavailable_counters = $unavailableCounters
+        boot_time_utc = $bootTime.ToUniversalTime().ToString(
             "o", [Globalization.CultureInfo]::InvariantCulture)
         uptime_seconds = [UInt64][math]::Max(0,
-            ([DateTime]::UtcNow - $os.LastBootUpTime.ToUniversalTime()).TotalSeconds)
-        total_bytes = [UInt64]$os.TotalVisibleMemorySize * 1KB
-        available_bytes = Get-G7MemoryCounterValue $memory "AvailableBytes"
-        committed_bytes = Get-G7MemoryCounterValue $memory "CommittedBytes"
-        commit_limit_bytes = Get-G7MemoryCounterValue $memory "CommitLimit"
-        free_and_zero_bytes = Get-G7MemoryCounterValue $memory "FreeAndZeroPageListBytes"
+            ([DateTime]::UtcNow - $bootTime.ToUniversalTime()).TotalSeconds)
+        total_bytes = $totalBytes
+        available_bytes = $availableBytes
+        committed_bytes = $committedBytes
+        commit_limit_bytes = $commitLimitBytes
+        free_and_zero_bytes = $freeAndZeroBytes
         standby_bytes = [UInt64]$standbyBytes
-        modified_bytes = Get-G7MemoryCounterValue $memory "ModifiedPageListBytes"
-        paged_pool_bytes = Get-G7MemoryCounterValue $memory "PoolPagedBytes"
-        paged_pool_resident_bytes = Get-G7MemoryCounterValue $memory "PoolPagedResidentBytes"
-        nonpaged_pool_bytes = Get-G7MemoryCounterValue $memory "PoolNonpagedBytes"
-        system_cache_bytes = Get-G7MemoryCounterValue $memory "SystemCacheResidentBytes"
+        modified_bytes = $modifiedBytes
+        paged_pool_bytes = $pagedPoolBytes
+        paged_pool_resident_bytes = $pagedPoolResidentBytes
+        nonpaged_pool_bytes = $nonpagedPoolBytes
+        system_cache_bytes = $systemCacheBytes
         process_working_set_bytes = [UInt64](($workingSets |
             Measure-Object -Property working_set_bytes -Sum).Sum)
         process_private_memory_bytes = [UInt64](($workingSets |

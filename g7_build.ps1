@@ -1,6 +1,8 @@
 param(
     [ValidateSet("Release", "RelWithDebInfo", "Debug")][string]$Configuration = "Release",
-    [string]$CMake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+    [string]$CMake = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+    [string]$WindowsSdkVersion = "10.0.26100.0",
+    [string]$WindowsSdkRootOverride = "C:\PROGRA~2\WI3CF2~1\10"
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,7 +16,7 @@ function Get-G7BuildInputPaths {
     $tracked = @(git -C $repo ls-files)
     $untracked = @(git -C $repo ls-files --others --exclude-standard)
     return @($tracked + $untracked | Where-Object {
-        $_ -notmatch '^(build|g7_runs)/' -and
+        $_ -notmatch '^(build[^/]*|g7_runs)/' -and
         ($_ -match '\.(c|cc|cpp|cu|h|hpp|cmake)$' -or
          $_ -match '(^|/)CMakeLists\.txt$')
     } | Sort-Object -Unique)
@@ -55,9 +57,18 @@ $inputsBefore = @(Get-G7BuildInputs)
 $fingerprintBefore = Get-G7InputFingerprint $inputsBefore
 $head = (git -C $repo rev-parse HEAD).Trim()
 $dirty = [bool](git -C $repo status --porcelain)
-$command = @($CMake, "--build", $buildDir, "--config", $Configuration, "--parallel")
+$buildArguments = @(
+    "--build", $buildDir, "--config", $Configuration, "--parallel", "--",
+    "/p:_LatestWindowsTargetPlatformVersion=$WindowsSdkVersion",
+    "/p:WindowsTargetPlatformVersion=$WindowsSdkVersion",
+    "/p:TargetPlatformVersion=$WindowsSdkVersion",
+    "/p:TargetPlatformSdkPath=$WindowsSdkRootOverride\",
+    "/p:TargetPlatformSdkRootOverride=$WindowsSdkRootOverride",
+    "/p:TargetPlatformDisplayName=Windows10SDK"
+)
+$command = @($CMake) + $buildArguments
 Write-Host ("[g7-build] " + ($command -join " "))
-& $CMake --build $buildDir --config $Configuration --parallel
+& $CMake @buildArguments
 if ($LASTEXITCODE -ne 0) { throw "CMake build failed: exit=$LASTEXITCODE" }
 
 $inputsAfter = @(Get-G7BuildInputs)

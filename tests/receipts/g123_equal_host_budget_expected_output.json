@@ -1,0 +1,23 @@
+{
+  "schema": "ds4_g123_expected_output_receipt_v1",
+  "status": "pass_n3_exact_full_open",
+  "claim_scope": "expected_output_provenance_only",
+  "source_result_basename": "g7_g123_equal_host_budget_20260718T155135337Z_59fe62edca_result.json",
+  "source_result_sha256": "4af183d77f7f9b31c4808e5129261528bb397c68da4dd58677ad1df5ca4ab8cb",
+  "prompt": "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
+  "prompt_sha256": "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+  "expected_content_sha256": "fd6c4522975a71e252b90199d49cfe3236310e2a7285dc0fc4d0e9d0e4885510",
+  "model_sha256": "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668",
+  "sidecar_sha256": "07199bc5503aa6e2dea10f702c1ca9e8f05a5bf466a56cbed031f6a5fca4bdf9",
+  "sidecar_payload_sha256": "02c8cb248a8184e365e2e486653484165db39402fd28320ba621fb4fdb3f7bd8",
+  "gate_kind": "benchmark",
+  "router_semantics": "full/open",
+  "reap_or_static_mask": false,
+  "max_tokens": 64,
+  "context": 256,
+  "host_budget_gib": 30.0,
+  "control_count": 3,
+  "candidate_count": 3,
+  "all_rows_exact": true,
+  "all_rows_uncontaminated": true
+}

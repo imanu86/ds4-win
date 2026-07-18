@@ -92,12 +92,52 @@ Resolver rules:
 - Missing Q1_0 entries are hard failures for composite use and must not fall back to approximate G46 data.
 - Resolver failure disables composite use for the affected run.
 
+### Per-selected-expert contract
+
+The executable resolver operates after the unchanged router has selected its
+six expert IDs and weights. For each selected expert it must use this order:
+
+1. exact IQ2 copy in protected VRAM;
+2. exact IQ2 copy in the published request snapshot in pinned RAM;
+3. exact IQ2 copy in the tier-owned probation/warm RAM pool;
+4. resident Q1_0 only when the authoritative IQ2 state is `SSD_COLD` and no
+   IQ2 RAM copy exists;
+5. otherwise fail closed.
+
+Router admissibility and representation residency are separate concerns. Q1_0
+residency must not add an expert to a closed router mask. The first executable
+composite therefore uses the explicit request-scoped open-router mode.
+
+The current token must never read an IQ2 expert from SSD after the resolver has
+selected Q1_0. IQ2 promotion is disabled in the first structural smoke. Router
+mass and frequency are still observed for Q1_0 routes so a later asynchronous
+promotion policy can act on future tokens.
+
+The hot IQ2 subset and cold Q1_0 subset execute independently with the original
+router IDs and weights. Their output vectors are summed once. Selection and
+weights are never recomputed, renormalized, or trained from the prompt.
+
+Structural runs enable `DS4_Q1_0_MIXED_TRACE=1`. They emit one provenance row
+for every selected route: layer, route index, expert ID, unchanged router
+weight, chosen representation, authoritative tier state, IQ2-RAM presence and
+both arena snapshot generations. Aggregate-only telemetry is insufficient.
+
+The mixed wrapper snapshots the IQ2 tier SSD counters before dispatching its
+hot subset. Any increase in IQ2 SSD bytes or cold-to-RAM loads during that
+dispatch is a fail-closed violation. This is scoped to the mixed layer and does
+not confuse unrelated transport in other layers with the selected Q1_0 route.
+
 ## Provenance
 
 Every composite-backed decision must carry provenance sufficient to reconstruct why the resolver selected its backing.
 
 Required provenance:
 
+- The active Q1 sidecar carries a byte-identical copy of the primary
+  `ffn_gate_inp.weight`; startup compares it before router IDs may address Q1
+  experts. Matching only model name, norms, or routing bias is insufficient.
+- The mixed resolver validates the complete `40 * 256` tier table before any
+  per-route entry access and fails closed on malformed state.
 - Env flag value and exact enablement decision.
 - G46 arena identity, version, and immutable descriptor.
 - Q1_0 arena identity, version, static descriptor, bounds, alignment, and source artifact identity.
@@ -142,6 +182,31 @@ Before performance or quality validation, the structural dual gate must prove:
 - Provenance is complete for each resolver decision.
 
 The structural dual gate is a prerequisite for all downstream claims.
+
+### First executable smoke
+
+The first run is targeted transport evidence, not a performance or quality
+sample:
+
+- one process, one generated token, temperature zero and no visible thinking;
+- the G73 transport stack for the primary IQ2 path;
+- a 6 GiB primary arena with 32 open-router reserve slots, deliberately small
+  enough to exercise at least one real Q1_0 cold route;
+- the verified layer-42 Q1_0 sidecar in a separate resident arena;
+- synchronous IQ2 promotion disabled;
+- required counters: mixed calls, Q1_0 resident routes and joins all positive;
+- required zero counters: mixed failures, Q1_0 resident misses, Q1_0 direct
+  pread fallbacks/bytes, mixed-layer IQ2 SSD bytes/violations and unresolved
+  resolver decisions;
+- exactly six per-route provenance rows, all bound to layer 42, unique route
+  and expert IDs, `SSD_COLD`, no IQ2 RAM copy and a live Q1_0 snapshot;
+- response content SHA-256 fixed to the known temp-zero one-token `Hello`
+  result; `outputs_identical` from a single repeat is not an exactness gate;
+- result source, header, harness and executable hashes must match current files,
+  including when `-SummarizeExisting` is used.
+
+If this passes, the same mechanism moves to the full 30 GiB G73 arena. Only
+that full-size run can precede exactness, `n >= 3`, L0-L3 and performance work.
 
 ## Validation Ladder
 

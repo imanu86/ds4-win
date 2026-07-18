@@ -12,6 +12,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "g7_system_counters.ps1")
 $nativeSource = @'
 using System;
 using System.Runtime.InteropServices;
@@ -133,21 +134,24 @@ function Get-GpuProcessMemory {
 
 function Get-PhysicalDiskSample {
     try {
-        $row = Get-CimInstance Win32_PerfFormattedData_PerfDisk_PhysicalDisk `
-            -ErrorAction Stop | Where-Object { $_.Name -eq "_Total" } |
-            Select-Object -First 1
-        if (-not $row) { throw "PhysicalDisk _Total was not found" }
         return [pscustomobject]@{
             seen = $true
-            percent_time = [double]$row.PercentDiskTime
-            bytes_per_second = [double]$row.DiskBytesPersec
-            read_bytes_per_second = [double]$row.DiskReadBytesPersec
-            write_bytes_per_second = [double]$row.DiskWriteBytesPersec
-            queue_length = [double]$row.CurrentDiskQueueLength
+            source = "pdh-english"
+            percent_time = $script:runtimeSystemSampler.Read(
+                "\PhysicalDisk(_Total)\% Disk Time")
+            bytes_per_second = $script:runtimeSystemSampler.Read(
+                "\PhysicalDisk(_Total)\Disk Bytes/sec")
+            read_bytes_per_second = $script:runtimeSystemSampler.Read(
+                "\PhysicalDisk(_Total)\Disk Read Bytes/sec")
+            write_bytes_per_second = $script:runtimeSystemSampler.Read(
+                "\PhysicalDisk(_Total)\Disk Write Bytes/sec")
+            queue_length = $script:runtimeSystemSampler.Read(
+                "\PhysicalDisk(_Total)\Current Disk Queue Length")
         }
     } catch {
         return [pscustomobject]@{
             seen = $false
+            source = "pdh-english"
             percent_time = $null
             bytes_per_second = $null
             read_bytes_per_second = $null
@@ -159,21 +163,26 @@ function Get-PhysicalDiskSample {
 
 function Get-SystemMemoryPressureSample {
     try {
-        $row = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory `
-            -ErrorAction Stop | Select-Object -First 1
-        if (-not $row) { throw "PerfOS Memory was not found" }
         return [pscustomobject]@{
             seen = $true
-            pages_input_per_second = [double]$row.PagesInputPersec
-            pages_output_per_second = [double]$row.PagesOutputPersec
-            page_reads_per_second = [double]$row.PageReadsPersec
-            page_writes_per_second = [double]$row.PageWritesPersec
-            modified_page_list_bytes = [Int64]$row.ModifiedPageListBytes
-            standby_cache_normal_priority_bytes = [Int64]$row.StandbyCacheNormalPriorityBytes
+            source = "pdh-english"
+            pages_input_per_second = $script:runtimeSystemSampler.Read(
+                "\Memory\Pages Input/sec")
+            pages_output_per_second = $script:runtimeSystemSampler.Read(
+                "\Memory\Pages Output/sec")
+            page_reads_per_second = $script:runtimeSystemSampler.Read(
+                "\Memory\Page Reads/sec")
+            page_writes_per_second = $script:runtimeSystemSampler.Read(
+                "\Memory\Page Writes/sec")
+            modified_page_list_bytes = [Int64]$script:runtimeSystemSampler.Read(
+                "\Memory\Modified Page List Bytes")
+            standby_cache_normal_priority_bytes = [Int64]$script:runtimeSystemSampler.Read(
+                "\Memory\Standby Cache Normal Priority Bytes")
         }
     } catch {
         return [pscustomobject]@{
             seen = $false
+            source = "pdh-english"
             pages_input_per_second = $null
             pages_output_per_second = $null
             page_reads_per_second = $null
@@ -233,6 +242,21 @@ function Convert-FileTimeToSeconds {
 }
 
 $contaminationCount = 0
+$script:runtimeSystemSampler = New-G7PdhEnglishSampler -Paths @(
+    "\PhysicalDisk(_Total)\% Disk Time",
+    "\PhysicalDisk(_Total)\Disk Bytes/sec",
+    "\PhysicalDisk(_Total)\Disk Read Bytes/sec",
+    "\PhysicalDisk(_Total)\Disk Write Bytes/sec",
+    "\PhysicalDisk(_Total)\Current Disk Queue Length",
+    "\Memory\Pages Input/sec",
+    "\Memory\Pages Output/sec",
+    "\Memory\Page Reads/sec",
+    "\Memory\Page Writes/sec",
+    "\Memory\Modified Page List Bytes",
+    "\Memory\Standby Cache Normal Priority Bytes"
+)
+Start-Sleep -Milliseconds 250
+
 try {
     while ([NativeTelemetry]::WaitForSingleObject($handle, 0) -eq [NativeTelemetry]::WAIT_TIMEOUT) {
         $remainingMs = [int][math]::Ceiling($nextSampleMs - $clock.Elapsed.TotalMilliseconds)
@@ -241,6 +265,7 @@ try {
 
         $nvidiaProcess = Start-NvidiaSample
         $gpuMemory = Get-GpuProcessMemory -TargetPid $TargetProcessId
+        $script:runtimeSystemSampler.Collect()
         $disk = Get-PhysicalDiskSample
         $memoryPressure = Get-SystemMemoryPressureSample
 
@@ -333,6 +358,9 @@ try {
         $nextSampleMs += $IntervalMs
     }
 } finally {
+    if ($null -ne $script:runtimeSystemSampler) {
+        $script:runtimeSystemSampler.Dispose()
+    }
     $writer.Dispose()
     $handle.Dispose()
 }

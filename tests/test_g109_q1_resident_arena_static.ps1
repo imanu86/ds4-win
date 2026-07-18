@@ -58,6 +58,7 @@ $envGate = Get-SourceBlock $coreText `
 foreach ($needle in @(
     'getenv("DS4_Q1_0_RESIDENT_ARENA")',
     'getenv("DS4_Q1_0_DUAL_ARENA")',
+    'getenv("DS4_Q1_0_SNAPSHOT_BACKING")',
     'strcmp(value, "0") == 0',
     'strcmp(value, "1") == 0',
     'expected 0 or 1',
@@ -89,7 +90,8 @@ foreach ($needle in @(
     'static cuda_dynamic_arena g_dynamic_arena;',
     'static cuda_dynamic_arena g_q1_0_dynamic_arena;',
     'static int cuda_q1_0_dual_arena_requested(void)',
-    'static int cuda_q1_0_exclusive_arena_active(void)')) {
+    'static int cuda_q1_0_exclusive_arena_active(void)',
+    'static int cuda_q1_0_dual_arena_layer_active(uint32_t layer)')) {
     Require-Text $cudaText $needle "two typed arena instances"
 }
 $exclusiveGuardCount = [regex]::Matches(
@@ -97,12 +99,12 @@ $exclusiveGuardCount = [regex]::Matches(
 if ($exclusiveGuardCount -lt 7) {
     throw "G109/G110 legacy Q1 guards were not migrated to the separate arena"
 }
-$postPrimaryArena = $cudaText.Substring($cudaText.LastIndexOf(
-    'extern "C" void ds4_gpu_dynamic_arena_abort(',
-    [StringComparison]::Ordinal))
-Forbid-Text $postPrimaryArena `
-    'g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0' `
-    "runtime observers use the separate-Q1 exclusivity guard"
+foreach ($needle in @(
+    'static int cuda_q1_0_snapshot_backing_requested(void)',
+    'extern "C" int ds4_gpu_dynamic_arena_bind_q1_0_snapshot(',
+    'policy=sparse-prefill-ranked iq2_host_snapshot=disabled')) {
+    Require-Text $cudaText $needle "explicit sparse snapshot backing"
+}
 
 $copy = Get-SourceBlock $cudaText `
     "static cuda_dynamic_arena_copy_status cuda_dynamic_arena_copy_expert_async(" `
@@ -170,7 +172,7 @@ $loader = Get-SourceBlock $cudaText `
     "static int cuda_moe_selected_load_q1_0(" `
     "static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(" `
     "Q1 selected loader"
-$branchPattern = '(?s)if \(cuda_q1_0_resident_arena_requested\(\)\) \{(?<resident>.*?)\r?\n    \} else \{\r?\n        std::vector<uint8_t> host_gate;(?<direct>.*)'
+$branchPattern = '(?s)if \(cuda_q1_0_resident_transport_requested\(\)\) \{(?<resident>.*?)\r?\n    \} else \{\r?\n        std::vector<uint8_t> host_gate;(?<direct>.*)'
 $branchMatch = [regex]::Match($loader, $branchPattern)
 if (-not $branchMatch.Success) {
     throw "G109/G110 Q1 selected loader resident/direct split missing"
@@ -178,9 +180,10 @@ if (-not $branchMatch.Success) {
 $resident = $branchMatch.Groups["resident"].Value
 $direct = $branchMatch.Groups["direct"].Value
 foreach ($needle in @(
-    'g_q1_0_dynamic_arena.backing',
+    'cuda_q1_0_route_arena(layer_index)',
+    'q1_arena->backing',
     'cuda_dynamic_arena_copy_expert_async(',
-    'g_q1_0_dynamic_arena,',
+    '*q1_arena,',
     'CUDA_DYNAMIC_ARENA_ENQUEUED',
     'g_q1_0_resident_hits += compact_count;',
     'g_q1_0_resident_h2d_bytes += route_h2d_bytes;')) {
@@ -205,7 +208,8 @@ foreach ($needle in @(
     'ds4_gpu_dynamic_arena_prepare(',
     'ds4_gpu_dynamic_arena_bind_q1_0(',
     'ds4_gpu_dynamic_arena_prepare_q1_0(',
-    'q1_slots != required_slots || q1_generation == 0',
+    'q1_slots != required_slots',
+    'q1_generation == 0',
     'Q1_0 dual mode failed closed')) {
     Require-Text $sessionArena $needle "primary plus Q1 setup"
 }

@@ -2474,6 +2474,46 @@ static int q1_0_dual_arena_requested(void) {
     return -1;
 }
 
+static int q1_0_dual_sparse_companion_requested(void) {
+    const char *value = getenv("DS4_Q1_0_DUAL_SPARSE_COMPANION");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_Q1_0_DUAL_SPARSE_COMPANION=%s; "
+            "expected 0 or 1\n", value);
+    return -1;
+}
+
+static int q1_0_mixed_cold_one_requested(void) {
+    const char *value = getenv("DS4_Q1_0_MIXED_COLD_ONE");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_Q1_0_MIXED_COLD_ONE=%s; expected 0 or 1\n",
+            value);
+    return -1;
+}
+
+static int q1_0_snapshot_backing_requested(void) {
+    const char *value = getenv("DS4_Q1_0_SNAPSHOT_BACKING");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_Q1_0_SNAPSHOT_BACKING=%s; expected 0 or 1\n",
+            value);
+    return -1;
+}
+
+static int q1_0_pageable_overflow_requested(void) {
+    const char *value = getenv("DS4_Q1_0_PAGEABLE_OVERFLOW");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_Q1_0_PAGEABLE_OVERFLOW=%s; expected 0 or 1\n",
+            value);
+    return -1;
+}
+
 static bool iq1_s_mixed_cold_one_requested(void) {
     const char *value = getenv("DS4_IQ1_S_MIXED_COLD_K");
     return value && strcmp(value, "1") == 0;
@@ -2510,7 +2550,9 @@ static ds4_routed_expert_source routed_expert_source(
         layer ? layer->ffn_down_exps : NULL,
         false,
     };
-    if (q1_0_sidecar_layer_active(model, layer_index)) {
+    if (q1_0_sidecar_layer_active(model, layer_index) &&
+        q1_0_dual_arena_requested() <= 0 &&
+        q1_0_snapshot_backing_requested() <= 0) {
         source.model = g_q1_0_sidecar.model;
         source.gate = g_q1_0_sidecar.gate[layer_index];
         source.up = g_q1_0_sidecar.up[layer_index];
@@ -3178,7 +3220,7 @@ static void iq1_s_identity_compare_tensor(
         uint32_t *matched_tensors) {
     ds4_tensor *a = required_tensor(sidecar, name);
     ds4_tensor *b = required_tensor(primary, name);
-    if (a->type != DS4_TENSOR_F32 || b->type != DS4_TENSOR_F32 ||
+    if (a->type != b->type ||
         a->ndim != b->ndim || a->bytes != b->bytes ||
         a->bytes > SIZE_MAX) {
         fprintf(stderr,
@@ -3245,6 +3287,29 @@ static void iq1_s_sidecar_validate_checkpoint_identity(
             "ds4: IQ1_S checkpoint identity validated: "
             "controls=%u bytes=%llu fnv1a64=%016llx\n",
             matched_tensors,
+            (unsigned long long)matched_bytes,
+            (unsigned long long)fingerprint);
+}
+
+static void q1_0_sidecar_validate_router_identity(
+        const ds4_model *sidecar,
+        const ds4_model *primary,
+        uint32_t first_layer,
+        uint32_t last_layer) {
+    uint64_t fingerprint = 1469598103934665603ull;
+    uint64_t matched_bytes = 0;
+    uint32_t matched_tensors = 0;
+    char name[96];
+    for (uint32_t il = first_layer; il <= last_layer; il++) {
+        snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", il);
+        iq1_s_identity_compare_tensor(
+            sidecar, primary, name,
+            &fingerprint, &matched_bytes, &matched_tensors);
+    }
+    fprintf(stderr,
+            "ds4: Q1_0 router identity validated: "
+            "layers=%u..%u controls=%u bytes=%llu fnv1a64=%016llx\n",
+            first_layer, last_layer, matched_tensors,
             (unsigned long long)matched_bytes,
             (unsigned long long)fingerprint);
 }
@@ -3322,9 +3387,8 @@ static void q1_0_sidecar_bind(
     if (!model || !primary_model) ds4_die("missing Q1_0 sidecar model");
     memset(&g_q1_0_sidecar, 0, sizeof(g_q1_0_sidecar));
     config_validate_model(model);
-    iq1_s_sidecar_validate_checkpoint_identity(model, primary_model);
-
-    const uint32_t routed_first_layer = 3u;
+    /* Hash-routed layers 0..2 are part of the closed Q1 snapshot too. */
+    const uint32_t routed_first_layer = 0u;
     const uint32_t routed_last_layer = DS4_N_LAYER - 1u;
     uint32_t first_layer = routed_first_layer;
     uint32_t last_layer = routed_last_layer;
@@ -3356,6 +3420,10 @@ static void q1_0_sidecar_bind(
         first_layer = (uint32_t)first;
         last_layer = (uint32_t)last;
     }
+
+    iq1_s_sidecar_validate_checkpoint_identity(model, primary_model);
+    q1_0_sidecar_validate_router_identity(
+        model, primary_model, first_layer, last_layer);
 
     uint64_t routed_bytes = 0;
     for (uint32_t il = first_layer; il <= last_layer; il++) {
@@ -11083,6 +11151,10 @@ static bool metal_graph_encode_decode_layer(
     const bool iq1_mixed_cold_one =
         iq1_s_mixed_cold_one_requested() &&
         iq1_s_sidecar_layer_active(model, il);
+    const bool q1_0_mixed_cold =
+        (q1_0_dual_arena_requested() > 0 ||
+         q1_0_snapshot_backing_requested() > 0) &&
+        q1_0_sidecar_layer_active(model, il);
     const uint64_t expert_in_dim = route.gate->dim[0];
     const uint64_t expert_mid_dim = route.gate->dim[1];
     const uint64_t down_in_dim = route.down->dim[0];
@@ -11701,6 +11773,7 @@ static bool metal_graph_encode_decode_layer(
      * the CUDA wrapper. Preparing all six routes here would fetch the cold
      * primary expert before that split and erase the transport saving. */
     const bool overlap_shared = ok && !iq1_mixed_cold_one &&
+        !q1_0_mixed_cold &&
         ds4_gpu_routed_moe_prepare_selected(
         route.model->map, route.model->size,
         route.gate->abs_offset,
@@ -11746,7 +11819,52 @@ static bool metal_graph_encode_decode_layer(
                                               g->shared_mid, 1) != 0;
         }
     }
-    if (ok && iq1_mixed_cold_one) {
+    if (ok && q1_0_mixed_cold) {
+        const ds4_tensor *q1_gate = g_q1_0_sidecar.gate[il];
+        const ds4_tensor *q1_up = g_q1_0_sidecar.up[il];
+        const ds4_tensor *q1_down = g_q1_0_sidecar.down[il];
+        const uint64_t q1_gate_row_bytes = routed_expert_row_bytes(q1_gate);
+        const uint64_t q1_gate_expert_bytes =
+            expert_mid_dim * q1_gate_row_bytes;
+        const uint64_t q1_down_row_bytes = routed_expert_row_bytes(q1_down);
+        const uint64_t q1_down_expert_bytes =
+            routed_out_dim * q1_down_row_bytes;
+        ok = ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
+                g->routed_out,
+                g->routed_gate,
+                g->routed_up,
+                g->routed_mid,
+                g->routed_down,
+                route.model->map,
+                route.model->size,
+                il,
+                route.gate->abs_offset,
+                route.up->abs_offset,
+                route.down->abs_offset,
+                route.gate->type,
+                route.down->type,
+                gate_expert_bytes,
+                gate_row_bytes,
+                down_expert_bytes,
+                down_row_bytes,
+                g_q1_0_sidecar.model->map,
+                g_q1_0_sidecar.model->size,
+                q1_gate->abs_offset,
+                q1_up->abs_offset,
+                q1_down->abs_offset,
+                q1_gate_expert_bytes,
+                q1_gate_row_bytes,
+                q1_down_expert_bytes,
+                q1_down_row_bytes,
+                (uint32_t)expert_in_dim,
+                (uint32_t)down_in_dim,
+                (uint32_t)routed_out_dim,
+                g->router_selected,
+                g->router_weights,
+                DS4_N_EXPERT_USED,
+                DS4_SWIGLU_CLAMP_EXP,
+                g->ffn_norm) != 0;
+    } else if (ok && iq1_mixed_cold_one) {
         const ds4_tensor *iq1_gate = g_iq1_s_sidecar.gate[il];
         const ds4_tensor *iq1_up = g_iq1_s_sidecar.up[il];
         const ds4_tensor *iq1_down = g_iq1_s_sidecar.down[il];
@@ -16392,6 +16510,7 @@ struct ds4_engine {
     ds4_model mtp_model;
     ds4_model iq1_s_sidecar_model;
     ds4_model q1_0_sidecar_model;
+    os_file_t nested_residual_file;
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
@@ -16407,6 +16526,7 @@ struct ds4_engine {
     bool mtp_ready;
     bool iq1_s_sidecar_ready;
     bool q1_0_sidecar_ready;
+    bool nested_residual_ready;
 };
 
 static bool cpu_directional_steering_enabled(
@@ -19270,6 +19390,7 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     os_mmap_init(&e->mtp_model.mmap);
     os_mmap_init(&e->iq1_s_sidecar_model.mmap);
     os_mmap_init(&e->q1_0_sidecar_model.mmap);
+    os_file_init(&e->nested_residual_file);
     e->backend = opt->backend;
     e->quality = opt->quality;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
@@ -19301,6 +19422,44 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     config_validate_model(&e->model);
     weights_bind(&e->weights, &e->model);
     ds4_reap_mask_install_bake(&e->model, &e->weights);
+    const char *nested_residual_path =
+        getenv("DS4_NESTED_RESIDUAL_SIDECAR");
+    if (nested_residual_path && nested_residual_path[0]) {
+        const char *exact = getenv("DS4_NESTED_RESIDUAL_EXACT");
+        const char *mask = getenv("DS4_REAP_MASK_FILE");
+        const char *tier_router = getenv("DS4_CUDA_PREFILL_TIER_ROUTER");
+        const char *verify_reconstruction =
+            getenv("DS4_NESTED_RESIDUAL_VERIFY_RECONSTRUCTION");
+        const char *benchmark_unverified =
+            getenv("DS4_NESTED_RESIDUAL_BENCHMARK_UNVERIFIED");
+        const char *iq1_path = getenv("DS4_IQ1_S_EXPERT_SIDECAR");
+        const char *q1_path = getenv("DS4_Q1_0_EXPERT_SIDECAR");
+        const bool nested_residual_verification_allowed =
+            (verify_reconstruction && strcmp(verify_reconstruction, "1") == 0) ||
+            (benchmark_unverified && strcmp(benchmark_unverified, "1") == 0);
+        if (e->backend != DS4_BACKEND_CUDA || e->model.bake_embedded ||
+            !exact || strcmp(exact, "1") != 0 ||
+            !nested_residual_verification_allowed ||
+            (mask && mask[0]) ||
+            !tier_router || strcmp(tier_router, "open") != 0 ||
+            (iq1_path && iq1_path[0]) || (q1_path && q1_path[0]) ||
+            os_file_open_read(
+                &e->nested_residual_file, nested_residual_path) != 0) {
+            fprintf(stderr,
+                    "ds4: nested residual exact mode requires CUDA, a "
+                    "non-baked primary, open router, verification or an "
+                    "explicit unverified benchmark gate, no quant sidecar, "
+                    "and a readable sidecar\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        e->nested_residual_ready = true;
+        fprintf(stderr,
+                "ds4: nested residual exact sidecar source: %s "
+                "router=open representation=authoritative-iq2\n",
+                nested_residual_path);
+    }
     const char *q1_0_sidecar_path = getenv("DS4_Q1_0_EXPERT_SIDECAR");
     if (q1_0_sidecar_path && q1_0_sidecar_path[0]) {
         if (e->backend != DS4_BACKEND_CUDA || e->model.bake_embedded) {
@@ -19321,14 +19480,32 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     const int q1_0_resident_arena = q1_0_resident_arena_requested();
     const int q1_0_dual_arena = q1_0_dual_arena_requested();
+    const int q1_0_dual_sparse_companion =
+        q1_0_dual_sparse_companion_requested();
+    const int q1_0_mixed_cold_one = q1_0_mixed_cold_one_requested();
+    const int q1_0_snapshot_backing = q1_0_snapshot_backing_requested();
+    const int q1_0_pageable_overflow =
+        q1_0_pageable_overflow_requested();
     const char *q1_0_selected_load = getenv("DS4_Q1_0_SELECTED_LOAD");
     if (q1_0_resident_arena < 0 || q1_0_dual_arena < 0 ||
+        q1_0_dual_sparse_companion < 0 || q1_0_mixed_cold_one < 0 ||
+        q1_0_snapshot_backing < 0 || q1_0_pageable_overflow < 0 ||
         (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0) ||
-        (q1_0_resident_arena > 0 &&
+        (q1_0_dual_sparse_companion > 0 &&
+         (q1_0_dual_arena <= 0 || q1_0_resident_arena <= 0 ||
+          q1_0_mixed_cold_one <= 0)) ||
+        (q1_0_mixed_cold_one > 0 && q1_0_dual_sparse_companion <= 0) ||
+        (q1_0_pageable_overflow > 0 && q1_0_snapshot_backing <= 0) ||
+        (q1_0_snapshot_backing > 0 &&
+         (q1_0_resident_arena > 0 || q1_0_dual_arena > 0)) ||
+        ((q1_0_resident_arena > 0 || q1_0_snapshot_backing > 0) &&
          (!e->q1_0_sidecar_ready || !q1_0_selected_load ||
           strcmp(q1_0_selected_load, "1") != 0))) {
         fprintf(stderr,
-                "ds4: Q1_0 resident/dual arena requires DS4_Q1_0_RESIDENT_ARENA=1, a valid Q1_0 sidecar and DS4_Q1_0_SELECTED_LOAD=1\n");
+                "ds4: invalid Q1_0 arena configuration; dual sparse 5+1 "
+                "requires resident+dual+cold-one, pageable overflow requires "
+                "exclusive snapshot backing, and every Q1_0 arena requires "
+                "a valid sidecar plus DS4_Q1_0_SELECTED_LOAD=1\n");
         ds4_engine_close(e);
         *out = NULL;
         return 1;
@@ -19448,6 +19625,17 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
 #endif
         }
         (void)ds4_gpu_set_model_file(&e->model.mmap.file);
+        if (e->nested_residual_ready &&
+            !ds4_gpu_set_nested_residual_sidecar(
+                &e->nested_residual_file,
+                e->model.map,
+                e->model.size)) {
+            fprintf(stderr,
+                    "ds4: failed to install nested residual exact sidecar in CUDA\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
         if (e->iq1_s_sidecar_ready &&
             !ds4_gpu_set_iq1_s_sidecar(
                 &e->iq1_s_sidecar_model.mmap.file,
@@ -19543,6 +19731,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_reap_mask_host_reset();
     memset(&g_iq1_s_sidecar, 0, sizeof(g_iq1_s_sidecar));
     memset(&g_q1_0_sidecar, 0, sizeof(g_q1_0_sidecar));
+    if (e->nested_residual_ready) {
+        os_file_close(&e->nested_residual_file);
+    }
     if (e->q1_0_sidecar_ready) model_close(&e->q1_0_sidecar_model);
     if (e->iq1_s_sidecar_ready) model_close(&e->iq1_s_sidecar_model);
     if (e->mtp_ready) model_close(&e->mtp_model);
@@ -19915,11 +20106,31 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (e->backend == DS4_BACKEND_CUDA) {
         const int q1_0_resident_arena = q1_0_resident_arena_requested();
         const int q1_0_dual_arena = q1_0_dual_arena_requested();
+        const int q1_0_dual_sparse_companion =
+            q1_0_dual_sparse_companion_requested();
+        const int q1_0_mixed_cold_one =
+            q1_0_mixed_cold_one_requested();
+        const int q1_0_snapshot_backing =
+            q1_0_snapshot_backing_requested();
+        const int q1_0_pageable_overflow =
+            q1_0_pageable_overflow_requested();
         const char *arena_gb_env = getenv("DS4_CUDA_DYNAMIC_ARENA_GB");
         const double arena_gb = arena_gb_env && arena_gb_env[0]
             ? strtod(arena_gb_env, NULL) : 0.0;
         if (q1_0_resident_arena < 0 || q1_0_dual_arena < 0 ||
-            (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0)) {
+            q1_0_dual_sparse_companion < 0 ||
+            q1_0_mixed_cold_one < 0 ||
+            q1_0_snapshot_backing < 0 || q1_0_pageable_overflow < 0 ||
+            (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0) ||
+            (q1_0_dual_sparse_companion > 0 &&
+             (q1_0_dual_arena <= 0 || q1_0_resident_arena <= 0 ||
+              q1_0_mixed_cold_one <= 0)) ||
+            (q1_0_mixed_cold_one > 0 &&
+             q1_0_dual_sparse_companion <= 0) ||
+            (q1_0_pageable_overflow > 0 &&
+             q1_0_snapshot_backing <= 0) ||
+            (q1_0_snapshot_backing > 0 &&
+             (q1_0_resident_arena > 0 || q1_0_dual_arena > 0))) {
             metal_graph_free(&s->graph);
             free(s);
             return 1;
@@ -19931,11 +20142,51 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
+        if (q1_0_snapshot_backing > 0 && arena_gb <= 0.0) {
+            fprintf(stderr,
+                    "ds4: Q1_0 snapshot backing requires DS4_CUDA_DYNAMIC_ARENA_GB>0\n");
+            metal_graph_free(&s->graph);
+            free(s);
+            return 1;
+        }
         if (arena_gb > 0.0) {
             ds4_gpu_dynamic_arena_layer layers[DS4_N_LAYER];
             const uint64_t requested = arena_gb >= (double)UINT64_MAX / 1073741824.0
                 ? UINT64_MAX : (uint64_t)(arena_gb * 1073741824.0);
-            if (q1_0_resident_arena <= 0 || q1_0_dual_arena > 0) {
+            if (q1_0_snapshot_backing > 0) {
+                uint64_t allocated = 0;
+                uint32_t slots = 0;
+                const bool primary_geometry_ready =
+                    dynamic_arena_build_layers(
+                        layers, &e->model, &e->weights);
+                const int primary_geometry_bound =
+                    primary_geometry_ready &&
+                    ds4_gpu_set_primary_moe_geometry(
+                        e->model.map, e->model.size, layers,
+                        DS4_N_LAYER, DS4_N_EXPERT);
+                const bool q1_geometry_ready = primary_geometry_bound &&
+                    dynamic_arena_build_q1_0_layers(
+                        layers, &e->q1_0_sidecar_model);
+                const int q1_bound = q1_geometry_ready &&
+                    ds4_gpu_dynamic_arena_bind_q1_0_snapshot(
+                        e->q1_0_sidecar_model.map,
+                        e->q1_0_sidecar_model.size,
+                        layers, DS4_N_LAYER, DS4_N_EXPERT,
+                        g_q1_0_sidecar.first_layer,
+                        g_q1_0_sidecar.last_layer);
+                if (!q1_bound || !ds4_gpu_dynamic_arena_prepare(
+                        requested, &allocated, &slots)) {
+                    fprintf(stderr,
+                            "ds4: Q1_0 sparse snapshot arena unavailable; failed closed\n");
+                    ds4_gpu_dynamic_arena_release();
+                    metal_graph_free(&s->graph);
+                    free(s);
+                    return 1;
+                }
+                fprintf(stderr,
+                        "ds4: Q1_0 sparse snapshot arena ready slots=%u allocated=%.3f GiB router=unchanged publication=prefill-mass-wrap\n",
+                        slots, (double)allocated / 1073741824.0);
+            } else if (q1_0_resident_arena <= 0 || q1_0_dual_arena > 0) {
                 uint64_t allocated = 0;
                 uint32_t slots = 0;
                 const bool primary_ready =
@@ -19970,7 +20221,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                     }
                 }
             }
-            if (q1_0_resident_arena > 0) {
+            if (q1_0_resident_arena > 0 && q1_0_snapshot_backing <= 0) {
                 uint64_t q1_allocated = 0;
                 uint32_t q1_slots = 0;
                 uint64_t q1_generation = 0;
@@ -19984,9 +20235,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         layers, DS4_N_LAYER, DS4_N_EXPERT,
                         g_q1_0_sidecar.first_layer,
                         g_q1_0_sidecar.last_layer);
-                if (!q1_bound || !ds4_gpu_dynamic_arena_prepare_q1_0(
+                const int q1_prepared = q1_bound &&
+                    (q1_0_dual_sparse_companion > 0 ||
+                     ds4_gpu_dynamic_arena_prepare_q1_0(
                         requested, &q1_allocated, &q1_slots,
-                        &q1_generation)) {
+                        &q1_generation));
+                if (!q1_prepared) {
                     fprintf(stderr,
                             "ds4: Q1_0 resident arena unavailable; failed closed\n");
                     ds4_gpu_dynamic_arena_release();
@@ -19997,7 +20251,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 const uint32_t required_slots =
                     (g_q1_0_sidecar.last_layer -
                      g_q1_0_sidecar.first_layer + 1u) * DS4_N_EXPERT;
-                if (q1_slots != required_slots || q1_generation == 0) {
+                if (q1_0_dual_sparse_companion > 0) {
+                    fprintf(stderr,
+                            "ds4: Q1_0 dual sparse companion deferred until "
+                            "prefill candidate publication storage=pageable "
+                            "router=unchanged policy=lowest-weight-one\n");
+                } else if (q1_slots != required_slots ||
+                           q1_generation == 0) {
                     fprintf(stderr,
                             "ds4: Q1_0 resident arena published invalid snapshot slots=%u required=%u generation=%" PRIu64 "; failed closed\n",
                             q1_slots, required_slots, q1_generation);

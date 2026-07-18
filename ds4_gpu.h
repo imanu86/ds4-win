@@ -101,6 +101,9 @@ int ds4_gpu_set_iq1_s_sidecar(const os_file_t *file,
 int ds4_gpu_set_q1_0_sidecar(const os_file_t *file,
                              const void *model_map,
                              uint64_t model_size);
+int ds4_gpu_set_nested_residual_sidecar(const os_file_t *file,
+                                        const void *source_map,
+                                        uint64_t source_size);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
 
 /* Native host-pinned expert arena. The arena is an explicit-copy DMA source;
@@ -109,7 +112,17 @@ int ds4_gpu_dynamic_arena_bind(
         const void *model_map, uint64_t model_size,
         const ds4_gpu_dynamic_arena_layer *layers,
         uint32_t n_layer, uint32_t n_expert);
+/* Metadata-only IQ2 catalog used when the physical host arena is Q1_0. */
+int ds4_gpu_set_primary_moe_geometry(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_dynamic_arena_layer *layers,
+        uint32_t n_layer, uint32_t n_expert);
 int ds4_gpu_dynamic_arena_bind_q1_0(
+        const void *model_map, uint64_t model_size,
+        const ds4_gpu_dynamic_arena_layer *layers,
+        uint32_t n_layer, uint32_t n_expert,
+        uint32_t active_layer_first, uint32_t active_layer_last);
+int ds4_gpu_dynamic_arena_bind_q1_0_snapshot(
         const void *model_map, uint64_t model_size,
         const ds4_gpu_dynamic_arena_layer *layers,
         uint32_t n_layer, uint32_t n_expert,
@@ -811,6 +824,42 @@ int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         const ds4_gpu_tensor *x,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key);
+
+int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        ds4_gpu_tensor       *experts,
+        const void             *main_model_map,
+        uint64_t                main_model_size,
+        uint32_t                layer_index,
+        uint64_t                main_gate_offset,
+        uint64_t                main_up_offset,
+        uint64_t                main_down_offset,
+        uint32_t                main_gate_type,
+        uint32_t                main_down_type,
+        uint64_t                main_gate_expert_bytes,
+        uint64_t                main_gate_row_bytes,
+        uint64_t                main_down_expert_bytes,
+        uint64_t                main_down_row_bytes,
+        const void             *q1_model_map,
+        uint64_t                q1_model_size,
+        uint64_t                q1_gate_offset,
+        uint64_t                q1_up_offset,
+        uint64_t                q1_down_offset,
+        uint64_t                q1_gate_expert_bytes,
+        uint64_t                q1_gate_row_bytes,
+        uint64_t                q1_down_expert_bytes,
+        uint64_t                q1_down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_expert,
+        float                   clamp,
+        const ds4_gpu_tensor *x);
 
 int ds4_gpu_routed_moe_prepare_selected(
         const void             *model_map,
