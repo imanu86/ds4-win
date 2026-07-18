@@ -10,5 +10,7 @@
 *.o
 *.dSYM/
 /misc/
+/build/
+/g7_runs/
 .*.swp
 .DS_Store
