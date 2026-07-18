@@ -4651,10 +4651,16 @@ if ($NestedResidualSidecar) {
     $nestedResidualMismatches = [UInt64]$nestedResidualSummary.Groups[7].Value
     $nestedResidualH2DBytes = [UInt64]$nestedResidualSummary.Groups[8].Value
     $nestedResidualFailures = [UInt64]$nestedResidualSummary.Groups[9].Value
+    $nestedResidualExpectedReconstructed = $nestedResidualCacheMisses
+    if ($NestedResidualGpuJoinResidualCache) {
+        $nestedResidualExpectedReconstructed =
+            $nestedResidualCacheHits + $nestedResidualCacheMisses
+    }
     if ($nestedResidualRouterCalls -eq 0 -or
         $nestedResidualCacheMisses -eq 0 -or
         $nestedResidualPreads -ne $nestedResidualCacheMisses -or
-        $nestedResidualReconstructed -ne $nestedResidualCacheMisses -or
+        $nestedResidualReconstructed -ne
+            $nestedResidualExpectedReconstructed -or
         $nestedResidualBytes -ne
             $nestedResidualPreads * [UInt64]3145728 -or
         $nestedResidualH2DBytes -ne

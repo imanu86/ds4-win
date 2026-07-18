@@ -2408,6 +2408,10 @@ __global__ static void cuda_nested_join_blocks_kernel(
 static void cuda_nested_residual_clear(void) {
     cuda_nested_residual_state &state = g_nested_residual;
     if (state.active || state.failures != 0) {
+        const uint64_t summary_cache_hits = state.residual_cache_enabled
+            ? state.residual_cache_hits : state.exact_cache_hits;
+        const uint64_t summary_cache_misses = state.residual_cache_enabled
+            ? state.residual_cache_misses : state.exact_cache_misses;
         fprintf(stderr,
                 "ds4: [nested-residual] result=summary router=open "
                 "router_calls=%llu "
@@ -2415,8 +2419,8 @@ static void cuda_nested_residual_clear(void) {
                 "residual_bytes=%llu reconstructed=%llu mismatches=%llu "
                 "h2d_bytes=%llu failures=%llu\n",
                 (unsigned long long)state.router_open_calls,
-                (unsigned long long)state.exact_cache_hits,
-                (unsigned long long)state.exact_cache_misses,
+                (unsigned long long)summary_cache_hits,
+                (unsigned long long)summary_cache_misses,
                 (unsigned long long)state.residual_preads,
                 (unsigned long long)state.residual_bytes,
                 (unsigned long long)state.reconstructed_experts,

@@ -7,9 +7,10 @@ $abRunnerPath = Join-Path $root 'g127_nested_gpu_join_residual_cache_ab.ps1'
 $protocolPath = Join-Path $root `
     'G127_NESTED_GPU_JOIN_RESIDUAL_CACHE_PROTOCOL.md'
 $harnessPath = Join-Path $root 'g7_measure.ps1'
+$cudaPath = Join-Path $root 'ds4_cuda.cu'
 
 foreach ($path in @($safetyRunnerPath, $abRunnerPath, $protocolPath,
-        $harnessPath)) {
+        $harnessPath, $cudaPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "G127 required file missing: $path"
     }
@@ -29,6 +30,7 @@ $safety = Get-Content -LiteralPath $safetyRunnerPath -Raw
 $runner = Get-Content -LiteralPath $abRunnerPath -Raw
 $protocol = Get-Content -LiteralPath $protocolPath -Raw
 $harness = Get-Content -LiteralPath $harnessPath -Raw
+$cuda = Get-Content -LiteralPath $cudaPath -Raw
 
 function Require-Text {
     param([string]$Text, [string]$Needle, [string]$Contract)
@@ -54,6 +56,21 @@ foreach ($needle in @(
         'nested_residual_gpu_join_residual_cache_cached_join_calls',
         'nested_residual_gpu_join_residual_cache_invariant_failures')) {
     Require-Text $harness $needle 'harness switch/parser/G127 receipt'
+}
+
+foreach ($needle in @(
+        'const uint64_t summary_cache_hits = state.residual_cache_enabled',
+        '? state.residual_cache_hits : state.exact_cache_hits',
+        'const uint64_t summary_cache_misses = state.residual_cache_enabled',
+        '? state.residual_cache_misses : state.exact_cache_misses')) {
+    Require-Text $cuda $needle 'runtime active-cache summary'
+}
+
+foreach ($needle in @(
+        '$nestedResidualExpectedReconstructed = $nestedResidualCacheMisses',
+        'if ($NestedResidualGpuJoinResidualCache)',
+        '$nestedResidualCacheHits + $nestedResidualCacheMisses')) {
+    Require-Text $harness $needle 'active-cache reconstruction accounting'
 }
 
 foreach ($needle in @(
