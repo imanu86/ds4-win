@@ -19,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $harness = Join-Path $root 'g7_measure.ps1'
 $bootstrap = Join-Path $root 'g7_harness_bootstrap.ps1'
+$outerRunner = $MyInvocation.MyCommand.Path
 $runs = Join-Path $root 'g7_runs'
 $exe = Join-Path $root 'build\Release\ds4_server.exe'
 $buildManifestPath = Join-Path $root 'build\Release\g7_build_manifest.json'
@@ -51,24 +52,35 @@ function Get-G127PSha256Text {
 }
 
 function Get-G127PCurrentBuildContract {
-    foreach ($path in @($exe, $buildManifestPath, $harness, $bootstrap)) {
+    foreach ($path in @($exe, $buildManifestPath, $harness, $bootstrap,
+            $outerRunner)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "G127P current-build input missing: $path"
         }
     }
-    $manifest = Get-Content -LiteralPath $buildManifestPath -Raw |
-        ConvertFrom-Json
+    try {
+        $manifest = Get-Content -LiteralPath $buildManifestPath -Raw |
+            ConvertFrom-Json
+    } catch {
+        throw 'G127P current build manifest is invalid JSON'
+    }
     $exeSHA = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).
         Hash.ToLowerInvariant()
     $manifestSHA = (Get-FileHash -LiteralPath $buildManifestPath `
         -Algorithm SHA256).Hash.ToLowerInvariant()
     if ([string]$manifest.schema -ne 'g7_native_windows_build_manifest_v1' -or
         [string]$manifest.executable_sha256 -ine $exeSHA -or
+        [string]$manifest.head -notmatch '^[0-9a-fA-F]{40}$' -or
+        $null -eq $manifest.PSObject.Properties[
+            'worktree_dirty_at_build_start'] -or
         [string]$manifest.input_fingerprint_sha256 -notmatch
             '^[0-9a-fA-F]{64}$') {
         throw 'G127P current build manifest contract mismatch'
     }
     return [pscustomobject]@{
+        build_head = ([string]$manifest.head).ToLowerInvariant()
+        build_worktree_dirty_at_build_start =
+            [bool]$manifest.worktree_dirty_at_build_start
         executable_sha256 = $exeSHA
         manifest_sha256 = $manifestSHA
         input_fingerprint_sha256 =
@@ -76,6 +88,8 @@ function Get-G127PCurrentBuildContract {
         harness_sha256 = (Get-FileHash -LiteralPath $harness `
             -Algorithm SHA256).Hash.ToLowerInvariant()
         bootstrap_sha256 = (Get-FileHash -LiteralPath $bootstrap `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+        outer_runner_sha256 = (Get-FileHash -LiteralPath $outerRunner `
             -Algorithm SHA256).Hash.ToLowerInvariant()
     }
 }
@@ -158,6 +172,46 @@ function Assert-G127PSafetyReceipt {
     }
 }
 
+function Assert-G127PAggregateProvenance {
+    param(
+        [Parameter(Mandatory=$true)][object]$ExpectedBuild,
+        [Parameter(Mandatory=$true)][object]$ExpectedSafety,
+        [Parameter(Mandatory=$true)][string]$Phase
+    )
+
+    $observedBuild = Get-G127PCurrentBuildContract
+    foreach ($field in @(
+            'build_head',
+            'executable_sha256',
+            'manifest_sha256',
+            'input_fingerprint_sha256',
+            'harness_sha256',
+            'bootstrap_sha256',
+            'outer_runner_sha256')) {
+        if ([string]$observedBuild.$field -ine
+                [string]$ExpectedBuild.$field) {
+            throw "G127P aggregate provenance changed at $Phase`: $field"
+        }
+    }
+    if ([bool]$observedBuild.build_worktree_dirty_at_build_start -ne
+            [bool]$ExpectedBuild.build_worktree_dirty_at_build_start) {
+        throw "G127P aggregate provenance changed at $Phase`: build dirty"
+    }
+
+    $observedSafety = Assert-G127PSafetyReceipt `
+        -ReceiptPath $ExpectedSafety.receipt_path `
+        -ExpectedReceiptSHA $ExpectedSafety.receipt_sha256 `
+        -CurrentBuild $observedBuild
+    if ($observedSafety.receipt_sha256 -ine
+            $ExpectedSafety.receipt_sha256 -or
+        $observedSafety.result_sha256 -ine
+            $ExpectedSafety.result_sha256 -or
+        $observedSafety.configuration_sha256 -ine
+            $ExpectedSafety.configuration_sha256) {
+        throw "G127P G127 safety provenance changed at $Phase"
+    }
+}
+
 function New-G127PSuffix {
     return ((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') +
         '_' + [Guid]::NewGuid().ToString('N').Substring(0, 10))
@@ -175,7 +229,6 @@ function New-G127PCommonHarnessArguments {
         '-GateKind', $GateKind,
         '-ModelPath', $model,
         '-ExpectedModelSHA256', $modelSHA,
-        '-ReuseVerifiedModelReceipt',
         '-Prompt', $prompt,
         '-ExpectedContentSHA256', $expectedContentSHA,
         '-MaxTokens', '64',
@@ -234,6 +287,7 @@ function New-G127PCommonHarnessArguments {
         )
     } else {
         $args += @(
+            '-ReuseVerifiedModelReceipt',
             '-NestedResidualStructuralN1',
             '-NestedResidualVerifyReconstruction'
         )
@@ -289,7 +343,16 @@ function Invoke-G127PChild {
         & $bootstrap @bootstrapArgs
         return
     }
-    if (Test-Path -LiteralPath $Plan.result_path -PathType Leaf) {
+    $resultExists = Test-Path -LiteralPath $Plan.result_path -PathType Leaf
+    if ($ResumeBatchTag -and $Plan.arm -eq 'safety') {
+        if (-not $resultExists) {
+            throw ('G127P resume requires existing candidate safety result: ' +
+                $Plan.result_path)
+        }
+        Write-Host ('[g127p] reuse and validate completed safety=' + $Plan.tag)
+        return
+    }
+    if ($resultExists) {
         if ($ResumeBatchTag) {
             Write-Host ('[g127p] reuse completed child=' + $Plan.tag)
             return
@@ -337,6 +400,31 @@ function Assert-G127PSharedResult {
         [string]$Json.reap_mask_file_requested -or
         [bool]$Json.embedded_bake_mask_observed) {
         throw "G127P shared exact/provenance/open-router gate failed: $($Plan.tag)"
+    }
+    if ([string]$Json.head -ine $currentBuild.build_head -or
+        [string]$Json.executable_sha256 -ine
+            $currentBuild.executable_sha256 -or
+        [string]$Json.build_manifest_sha256 -ine
+            $currentBuild.manifest_sha256 -or
+        [string]$Json.build_manifest_input_fingerprint_sha256 -ine
+            $currentBuild.input_fingerprint_sha256 -or
+        [string]$Json.build_manifest_head -ine $currentBuild.build_head -or
+        [bool]$Json.build_manifest_worktree_dirty_at_build_start -ne
+            [bool]$currentBuild.build_worktree_dirty_at_build_start -or
+        [string]$Json.harness_sha256 -ine $currentBuild.harness_sha256) {
+        throw "G127P child build provenance gate failed: $($Plan.tag)"
+    }
+    if ($Plan.gate_kind -eq 'benchmark') {
+        if ([string]$Json.nested_residual_gpu_join_safety_receipt_sha256 -ine
+                $g127SafetyContract.receipt_sha256 -or
+            [string]$Json.nested_residual_gpu_join_safety_result_sha256 -ine
+                $g127SafetyContract.result_sha256 -or
+            -not [bool]$Json.nested_residual_gpu_join_safety_receipt_validated) {
+            throw "G127P child G127 safety provenance gate failed: $($Plan.tag)"
+        }
+    } elseif ([string]$Json.nested_residual_gpu_join_safety_receipt_sha256 -or
+        [bool]$Json.nested_residual_gpu_join_safety_receipt_validated) {
+        throw "G127P structural safety unexpectedly reused G127 receipt: $($Plan.tag)"
     }
     if (-not [bool]$Json.nested_residual_gpu_join_requested -or
         -not [bool]$Json.nested_residual_gpu_join_observed -or
@@ -417,8 +505,19 @@ function Assert-G127PRoutePackedCopy {
 function Read-G127PChildResult {
     param([Parameter(Mandatory=$true)][object]$Plan)
 
-    $json = Get-Content -LiteralPath $Plan.result_path -Raw |
+    if (-not (Test-Path -LiteralPath $Plan.result_path -PathType Leaf)) {
+        throw "G127P child result missing during validation: $($Plan.result_path)"
+    }
+    $resolvedResult = (Resolve-Path -LiteralPath $Plan.result_path).Path
+    $resultSHA = (Get-FileHash -LiteralPath $resolvedResult `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $json = Get-Content -LiteralPath $resolvedResult -Raw |
         ConvertFrom-Json
+    $resultSHAAfterRead = (Get-FileHash -LiteralPath $resolvedResult `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($resultSHAAfterRead -ine $resultSHA) {
+        throw "G127P child result changed while validating: $($Plan.tag)"
+    }
     Assert-G127PSharedResult -Plan $Plan -Json $json
     Assert-G127PRoutePackedCopy -Plan $Plan -Json $json
     $sample = @($json.results)[0]
@@ -428,7 +527,8 @@ function Read-G127PChildResult {
         repeat_index = [int]$Plan.repeat_index
         tag = $Plan.tag
         gate_kind = $Plan.gate_kind
-        result_path = $Plan.result_path
+        result_path = $resolvedResult
+        result_sha256 = $resultSHA
         exact = $true
         uncontaminated = $true
         tokens_per_second = [double]$sample.tokens_per_second
@@ -553,12 +653,16 @@ $rows = @()
 $safetyPlan = @($plans | Where-Object { $_.arm -eq 'safety' })[0]
 Invoke-G127PChild -Plan $safetyPlan
 $rows += Read-G127PChildResult -Plan $safetyPlan
+Assert-G127PAggregateProvenance -ExpectedBuild $currentBuild `
+    -ExpectedSafety $g127SafetyContract -Phase 'before benchmark launch'
 
 $benchmarkPlans = @($plans | Where-Object { $_.arm -ne 'safety' })
 foreach ($plan in $benchmarkPlans) {
     Invoke-G127PChild -Plan $plan
     $rows += Read-G127PChildResult -Plan $plan
 }
+Assert-G127PAggregateProvenance -ExpectedBuild $currentBuild `
+    -ExpectedSafety $g127SafetyContract -Phase 'final aggregate'
 $safetyRows = @($rows | Where-Object { $_.arm -eq 'safety' })
 $controlRows = @($rows | Where-Object { $_.arm -eq 'control' })
 $candidateRows = @($rows | Where-Object { $_.arm -eq 'candidate' })
@@ -604,6 +708,22 @@ $result = [ordered]@{
     g127_safety_result_sha256 = $g127SafetyContract.result_sha256
     g127_safety_configuration_sha256 =
         $g127SafetyContract.configuration_sha256
+    aggregate_provenance = [ordered]@{
+        build_head = $currentBuild.build_head
+        build_worktree_dirty_at_build_start =
+            $currentBuild.build_worktree_dirty_at_build_start
+        executable_sha256 = $currentBuild.executable_sha256
+        build_manifest_sha256 = $currentBuild.manifest_sha256
+        build_manifest_input_fingerprint_sha256 =
+            $currentBuild.input_fingerprint_sha256
+        harness_sha256 = $currentBuild.harness_sha256
+        bootstrap_sha256 = $currentBuild.bootstrap_sha256
+        outer_runner_sha256 = $currentBuild.outer_runner_sha256
+        g127_safety_receipt_sha256 =
+            $g127SafetyContract.receipt_sha256
+        pre_benchmark_verified = $true
+        final_verified = $true
+    }
     order = @($plans | ForEach-Object {
         [pscustomobject]@{
             order_position = $_.order_position

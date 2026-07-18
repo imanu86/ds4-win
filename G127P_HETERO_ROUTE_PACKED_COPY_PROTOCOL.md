@@ -41,6 +41,12 @@ forbids a receipt on verified structural safety. The benchmark children use
 the current-build G127 receipt only to satisfy the nested GPU-join harness
 requirement.
 
+`-ReuseVerifiedModelReceipt` is restricted to candidate structural safety.
+Benchmark children must not receive it: each benchmark performs the normal
+model verification accepted by `GateKind=benchmark`. The G127 safety receipt
+passed to benchmark children is a separate nested GPU-join prerequisite and
+does not authorize model-receipt reuse.
+
 ## Mandatory execution order
 
 The order is fixed and fail-closed. Candidate safety is executed and validated
@@ -56,6 +62,13 @@ validated immediately after it finishes.
 7. candidate r3.
 
 The safety child is structural only. It has no SOTA, timing or quality verdict.
+
+For a resumed batch, `-ResumeBatchTag` reuses and immediately validates an
+existing candidate safety result. It must never rerun that safety. If the
+expected safety result is absent, resume fails closed before any benchmark.
+Existing benchmark results are likewise reused and validated; only missing
+benchmark children are launched. The current recovery tag is
+`g127p_clean_20260718T231000906Z_9648b4bc65`.
 
 ## Candidate route-packed gates
 
@@ -113,6 +126,21 @@ Every child must preserve:
 - zero selected-load fallbacks;
 - machine quiescence preflight ready, not skipped;
 - runtime contamination consecutive peak zero.
+
+Before benchmark launch, the aggregate records the build-manifest head and
+dirty-at-build-start flag, executable SHA-256, build-manifest SHA-256 and input
+fingerprint, harness SHA-256, bootstrap SHA-256, outer runner SHA-256, and G127
+safety receipt SHA-256. Every child row records the SHA-256 of the exact result
+JSON that was parsed. Child results are bound to the executable, manifest,
+manifest fingerprint, build head/dirty state, harness, and, for benchmark
+children, the validated G127 safety receipt.
+
+After candidate safety validation and again after the final benchmark child,
+the runner recomputes aggregate provenance. It fails closed if the outer
+runner, harness, bootstrap, executable, build manifest/fingerprint, build
+head/dirty state, G127 safety receipt, linked safety result, or safety
+configuration changed since preflight. No aggregate JSON is emitted from a
+mixed-provenance run.
 
 ## Verdict rule
 

@@ -109,8 +109,40 @@ foreach ($needle in @(
         'needs_outlier_extension',
         'threshold_ratio = 1.20',
         'G127P candidate hetero packed-copy gate failed',
-        'G127P control packed-copy gate failed')) {
+        'G127P control packed-copy gate failed',
+        'Assert-G127PAggregateProvenance',
+        'build_head',
+        'build_worktree_dirty_at_build_start',
+        'executable_sha256',
+        'manifest_sha256',
+        'input_fingerprint_sha256',
+        'harness_sha256',
+        'bootstrap_sha256',
+        'outer_runner_sha256',
+        'result_sha256 = $resultSHA',
+        "-Phase 'before benchmark launch'",
+        "-Phase 'final aggregate'",
+        "if (`$ResumeBatchTag -and `$Plan.arm -eq 'safety')",
+        'resume requires existing candidate safety result')) {
     Require-Text $runner $needle 'runner protocol'
+}
+
+$reuseLiteralCount = ([regex]::Matches(
+        $runner, [regex]::Escape("'-ReuseVerifiedModelReceipt'"))).Count
+if ($reuseLiteralCount -ne 1) {
+    throw "G127P runner must add ReuseVerifiedModelReceipt exactly once, got $reuseLiteralCount"
+}
+
+$preBenchmarkProvenanceIndex = $runner.IndexOf(
+    "-Phase 'before benchmark launch'", [StringComparison]::Ordinal)
+$benchmarkLoopIndex = $runner.IndexOf(
+    'foreach ($plan in $benchmarkPlans)', [StringComparison]::Ordinal)
+$finalProvenanceIndex = $runner.IndexOf(
+    "-Phase 'final aggregate'", [StringComparison]::Ordinal)
+if ($preBenchmarkProvenanceIndex -lt 0 -or
+    $benchmarkLoopIndex -le $preBenchmarkProvenanceIndex -or
+    $finalProvenanceIndex -le $benchmarkLoopIndex) {
+    throw 'G127P aggregate provenance checks do not bracket benchmarks'
 }
 
 foreach ($needle in @(
@@ -130,6 +162,11 @@ foreach ($needle in @(
         'Candidate safety is executed and validated',
         'immediately before any benchmark child',
         'validated immediately after it finishes',
+        '`-ReuseVerifiedModelReceipt` is restricted to candidate structural safety',
+        'Benchmark children must not receive it',
+        '`-ResumeBatchTag` reuses and immediately validates',
+        'It must never rerun that safety',
+        'g127p_clean_20260718T231000906Z_9648b4bc65',
         'gpu_resident_routes_miss_experts >= nested_residual_vram_misses',
         'gpu_resident_routes_miss_experts - nested_residual_vram_misses',
         '11373 - 995 = 10378',
@@ -138,6 +175,9 @@ foreach ($needle in @(
         'Nested residual GPU-join routes are expected to',
         'bypass packed',
         'three exact, uncontaminated benchmark processes per arm',
+        'outer runner SHA-256',
+        'Every child row records the SHA-256',
+        'No aggregate JSON is emitted from a',
         'No verdict',
         'is allowed from the safety run or from n=1')) {
     Require-Text $protocol $needle 'protocol doc'
@@ -156,11 +196,25 @@ foreach ($forbidden in @(
 
 $dummyReceipt = 'C:\g127p-static\g127-receipt.json'
 $dummyReceiptSHA = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-$whatIfOutput = @(& $runnerPath -Tag 'g127p_static_probe' `
+$resumeBatchTag = 'g127p_clean_20260718T231000906Z_9648b4bc65'
+$whatIfOutput = @(& $runnerPath -ResumeBatchTag $resumeBatchTag `
     -G127SafetyReceipt $dummyReceipt `
     -ExpectedG127SafetyReceiptSHA256 $dummyReceiptSHA `
     -InterChildCooldownSec 0 -WhatIf)
 $whatIfText = $whatIfOutput -join "`n"
+$planOutputs = @($whatIfOutput | Where-Object {
+        ([string]$_).IndexOf(
+            '"schema":  "g127p_hetero_route_packed_copy_ab_plan_v1"',
+            [StringComparison]::Ordinal) -ge 0
+    })
+if ($planOutputs.Count -ne 1) {
+    throw "G127P WhatIf expected one outer plan, got $($planOutputs.Count)"
+}
+$whatIfPlan = ([string]$planOutputs[0]) | ConvertFrom-Json
+if ([string]$whatIfPlan.batch_tag -ne $resumeBatchTag -or
+    [string]$whatIfPlan.resume_batch_tag -ne $resumeBatchTag) {
+    throw 'G127P WhatIf did not preserve the requested resume batch tag'
+}
 foreach ($needle in @(
         '"schema":  "g127p_hetero_route_packed_copy_ab_plan_v1"',
         '"child_count":  7',
@@ -201,10 +255,30 @@ if (-not $safetyMatch.Success) {
 $safetyBlock = $safetyMatch.Value
 foreach ($needle in @(
         '"-RoutePackedCopy"',
+        '"-ReuseVerifiedModelReceipt"',
         '"-NestedResidualStructuralN1"',
         '"-NestedResidualVerifyReconstruction"')) {
     if ($safetyBlock.IndexOf($needle, [StringComparison]::Ordinal) -lt 0) {
         throw "G127P safety WhatIf missing marker: $needle"
+    }
+}
+
+$safetyChildren = @($whatIfPlan.children | Where-Object {
+        [string]$_.arm -eq 'safety'
+    })
+$benchmarkChildren = @($whatIfPlan.children | Where-Object {
+        [string]$_.gate_kind -eq 'benchmark'
+    })
+if ($safetyChildren.Count -ne 1 -or $benchmarkChildren.Count -ne 6) {
+    throw 'G127P WhatIf child partition is not safety one plus benchmark six'
+}
+$safetyArguments = @($safetyChildren[0].harness_arguments)
+if ($safetyArguments -notcontains '-ReuseVerifiedModelReceipt') {
+    throw 'G127P structural safety lacks ReuseVerifiedModelReceipt'
+}
+foreach ($child in $benchmarkChildren) {
+    if (@($child.harness_arguments) -contains '-ReuseVerifiedModelReceipt') {
+        throw "G127P benchmark child reuses verified model receipt: $($child.tag)"
     }
 }
 foreach ($forbidden in @(
