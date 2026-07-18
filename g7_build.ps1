@@ -98,14 +98,13 @@ $fingerprintAfter = Get-G7InputFingerprint $inputsAfter
 if ($fingerprintAfter -ne $fingerprintBefore) {
     throw "Build inputs changed while compiling; manifest refused"
 }
-if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
-    if ($generator -like "Ninja*") {
-        $ninjaExe = Join-Path $buildDir "ds4_server.exe"
-        if (Test-Path -LiteralPath $ninjaExe -PathType Leaf) {
-            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
-            Copy-Item -LiteralPath $ninjaExe -Destination $exe -Force
-        }
+if ($generator -like "Ninja*") {
+    $ninjaExe = Join-Path $buildDir "ds4_server.exe"
+    if (-not (Test-Path -LiteralPath $ninjaExe -PathType Leaf)) {
+        throw "Ninja built executable not found: $ninjaExe"
     }
+    New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    Copy-Item -LiteralPath $ninjaExe -Destination $exe -Force
 }
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "Built executable not found: $exe"
