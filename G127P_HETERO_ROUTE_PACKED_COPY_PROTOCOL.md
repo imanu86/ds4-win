@@ -127,13 +127,17 @@ Every child must preserve:
 - machine quiescence preflight ready, not skipped;
 - runtime contamination consecutive peak zero.
 
-Before benchmark launch, the aggregate records the build-manifest head and
-dirty-at-build-start flag, executable SHA-256, build-manifest SHA-256 and input
-fingerprint, harness SHA-256, bootstrap SHA-256, outer runner SHA-256, and G127
-safety receipt SHA-256. Every child row records the SHA-256 of the exact result
-JSON that was parsed. Child results are bound to the executable, manifest,
-manifest fingerprint, build head/dirty state, harness, and, for benchmark
-children, the validated G127 safety receipt.
+Before benchmark launch, the aggregate records two distinct identities: the
+clean repository HEAD that launches the children, and the build-manifest HEAD
+that produced the executable. It also records the build dirty-at-start flag,
+executable SHA-256, build-manifest SHA-256 and input fingerprint, harness
+SHA-256, bootstrap SHA-256, outer runner SHA-256, and G127 safety receipt
+SHA-256. Every child row records the SHA-256 of the exact result JSON that was
+parsed. Child results are bound to the clean launching repository HEAD, the
+executable, manifest, manifest fingerprint, build HEAD/dirty state, harness,
+and, for benchmark children, the validated G127 safety receipt. The repository
+HEAD and build HEAD may differ after a runner-only commit; they must never be
+conflated.
 
 After candidate safety validation and again after the final benchmark child,
 the runner recomputes aggregate provenance. It fails closed if the outer

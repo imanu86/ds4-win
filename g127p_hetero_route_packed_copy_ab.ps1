@@ -68,9 +68,13 @@ function Get-G127PCurrentBuildContract {
         Hash.ToLowerInvariant()
     $manifestSHA = (Get-FileHash -LiteralPath $buildManifestPath `
         -Algorithm SHA256).Hash.ToLowerInvariant()
+    $repoHead = (git -C $root rev-parse HEAD).Trim().ToLowerInvariant()
+    $repoDirty = [bool](git -C $root status --porcelain)
     if ([string]$manifest.schema -ne 'g7_native_windows_build_manifest_v1' -or
         [string]$manifest.executable_sha256 -ine $exeSHA -or
         [string]$manifest.head -notmatch '^[0-9a-fA-F]{40}$' -or
+        $repoHead -notmatch '^[0-9a-f]{40}$' -or
+        $repoDirty -or
         $null -eq $manifest.PSObject.Properties[
             'worktree_dirty_at_build_start'] -or
         [string]$manifest.input_fingerprint_sha256 -notmatch
@@ -78,6 +82,8 @@ function Get-G127PCurrentBuildContract {
         throw 'G127P current build manifest contract mismatch'
     }
     return [pscustomobject]@{
+        repo_head = $repoHead
+        repo_worktree_dirty = $repoDirty
         build_head = ([string]$manifest.head).ToLowerInvariant()
         build_worktree_dirty_at_build_start =
             [bool]$manifest.worktree_dirty_at_build_start
@@ -181,6 +187,7 @@ function Assert-G127PAggregateProvenance {
 
     $observedBuild = Get-G127PCurrentBuildContract
     foreach ($field in @(
+            'repo_head',
             'build_head',
             'executable_sha256',
             'manifest_sha256',
@@ -196,6 +203,10 @@ function Assert-G127PAggregateProvenance {
     if ([bool]$observedBuild.build_worktree_dirty_at_build_start -ne
             [bool]$ExpectedBuild.build_worktree_dirty_at_build_start) {
         throw "G127P aggregate provenance changed at $Phase`: build dirty"
+    }
+    if ([bool]$observedBuild.repo_worktree_dirty -ne
+            [bool]$ExpectedBuild.repo_worktree_dirty) {
+        throw "G127P aggregate provenance changed at $Phase`: repo dirty"
     }
 
     $observedSafety = Assert-G127PSafetyReceipt `
@@ -401,7 +412,7 @@ function Assert-G127PSharedResult {
         [bool]$Json.embedded_bake_mask_observed) {
         throw "G127P shared exact/provenance/open-router gate failed: $($Plan.tag)"
     }
-    if ([string]$Json.head -ine $currentBuild.build_head -or
+    if ([string]$Json.head -ine $currentBuild.repo_head -or
         [string]$Json.executable_sha256 -ine
             $currentBuild.executable_sha256 -or
         [string]$Json.build_manifest_sha256 -ine
@@ -529,6 +540,8 @@ function Read-G127PChildResult {
         gate_kind = $Plan.gate_kind
         result_path = $resolvedResult
         result_sha256 = $resultSHA
+        repo_head = [string]$json.head
+        build_head = [string]$json.build_manifest_head
         exact = $true
         uncontaminated = $true
         tokens_per_second = [double]$sample.tokens_per_second
@@ -709,6 +722,8 @@ $result = [ordered]@{
     g127_safety_configuration_sha256 =
         $g127SafetyContract.configuration_sha256
     aggregate_provenance = [ordered]@{
+        repo_head = $currentBuild.repo_head
+        repo_worktree_dirty = $currentBuild.repo_worktree_dirty
         build_head = $currentBuild.build_head
         build_worktree_dirty_at_build_start =
             $currentBuild.build_worktree_dirty_at_build_start
