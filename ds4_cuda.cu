@@ -22236,13 +22236,6 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
         return NULL;
     }
-    if (packed_copy_requested && gate_expert_bytes != down_expert_bytes) {
-        fprintf(stderr,
-                "ds4: CUDA route packed H2D copy refused: gate/down expert bytes differ (%llu/%llu)\n",
-                (unsigned long long)gate_expert_bytes,
-                (unsigned long long)down_expert_bytes);
-        return NULL;
-    }
     if (g_moe_expert_cache.capacity != 0 &&
         g_moe_expert_cache.requested == requested &&
         g_moe_expert_cache.gate_expert_bytes == gate_expert_bytes &&
@@ -22322,12 +22315,22 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         char *transient_down = NULL;
         cudaStream_t route_stream = NULL;
         if (packed_copy_requested) {
-            const uint64_t plane_bytes = (uint64_t)cap * gate_expert_bytes;
-            err = cudaMalloc(&packed_base, (size_t)(plane_bytes * 3ull));
+            const uint64_t gate_plane_bytes =
+                (uint64_t)cap * gate_expert_bytes;
+            const uint64_t down_plane_bytes =
+                (uint64_t)cap * down_expert_bytes;
+            if (gate_plane_bytes >
+                    (UINT64_MAX - down_plane_bytes) / 2ull) {
+                err = cudaErrorMemoryAllocation;
+            } else {
+                const uint64_t packed_bytes =
+                    gate_plane_bytes * 2ull + down_plane_bytes;
+                err = cudaMalloc(&packed_base, (size_t)packed_bytes);
+            }
             if (err == cudaSuccess) {
                 gate = packed_base;
-                up = (char *)packed_base + plane_bytes;
-                down = (char *)packed_base + plane_bytes * 2ull;
+                up = (char *)packed_base + gate_plane_bytes;
+                down = (char *)packed_base + gate_plane_bytes * 2ull;
             }
         } else {
             err = cudaMalloc(&gate, (size_t)((uint64_t)cap * gate_expert_bytes));
@@ -22367,14 +22370,23 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
             err = cudaHostGetDevicePointer((void **)&request_device, request_host, 0);
         }
         if (err == cudaSuccess && gpu_routes && packed_copy_requested) {
-            const uint64_t plane_bytes =
+            const uint64_t gate_plane_bytes =
                 (uint64_t)CUDA_MOE_ROUTE_COUNT * gate_expert_bytes;
-            err = cudaHostAlloc((void **)&host_packed_base,
-                (size_t)(plane_bytes * 3ull), cudaHostAllocDefault);
+            const uint64_t down_plane_bytes =
+                (uint64_t)CUDA_MOE_ROUTE_COUNT * down_expert_bytes;
+            if (gate_plane_bytes >
+                    (UINT64_MAX - down_plane_bytes) / 2ull) {
+                err = cudaErrorMemoryAllocation;
+            } else {
+                const uint64_t packed_bytes =
+                    gate_plane_bytes * 2ull + down_plane_bytes;
+                err = cudaHostAlloc((void **)&host_packed_base,
+                    (size_t)packed_bytes, cudaHostAllocDefault);
+            }
             if (err == cudaSuccess) {
                 host_gate = host_packed_base;
-                host_up = host_packed_base + plane_bytes;
-                host_down = host_packed_base + plane_bytes * 2ull;
+                host_up = host_packed_base + gate_plane_bytes;
+                host_down = host_packed_base + gate_plane_bytes * 2ull;
             }
         }
         if (err == cudaSuccess && gpu_routes && !packed_copy_requested) {
@@ -22391,14 +22403,24 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
         }
         if (err == cudaSuccess && tier_mode == CUDA_MOE_TIER_ENFORCE &&
             packed_copy_requested) {
-            const uint64_t plane_bytes =
+            const uint64_t gate_plane_bytes =
                 (uint64_t)CUDA_MOE_ROUTE_COUNT * gate_expert_bytes;
-            err = cudaMalloc((void **)&transient_packed_base,
-                (size_t)(plane_bytes * 3ull));
+            const uint64_t down_plane_bytes =
+                (uint64_t)CUDA_MOE_ROUTE_COUNT * down_expert_bytes;
+            if (gate_plane_bytes >
+                    (UINT64_MAX - down_plane_bytes) / 2ull) {
+                err = cudaErrorMemoryAllocation;
+            } else {
+                const uint64_t packed_bytes =
+                    gate_plane_bytes * 2ull + down_plane_bytes;
+                err = cudaMalloc((void **)&transient_packed_base,
+                    (size_t)packed_bytes);
+            }
             if (err == cudaSuccess) {
                 transient_gate = transient_packed_base;
-                transient_up = transient_packed_base + plane_bytes;
-                transient_down = transient_packed_base + plane_bytes * 2ull;
+                transient_up = transient_packed_base + gate_plane_bytes;
+                transient_down = transient_packed_base +
+                    gate_plane_bytes * 2ull;
             }
         }
         if (err == cudaSuccess && tier_mode == CUDA_MOE_TIER_ENFORCE &&
@@ -22532,8 +22554,9 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
                         cap);
                 if (packed_copy_requested) {
                     fprintf(stderr,
-                            "ds4: CUDA route packed H2D copy active: expert_bytes=%llu resident_pitch=%llu transient_pitch=%llu\n",
+                            "ds4: CUDA route packed H2D copy active: gate_bytes=%llu down_bytes=%llu submissions_per_expert=2 resident_gate_pitch=%llu transient_gate_pitch=%llu\n",
                             (unsigned long long)gate_expert_bytes,
+                            (unsigned long long)down_expert_bytes,
                             (unsigned long long)((uint64_t)cap * gate_expert_bytes),
                             (unsigned long long)((uint64_t)CUDA_MOE_ROUTE_COUNT * gate_expert_bytes));
                 }
@@ -22658,32 +22681,34 @@ static int cuda_moe_route_copy_expert_h2d_async(
         uint64_t src_pitch) {
     if (!cache || !cache->packed_copy_requested ||
         cache->gate_expert_bytes == 0 ||
-        cache->gate_expert_bytes != cache->down_expert_bytes ||
+        cache->down_expert_bytes == 0 ||
         !dst_gate || !dst_up || !dst_down ||
         !host_gate || !host_up || !host_down ||
         dst_pitch == 0 || src_pitch == 0) {
         return 0;
     }
-    const uint64_t expert_bytes = cache->gate_expert_bytes;
     if (dst_up != dst_gate + dst_pitch ||
-        dst_down != dst_gate + dst_pitch * 2ull ||
-        host_up != host_gate + src_pitch ||
-        host_down != host_gate + src_pitch * 2ull) {
+        host_up != host_gate + src_pitch) {
         fprintf(stderr,
-                "ds4: CUDA route packed H2D copy refused: non-contiguous layout\n");
+                "ds4: CUDA route packed H2D copy refused: gate/up layout is not contiguous\n");
         return 0;
     }
     if (cudaMemcpy2DAsync(dst_gate, (size_t)dst_pitch,
                           host_gate, (size_t)src_pitch,
-                          (size_t)expert_bytes, 3u,
+                          (size_t)cache->gate_expert_bytes, 2u,
                           cudaMemcpyHostToDevice,
-                          cache->route_upload_stream) != cudaSuccess) {
+                          cache->route_upload_stream) != cudaSuccess ||
+        cudaMemcpyAsync(dst_down, host_down,
+                        (size_t)cache->down_expert_bytes,
+                        cudaMemcpyHostToDevice,
+                        cache->route_upload_stream) != cudaSuccess) {
         (void)cudaGetLastError();
         return 0;
     }
     cache->packed_copy_experts++;
-    cache->packed_copy_submissions++;
-    cache->packed_copy_bytes += expert_bytes * 3ull;
+    cache->packed_copy_submissions += 2ull;
+    cache->packed_copy_bytes +=
+        cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
     return 1;
 }
 

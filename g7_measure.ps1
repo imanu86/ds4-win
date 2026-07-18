@@ -4477,10 +4477,11 @@ if ($RoutePackedCopy) {
     if (-not $gpuRoutesObserved -or
         $gpuRoutesPackedCopyRequested -ne 1 -or
         $gpuRoutesPackedCopyExperts -le 0 -or
-        $gpuRoutesPackedCopySubmissions -ne $gpuRoutesPackedCopyExperts -or
+        $gpuRoutesPackedCopySubmissions -ne
+            (2 * $gpuRoutesPackedCopyExperts) -or
         $gpuRoutesPackedCopyBytes -le 0 -or
         $gpuRoutesLegacyCopySubmissions -ne 0) {
-        throw "RoutePackedCopy was requested but packed route copy accounting did not prove exclusive packed copies"
+        throw "RoutePackedCopy was requested but heterogeneous packed route accounting did not prove exactly two submissions per expert with no legacy copies"
     }
 } elseif ($gpuRoutesPackedCopyRequested -ne 0 -or
     $gpuRoutesPackedCopyExperts -ne 0 -or
