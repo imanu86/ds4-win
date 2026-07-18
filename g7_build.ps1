@@ -45,6 +45,20 @@ function Get-G7InputFingerprint([object[]]$Inputs) {
     ).Replace("-", "").ToLowerInvariant()
 }
 
+function Get-G7CMakeGenerator {
+    $cachePath = Join-Path $buildDir "CMakeCache.txt"
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) {
+        throw "CMake cache not found: $cachePath"
+    }
+    $line = Get-Content -LiteralPath $cachePath | Where-Object {
+        $_ -match '^CMAKE_GENERATOR:INTERNAL='
+    } | Select-Object -First 1
+    if (-not $line) {
+        throw "CMAKE_GENERATOR missing from cache: $cachePath"
+    }
+    return ($line -replace '^CMAKE_GENERATOR:INTERNAL=', '').Trim()
+}
+
 if (-not (Test-Path -LiteralPath $CMake -PathType Leaf)) {
     throw "CMake not found: $CMake"
 }
@@ -57,15 +71,23 @@ $inputsBefore = @(Get-G7BuildInputs)
 $fingerprintBefore = Get-G7InputFingerprint $inputsBefore
 $head = (git -C $repo rev-parse HEAD).Trim()
 $dirty = [bool](git -C $repo status --porcelain)
-$buildArguments = @(
-    "--build", $buildDir, "--config", $Configuration, "--parallel", "--",
-    "/p:_LatestWindowsTargetPlatformVersion=$WindowsSdkVersion",
-    "/p:WindowsTargetPlatformVersion=$WindowsSdkVersion",
-    "/p:TargetPlatformVersion=$WindowsSdkVersion",
-    "/p:TargetPlatformSdkPath=$WindowsSdkRootOverride\",
-    "/p:TargetPlatformSdkRootOverride=$WindowsSdkRootOverride",
-    "/p:TargetPlatformDisplayName=Windows10SDK"
-)
+$generator = Get-G7CMakeGenerator
+$buildArguments = @("--build", $buildDir, "--config", $Configuration, "--parallel")
+if ($generator -like "Visual Studio*") {
+    $buildArguments += @(
+        "--",
+        "/p:_LatestWindowsTargetPlatformVersion=$WindowsSdkVersion",
+        "/p:WindowsTargetPlatformVersion=$WindowsSdkVersion",
+        "/p:TargetPlatformVersion=$WindowsSdkVersion",
+        "/p:TargetPlatformSdkPath=$WindowsSdkRootOverride\",
+        "/p:TargetPlatformSdkRootOverride=$WindowsSdkRootOverride",
+        "/p:TargetPlatformDisplayName=Windows10SDK"
+    )
+} elseif ($generator -like "Ninja*") {
+    # Ninja rejects MSBuild /p: properties after "--"; keep the manifest output stable below.
+} else {
+    throw "Unsupported CMake generator for g7 build wrapper: $generator"
+}
 $command = @($CMake) + $buildArguments
 Write-Host ("[g7-build] " + ($command -join " "))
 & $CMake @buildArguments
@@ -75,6 +97,15 @@ $inputsAfter = @(Get-G7BuildInputs)
 $fingerprintAfter = Get-G7InputFingerprint $inputsAfter
 if ($fingerprintAfter -ne $fingerprintBefore) {
     throw "Build inputs changed while compiling; manifest refused"
+}
+if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+    if ($generator -like "Ninja*") {
+        $ninjaExe = Join-Path $buildDir "ds4_server.exe"
+        if (Test-Path -LiteralPath $ninjaExe -PathType Leaf) {
+            New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+            Copy-Item -LiteralPath $ninjaExe -Destination $exe -Force
+        }
+    }
 }
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "Built executable not found: $exe"

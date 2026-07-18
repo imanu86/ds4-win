@@ -130,6 +130,7 @@ param(
     [switch]$NestedResidualStructuralN1,
     [switch]$NestedResidualGpuCache,
     [switch]$NestedResidualGpuJoin,
+    [switch]$NestedResidualGpuJoinResidualCache,
     [string]$NestedResidualGpuJoinSafetyReceipt = "",
     [string]$ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 = "",
     [switch]$AllowNestedResidualBenchmarkSuite,
@@ -967,6 +968,7 @@ if ($NestedResidualSidecar) {
           $NestedResidualStructuralN1 -or
           $NestedResidualGpuCache -or
           $NestedResidualGpuJoin -or
+          $NestedResidualGpuJoinResidualCache -or
           $NestedResidualGpuJoinSafetyReceipt -or
           $ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 -or
           $AllowNestedResidualBenchmarkSuite -or
@@ -995,6 +997,11 @@ if ($NestedResidualGpuJoin) {
             $GateKind -ne "benchmark") {
             throw "NestedResidualGpuJoin without runtime reconstruction verification requires a hash-pinned G125 safety receipt and an explicit outer benchmark suite"
         }
+    }
+}
+if ($NestedResidualGpuJoinResidualCache) {
+    if (-not $NestedResidualGpuJoin -or -not $NestedResidualGpuCache) {
+        throw "NestedResidualGpuJoinResidualCache requires NestedResidualGpuJoin and NestedResidualGpuCache"
     }
 }
 if ($NestedResidualGpuJoinSafetyReceipt) {
@@ -1520,6 +1527,11 @@ if ($NestedResidualSidecar) {
     } else {
         Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN -ErrorAction SilentlyContinue
     }
+    if ($NestedResidualGpuJoinResidualCache) {
+        $env:DS4_NESTED_RESIDUAL_GPU_JOIN_RESIDUAL_CACHE = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN_RESIDUAL_CACHE -ErrorAction SilentlyContinue
+    }
 } else {
     Remove-Item Env:\DS4_NESTED_RESIDUAL_SIDECAR -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_EXACT -ErrorAction SilentlyContinue
@@ -1531,6 +1543,7 @@ if ($NestedResidualSidecar) {
     Remove-Item Env:\DS4_NESTED_RESIDUAL_CACHE_EXPERTS -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_CACHE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN_RESIDUAL_CACHE -ErrorAction SilentlyContinue
 }
 if ($Iq1SExpertSidecar) {
     $env:DS4_IQ1_S_EXPERT_SIDECAR = $Iq1SExpertSidecar
@@ -2387,8 +2400,12 @@ foreach ($input in @($buildManifest.inputs)) {
 if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
     $safetyReceipt = $nestedResidualGpuJoinSafetyReceiptAtStart
     $safetyResult = $nestedResidualGpuJoinSafetyResultAtStart
-    if ([string]$safetyReceipt.schema -ne
-            "ds4_g125_nested_gpu_join_safety_v1" -or
+    $safetyReceiptSchema = [string]$safetyReceipt.schema
+    $safetyReceiptIsG125 = $safetyReceiptSchema -eq
+        "ds4_g125_nested_gpu_join_safety_v1"
+    $safetyReceiptIsG127 = $safetyReceiptSchema -eq
+        "ds4_g127_nested_gpu_join_residual_cache_safety_v1"
+    if ((-not $safetyReceiptIsG125 -and -not $safetyReceiptIsG127) -or
         [string]$safetyReceipt.status -ne
             "pass_structural_n1_no_performance_or_quality_verdict" -or
         [string]$safetyReceipt.routing_contract -ne
@@ -2419,6 +2436,38 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
         [UInt64]$safetyReceipt.gpu_cache.h2d_bytes -eq 0 -or
         [UInt64]$safetyReceipt.gpu_cache.failures -ne 0) {
         throw "Nested residual GPU join safety receipt contract mismatch"
+    }
+    if ($NestedResidualGpuJoinResidualCache -and -not $safetyReceiptIsG127) {
+        throw "Nested residual GPU join residual cache requires a G127 safety receipt"
+    }
+    if ($safetyReceiptIsG127 -and
+        ([string]$safetyReceipt.result_sha256 -ine
+            $nestedResidualGpuJoinSafetyResultHashAtStart -or
+         [string]$safetyReceipt.claim_scope -ne
+            "structural_safety_only_no_sota_no_quality_verdict" -or
+         [int]$safetyReceipt.residual_cache.enabled -ne 1 -or
+         [UInt64]$safetyReceipt.residual_cache.hits -eq 0 -or
+         [UInt64]$safetyReceipt.residual_cache.misses -eq 0 -or
+         [UInt64]$safetyReceipt.residual_cache.capacity -eq 0 -or
+         [UInt64]$safetyReceipt.residual_cache.entries -gt
+            [UInt64]$safetyReceipt.residual_cache.capacity -or
+         [UInt64]$safetyReceipt.residual_cache.pread_bytes_avoided -eq 0 -or
+         [UInt64]$safetyReceipt.residual_cache.cached_join_calls -eq 0 -or
+         [UInt64]$safetyReceipt.residual_cache.invariant_failures -ne 0 -or
+         -not [bool]$safetyReceipt.exactness.reconstruction_verify -or
+         [UInt64]$safetyReceipt.exactness.verify_mismatches -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.nested_mismatches -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.nested_failures -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.gpu_join_failures -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.cpu_reconstruct_calls -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.native_h2d_bytes -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.selected_load_fallbacks -ne 0 -or
+         [UInt64]$safetyReceipt.exactness.fallback_markers -ne 0 -or
+         -not [bool]$safetyReceipt.machine_quiescence.ready_to_launch -or
+         [bool]$safetyReceipt.machine_quiescence.skipped -or
+         [int]$safetyReceipt.machine_quiescence.preflight_failures -ne 0 -or
+         [int]$safetyReceipt.machine_quiescence.runtime_contamination_consecutive_peak -ne 0)) {
+        throw "Nested residual GPU join G127 safety receipt contract mismatch"
     }
     $safetyActualHashes = @($safetyResult.results | ForEach-Object {
         [string]$_.content_sha256
@@ -2486,6 +2535,21 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
         -not [bool]$safetyResult.split_fused_requested -or
         -not [bool]$safetyResult.route_no_default_sync_requested) {
         throw "Nested residual GPU join safety result no longer binds to this benchmark configuration"
+    }
+    if ($safetyReceiptIsG127 -and
+        (-not [bool]$safetyResult.nested_residual_gpu_join_residual_cache_requested -or
+         -not [bool]$safetyResult.nested_residual_gpu_join_residual_cache_observed -or
+         [int]$safetyResult.nested_residual_gpu_join_residual_cache_enabled_runtime -ne 1 -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_hits -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_misses -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_capacity -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_entries -gt
+            [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_capacity -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_pread_bytes_avoided -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_cached_join_calls -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_invariant_failures -ne 0 -or
+         [UInt64]$safetyResult.moe_overlapped_io_fallbacks -ne 0)) {
+        throw "Nested residual GPU join G127 safety result no longer binds to this benchmark"
     }
     $nestedResidualGpuJoinSafetyReceiptValidated = $true
 }
@@ -4496,6 +4560,19 @@ $nestedResidualGpuJoinVerifySeconds = [double]0
 $nestedResidualGpuJoinVerifyMismatches = [UInt64]0
 $nestedResidualGpuJoinFailures = [UInt64]0
 $nestedResidualGpuJoinCpuReconstructCalls = [UInt64]0
+$nestedResidualGpuJoinResidualCacheObserved = $false
+$nestedResidualGpuJoinResidualCacheRawSummary = ""
+$nestedResidualGpuJoinResidualCacheEnabledRuntime = 0
+$nestedResidualGpuJoinResidualCacheHits = [UInt64]0
+$nestedResidualGpuJoinResidualCacheMisses = [UInt64]0
+$nestedResidualGpuJoinResidualCacheEvictions = [UInt64]0
+$nestedResidualGpuJoinResidualCacheEntries = [UInt64]0
+$nestedResidualGpuJoinResidualCacheCapacity = [UInt64]0
+$nestedResidualGpuJoinResidualCachePreadBytes = [UInt64]0
+$nestedResidualGpuJoinResidualCachePreadBytesAvoided = [UInt64]0
+$nestedResidualGpuJoinResidualCacheH2DBytes = [UInt64]0
+$nestedResidualGpuJoinResidualCacheCachedJoinCalls = [UInt64]0
+$nestedResidualGpuJoinResidualCacheInvariantFailures = [UInt64]0
 $nestedResidualProfileObserved = $false
 $nestedResidualProfileRawSummary = ""
 $nestedResidualProfileLookupCalls = [UInt64]0
@@ -4534,6 +4611,9 @@ $nestedResidualVramSummaryMatches = [regex]::Matches(
 $nestedResidualGpuJoinSummaryMatches = [regex]::Matches(
     $q1_0SidecarLogText,
     '(?m)^(?:ds4: )?\[(?:nested-residual-gpu-join|nested-residual)\] result=(?:summary|gpu_join_summary)(?=[^\r\n]*(?:gpu_join|cpu_reconstruct|base_h2d_bytes|residual_h2d_bytes))([^\r\n]*)\r?$')
+$nestedResidualGpuJoinResidualCacheSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual-residual-cache\] result=summary enabled=(\d+) hits=(\d+) misses=(\d+) evictions=(\d+) entries=(\d+) capacity=(\d+) pread_bytes=(\d+) pread_bytes_avoided=(\d+) h2d_bytes=(\d+) cached_join_calls=(\d+) invariant_failures=(\d+)\r?$')
 $nestedResidualProfileSummaryMatches = [regex]::Matches(
     $q1_0SidecarLogText,
     '(?m)^(?:ds4: )?\[nested-residual-profile\] result=summary enabled=1 lookup_calls=(\d+) lookup_s=([0-9.]+) pread_calls=(\d+) pread_s=([0-9.]+) reconstruct_calls=(\d+) reconstruct_blocks=(\d+) reconstruct_s=([0-9.]+) verify_calls=(\d+) verify_bytes=(\d+) verify_s=([0-9.]+) reuse_wait_calls=(\d+) reuse_wait_s=([0-9.]+) host_copy_calls=(\d+) host_copy_s=([0-9.]+) h2d_enqueue_calls=(\d+) h2d_enqueue_s=([0-9.]+) h2d_sync_calls=(\d+) h2d_sync_s=([0-9.]+) route_begin_calls=(\d+) route_begin_s=([0-9.]+) route_resolve_sync_calls=(\d+) route_resolve_sync_s=([0-9.]+) route_ready_wait_calls=(\d+) route_ready_wait_s=([0-9.]+) packed_copy=(\d+) split_fused=(\d+) verify=(\d+)\r?$')
@@ -4706,8 +4786,56 @@ if ($NestedResidualSidecar) {
             throw "Nested residual GPU join counters are inconsistent"
         }
         $nestedResidualGpuJoinObserved = $true
+        if ($NestedResidualGpuJoinResidualCache) {
+            if ($nestedResidualGpuJoinResidualCacheSummaryMatches.Count -ne 1) {
+                throw "Nested residual GPU join residual cache requires exactly one summary; observed $($nestedResidualGpuJoinResidualCacheSummaryMatches.Count)"
+            }
+            $residualCacheSummary =
+                $nestedResidualGpuJoinResidualCacheSummaryMatches[0]
+            $nestedResidualGpuJoinResidualCacheRawSummary =
+                $residualCacheSummary.Value
+            $nestedResidualGpuJoinResidualCacheEnabledRuntime =
+                [int]$residualCacheSummary.Groups[1].Value
+            $nestedResidualGpuJoinResidualCacheHits =
+                [UInt64]$residualCacheSummary.Groups[2].Value
+            $nestedResidualGpuJoinResidualCacheMisses =
+                [UInt64]$residualCacheSummary.Groups[3].Value
+            $nestedResidualGpuJoinResidualCacheEvictions =
+                [UInt64]$residualCacheSummary.Groups[4].Value
+            $nestedResidualGpuJoinResidualCacheEntries =
+                [UInt64]$residualCacheSummary.Groups[5].Value
+            $nestedResidualGpuJoinResidualCacheCapacity =
+                [UInt64]$residualCacheSummary.Groups[6].Value
+            $nestedResidualGpuJoinResidualCachePreadBytes =
+                [UInt64]$residualCacheSummary.Groups[7].Value
+            $nestedResidualGpuJoinResidualCachePreadBytesAvoided =
+                [UInt64]$residualCacheSummary.Groups[8].Value
+            $nestedResidualGpuJoinResidualCacheH2DBytes =
+                [UInt64]$residualCacheSummary.Groups[9].Value
+            $nestedResidualGpuJoinResidualCacheCachedJoinCalls =
+                [UInt64]$residualCacheSummary.Groups[10].Value
+            $nestedResidualGpuJoinResidualCacheInvariantFailures =
+                [UInt64]$residualCacheSummary.Groups[11].Value
+            if ($nestedResidualGpuJoinResidualCacheEnabledRuntime -ne 1 -or
+                $nestedResidualGpuJoinResidualCacheHits -eq 0 -or
+                $nestedResidualGpuJoinResidualCacheMisses -eq 0 -or
+                $nestedResidualGpuJoinResidualCacheCapacity -eq 0 -or
+                $nestedResidualGpuJoinResidualCacheEntries -gt
+                    $nestedResidualGpuJoinResidualCacheCapacity -or
+                $nestedResidualGpuJoinResidualCachePreadBytesAvoided -eq 0 -or
+                $nestedResidualGpuJoinResidualCacheCachedJoinCalls -eq 0 -or
+                $nestedResidualGpuJoinResidualCacheInvariantFailures -ne 0) {
+                throw "Nested residual GPU join residual cache counters are inconsistent"
+            }
+            $nestedResidualGpuJoinResidualCacheObserved = $true
+        } elseif ($nestedResidualGpuJoinResidualCacheSummaryMatches.Count -ne 0 -or
+                  $q1_0SidecarLogText -match '\[nested-residual-residual-cache\]') {
+            throw "Nested residual GPU join residual cache telemetry appeared while NestedResidualGpuJoinResidualCache was disabled"
+        }
     } elseif ($nestedResidualGpuJoinSummaryMatches.Count -ne 0 -or
-              $q1_0SidecarLogText -match '\[(?:nested-residual-gpu-join|nested-residual)\] result=(?:summary|gpu_join_summary)[^\r\n]*(?:gpu_join|cpu_reconstruct|base_h2d_bytes|residual_h2d_bytes)') {
+              $nestedResidualGpuJoinResidualCacheSummaryMatches.Count -ne 0 -or
+              $q1_0SidecarLogText -match '\[(?:nested-residual-gpu-join|nested-residual)\] result=(?:summary|gpu_join_summary)[^\r\n]*(?:gpu_join|cpu_reconstruct|base_h2d_bytes|residual_h2d_bytes)' -or
+              $q1_0SidecarLogText -match '\[nested-residual-residual-cache\]') {
         throw "Nested residual GPU join telemetry appeared while NestedResidualGpuJoin was disabled"
     }
     if ($NestedResidualProfile) {
@@ -6576,6 +6704,34 @@ $rawOutputs = [pscustomobject]@{
     nested_residual_gpu_join_failures = $nestedResidualGpuJoinFailures
     nested_residual_gpu_join_cpu_reconstruct_calls =
         $nestedResidualGpuJoinCpuReconstructCalls
+    nested_residual_gpu_join_residual_cache_requested =
+        [bool]$NestedResidualGpuJoinResidualCache
+    nested_residual_gpu_join_residual_cache_observed =
+        $nestedResidualGpuJoinResidualCacheObserved
+    nested_residual_gpu_join_residual_cache_raw_summary =
+        $nestedResidualGpuJoinResidualCacheRawSummary
+    nested_residual_gpu_join_residual_cache_enabled_runtime =
+        $nestedResidualGpuJoinResidualCacheEnabledRuntime
+    nested_residual_gpu_join_residual_cache_hits =
+        $nestedResidualGpuJoinResidualCacheHits
+    nested_residual_gpu_join_residual_cache_misses =
+        $nestedResidualGpuJoinResidualCacheMisses
+    nested_residual_gpu_join_residual_cache_evictions =
+        $nestedResidualGpuJoinResidualCacheEvictions
+    nested_residual_gpu_join_residual_cache_entries =
+        $nestedResidualGpuJoinResidualCacheEntries
+    nested_residual_gpu_join_residual_cache_capacity =
+        $nestedResidualGpuJoinResidualCacheCapacity
+    nested_residual_gpu_join_residual_cache_pread_bytes =
+        $nestedResidualGpuJoinResidualCachePreadBytes
+    nested_residual_gpu_join_residual_cache_pread_bytes_avoided =
+        $nestedResidualGpuJoinResidualCachePreadBytesAvoided
+    nested_residual_gpu_join_residual_cache_h2d_bytes =
+        $nestedResidualGpuJoinResidualCacheH2DBytes
+    nested_residual_gpu_join_residual_cache_cached_join_calls =
+        $nestedResidualGpuJoinResidualCacheCachedJoinCalls
+    nested_residual_gpu_join_residual_cache_invariant_failures =
+        $nestedResidualGpuJoinResidualCacheInvariantFailures
     nested_residual_profile_requested = [bool]$NestedResidualProfile
     nested_residual_profile_observed = $nestedResidualProfileObserved
     nested_residual_profile = [ordered]@{
@@ -6946,6 +7102,34 @@ $summary = [pscustomobject]@{
     nested_residual_gpu_join_failures = $nestedResidualGpuJoinFailures
     nested_residual_gpu_join_cpu_reconstruct_calls =
         $nestedResidualGpuJoinCpuReconstructCalls
+    nested_residual_gpu_join_residual_cache_requested =
+        [bool]$NestedResidualGpuJoinResidualCache
+    nested_residual_gpu_join_residual_cache_observed =
+        $nestedResidualGpuJoinResidualCacheObserved
+    nested_residual_gpu_join_residual_cache_raw_summary =
+        $nestedResidualGpuJoinResidualCacheRawSummary
+    nested_residual_gpu_join_residual_cache_enabled_runtime =
+        $nestedResidualGpuJoinResidualCacheEnabledRuntime
+    nested_residual_gpu_join_residual_cache_hits =
+        $nestedResidualGpuJoinResidualCacheHits
+    nested_residual_gpu_join_residual_cache_misses =
+        $nestedResidualGpuJoinResidualCacheMisses
+    nested_residual_gpu_join_residual_cache_evictions =
+        $nestedResidualGpuJoinResidualCacheEvictions
+    nested_residual_gpu_join_residual_cache_entries =
+        $nestedResidualGpuJoinResidualCacheEntries
+    nested_residual_gpu_join_residual_cache_capacity =
+        $nestedResidualGpuJoinResidualCacheCapacity
+    nested_residual_gpu_join_residual_cache_pread_bytes =
+        $nestedResidualGpuJoinResidualCachePreadBytes
+    nested_residual_gpu_join_residual_cache_pread_bytes_avoided =
+        $nestedResidualGpuJoinResidualCachePreadBytesAvoided
+    nested_residual_gpu_join_residual_cache_h2d_bytes =
+        $nestedResidualGpuJoinResidualCacheH2DBytes
+    nested_residual_gpu_join_residual_cache_cached_join_calls =
+        $nestedResidualGpuJoinResidualCacheCachedJoinCalls
+    nested_residual_gpu_join_residual_cache_invariant_failures =
+        $nestedResidualGpuJoinResidualCacheInvariantFailures
     nested_residual_profile_requested = [bool]$NestedResidualProfile
     nested_residual_profile_observed = $nestedResidualProfileObserved
     nested_residual_profile = [ordered]@{
@@ -7850,6 +8034,7 @@ Write-Host ("nested residual exact-cache requested experts: " + $NestedResidualC
 Write-Host ("nested residual gpu-cache requested/observed/route-calls/hits/misses/host-fills/host-bytes/h2d-bytes/failures: " + [bool]$NestedResidualGpuCache + " / " + $nestedResidualVramRuntimeObserved + " / " + $nestedResidualVramRouteCalls + " / " + $nestedResidualVramHits + " / " + $nestedResidualVramMisses + " / " + $nestedResidualVramHostFills + " / " + $nestedResidualVramHostBytes + " / " + $nestedResidualVramH2DBytes + " / " + $nestedResidualVramFailures)
 Write-Host ("nested residual gpu-join safety receipt validated/path/hash: " + $nestedResidualGpuJoinSafetyReceiptValidated + " / " + $nestedResidualGpuJoinSafetyReceiptPathAtStart + " / " + $nestedResidualGpuJoinSafetyReceiptHashAtStart)
 Write-Host ("nested residual gpu-join requested/observed/runtime-requested/runtime-observed/calls/blocks/base-H2D/residual-H2D/native-H2D/sec/wait-calls/wait-sec/verify-calls/verify-bytes/verify-sec/mismatches/failures/cpu-reconstruct-calls: " + [bool]$NestedResidualGpuJoin + " / " + $nestedResidualGpuJoinObserved + " / " + $nestedResidualGpuJoinRequestedRuntime + " / " + $nestedResidualGpuJoinObservedRuntime + " / " + $nestedResidualGpuJoinCalls + " / " + $nestedResidualGpuJoinBlocks + " / " + $nestedResidualGpuJoinBaseH2DBytes + " / " + $nestedResidualGpuJoinResidualH2DBytes + " / " + $nestedResidualGpuJoinNativeH2DBytes + " / " + $nestedResidualGpuJoinSeconds + " / " + $nestedResidualGpuJoinWaitCalls + " / " + $nestedResidualGpuJoinWaitSeconds + " / " + $nestedResidualGpuJoinVerifyCalls + " / " + $nestedResidualGpuJoinVerifyBytes + " / " + $nestedResidualGpuJoinVerifySeconds + " / " + $nestedResidualGpuJoinVerifyMismatches + " / " + $nestedResidualGpuJoinFailures + " / " + $nestedResidualGpuJoinCpuReconstructCalls)
+Write-Host ("nested residual gpu-join residual-cache requested/observed/enabled/hits/misses/evictions/entries/capacity/pread-bytes/pread-avoided/H2D/cached-join-calls/invariant-failures: " + [bool]$NestedResidualGpuJoinResidualCache + " / " + $nestedResidualGpuJoinResidualCacheObserved + " / " + $nestedResidualGpuJoinResidualCacheEnabledRuntime + " / " + $nestedResidualGpuJoinResidualCacheHits + " / " + $nestedResidualGpuJoinResidualCacheMisses + " / " + $nestedResidualGpuJoinResidualCacheEvictions + " / " + $nestedResidualGpuJoinResidualCacheEntries + " / " + $nestedResidualGpuJoinResidualCacheCapacity + " / " + $nestedResidualGpuJoinResidualCachePreadBytes + " / " + $nestedResidualGpuJoinResidualCachePreadBytesAvoided + " / " + $nestedResidualGpuJoinResidualCacheH2DBytes + " / " + $nestedResidualGpuJoinResidualCacheCachedJoinCalls + " / " + $nestedResidualGpuJoinResidualCacheInvariantFailures)
 Write-Host ("nested residual profile requested/observed lookup/pread/reconstruct/verify/host-copy/H2D-enqueue/H2D-sync/submit-launch/ready-wait sec: " + [bool]$NestedResidualProfile + " / " + $nestedResidualProfileObserved + " / " + $nestedResidualProfileLookupSeconds + " / " + $nestedResidualProfilePreadSeconds + " / " + $nestedResidualProfileReconstructSeconds + " / " + $nestedResidualProfileVerifySeconds + " / " + $nestedResidualProfileHostCopySeconds + " / " + $nestedResidualProfileH2DEnqueueSeconds + " / " + $nestedResidualProfileH2DSyncSeconds + " / " + $nestedResidualProfileRouteBeginSeconds + " / " + $nestedResidualProfileRouteReadyWaitSeconds)
 Write-Host ("Q1_0 sidecar enabled/selected-load/resident/dual-requested/dual-observed/observed/calls/slots/loads/failures: " + [bool]$Q1_0ExpertSidecar + " / " + [bool]$Q1_0SelectedLoad + " / " + [bool]$Q1_0ResidentArena + " / " + [bool]$Q1_0DualArena + " / " + $q1_0DualArenaRuntimeObserved + " / " + $q1_0SidecarRuntimeObserved + " / " + $q1_0SidecarCalls + " / " + $q1_0SidecarSlots + " / " + $q1_0SidecarSelectedLoads + " / " + $q1_0SidecarFailures)
 Write-Host ("Q1_0 resident mode/hits/misses/H2D bytes/direct-fallbacks/direct-bytes/bootstrap: " + $q1_0ResidentMode + " / " + $q1_0ResidentHits + " / " + $q1_0ResidentMisses + " / " + $q1_0ResidentH2DBytes + " / " + $q1_0DirectPreadFallbacks + " / " + $q1_0DirectPreadBytes + " / " + $q1_0BootstrapEntries)

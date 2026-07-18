@@ -298,6 +298,14 @@ struct cuda_nested_residual_state {
     uint64_t gpu_join_failures;
     uint64_t gpu_join_cpu_reconstruct_calls;
     uint64_t gpu_join_wait_calls;
+    uint64_t residual_cache_hits;
+    uint64_t residual_cache_misses;
+    uint64_t residual_cache_evictions;
+    uint64_t residual_cache_pread_bytes;
+    uint64_t residual_cache_pread_bytes_avoided;
+    uint64_t residual_cache_h2d_bytes;
+    uint64_t residual_cache_cached_join_calls;
+    uint64_t residual_cache_invariant_failures;
     uint64_t failures;
     uint64_t profile_lookup_calls;
     uint64_t profile_pread_calls;
@@ -339,6 +347,8 @@ struct cuda_nested_residual_state {
     uint8_t gpu_join_mutex_ready;
     uint8_t gpu_join_event_created;
     uint8_t gpu_join_event_pending;
+    uint8_t residual_cache_requested_flag;
+    uint8_t residual_cache_enabled;
     std::vector<uint8_t> residual_scratch;
     os_mutex_t gpu_join_mutex;
     cudaEvent_t gpu_join_done_event;
@@ -1049,6 +1059,7 @@ static int cuda_moe_prefill_tier_reserve_slots_requested(void);
 static int cuda_nested_residual_layer_required(uint32_t layer_index);
 static int cuda_nested_residual_gpu_cache_requested(void);
 static int cuda_nested_residual_gpu_join_requested(void);
+static int cuda_nested_residual_gpu_join_residual_cache_requested(void);
 static int cuda_nested_residual_fill_route_host_exact(
         uint32_t layer_index, uint32_t expert,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -2461,6 +2472,28 @@ static void cuda_nested_residual_clear(void) {
                     (unsigned long long)state.gpu_join_failures,
                     (unsigned long long)state.gpu_join_cpu_reconstruct_calls);
         }
+        if (state.residual_cache_requested_flag ||
+            state.residual_cache_enabled ||
+            state.residual_cache_hits || state.residual_cache_misses ||
+            state.residual_cache_invariant_failures) {
+            fprintf(stderr,
+                    "ds4: [nested-residual-residual-cache] result=summary "
+                    "enabled=%u hits=%llu misses=%llu evictions=%llu "
+                    "entries=%u capacity=%u pread_bytes=%llu "
+                    "pread_bytes_avoided=%llu h2d_bytes=%llu "
+                    "cached_join_calls=%llu invariant_failures=%llu\n",
+                    (unsigned)state.residual_cache_enabled,
+                    (unsigned long long)state.residual_cache_hits,
+                    (unsigned long long)state.residual_cache_misses,
+                    (unsigned long long)state.residual_cache_evictions,
+                    state.cache_count,
+                    state.cache_capacity,
+                    (unsigned long long)state.residual_cache_pread_bytes,
+                    (unsigned long long)state.residual_cache_pread_bytes_avoided,
+                    (unsigned long long)state.residual_cache_h2d_bytes,
+                    (unsigned long long)state.residual_cache_cached_join_calls,
+                    (unsigned long long)state.residual_cache_invariant_failures);
+        }
         if (state.profile_enabled) {
             const char *packed = getenv("DS4_CUDA_MOE_ROUTE_PACKED_COPY");
             const char *split_fused = getenv("DS4_CUDA_MOE_SPLIT_FUSED");
@@ -2638,6 +2671,11 @@ static int cuda_nested_residual_preload_base(void) {
     state.residual_scratch.resize((size_t)max_residual);
     state.gpu_join_requested_flag =
         cuda_nested_residual_gpu_join_requested() ? 1u : 0u;
+    state.residual_cache_requested_flag =
+        cuda_nested_residual_gpu_join_residual_cache_requested() ? 1u : 0u;
+    state.residual_cache_enabled =
+        state.gpu_join_requested_flag && state.residual_cache_requested_flag ?
+        1u : 0u;
     if (state.gpu_join_requested_flag) {
         state.gpu_join_requested = 1u;
         cudaError_t err = cudaHostAlloc(
@@ -20148,6 +20186,11 @@ static int cuda_nested_residual_gpu_join_requested(void) {
     return env && strcmp(env, "1") == 0;
 }
 
+static int cuda_nested_residual_gpu_join_residual_cache_requested(void) {
+    const char *env = getenv("DS4_NESTED_RESIDUAL_GPU_JOIN_RESIDUAL_CACHE");
+    return env && strcmp(env, "1") == 0;
+}
+
 static int cuda_moe_prefill_vram_seed_total_requested(void) {
     const char *env = getenv("DS4_CUDA_PREFILL_VRAM_SEED_TOTAL");
     if (!env || !env[0] || strcmp(env, "0") == 0) return 0;
@@ -24686,6 +24729,14 @@ extern "C" int ds4_gpu_routed_moe_prepare_selected(
 static int cuda_nested_residual_resolve_exact(
         uint32_t layer_index, uint32_t expert, uint32_t *slot_out) {
     cuda_nested_residual_state &state = g_nested_residual;
+    if (state.residual_cache_enabled) {
+        fprintf(stderr,
+                "ds4: nested residual CPU resolver refused in residual-cache mode\n");
+        state.residual_cache_invariant_failures++;
+        state.failures++;
+        state.hard_failure = 1;
+        return -1;
+    }
     if (!slot_out || !state.active ||
         layer_index >= CUDA_NESTED_RESIDUAL_LAYER_COUNT ||
         expert >= CUDA_NESTED_RESIDUAL_EXPERT_COUNT ||
@@ -24857,6 +24908,155 @@ static int cuda_nested_residual_resolve_exact(
     return 1;
 }
 
+static int cuda_nested_residual_resolve_residual_slot_locked(
+        uint32_t layer_index, uint32_t expert, uint32_t *slot_out) {
+    cuda_nested_residual_state &state = g_nested_residual;
+    if (!slot_out || !state.residual_cache_enabled ||
+        layer_index >= CUDA_NESTED_RESIDUAL_LAYER_COUNT ||
+        expert >= CUDA_NESTED_RESIDUAL_EXPERT_COUNT ||
+        !state.layers[layer_index].ready) {
+        state.residual_cache_invariant_failures++;
+        state.failures++;
+        return -1;
+    }
+    cuda_nested_residual_layer &layer = state.layers[layer_index];
+    if (layer.residual_expert_bytes == 0 ||
+        layer.residual_expert_bytes > state.cache_slot_bytes ||
+        state.cache_capacity == 0 ||
+        state.cache_by_layer_expert.size() <
+            CUDA_NESTED_RESIDUAL_LAYER_COUNT *
+                CUDA_NESTED_RESIDUAL_EXPERT_COUNT) {
+        state.residual_cache_invariant_failures++;
+        state.failures++;
+        return -1;
+    }
+
+    const int profile = state.profile_enabled != 0;
+    const double lookup_started = profile ? cuda_wall_sec() : 0.0;
+    if (profile) state.profile_lookup_calls++;
+    const uint32_t map_index = layer_index *
+        CUDA_NESTED_RESIDUAL_EXPERT_COUNT + expert;
+    const int32_t cached = state.cache_by_layer_expert[map_index];
+    if (cached >= 0 && (uint32_t)cached < state.cache_capacity) {
+        cuda_nested_residual_cache_slot &slot =
+            state.cache_slots[(uint32_t)cached];
+        if (slot.valid && slot.layer == layer_index && slot.expert == expert) {
+            if (profile) {
+                state.profile_lookup_seconds +=
+                    cuda_wall_sec() - lookup_started;
+            }
+            slot.age = ++state.age;
+            state.residual_cache_hits++;
+            state.residual_cache_pread_bytes_avoided +=
+                layer.residual_expert_bytes;
+            *slot_out = (uint32_t)cached;
+            return 1;
+        }
+        if (profile) {
+            state.profile_lookup_seconds += cuda_wall_sec() - lookup_started;
+        }
+        state.residual_cache_invariant_failures++;
+        state.reconstruction_mismatches++;
+        state.failures++;
+        return -1;
+    }
+
+    uint32_t victim = UINT32_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < state.cache_capacity; i++) {
+        const cuda_nested_residual_cache_slot &slot = state.cache_slots[i];
+        if (!slot.valid) {
+            victim = i;
+            break;
+        }
+        if (slot.age < oldest) {
+            oldest = slot.age;
+            victim = i;
+        }
+    }
+    if (victim == UINT32_MAX) {
+        if (profile) {
+            state.profile_lookup_seconds += cuda_wall_sec() - lookup_started;
+        }
+        state.residual_cache_invariant_failures++;
+        state.failures++;
+        return -1;
+    }
+    if (profile) {
+        state.profile_lookup_seconds += cuda_wall_sec() - lookup_started;
+    }
+
+    cuda_nested_residual_cache_slot &slot = state.cache_slots[victim];
+    if (slot.copy_pending) {
+        const double wait_started = profile ? cuda_wall_sec() : 0.0;
+        const cudaError_t wait = cudaEventSynchronize(slot.reuse_event);
+        if (profile) {
+            state.profile_reuse_wait_calls++;
+            state.profile_reuse_wait_seconds +=
+                cuda_wall_sec() - wait_started;
+        }
+        if (wait != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: nested residual residual-cache reuse wait failed: %s\n",
+                    cudaGetErrorString(wait));
+            (void)cudaGetLastError();
+            state.residual_cache_invariant_failures++;
+            state.failures++;
+            return -1;
+        }
+        slot.copy_pending = 0;
+    }
+    if (slot.valid) {
+        const uint32_t old_index = slot.layer *
+            CUDA_NESTED_RESIDUAL_EXPERT_COUNT + slot.expert;
+        if (old_index < state.cache_by_layer_expert.size() &&
+            state.cache_by_layer_expert[old_index] == (int32_t)victim) {
+            state.cache_by_layer_expert[old_index] = -1;
+        }
+        slot.valid = 0;
+        if (state.cache_count > 0) state.cache_count--;
+        state.residual_cache_evictions++;
+    }
+
+    const uint64_t residual_offset = layer.residual_layer_start +
+        (uint64_t)expert * layer.residual_expert_bytes;
+    if (residual_offset > state.file_size ||
+        layer.residual_expert_bytes > state.file_size - residual_offset) {
+        state.residual_cache_invariant_failures++;
+        state.failures++;
+        return -1;
+    }
+    uint8_t *destination = state.cache +
+        (uint64_t)victim * state.cache_slot_bytes;
+    const double pread_started = profile ? cuda_wall_sec() : 0.0;
+    const int pread_ok = cuda_pread_full(
+        &state.file, destination, layer.residual_expert_bytes,
+        residual_offset);
+    if (profile) {
+        state.profile_pread_calls++;
+        state.profile_pread_seconds += cuda_wall_sec() - pread_started;
+    }
+    if (!pread_ok) {
+        state.failures++;
+        return -1;
+    }
+
+    state.residual_cache_misses++;
+    state.residual_preads++;
+    state.residual_bytes += layer.residual_expert_bytes;
+    state.residual_cache_pread_bytes += layer.residual_expert_bytes;
+    slot.layer = layer_index;
+    slot.expert = expert;
+    slot.age = ++state.age;
+    slot.valid = 1;
+    if (state.cache_count < state.cache_capacity) {
+        state.cache_count++;
+    }
+    state.cache_by_layer_expert[map_index] = (int32_t)victim;
+    *slot_out = victim;
+    return 1;
+}
+
 static int cuda_nested_residual_join_to_device_exact(
         uint32_t layer_index, uint32_t expert,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -24886,6 +25086,8 @@ static int cuda_nested_residual_join_to_device_exact(
     const cuda_nested_residual_record &down = layer.records[2];
     uint64_t residual_offset = 0;
     const uint8_t *expert_base = NULL;
+    const uint8_t *residual_host_source = state.gpu_join_residual_host;
+    uint32_t residual_cache_slot = UINT32_MAX;
     double join_started = 0.0;
     cudaError_t err = cudaSuccess;
     char *dst[CUDA_NESTED_RESIDUAL_PART_COUNT] = {
@@ -24949,23 +25151,33 @@ static int cuda_nested_residual_join_to_device_exact(
         }
         state.gpu_join_event_pending = 0u;
     }
-    residual_offset = layer.residual_layer_start +
-        (uint64_t)expert * layer.residual_expert_bytes;
-    if (residual_offset > state.file_size ||
-        layer.residual_expert_bytes > state.file_size - residual_offset) {
-        state.gpu_join_failures++;
-        state.failures++;
-        goto fail_locked;
+    if (state.residual_cache_enabled) {
+        if (cuda_nested_residual_resolve_residual_slot_locked(
+                layer_index, expert, &residual_cache_slot) != 1) {
+            state.gpu_join_failures++;
+            goto fail_locked;
+        }
+        residual_host_source = state.cache +
+            (uint64_t)residual_cache_slot * state.cache_slot_bytes;
+    } else {
+        residual_offset = layer.residual_layer_start +
+            (uint64_t)expert * layer.residual_expert_bytes;
+        if (residual_offset > state.file_size ||
+            layer.residual_expert_bytes > state.file_size - residual_offset) {
+            state.gpu_join_failures++;
+            state.failures++;
+            goto fail_locked;
+        }
+        if (!cuda_pread_full(&state.file, state.gpu_join_residual_host,
+                             layer.residual_expert_bytes, residual_offset)) {
+            state.gpu_join_failures++;
+            state.failures++;
+            goto fail_locked;
+        }
+        state.exact_cache_misses++;
+        state.residual_preads++;
+        state.residual_bytes += layer.residual_expert_bytes;
     }
-    if (!cuda_pread_full(&state.file, state.gpu_join_residual_host,
-                         layer.residual_expert_bytes, residual_offset)) {
-        state.gpu_join_failures++;
-        state.failures++;
-        goto fail_locked;
-    }
-    state.exact_cache_misses++;
-    state.residual_preads++;
-    state.residual_bytes += layer.residual_expert_bytes;
 
     expert_base = state.base + layer.base_offset +
         (uint64_t)expert * layer.base_expert_bytes;
@@ -24976,7 +25188,7 @@ static int cuda_nested_residual_join_to_device_exact(
     if (err == cudaSuccess) stream_touched = 1;
     if (err == cudaSuccess) {
         err = cudaMemcpyAsync(
-            state.gpu_join_residual_device, state.gpu_join_residual_host,
+            state.gpu_join_residual_device, residual_host_source,
             (size_t)layer.residual_expert_bytes,
             cudaMemcpyHostToDevice, stream);
         if (err == cudaSuccess) stream_touched = 1;
@@ -24992,6 +25204,10 @@ static int cuda_nested_residual_join_to_device_exact(
     }
     state.gpu_join_base_h2d_bytes += layer.base_expert_bytes;
     state.gpu_join_residual_h2d_bytes += layer.residual_expert_bytes;
+    if (state.residual_cache_enabled) {
+        state.residual_cache_h2d_bytes += layer.residual_expert_bytes;
+        state.residual_cache_cached_join_calls++;
+    }
     state.h2d_bytes +=
         layer.base_expert_bytes + layer.residual_expert_bytes;
 
