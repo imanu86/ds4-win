@@ -148,6 +148,95 @@ Across the three exact, uncontaminated rows per arm, candidate residual preads
 and residual bytes must both be lower than control, and total avoided pread
 bytes must be positive. Only then can G127 report its scoped transport A/B.
 
+## Result
+
+G127 completed the balanced six-process sequence with three independent
+processes per arm. All six accepted outputs were exact and uncontaminated,
+with machine-quiescence preflight failures `0` and runtime contamination peak
+`0` on every row.
+
+The admitted G127 safety receipt is:
+
+`C:\Users\imanu\Documents\Codex\2026-07-07\cia\work\ds4-win-publish-g126-20260718-v2\g7_runs\g7_g127_clean_safety_v2_20260718T221247584Z_10b3d546a4_receipt.json`
+
+SHA-256:
+
+`906dbf4cec4e2e53a49de3568aabd19346da6809bef0eba68cc9eb3166e704b0`
+
+The linked safety result SHA-256 is
+`85c9ecb678e9ecb0bcfa9b0ce1ec87136d03d67029134aa2bda492029c372a37`.
+The receipt binds exact content SHA
+`fd6c4522975a71e252b90199d49cfe3236310e2a7285dc0fc4d0e9d0e4885510`,
+prompt SHA
+`38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6`,
+configuration SHA
+`99b58845fa0aae49f3e29774c7834bcb50a48fc8ddafd795442989f3cfb9af23`,
+model SHA
+`efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668`,
+sidecar SHA
+`07199bc5503aa6e2dea10f702c1ca9e8f05a5bf466a56cbed031f6a5fca4bdf9`,
+sidecar payload SHA
+`02c8cb248a8184e365e2e486653484165db39402fd28320ba621fb4fdb3f7bd8`,
+executable SHA
+`d610f60eb6e6322ff444a49d0b2a4ae45e45ac9a5ac60688acc537f05621155c`,
+build manifest SHA
+`277f948355d9758aee09fa84b34ec5ce3679c8308849bbf4326bc3e84d95ac6a`,
+build input fingerprint SHA
+`3387d4a2d987b6a1a9423ab99fa55d5323f585a788d94d546bd4a5f211ecf268`,
+build head `84d2b66eb30cdaec0df75daf179249b08dcc1d94`, harness SHA
+`8265416a6b0897c45cfc2c403a848e92c0335976a64330a9eb4066148fd445c1`,
+and bootstrap SHA
+`1f0da3473ad707c605d32dd55da454f9ebf74456ed479204a2763668f203fee0`.
+Safety exactness counters were reconstruction verify `true`, verify calls
+`3783`, verify bytes `8925216768`, verify mismatches `0`, nested mismatches
+`0`, nested failures `0`, GPU-join failures `0`, CPU reconstruct calls `0`,
+native H2D bytes `0`, selected-load fallbacks `0`, and fallback markers `0`.
+Safety quiescence was ready-to-launch `true`, skipped `false`, preflight
+failures `0`, and runtime contamination consecutive peak `0`.
+
+The first G127 safety attempt
+`g7_g127_clean_safety_20260718T220600228Z_87825500c7` is deliberately not an
+admitted safety receipt. It produced only preflight, raw-output, telemetry and
+stderr artifacts, with `raw_outputs.complete=false` and no `_receipt.json`.
+That attempt failed closed at the accounting/protocol layer and carries no
+performance, quality, SOTA or A/B claim, even though its raw runtime log is
+retained for provenance.
+
+| Pos | Arm | Repeat | Exact | Clean | E2E t/s | Decode t/s | TTFT s | Residual preads | Residual bytes | Cache hits | Cache misses | Pread bytes avoided |
+|---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | control | 1 | true | true | `0.643550` | `1.58` | `58.677` | `1261` | `3966763008` | `0` | `0` | `0` |
+| 2 | candidate | 1 | true | true | `0.655797` | `1.59` | `56.863` | `869` | `2733637632` | `392` | `869` | `1233125376` |
+| 3 | candidate | 2 | true | true | `0.654041` | `1.58` | `56.876` | `869` | `2733637632` | `392` | `869` | `1233125376` |
+| 4 | control | 2 | true | true | `0.629410` | `1.57` | `60.557` | `1261` | `3966763008` | `0` | `0` | `0` |
+| 5 | control | 3 | true | true | `0.636016` | `1.57` | `59.496` | `1261` | `3966763008` | `0` | `0` | `0` |
+| 6 | candidate | 3 | true | true | `0.645700` | `1.59` | `58.501` | `869` | `2733637632` | `392` | `869` | `1233125376` |
+
+| Metric | Control mean | Candidate mean | Delta |
+|---|---:|---:|---:|
+| E2E tokens/s | `0.6363253333333333` | `0.651846` | `+2.439108715877003%` |
+| Server decode tokens/s | `1.5733333333333335` | `1.5866666666666667` | `+0.8474576271186418%` |
+| TTFT seconds | `59.576666666666675` | `57.413333333333334` | `-2.163333333333341` |
+
+Transport moved in the intended direction and was stable across all three
+candidate rows: residual preads were `1261` per control row versus `869` per
+candidate row, and candidate avoided `1233125376` residual pread bytes on each
+row. Aggregated residual preads fell from `3783` to `2607`; residual bytes
+fell from `11900289024` to `8200912896`; total candidate pread bytes avoided
+were `3699376128`.
+
+The scoped verdict is therefore honest but narrow: pread avoidance is stable
+and exact under the recorded provenance/quiescence gates, while server decode
+improved only `+0.847%`. G127 is not SOTA, is not a general latency or quality
+claim, and does not replace longer L0-L3 grading.
+
+Authoritative aggregate:
+
+`C:\Users\imanu\Documents\Codex\2026-07-07\cia\work\ds4-win-publish-g126-20260718-v2\g7_runs\g7_g127_clean_ab_20260718T221539174Z_6088859efa_result.json`
+
+SHA-256:
+
+`b580aba04d5b138c786b634570b06544f1ec2387e1380afad79d38f9ab8c8902`
+
 ## Static-only validation for this task
 
 Run only:
