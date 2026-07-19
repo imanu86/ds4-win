@@ -126,7 +126,10 @@ param(
     [string]$ExpectedNestedResidualPayloadSHA256 = "",
     [switch]$NestedResidualVerifyReconstruction,
     [switch]$NestedResidualProfile,
-    [ValidateRange(1, 64)][int]$NestedResidualCacheExperts = 6,
+    [switch]$NestedResidualPageableBase,
+    [ValidateRange(0.0, 30.0)][double]$NestedResidualBasePinnedGiB = 0,
+    [switch]$NestedResidualCachePageable,
+    [ValidateRange(0, 4096)][int]$NestedResidualCacheExperts = 6,
     [switch]$NestedResidualStructuralN1,
     [switch]$NestedResidualGpuCache,
     [switch]$NestedResidualGpuJoin,
@@ -896,6 +899,23 @@ $benchmarkVerifiedReceiptLockProofRequired = $false
 $benchmarkVerifiedReceiptLockProofObserved = $false
 $benchmarkVerifiedReceiptLockProof = $null
 $nestedResidualBenchmarkMember = $false
+$nestedResidualStructuralMember = $false
+$nestedResidualAllLayerStorageRequested = [bool](
+    $NestedResidualPageableBase -or $NestedResidualCachePageable -or
+    $NestedResidualBasePinnedGiB -ne 0.0)
+$nestedResidualExpectedBaseHostGiB = 0.0
+$nestedResidualExpectedResidualCacheHostGiB = 0.0
+$nestedResidualExpectedHostAllocationGiB = 0.0
+if ($nestedResidualAllLayerStorageRequested) {
+    # DS4 routed layers 3..42 contain 10,240 exact nested base entries at
+    # 3.75 MiB each. Residual-cache slots are 3 MiB each.
+    $nestedResidualExpectedBaseHostGiB = 37.5
+    $nestedResidualExpectedResidualCacheHostGiB =
+        ([double]$NestedResidualCacheExperts * 3.0) / 1024.0
+    $nestedResidualExpectedHostAllocationGiB =
+        $nestedResidualExpectedBaseHostGiB +
+        $nestedResidualExpectedResidualCacheHostGiB + $DynamicArenaGiB
+}
 if ($AllowNestedResidualBenchmarkSuite) {
     if (-not $NestedResidualSidecar) {
         throw "AllowNestedResidualBenchmarkSuite requires NestedResidualSidecar"
@@ -965,6 +985,9 @@ if ($NestedResidualSidecar) {
           $ExpectedNestedResidualPayloadSHA256 -or
           $NestedResidualVerifyReconstruction -or
           $NestedResidualProfile -or
+          $NestedResidualPageableBase -or
+          $NestedResidualBasePinnedGiB -ne 0.0 -or
+          $NestedResidualCachePageable -or
           $NestedResidualStructuralN1 -or
           $NestedResidualGpuCache -or
           $NestedResidualGpuJoin -or
@@ -979,9 +1002,53 @@ if ($NestedResidualStructuralN1 -and
     ($GateKind -ne "structural-safety" -or $Repeats -ne 1 -or $Warmup)) {
     throw "NestedResidualStructuralN1 requires GateKind=structural-safety, Repeats=1, and no warmup"
 }
+if ($nestedResidualStructuralMember -and
+    $nestedResidualAllLayerStorageRequested -and
+    -not $NestedResidualVerifyReconstruction) {
+    throw "Nested residual all-layer storage requires exact reconstruction verification for safety"
+}
+if ($NestedResidualCacheExperts -gt 64 -and -not $NestedResidualCachePageable) {
+    throw "Nested residual cache experts must fail closed above 64 unless NestedResidualCachePageable is enabled"
+}
+if ($NestedResidualPageableBase) {
+    if (-not $NestedResidualGpuCache -or -not $NestedResidualGpuJoin) {
+        throw "Nested residual pageable base requires NestedResidualGpuCache and NestedResidualGpuJoin"
+    }
+    if ($NestedResidualBasePinnedGiB -le 0.0) {
+        throw "Nested residual base pinned GiB budget must be provided when pageable base is enabled"
+    }
+    if (-not $ForceOpenRouter -or $ReapMaskFile -or $AllowEmbeddedBakeMask) {
+        throw "Nested residual all-layer storage requires full/open router and no mask"
+    }
+}
+if ($nestedResidualAllLayerStorageRequested -and
+    (-not $NestedResidualPageableBase -or
+     -not $NestedResidualCachePageable)) {
+    throw "G128 all-layer storage requires both pageable base and pageable residual cache"
+}
+if ($nestedResidualAllLayerStorageRequested -and
+    $NestedResidualCacheExperts -lt 40) {
+    throw "G128 all-layer storage requires at least one residual-cache slot per routed layer"
+}
+if ($nestedResidualAllLayerStorageRequested -and
+    ($NestedResidualBasePinnedGiB + $DynamicArenaGiB) -gt 30.0) {
+    throw "G128 all-layer storage requires nested base pinned GiB plus dynamic arena GiB <= 30"
+}
+if ($NestedResidualBasePinnedGiB -gt 0.0 -and -not $NestedResidualPageableBase) {
+    throw "NestedResidualBasePinnedGiB requires NestedResidualPageableBase"
+}
+if ($NestedResidualCachePageable) {
+    if (-not $NestedResidualGpuJoinResidualCache) {
+        throw "NestedResidualCachePageable requires NestedResidualGpuJoinResidualCache"
+    }
+    if (-not $ForceOpenRouter -or $ReapMaskFile -or $AllowEmbeddedBakeMask) {
+        throw "Nested residual all-layer storage requires full/open router and no mask"
+    }
+}
 if ($NestedResidualGpuCache) {
     if (-not $NestedResidualSidecar -or -not $GpuResidentRoutes -or
-        -not $SplitFused -or $NestedResidualCacheExperts -lt 1) {
+        -not $SplitFused -or
+        ($NestedResidualCacheExperts -lt 1 -and -not $NestedResidualCachePageable)) {
         throw "NestedResidualGpuCache requires NestedResidualSidecar, GpuResidentRoutes, SplitFused, and NestedResidualCacheExperts >= 1"
     }
 }
@@ -995,7 +1062,7 @@ if ($NestedResidualGpuJoin) {
             -not $ExpectedNestedResidualGpuJoinSafetyReceiptSHA256 -or
             -not $AllowNestedResidualBenchmarkSuite -or
             $GateKind -ne "benchmark") {
-            throw "NestedResidualGpuJoin without runtime reconstruction verification requires a hash-pinned G125 safety receipt and an explicit outer benchmark suite"
+            throw "NestedResidualGpuJoin without runtime reconstruction verification requires a compatible hash-pinned safety receipt and an explicit outer benchmark suite"
         }
     }
 }
@@ -1517,6 +1584,20 @@ if ($NestedResidualSidecar) {
     }
     $env:DS4_NESTED_RESIDUAL_CACHE_EXPERTS =
         [string]$NestedResidualCacheExperts
+    if ($NestedResidualPageableBase) {
+        $env:DS4_NESTED_RESIDUAL_PAGEABLE_BASE = "1"
+        $env:DS4_NESTED_RESIDUAL_BASE_PINNED_GIB =
+            $NestedResidualBasePinnedGiB.ToString(
+                [Globalization.CultureInfo]::InvariantCulture)
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_PAGEABLE_BASE -ErrorAction SilentlyContinue
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_BASE_PINNED_GIB -ErrorAction SilentlyContinue
+    }
+    if ($NestedResidualCachePageable) {
+        $env:DS4_NESTED_RESIDUAL_CACHE_PAGEABLE = "1"
+    } else {
+        Remove-Item Env:\DS4_NESTED_RESIDUAL_CACHE_PAGEABLE -ErrorAction SilentlyContinue
+    }
     if ($NestedResidualGpuCache) {
         $env:DS4_NESTED_RESIDUAL_GPU_CACHE = "1"
     } else {
@@ -1541,6 +1622,9 @@ if ($NestedResidualSidecar) {
     Remove-Item Env:\DS4_NESTED_RESIDUAL_BENCHMARK_UNVERIFIED -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_PROFILE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_CACHE_EXPERTS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_PAGEABLE_BASE -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_BASE_PINNED_GIB -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_NESTED_RESIDUAL_CACHE_PAGEABLE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_CACHE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_NESTED_RESIDUAL_GPU_JOIN_RESIDUAL_CACHE -ErrorAction SilentlyContinue
@@ -2119,6 +2203,11 @@ if ($effectiveMinimumAvailableGiB -eq 0.0) {
             $effectiveMinimumAvailableGiB,
             ($DynamicArenaGiB * 1.5) + 2.0)
     }
+    if ($nestedResidualAllLayerStorageRequested) {
+        $effectiveMinimumAvailableGiB = [math]::Max(
+            $effectiveMinimumAvailableGiB,
+            $nestedResidualExpectedHostAllocationGiB + 4.0)
+    }
 }
 $memoryPreflight = Invoke-G7MemoryPreflight -Skip:$SkipMemoryPreflight `
     -MinimumAvailableGiB $effectiveMinimumAvailableGiB -Label ("g7:" + $Tag)
@@ -2405,7 +2494,12 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
         "ds4_g125_nested_gpu_join_safety_v1"
     $safetyReceiptIsG127 = $safetyReceiptSchema -eq
         "ds4_g127_nested_gpu_join_residual_cache_safety_v1"
-    if ((-not $safetyReceiptIsG125 -and -not $safetyReceiptIsG127) -or
+    $safetyReceiptIsG128 = $safetyReceiptSchema -eq
+        "ds4_g128_all_layer_nested_storage_safety_v1"
+    $safetyReceiptHasResidualCache =
+        $safetyReceiptIsG127 -or $safetyReceiptIsG128
+    if ((-not $safetyReceiptIsG125 -and -not $safetyReceiptIsG127 -and
+         -not $safetyReceiptIsG128) -or
         [string]$safetyReceipt.status -ne
             "pass_structural_n1_no_performance_or_quality_verdict" -or
         [string]$safetyReceipt.routing_contract -ne
@@ -2437,10 +2531,11 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
         [UInt64]$safetyReceipt.gpu_cache.failures -ne 0) {
         throw "Nested residual GPU join safety receipt contract mismatch"
     }
-    if ($NestedResidualGpuJoinResidualCache -and -not $safetyReceiptIsG127) {
-        throw "Nested residual GPU join residual cache requires a G127 safety receipt"
+    if ($NestedResidualGpuJoinResidualCache -and
+        -not $safetyReceiptHasResidualCache) {
+        throw "Nested residual GPU join residual cache requires a G127 safety receipt or compatible G128 safety receipt"
     }
-    if ($safetyReceiptIsG127 -and
+    if ($safetyReceiptHasResidualCache -and
         ([string]$safetyReceipt.result_sha256 -ine
             $nestedResidualGpuJoinSafetyResultHashAtStart -or
          [string]$safetyReceipt.claim_scope -ne
@@ -2467,7 +2562,69 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
          [bool]$safetyReceipt.machine_quiescence.skipped -or
          [int]$safetyReceipt.machine_quiescence.preflight_failures -ne 0 -or
          [int]$safetyReceipt.machine_quiescence.runtime_contamination_consecutive_peak -ne 0)) {
-        throw "Nested residual GPU join G127 safety receipt contract mismatch"
+        if ($safetyReceiptIsG127) {
+            throw "Nested residual GPU join G127 safety receipt contract mismatch"
+        }
+        throw "Nested residual GPU join G128 safety receipt contract mismatch"
+    }
+    if ($safetyReceiptIsG128) {
+        $receiptSidecarPath = [IO.Path]::GetFullPath(
+            [string]$safetyReceipt.sidecar.path)
+        if ([string]$safetyReceipt.claim_scope -ne
+                "structural_safety_only_no_sota_no_quality_verdict" -or
+            $receiptSidecarPath -ine $nestedResidualInfoAtStart.FullName -or
+            [UInt64]$safetyReceipt.sidecar.bytes -ne
+                [UInt64]$nestedResidualInfoAtStart.Length -or
+            [string]$safetyReceipt.sidecar.sha256 -ine
+                $nestedResidualHashAtStart -or
+            [string]$safetyReceipt.sidecar.source_sha256 -ine
+                $ExpectedNestedResidualSourceSHA256 -or
+            [string]$safetyReceipt.sidecar.payload_sha256 -ine
+                $ExpectedNestedResidualPayloadSHA256 -or
+            [int]$safetyReceipt.all_layer.first -ne 3 -or
+            [int]$safetyReceipt.all_layer.last -ne 42 -or
+            [int]$safetyReceipt.all_layer.count -ne 40 -or
+            -not [bool]$safetyReceipt.base_storage.pageable_enabled -or
+            [double]$safetyReceipt.base_storage.pinned_gib_requested -ne
+                $NestedResidualBasePinnedGiB -or
+            [double]$safetyReceipt.base_storage.dynamic_arena_gib -ne
+                $DynamicArenaGiB -or
+            [double]$safetyReceipt.base_storage.expected_base_host_gib -ne
+                $nestedResidualExpectedBaseHostGiB -or
+            [double]$safetyReceipt.base_storage.expected_residual_cache_host_gib -ne
+                $nestedResidualExpectedResidualCacheHostGiB -or
+            [double]$safetyReceipt.base_storage.expected_total_host_allocation_gib -ne
+                $nestedResidualExpectedHostAllocationGiB -or
+            [UInt64]$safetyReceipt.base_storage.pinned_entries -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pinned_bytes -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pinned_hits -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pinned_h2d_bytes -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pageable_entries -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pageable_bytes -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pageable_hits -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.pageable_h2d_bytes -eq 0 -or
+            [UInt64]$safetyReceipt.base_storage.invariant_failures -ne 0 -or
+            -not [bool]$safetyReceipt.residual_cache.pageable_enabled -or
+            [UInt64]$safetyReceipt.residual_cache.capacity -ne
+                [UInt64]$NestedResidualCacheExperts -or
+            [UInt64]$safetyReceipt.residual_cache.pinned_entries -ne 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pinned_bytes -ne 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pinned_hits -ne 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pinned_h2d_bytes -ne 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pageable_entries -eq 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pageable_bytes -eq 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pageable_hits -eq 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pageable_h2d_bytes -eq 0 -or
+            [UInt64]$safetyReceipt.residual_cache.pageable_invariant_failures -ne 0 -or
+            [UInt64]$safetyReceipt.residual_cache.partitioned -ne 1 -or
+            [UInt64]$safetyReceipt.residual_cache.layer_slots_min -eq 0 -or
+            [UInt64]$safetyReceipt.residual_cache.layer_slots_max -lt
+                [UInt64]$safetyReceipt.residual_cache.layer_slots_min -or
+            [UInt64]$safetyReceipt.residual_cache.layer_slots_max -gt
+                [UInt64]$safetyReceipt.residual_cache.layer_slots_min +
+                    [UInt64]1) {
+            throw "Nested residual G128 all-layer safety receipt contract mismatch"
+        }
     }
     $safetyActualHashes = @($safetyResult.results | ForEach-Object {
         [string]$_.content_sha256
@@ -2536,7 +2693,7 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
         -not [bool]$safetyResult.route_no_default_sync_requested) {
         throw "Nested residual GPU join safety result no longer binds to this benchmark configuration"
     }
-    if ($safetyReceiptIsG127 -and
+    if ($safetyReceiptHasResidualCache -and
         (-not [bool]$safetyResult.nested_residual_gpu_join_residual_cache_requested -or
          -not [bool]$safetyResult.nested_residual_gpu_join_residual_cache_observed -or
          [int]$safetyResult.nested_residual_gpu_join_residual_cache_enabled_runtime -ne 1 -or
@@ -2549,7 +2706,45 @@ if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
          [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_cached_join_calls -eq 0 -or
          [UInt64]$safetyResult.nested_residual_gpu_join_residual_cache_invariant_failures -ne 0 -or
          [UInt64]$safetyResult.moe_overlapped_io_fallbacks -ne 0)) {
-        throw "Nested residual GPU join G127 safety result no longer binds to this benchmark"
+        if ($safetyReceiptIsG127) {
+            throw "Nested residual GPU join G127 safety result no longer binds to this benchmark"
+        }
+        throw "Nested residual GPU join G128 safety result no longer binds to this benchmark"
+    }
+    if ($safetyReceiptIsG128 -and
+        (-not [bool]$safetyResult.nested_residual_pageable_base_requested -or
+         -not [bool]$safetyResult.nested_residual_cache_pageable_requested -or
+         [double]$safetyResult.nested_residual_base_pinned_gib_requested -ne
+            $NestedResidualBasePinnedGiB -or
+         [int]$safetyResult.nested_residual_all_layer_first_layer -ne 3 -or
+         [int]$safetyResult.nested_residual_all_layer_last_layer -ne 42 -or
+         [int]$safetyResult.nested_residual_all_layer_count -ne 40 -or
+         [UInt64]$safetyResult.nested_residual_base_pinned_entries -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pinned_bytes -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pinned_hits -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pinned_h2d_bytes -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pageable_entries -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pageable_bytes -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pageable_hits -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_base_pageable_h2d_bytes -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_storage_invariant_failures -ne 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pinned_entries -ne 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pinned_bytes -ne 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pinned_hits -ne 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pinned_h2d_bytes -ne 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pageable_entries -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pageable_bytes -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pageable_hits -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pageable_h2d_bytes -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_pageable_invariant_failures -ne 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_layer_partitioned -ne 1 -or
+         [UInt64]$safetyResult.nested_residual_cache_layer_slots_min -eq 0 -or
+         [UInt64]$safetyResult.nested_residual_cache_layer_slots_max -lt
+            [UInt64]$safetyResult.nested_residual_cache_layer_slots_min -or
+         [UInt64]$safetyResult.nested_residual_cache_layer_slots_max -gt
+            [UInt64]$safetyResult.nested_residual_cache_layer_slots_min +
+                [UInt64]1)) {
+        throw "Nested residual G128 all-layer safety result no longer binds to this benchmark"
     }
     $nestedResidualGpuJoinSafetyReceiptValidated = $true
 }
@@ -4543,6 +4738,33 @@ $nestedResidualVramHostFills = [UInt64]0
 $nestedResidualVramHostBytes = [UInt64]0
 $nestedResidualVramH2DBytes = [UInt64]0
 $nestedResidualVramFailures = [UInt64]0
+$nestedResidualAllLayerFirstLayer = 0
+$nestedResidualAllLayerLastLayer = 0
+$nestedResidualAllLayerCount = 0
+$nestedResidualBaseStorageRawSummary = ""
+$nestedResidualBasePinnedEntries = [UInt64]0
+$nestedResidualBasePinnedBytes = [UInt64]0
+$nestedResidualBasePinnedHits = [UInt64]0
+$nestedResidualBasePinnedH2DBytes = [UInt64]0
+$nestedResidualBasePageableEntries = [UInt64]0
+$nestedResidualBasePageableBytes = [UInt64]0
+$nestedResidualBasePageableHits = [UInt64]0
+$nestedResidualBasePageableH2DBytes = [UInt64]0
+$nestedResidualStorageInvariantFailures = [UInt64]0
+$nestedResidualCachePageableRawSummary = ""
+$nestedResidualCachePinnedEntries = [UInt64]0
+$nestedResidualCachePinnedBytes = [UInt64]0
+$nestedResidualCachePinnedHits = [UInt64]0
+$nestedResidualCachePinnedH2DBytes = [UInt64]0
+$nestedResidualCachePageableEntries = [UInt64]0
+$nestedResidualCachePageableBytes = [UInt64]0
+$nestedResidualCachePageableHits = [UInt64]0
+$nestedResidualCachePageableH2DBytes = [UInt64]0
+$nestedResidualCachePageableCachedJoinCalls = [UInt64]0
+$nestedResidualCacheLayerPartitioned = [UInt64]0
+$nestedResidualCacheLayerSlotsMin = [UInt64]0
+$nestedResidualCacheLayerSlotsMax = [UInt64]0
+$nestedResidualCachePageableInvariantFailures = [UInt64]0
 $nestedResidualGpuJoinObserved = $false
 $nestedResidualGpuJoinRawSummary = ""
 $nestedResidualGpuJoinRequestedRuntime = 0
@@ -4609,6 +4831,15 @@ $nestedResidualSummaryMatches = [regex]::Matches(
 $nestedResidualVramSummaryMatches = [regex]::Matches(
     $q1_0SidecarLogText,
     '(?m)^(?:ds4: )?\[nested-residual-vram\] result=summary route_calls=(\d+) hits=(\d+) misses=(\d+) host_fills=(\d+) host_bytes=(\d+) h2d_bytes=(\d+) failures=(\d+)\r?$')
+$nestedResidualBootstrapMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual\] bootstrap-ready[^\r\n]*\ball_layer_first=(\d+)\s+all_layer_last=(\d+)\s+all_layer_count=(\d+)[^\r\n]*\r?$')
+$nestedResidualBaseStorageSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual-base-storage\] result=summary([^\r\n]*)\r?$')
+$nestedResidualCachePageableSummaryMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[nested-residual-cache-pageable\] result=summary([^\r\n]*)\r?$')
 $nestedResidualGpuJoinSummaryMatches = [regex]::Matches(
     $q1_0SidecarLogText,
     '(?m)^(?:ds4: )?\[(?:nested-residual-gpu-join|nested-residual)\] result=(?:summary|gpu_join_summary)(?=[^\r\n]*(?:gpu_join|cpu_reconstruct|base_h2d_bytes|residual_h2d_bytes))([^\r\n]*)\r?$')
@@ -4637,6 +4868,29 @@ function Get-G7NestedResidualGpuJoinValue {
         }
     }
     throw "Nested residual GPU join summary missing counter: $Kind"
+}
+function Get-G7KeyValueSummaryMap {
+    param([Parameter(Mandatory=$true)][string]$Text)
+
+    $map = @{}
+    foreach ($counterMatch in [regex]::Matches(
+            $Text, '([A-Za-z0-9_]+)=([^\s\r\n]+)')) {
+        $map[$counterMatch.Groups[1].Value] =
+            $counterMatch.Groups[2].Value
+    }
+    return $map
+}
+function Get-G7RequiredUInt64Counter {
+    param(
+        [Parameter(Mandatory=$true)][hashtable]$Map,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)][string]$SummaryName
+    )
+
+    if (-not $Map.ContainsKey($Name)) {
+        throw "$SummaryName summary missing counter: $Name"
+    }
+    return [UInt64]$Map[$Name]
 }
 if ($NestedResidualSidecar) {
     if ($nestedResidualSummaryMatches.Count -ne 1) {
@@ -4672,6 +4926,148 @@ if ($NestedResidualSidecar) {
         throw "Nested residual runtime counters are inconsistent"
     }
     $nestedResidualRuntimeObserved = $true
+    if ($nestedResidualBootstrapMatches.Count -gt 1) {
+        throw "Nested residual bootstrap runtime requires at most one ready marker; observed $($nestedResidualBootstrapMatches.Count)"
+    }
+    if ($nestedResidualBootstrapMatches.Count -eq 1) {
+        $nestedResidualBootstrap = $nestedResidualBootstrapMatches[0]
+        $nestedResidualAllLayerFirstLayer =
+            [int]$nestedResidualBootstrap.Groups[1].Value
+        $nestedResidualAllLayerLastLayer =
+            [int]$nestedResidualBootstrap.Groups[2].Value
+        $nestedResidualAllLayerCount =
+            [int]$nestedResidualBootstrap.Groups[3].Value
+    }
+    if ($nestedResidualAllLayerStorageRequested -and
+        ($nestedResidualBootstrapMatches.Count -ne 1 -or
+         $nestedResidualAllLayerFirstLayer -ne 3 -or
+         $nestedResidualAllLayerLastLayer -ne 42 -or
+         $nestedResidualAllLayerCount -ne 40)) {
+        throw "Nested residual all-layer runtime coverage must be exactly layers 3..42"
+    }
+    if ($NestedResidualPageableBase) {
+        if ($nestedResidualBaseStorageSummaryMatches.Count -ne 1) {
+            throw "Nested residual base storage telemetry requires exactly one summary; observed $($nestedResidualBaseStorageSummaryMatches.Count)"
+        }
+        $baseStorageSummary = $nestedResidualBaseStorageSummaryMatches[0]
+        $nestedResidualBaseStorageRawSummary = $baseStorageSummary.Value
+        $baseStorageCounters = Get-G7KeyValueSummaryMap `
+            -Text $baseStorageSummary.Groups[1].Value
+        if ([string]$baseStorageCounters['mapped'] -ne '0' -or
+            [string]$baseStorageCounters['router'] -ne 'open' -or
+            [string]$baseStorageCounters['exact'] -ne '1') {
+            throw "Nested residual base storage semantic markers are inconsistent"
+        }
+        $nestedResidualBasePinnedEntries = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pinned_entries" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePinnedBytes = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pinned_bytes" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePinnedHits = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pinned_hits" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePinnedH2DBytes = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pinned_h2d_bytes" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePageableEntries = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pageable_entries" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePageableBytes = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pageable_bytes" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePageableHits = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pageable_hits" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualBasePageableH2DBytes = Get-G7RequiredUInt64Counter `
+            -Map $baseStorageCounters -Name "pageable_h2d_bytes" `
+            -SummaryName "Nested residual base storage"
+        $nestedResidualStorageInvariantFailures =
+            Get-G7RequiredUInt64Counter `
+                -Map $baseStorageCounters -Name "invariant_failures" `
+                -SummaryName "Nested residual base storage"
+        if ($nestedResidualBasePageableEntries -eq 0 -or
+            $nestedResidualBasePageableBytes -eq 0 -or
+            $nestedResidualStorageInvariantFailures -ne 0) {
+            throw "Nested residual base storage counters are inconsistent"
+        }
+    } elseif ($nestedResidualBaseStorageSummaryMatches.Count -ne 0 -or
+              $q1_0SidecarLogText -match '\[nested-residual-base-storage\]') {
+        throw "Nested residual pageable-base telemetry appeared while feature was disabled"
+    }
+    if ($NestedResidualCachePageable) {
+        if ($nestedResidualCachePageableSummaryMatches.Count -ne 1) {
+            throw "Nested residual residual-cache pageable telemetry requires exactly one summary; observed $($nestedResidualCachePageableSummaryMatches.Count)"
+        }
+        $cachePageableSummary = $nestedResidualCachePageableSummaryMatches[0]
+        $nestedResidualCachePageableRawSummary = $cachePageableSummary.Value
+        $cachePageableCounters = Get-G7KeyValueSummaryMap `
+            -Text $cachePageableSummary.Groups[1].Value
+        if ([string]$cachePageableCounters['mapped'] -ne '0' -or
+            [string]$cachePageableCounters['router'] -ne 'open' -or
+            [string]$cachePageableCounters['exact'] -ne '1') {
+            throw "Nested residual cache pageable semantic markers are inconsistent"
+        }
+        $nestedResidualCachePinnedEntries = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pinned_entries" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePinnedBytes = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pinned_bytes" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePinnedHits = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pinned_hits" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePinnedH2DBytes = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pinned_h2d_bytes" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePageableEntries = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pageable_entries" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePageableBytes = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pageable_bytes" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePageableHits = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pageable_hits" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePageableH2DBytes = Get-G7RequiredUInt64Counter `
+            -Map $cachePageableCounters -Name "pageable_h2d_bytes" `
+            -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePageableCachedJoinCalls =
+            Get-G7RequiredUInt64Counter `
+                -Map $cachePageableCounters -Name "cached_join_calls" `
+                -SummaryName "Nested residual cache pageable"
+        $nestedResidualCacheLayerPartitioned =
+            Get-G7RequiredUInt64Counter `
+                -Map $cachePageableCounters -Name "partitioned" `
+                -SummaryName "Nested residual cache pageable"
+        $nestedResidualCacheLayerSlotsMin =
+            Get-G7RequiredUInt64Counter `
+                -Map $cachePageableCounters -Name "layer_slots_min" `
+                -SummaryName "Nested residual cache pageable"
+        $nestedResidualCacheLayerSlotsMax =
+            Get-G7RequiredUInt64Counter `
+                -Map $cachePageableCounters -Name "layer_slots_max" `
+                -SummaryName "Nested residual cache pageable"
+        $nestedResidualCachePageableInvariantFailures =
+            Get-G7RequiredUInt64Counter `
+                -Map $cachePageableCounters -Name "invariant_failures" `
+                -SummaryName "Nested residual cache pageable"
+        if ($nestedResidualCachePageableEntries -eq 0 -or
+            $nestedResidualCachePageableBytes -eq 0 -or
+            $nestedResidualCachePageableCachedJoinCalls -eq 0 -or
+            $nestedResidualCacheLayerPartitioned -ne 1 -or
+            $nestedResidualCacheLayerSlotsMin -eq 0 -or
+            $nestedResidualCacheLayerSlotsMax -lt
+                $nestedResidualCacheLayerSlotsMin -or
+            $nestedResidualCacheLayerSlotsMax -gt
+                ($nestedResidualCacheLayerSlotsMin + 1) -or
+            $nestedResidualCachePageableInvariantFailures -ne 0) {
+            throw "Nested residual cache pageable counters are inconsistent"
+        }
+    } elseif ($nestedResidualCachePageableSummaryMatches.Count -ne 0 -or
+              $q1_0SidecarLogText -match '\[nested-residual-cache-pageable\]') {
+        throw "Nested residual cache pageable telemetry appeared while feature was disabled"
+    }
     if ($NestedResidualGpuCache) {
         if ($nestedResidualVramSummaryMatches.Count -ne 1) {
             throw "Nested residual GPU-cache requires exactly one VRAM summary; observed $($nestedResidualVramSummaryMatches.Count)"
@@ -4916,9 +5312,11 @@ if ($NestedResidualSidecar) {
     }
 } elseif ($nestedResidualSummaryMatches.Count -ne 0 -or
           $nestedResidualVramSummaryMatches.Count -ne 0 -or
+          $nestedResidualBaseStorageSummaryMatches.Count -ne 0 -or
+          $nestedResidualCachePageableSummaryMatches.Count -ne 0 -or
           $nestedResidualGpuJoinSummaryMatches.Count -ne 0 -or
           $nestedResidualProfileSummaryMatches.Count -ne 0 -or
-          $q1_0SidecarLogText -match '\[nested-residual(?:-vram|-gpu-join|-profile)?\]') {
+          $q1_0SidecarLogText -match '\[nested-residual(?:-vram|-gpu-join|-profile|-base-storage|-cache-pageable)?\]') {
     throw "Nested residual runtime telemetry appeared while nested residual was disabled"
 }
 $q1_0Telemetry = Read-G7Q1_0SidecarTelemetry `
@@ -6644,6 +7042,18 @@ $rawOutputs = [pscustomobject]@{
     nested_residual_expected_payload_sha256 = $(if ($ExpectedNestedResidualPayloadSHA256) { $ExpectedNestedResidualPayloadSHA256.ToLowerInvariant() } else { "" })
     nested_residual_verify_reconstruction = [bool]$NestedResidualVerifyReconstruction
     nested_residual_cache_experts_requested = $NestedResidualCacheExperts
+    nested_residual_pageable_base_requested = [bool]$NestedResidualPageableBase
+    nested_residual_base_pinned_gib_requested = $NestedResidualBasePinnedGiB
+    nested_residual_cache_pageable_requested = [bool]$NestedResidualCachePageable
+    nested_residual_expected_base_host_gib =
+        $nestedResidualExpectedBaseHostGiB
+    nested_residual_expected_residual_cache_host_gib =
+        $nestedResidualExpectedResidualCacheHostGiB
+    nested_residual_expected_host_allocation_gib =
+        $nestedResidualExpectedHostAllocationGiB
+    nested_residual_all_layer_first_layer = $nestedResidualAllLayerFirstLayer
+    nested_residual_all_layer_last_layer = $nestedResidualAllLayerLastLayer
+    nested_residual_all_layer_count = $nestedResidualAllLayerCount
     nested_residual_structural_n1_requested = [bool]$NestedResidualStructuralN1
     nested_residual_gpu_cache_requested = [bool]$NestedResidualGpuCache
     nested_residual_gpu_join_requested = [bool]$NestedResidualGpuJoin
@@ -6681,6 +7091,44 @@ $rawOutputs = [pscustomobject]@{
     nested_residual_vram_host_bytes = $nestedResidualVramHostBytes
     nested_residual_vram_h2d_bytes = $nestedResidualVramH2DBytes
     nested_residual_vram_failures = $nestedResidualVramFailures
+    nested_residual_base_storage_raw_summary =
+        $nestedResidualBaseStorageRawSummary
+    nested_residual_base_pinned_entries = $nestedResidualBasePinnedEntries
+    nested_residual_base_pinned_bytes = $nestedResidualBasePinnedBytes
+    nested_residual_base_pinned_hits = $nestedResidualBasePinnedHits
+    nested_residual_base_pinned_h2d_bytes =
+        $nestedResidualBasePinnedH2DBytes
+    nested_residual_base_pageable_entries =
+        $nestedResidualBasePageableEntries
+    nested_residual_base_pageable_bytes = $nestedResidualBasePageableBytes
+    nested_residual_base_pageable_hits = $nestedResidualBasePageableHits
+    nested_residual_base_pageable_h2d_bytes =
+        $nestedResidualBasePageableH2DBytes
+    nested_residual_storage_invariant_failures =
+        $nestedResidualStorageInvariantFailures
+    nested_residual_cache_pageable_raw_summary =
+        $nestedResidualCachePageableRawSummary
+    nested_residual_cache_pinned_entries = $nestedResidualCachePinnedEntries
+    nested_residual_cache_pinned_bytes = $nestedResidualCachePinnedBytes
+    nested_residual_cache_pinned_hits = $nestedResidualCachePinnedHits
+    nested_residual_cache_pinned_h2d_bytes =
+        $nestedResidualCachePinnedH2DBytes
+    nested_residual_cache_pageable_entries =
+        $nestedResidualCachePageableEntries
+    nested_residual_cache_pageable_bytes = $nestedResidualCachePageableBytes
+    nested_residual_cache_pageable_hits = $nestedResidualCachePageableHits
+    nested_residual_cache_pageable_h2d_bytes =
+        $nestedResidualCachePageableH2DBytes
+    nested_residual_cache_pageable_cached_join_calls =
+        $nestedResidualCachePageableCachedJoinCalls
+    nested_residual_cache_layer_partitioned =
+        $nestedResidualCacheLayerPartitioned
+    nested_residual_cache_layer_slots_min =
+        $nestedResidualCacheLayerSlotsMin
+    nested_residual_cache_layer_slots_max =
+        $nestedResidualCacheLayerSlotsMax
+    nested_residual_cache_pageable_invariant_failures =
+        $nestedResidualCachePageableInvariantFailures
     nested_residual_gpu_join_observed = $nestedResidualGpuJoinObserved
     nested_residual_gpu_join_raw_summary = $nestedResidualGpuJoinRawSummary
     nested_residual_gpu_join_requested_runtime =
@@ -7042,6 +7490,18 @@ $summary = [pscustomobject]@{
     nested_residual_expected_payload_sha256 = $(if ($ExpectedNestedResidualPayloadSHA256) { $ExpectedNestedResidualPayloadSHA256.ToLowerInvariant() } else { "" })
     nested_residual_verify_reconstruction = [bool]$NestedResidualVerifyReconstruction
     nested_residual_cache_experts_requested = $NestedResidualCacheExperts
+    nested_residual_pageable_base_requested = [bool]$NestedResidualPageableBase
+    nested_residual_base_pinned_gib_requested = $NestedResidualBasePinnedGiB
+    nested_residual_cache_pageable_requested = [bool]$NestedResidualCachePageable
+    nested_residual_expected_base_host_gib =
+        $nestedResidualExpectedBaseHostGiB
+    nested_residual_expected_residual_cache_host_gib =
+        $nestedResidualExpectedResidualCacheHostGiB
+    nested_residual_expected_host_allocation_gib =
+        $nestedResidualExpectedHostAllocationGiB
+    nested_residual_all_layer_first_layer = $nestedResidualAllLayerFirstLayer
+    nested_residual_all_layer_last_layer = $nestedResidualAllLayerLastLayer
+    nested_residual_all_layer_count = $nestedResidualAllLayerCount
     nested_residual_structural_n1_requested = [bool]$NestedResidualStructuralN1
     nested_residual_gpu_cache_requested = [bool]$NestedResidualGpuCache
     nested_residual_gpu_join_requested = [bool]$NestedResidualGpuJoin
@@ -7079,6 +7539,44 @@ $summary = [pscustomobject]@{
     nested_residual_vram_host_bytes = $nestedResidualVramHostBytes
     nested_residual_vram_h2d_bytes = $nestedResidualVramH2DBytes
     nested_residual_vram_failures = $nestedResidualVramFailures
+    nested_residual_base_storage_raw_summary =
+        $nestedResidualBaseStorageRawSummary
+    nested_residual_base_pinned_entries = $nestedResidualBasePinnedEntries
+    nested_residual_base_pinned_bytes = $nestedResidualBasePinnedBytes
+    nested_residual_base_pinned_hits = $nestedResidualBasePinnedHits
+    nested_residual_base_pinned_h2d_bytes =
+        $nestedResidualBasePinnedH2DBytes
+    nested_residual_base_pageable_entries =
+        $nestedResidualBasePageableEntries
+    nested_residual_base_pageable_bytes = $nestedResidualBasePageableBytes
+    nested_residual_base_pageable_hits = $nestedResidualBasePageableHits
+    nested_residual_base_pageable_h2d_bytes =
+        $nestedResidualBasePageableH2DBytes
+    nested_residual_storage_invariant_failures =
+        $nestedResidualStorageInvariantFailures
+    nested_residual_cache_pageable_raw_summary =
+        $nestedResidualCachePageableRawSummary
+    nested_residual_cache_pinned_entries = $nestedResidualCachePinnedEntries
+    nested_residual_cache_pinned_bytes = $nestedResidualCachePinnedBytes
+    nested_residual_cache_pinned_hits = $nestedResidualCachePinnedHits
+    nested_residual_cache_pinned_h2d_bytes =
+        $nestedResidualCachePinnedH2DBytes
+    nested_residual_cache_pageable_entries =
+        $nestedResidualCachePageableEntries
+    nested_residual_cache_pageable_bytes = $nestedResidualCachePageableBytes
+    nested_residual_cache_pageable_hits = $nestedResidualCachePageableHits
+    nested_residual_cache_pageable_h2d_bytes =
+        $nestedResidualCachePageableH2DBytes
+    nested_residual_cache_pageable_cached_join_calls =
+        $nestedResidualCachePageableCachedJoinCalls
+    nested_residual_cache_layer_partitioned =
+        $nestedResidualCacheLayerPartitioned
+    nested_residual_cache_layer_slots_min =
+        $nestedResidualCacheLayerSlotsMin
+    nested_residual_cache_layer_slots_max =
+        $nestedResidualCacheLayerSlotsMax
+    nested_residual_cache_pageable_invariant_failures =
+        $nestedResidualCachePageableInvariantFailures
     nested_residual_gpu_join_observed = $nestedResidualGpuJoinObserved
     nested_residual_gpu_join_raw_summary = $nestedResidualGpuJoinRawSummary
     nested_residual_gpu_join_requested_runtime =

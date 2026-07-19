@@ -261,11 +261,20 @@ struct cuda_nested_residual_state {
     os_file_t file;
     const uint8_t *source_map;
     uint8_t *base;
+    uint8_t *base_pageable;
     uint8_t *cache;
     uint64_t source_size;
     uint64_t file_size;
     uint64_t payload_bytes;
     uint64_t base_bytes;
+    uint64_t base_pinned_bytes;
+    uint64_t base_pageable_bytes;
+    uint64_t base_pinned_hits;
+    uint64_t base_pageable_hits;
+    uint64_t base_pinned_h2d_bytes;
+    uint64_t base_pageable_h2d_bytes;
+    uint64_t storage_invariant_failures;
+    uint64_t cache_pageable_invariant_failures;
     uint64_t cache_slot_bytes;
     uint64_t cache_bytes;
     uint64_t max_residual_expert_bytes;
@@ -336,6 +345,13 @@ struct cuda_nested_residual_state {
     double profile_route_ready_wait_seconds;
     uint32_t cache_capacity;
     uint32_t cache_count;
+    uint32_t cache_layer_begin[CUDA_NESTED_RESIDUAL_LAYER_COUNT];
+    uint32_t cache_layer_capacity[CUDA_NESTED_RESIDUAL_LAYER_COUNT];
+    uint32_t base_pinned_entries;
+    uint32_t base_pageable_entries;
+    uint32_t all_layer_first;
+    uint32_t all_layer_last;
+    uint32_t all_layer_count;
     uint8_t source_sha256[32];
     uint8_t payload_sha256[32];
     uint8_t file_valid;
@@ -349,6 +365,10 @@ struct cuda_nested_residual_state {
     uint8_t gpu_join_event_pending;
     uint8_t residual_cache_requested_flag;
     uint8_t residual_cache_enabled;
+    uint8_t pageable_base_enabled;
+    uint8_t cache_pageable;
+    uint8_t cache_layer_partitioned;
+    uint8_t all_layer_storage;
     std::vector<uint8_t> residual_scratch;
     os_mutex_t gpu_join_mutex;
     cudaEvent_t gpu_join_done_event;
@@ -361,6 +381,8 @@ struct cuda_nested_residual_state {
     uint64_t gpu_join_verify_host_bytes;
     std::vector<cuda_nested_residual_cache_slot> cache_slots;
     std::vector<int32_t> cache_by_layer_expert;
+    std::vector<uint8_t *> base_by_layer_expert;
+    std::vector<uint8_t> base_storage_by_layer_expert;
     cuda_nested_residual_layer layers[CUDA_NESTED_RESIDUAL_LAYER_COUNT];
 };
 
@@ -2405,9 +2427,134 @@ __global__ static void cuda_nested_join_blocks_kernel(
     }
 }
 
+static int cuda_nested_residual_env_flag(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr, "ds4: invalid %s=%s (expected 0 or 1)\n", name, value);
+    return -1;
+}
+
+static uint64_t cuda_nested_residual_base_pinned_budget(void) {
+    const char *value = getenv("DS4_NESTED_RESIDUAL_BASE_PINNED_GIB");
+    if (!value || !value[0]) return UINT64_MAX;
+    char *end = NULL;
+    errno = 0;
+    const double gib = strtod(value, &end);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == value || errno != 0 || !end || *end != '\0' ||
+        !std::isfinite(gib) || gib < 0.0 || gib > 30.0) {
+        fprintf(stderr,
+                "ds4: invalid DS4_NESTED_RESIDUAL_BASE_PINNED_GIB=%s\n",
+                value);
+        return UINT64_MAX - 1u;
+    }
+    const long double bytes = (long double)gib * 1073741824.0L;
+    if (bytes > (long double)UINT64_MAX) return UINT64_MAX - 1u;
+    return (uint64_t)bytes;
+}
+
+static uint8_t *cuda_nested_residual_pageable_alloc(uint64_t bytes) {
+    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return NULL;
+#ifdef _WIN32
+    return (uint8_t *)VirtualAlloc(
+        NULL, (SIZE_T)bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    return (uint8_t *)malloc((size_t)bytes);
+#endif
+}
+
+static void cuda_nested_residual_pageable_free(uint8_t *ptr) {
+    if (!ptr) return;
+#ifdef _WIN32
+    (void)VirtualFree(ptr, 0, MEM_RELEASE);
+#else
+    free(ptr);
+#endif
+}
+
+static void cuda_nested_residual_note_cache_invariant_failure(
+        cuda_nested_residual_state &state) {
+    state.residual_cache_invariant_failures++;
+    if (state.cache_pageable) state.cache_pageable_invariant_failures++;
+}
+
+static const uint8_t *cuda_nested_residual_base_expert(
+        cuda_nested_residual_state &state,
+        uint32_t layer,
+        uint32_t expert,
+        uint8_t *pageable_out) {
+    if (pageable_out) *pageable_out = 0;
+    if (layer >= CUDA_NESTED_RESIDUAL_LAYER_COUNT ||
+        expert >= CUDA_NESTED_RESIDUAL_EXPERT_COUNT) {
+        return NULL;
+    }
+    const size_t index = (size_t)layer *
+        CUDA_NESTED_RESIDUAL_EXPERT_COUNT + expert;
+    if (index >= state.base_by_layer_expert.size() ||
+        index >= state.base_storage_by_layer_expert.size() ||
+        !state.base_by_layer_expert[index]) {
+        return NULL;
+    }
+    if (pageable_out) {
+        *pageable_out = state.base_storage_by_layer_expert[index];
+    }
+    return state.base_by_layer_expert[index];
+}
+
 static void cuda_nested_residual_clear(void) {
     cuda_nested_residual_state &state = g_nested_residual;
     if (state.active || state.failures != 0) {
+        const uint32_t nested_residual_base_pinned_entries =
+            state.base_pinned_entries;
+        const uint32_t nested_residual_base_pageable_entries =
+            state.base_pageable_entries;
+        const uint64_t nested_residual_base_pinned_bytes =
+            state.base_pinned_bytes;
+        const uint64_t nested_residual_base_pageable_bytes =
+            state.base_pageable_bytes;
+        const uint64_t nested_residual_base_pinned_hits =
+            state.base_pinned_hits;
+        const uint64_t nested_residual_base_pageable_hits =
+            state.base_pageable_hits;
+        const uint64_t nested_residual_base_pinned_h2d_bytes =
+            state.base_pinned_h2d_bytes;
+        const uint64_t nested_residual_base_pageable_h2d_bytes =
+            state.base_pageable_h2d_bytes;
+        const uint32_t nested_residual_cache_pinned_entries =
+            state.cache_pageable ? 0u : state.cache_count;
+        const uint32_t nested_residual_cache_pageable_entries =
+            state.cache_pageable ? state.cache_count : 0u;
+        const uint64_t nested_residual_cache_pinned_bytes =
+            state.cache_pageable ? 0u : state.cache_bytes;
+        const uint64_t nested_residual_cache_pageable_bytes =
+            state.cache_pageable ? state.cache_bytes : 0u;
+        const uint64_t nested_residual_cache_pinned_hits =
+            state.cache_pageable ? 0u : state.residual_cache_hits;
+        const uint64_t nested_residual_cache_pageable_hits =
+            state.cache_pageable ? state.residual_cache_hits : 0u;
+        const uint64_t nested_residual_cache_pinned_h2d_bytes =
+            state.cache_pageable ? 0u : state.residual_cache_h2d_bytes;
+        const uint64_t nested_residual_cache_pageable_h2d_bytes =
+            state.cache_pageable ? state.residual_cache_h2d_bytes : 0u;
+        uint32_t nested_residual_cache_layer_slots_min =
+            state.cache_capacity;
+        uint32_t nested_residual_cache_layer_slots_max =
+            state.cache_capacity;
+        if (state.cache_layer_partitioned) {
+            nested_residual_cache_layer_slots_min = UINT32_MAX;
+            nested_residual_cache_layer_slots_max = 0;
+            for (uint32_t layer = 0;
+                 layer < CUDA_NESTED_RESIDUAL_LAYER_COUNT; layer++) {
+                if (!state.layers[layer].ready) continue;
+                nested_residual_cache_layer_slots_min = std::min(
+                    nested_residual_cache_layer_slots_min,
+                    state.cache_layer_capacity[layer]);
+                nested_residual_cache_layer_slots_max = std::max(
+                    nested_residual_cache_layer_slots_max,
+                    state.cache_layer_capacity[layer]);
+            }
+        }
         const uint64_t summary_cache_hits = state.residual_cache_enabled
             ? state.residual_cache_hits : state.exact_cache_hits;
         const uint64_t summary_cache_misses = state.residual_cache_enabled
@@ -2427,6 +2574,53 @@ static void cuda_nested_residual_clear(void) {
                 (unsigned long long)state.reconstruction_mismatches,
                 (unsigned long long)state.h2d_bytes,
                 (unsigned long long)state.failures);
+        if (state.pageable_base_enabled) {
+            fprintf(stderr,
+                    "ds4: [nested-residual-base-storage] result=summary "
+                    "pinned_entries=%u pinned_bytes=%llu pinned_hits=%llu "
+                    "pinned_h2d_bytes=%llu pageable_entries=%u "
+                    "pageable_bytes=%llu pageable_hits=%llu "
+                    "pageable_h2d_bytes=%llu invariant_failures=%llu "
+                    "mapped=0 router=open exact=1\n",
+                    nested_residual_base_pinned_entries,
+                    (unsigned long long)nested_residual_base_pinned_bytes,
+                    (unsigned long long)nested_residual_base_pinned_hits,
+                    (unsigned long long)
+                        nested_residual_base_pinned_h2d_bytes,
+                    nested_residual_base_pageable_entries,
+                    (unsigned long long)nested_residual_base_pageable_bytes,
+                    (unsigned long long)nested_residual_base_pageable_hits,
+                    (unsigned long long)
+                        nested_residual_base_pageable_h2d_bytes,
+                    (unsigned long long)state.storage_invariant_failures);
+        }
+        if (state.cache_pageable) {
+            fprintf(stderr,
+                    "ds4: [nested-residual-cache-pageable] result=summary "
+                    "pinned_entries=%u pinned_bytes=%llu pinned_hits=%llu "
+                    "pinned_h2d_bytes=%llu pageable_entries=%u "
+                    "pageable_bytes=%llu pageable_hits=%llu "
+                    "pageable_h2d_bytes=%llu cached_join_calls=%llu "
+                    "partitioned=%u layer_slots_min=%u layer_slots_max=%u "
+                    "invariant_failures=%llu mapped=0 router=open exact=1\n",
+                    nested_residual_cache_pinned_entries,
+                    (unsigned long long)nested_residual_cache_pinned_bytes,
+                    (unsigned long long)nested_residual_cache_pinned_hits,
+                    (unsigned long long)
+                        nested_residual_cache_pinned_h2d_bytes,
+                    nested_residual_cache_pageable_entries,
+                    (unsigned long long)nested_residual_cache_pageable_bytes,
+                    (unsigned long long)nested_residual_cache_pageable_hits,
+                    (unsigned long long)
+                        nested_residual_cache_pageable_h2d_bytes,
+                    (unsigned long long)
+                        state.residual_cache_cached_join_calls,
+                    (unsigned)state.cache_layer_partitioned,
+                    nested_residual_cache_layer_slots_min,
+                    nested_residual_cache_layer_slots_max,
+                    (unsigned long long)
+                        state.cache_pageable_invariant_failures);
+        }
         if (cuda_nested_residual_gpu_cache_requested() ||
             state.gpu_route_calls != 0 || state.gpu_cache_failures != 0) {
             fprintf(stderr,
@@ -2561,7 +2755,14 @@ static void cuda_nested_residual_clear(void) {
         os_mutex_destroy(&state.gpu_join_mutex);
     }
     if (state.base) (void)cudaFreeHost(state.base);
-    if (state.cache) (void)cudaFreeHost(state.cache);
+    cuda_nested_residual_pageable_free(state.base_pageable);
+    if (state.cache) {
+        if (state.cache_pageable) {
+            cuda_nested_residual_pageable_free(state.cache);
+        } else {
+            (void)cudaFreeHost(state.cache);
+        }
+    }
     if (state.gpu_join_residual_host)
         (void)cudaFreeHost(state.gpu_join_residual_host);
     if (state.gpu_join_verify_host)
@@ -2577,45 +2778,174 @@ static void cuda_nested_residual_clear(void) {
 
 static int cuda_nested_residual_preload_base(void) {
     cuda_nested_residual_state &state = g_nested_residual;
-    uint64_t base_cursor = 0;
+    uint64_t total_base_bytes = 0;
     uint64_t max_base = 0;
     uint64_t max_native = 0;
     uint64_t max_residual = 0;
+    uint32_t total_entries = 0;
+    uint32_t nested_residual_all_layer_first_layer = UINT32_MAX;
+    uint32_t nested_residual_all_layer_last_layer = 0;
+    uint32_t nested_residual_all_layer_count = 0;
     for (uint32_t layer = 0; layer < CUDA_NESTED_RESIDUAL_LAYER_COUNT;
          layer++) {
         cuda_nested_residual_layer &entry = state.layers[layer];
         if (!entry.ready) continue;
-        entry.base_offset = base_cursor;
+        nested_residual_all_layer_first_layer = std::min(
+            nested_residual_all_layer_first_layer, layer);
+        nested_residual_all_layer_last_layer = std::max(
+            nested_residual_all_layer_last_layer, layer);
+        nested_residual_all_layer_count++;
+        entry.base_offset = 0;
         if (entry.base_expert_bytes >
-            (UINT64_MAX - base_cursor) / CUDA_NESTED_RESIDUAL_EXPERT_COUNT) {
+            (UINT64_MAX - total_base_bytes) /
+                CUDA_NESTED_RESIDUAL_EXPERT_COUNT) {
             return 0;
         }
-        base_cursor += entry.base_expert_bytes *
+        total_base_bytes += entry.base_expert_bytes *
             CUDA_NESTED_RESIDUAL_EXPERT_COUNT;
+        if (total_entries > UINT32_MAX -
+                CUDA_NESTED_RESIDUAL_EXPERT_COUNT) return 0;
+        total_entries += CUDA_NESTED_RESIDUAL_EXPERT_COUNT;
         max_base = std::max(max_base, entry.base_expert_bytes);
         max_native = std::max(max_native, entry.native_expert_bytes);
         max_residual = std::max(max_residual, entry.residual_expert_bytes);
     }
-    if (base_cursor == 0 || max_native == 0 || max_residual == 0) return 0;
-    if (cudaHostAlloc((void **)&state.base, (size_t)base_cursor,
+    if (total_base_bytes == 0 || total_entries == 0 || max_base == 0 ||
+        max_native == 0 || max_residual == 0 ||
+        max_base > UINT64_MAX / total_entries) return 0;
+
+    state.gpu_join_requested_flag =
+        cuda_nested_residual_gpu_join_requested() ? 1u : 0u;
+    state.residual_cache_requested_flag =
+        cuda_nested_residual_gpu_join_residual_cache_requested() ? 1u : 0u;
+    state.residual_cache_enabled =
+        state.gpu_join_requested_flag && state.residual_cache_requested_flag ?
+        1u : 0u;
+    const int pageable_base = cuda_nested_residual_env_flag(
+        "DS4_NESTED_RESIDUAL_PAGEABLE_BASE");
+    const int cache_pageable = cuda_nested_residual_env_flag(
+        "DS4_NESTED_RESIDUAL_CACHE_PAGEABLE");
+    const uint64_t pinned_budget =
+        cuda_nested_residual_base_pinned_budget();
+    if (pageable_base < 0 || cache_pageable < 0 ||
+        pinned_budget == UINT64_MAX - 1u ||
+        (pageable_base && pinned_budget == UINT64_MAX) ||
+        (!pageable_base && pinned_budget != UINT64_MAX) ||
+        (cache_pageable && !state.residual_cache_enabled)) {
+        state.storage_invariant_failures++;
+        fprintf(stderr,
+                "ds4: nested residual base storage contract invalid "
+                "pageable=%d pinned_budget=%llu cache_pageable=%d\n",
+                pageable_base, (unsigned long long)pinned_budget,
+                cache_pageable);
+        return 0;
+    }
+    const int all_layer_storage = pageable_base || cache_pageable;
+    if (all_layer_storage &&
+        (nested_residual_all_layer_first_layer != 3u ||
+         nested_residual_all_layer_last_layer != 42u ||
+         nested_residual_all_layer_count != 40u)) {
+        state.storage_invariant_failures++;
+        fprintf(stderr,
+                "ds4: all-layer nested sidecar coverage must be exactly "
+                "layers 3..42 observed_first=%u observed_last=%u "
+                "observed_count=%u\n",
+                nested_residual_all_layer_first_layer,
+                nested_residual_all_layer_last_layer,
+                nested_residual_all_layer_count);
+        return 0;
+    }
+    state.all_layer_storage = all_layer_storage ? 1u : 0u;
+    state.pageable_base_enabled = pageable_base ? 1u : 0u;
+    state.all_layer_first = nested_residual_all_layer_first_layer;
+    state.all_layer_last = nested_residual_all_layer_last_layer;
+    state.all_layer_count = nested_residual_all_layer_count;
+    uint64_t pinned_entries64 = total_entries;
+    if (pageable_base) {
+        pinned_entries64 = std::min(
+            (uint64_t)total_entries, pinned_budget / max_base);
+    }
+    const uint64_t pageable_entries64 =
+        (uint64_t)total_entries - pinned_entries64;
+    if (pageable_base &&
+        (pinned_entries64 == 0 || pageable_entries64 == 0)) {
+        state.storage_invariant_failures++;
+        fprintf(stderr,
+                "ds4: nested residual pageable base requires both storage "
+                "classes pinned_entries=%llu pageable_entries=%llu\n",
+                (unsigned long long)pinned_entries64,
+                (unsigned long long)pageable_entries64);
+        return 0;
+    }
+    const uint64_t pinned_bytes = pinned_entries64 * max_base;
+    const uint64_t pageable_bytes = pageable_entries64 * max_base;
+    if (pinned_bytes != 0 &&
+        cudaHostAlloc((void **)&state.base, (size_t)pinned_bytes,
                       cudaHostAllocDefault) != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr,
                 "ds4: nested residual pinned base allocation failed bytes=%llu\n",
-                (unsigned long long)base_cursor);
+                (unsigned long long)pinned_bytes);
         return 0;
     }
-    state.base_bytes = base_cursor;
+    if (pageable_bytes != 0) {
+        state.base_pageable =
+            cuda_nested_residual_pageable_alloc(pageable_bytes);
+        if (!state.base_pageable) {
+            fprintf(stderr,
+                    "ds4: nested residual pageable base allocation failed bytes=%llu\n",
+                    (unsigned long long)pageable_bytes);
+            return 0;
+        }
+    }
+    state.base_bytes = pinned_bytes + pageable_bytes;
+    state.base_pinned_bytes = pinned_bytes;
+    state.base_pageable_bytes = pageable_bytes;
+    state.base_pinned_entries = (uint32_t)pinned_entries64;
+    state.base_pageable_entries = (uint32_t)pageable_entries64;
     state.max_residual_expert_bytes = max_residual;
+    try {
+        const size_t bindings = (size_t)CUDA_NESTED_RESIDUAL_LAYER_COUNT *
+            CUDA_NESTED_RESIDUAL_EXPERT_COUNT;
+        state.base_by_layer_expert.assign(bindings, NULL);
+        state.base_storage_by_layer_expert.assign(bindings, 0u);
+    } catch (...) {
+        fprintf(stderr,
+                "ds4: nested residual base metadata allocation failed\n");
+        return 0;
+    }
 
+    uint64_t entry_cursor = 0;
+    uint64_t pinned_cursor = 0;
+    uint64_t pageable_cursor = 0;
     for (uint32_t layer = 0; layer < CUDA_NESTED_RESIDUAL_LAYER_COUNT;
          layer++) {
         cuda_nested_residual_layer &entry = state.layers[layer];
         if (!entry.ready) continue;
+        uint32_t layer_pinned = 0;
+        uint32_t layer_pageable = 0;
         for (uint32_t expert = 0;
              expert < CUDA_NESTED_RESIDUAL_EXPERT_COUNT; expert++) {
-            uint8_t *expert_base = state.base + entry.base_offset +
-                (uint64_t)expert * entry.base_expert_bytes;
+            const uint64_t pinned_before =
+                entry_cursor * pinned_entries64 / total_entries;
+            const uint64_t pinned_after =
+                (entry_cursor + 1u) * pinned_entries64 / total_entries;
+            const int use_pinned = pinned_after > pinned_before;
+            uint8_t *expert_base = NULL;
+            if (use_pinned) {
+                expert_base = state.base + pinned_cursor++ * max_base;
+                layer_pinned++;
+            } else {
+                expert_base = state.base_pageable +
+                    pageable_cursor++ * max_base;
+                layer_pageable++;
+            }
+            const size_t binding = (size_t)layer *
+                CUDA_NESTED_RESIDUAL_EXPERT_COUNT + expert;
+            state.base_by_layer_expert[binding] = expert_base;
+            state.base_storage_by_layer_expert[binding] =
+                use_pinned ? 0u : 1u;
+            entry_cursor++;
             for (uint32_t part = 0;
                  part < CUDA_NESTED_RESIDUAL_PART_COUNT; part++) {
                 const cuda_nested_residual_record &record =
@@ -2636,9 +2966,19 @@ static int cuda_nested_residual_preload_base(void) {
         }
         fprintf(stderr,
                 "ds4: [nested-residual] base-ready layer=%u experts=256 "
-                "bytes=%llu pinned=1 mapped=0\n",
+                "bytes=%llu pinned_entries=%u pageable_entries=%u "
+                "mapped=0\n",
                 layer,
-                (unsigned long long)(entry.base_expert_bytes * 256u));
+                (unsigned long long)(entry.base_expert_bytes * 256u),
+                layer_pinned, layer_pageable);
+    }
+    if (entry_cursor != total_entries ||
+        pinned_cursor != pinned_entries64 ||
+        pageable_cursor != pageable_entries64) {
+        state.storage_invariant_failures++;
+        fprintf(stderr,
+                "ds4: nested residual base partition invariant failed\n");
+        return 0;
     }
 
     uint32_t cache_capacity = 6u;
@@ -2646,7 +2986,9 @@ static int cuda_nested_residual_preload_base(void) {
     if (cache_env && cache_env[0]) {
         char *end = NULL;
         const unsigned long value = strtoul(cache_env, &end, 10);
-        if (end == cache_env || *end != '\0' || value == 0 || value > 64u) {
+        const unsigned long maximum = cache_pageable ? 4096u : 64u;
+        if (end == cache_env || *end != '\0' || value == 0 ||
+            value > maximum) {
             fprintf(stderr,
                     "ds4: invalid DS4_NESTED_RESIDUAL_CACHE_EXPERTS=%s\n",
                     cache_env);
@@ -2654,32 +2996,70 @@ static int cuda_nested_residual_preload_base(void) {
         }
         cache_capacity = (uint32_t)value;
     }
-    if (max_native > UINT64_MAX / cache_capacity) return 0;
-    state.cache_slot_bytes = max_native;
-    state.cache_bytes = max_native * cache_capacity;
-    if (cudaHostAlloc((void **)&state.cache, (size_t)state.cache_bytes,
-                      cudaHostAllocDefault) != cudaSuccess) {
+    state.cache_slot_bytes = state.residual_cache_enabled ?
+        max_residual : max_native;
+    if (state.cache_slot_bytes > UINT64_MAX / cache_capacity) return 0;
+    state.cache_bytes = state.cache_slot_bytes * cache_capacity;
+    state.cache_pageable = cache_pageable ? 1u : 0u;
+    if (state.cache_pageable) {
+        state.cache = cuda_nested_residual_pageable_alloc(state.cache_bytes);
+    } else if (cudaHostAlloc((void **)&state.cache,
+                             (size_t)state.cache_bytes,
+                             cudaHostAllocDefault) != cudaSuccess) {
         (void)cudaGetLastError();
+        state.cache = NULL;
+    }
+    if (!state.cache) {
         fprintf(stderr,
-                "ds4: nested residual pinned exact-cache allocation failed bytes=%llu\n",
-                (unsigned long long)state.cache_bytes);
+                "ds4: nested residual cache allocation failed bytes=%llu pageable=%u\n",
+                (unsigned long long)state.cache_bytes,
+                (unsigned)state.cache_pageable);
         return 0;
     }
     state.cache_capacity = cache_capacity;
     state.cache_slots.assign(cache_capacity,
                              cuda_nested_residual_cache_slot{});
+    if (state.cache_pageable && state.all_layer_storage) {
+        if (cache_capacity < nested_residual_all_layer_count) {
+            fprintf(stderr,
+                    "ds4: nested residual pageable cache requires at least "
+                    "one slot per ready layer capacity=%u layers=%u\n",
+                    cache_capacity, nested_residual_all_layer_count);
+            return 0;
+        }
+        const uint32_t slots_per_layer =
+            cache_capacity / nested_residual_all_layer_count;
+        const uint32_t extra_slots =
+            cache_capacity % nested_residual_all_layer_count;
+        uint32_t slot_cursor = 0;
+        uint32_t ready_cursor = 0;
+        for (uint32_t layer = 0;
+             layer < CUDA_NESTED_RESIDUAL_LAYER_COUNT; layer++) {
+            if (!state.layers[layer].ready) continue;
+            const uint32_t layer_capacity = slots_per_layer +
+                (ready_cursor < extra_slots ? 1u : 0u);
+            state.cache_layer_begin[layer] = slot_cursor;
+            state.cache_layer_capacity[layer] = layer_capacity;
+            slot_cursor += layer_capacity;
+            ready_cursor++;
+        }
+        if (slot_cursor != cache_capacity ||
+            ready_cursor != nested_residual_all_layer_count) {
+            cuda_nested_residual_note_cache_invariant_failure(state);
+            fprintf(stderr,
+                    "ds4: nested residual cache partition invariant failed "
+                    "slots=%u/%u layers=%u/%u\n",
+                    slot_cursor, cache_capacity, ready_cursor,
+                    nested_residual_all_layer_count);
+            return 0;
+        }
+        state.cache_layer_partitioned = 1u;
+    }
     state.cache_by_layer_expert.assign(
         CUDA_NESTED_RESIDUAL_LAYER_COUNT *
             CUDA_NESTED_RESIDUAL_EXPERT_COUNT,
         -1);
     state.residual_scratch.resize((size_t)max_residual);
-    state.gpu_join_requested_flag =
-        cuda_nested_residual_gpu_join_requested() ? 1u : 0u;
-    state.residual_cache_requested_flag =
-        cuda_nested_residual_gpu_join_residual_cache_requested() ? 1u : 0u;
-    state.residual_cache_enabled =
-        state.gpu_join_requested_flag && state.residual_cache_requested_flag ?
-        1u : 0u;
     if (state.gpu_join_requested_flag) {
         state.gpu_join_requested = 1u;
         cudaError_t err = cudaHostAlloc(
@@ -2735,10 +3115,26 @@ static int cuda_nested_residual_preload_base(void) {
     }
     fprintf(stderr,
             "ds4: [nested-residual] bootstrap-ready base_bytes=%llu "
-            "cache_entries=%u cache_bytes=%llu router=open exact=1\n",
+            "base_pinned_bytes=%llu base_pageable_bytes=%llu "
+            "base_pinned_entries=%u base_pageable_entries=%u "
+            "cache_entries=%u cache_bytes=%llu cache_pageable=%u "
+            "cache_layer_partitioned=%u "
+            "all_layer=%u all_layer_first=%u all_layer_last=%u "
+            "all_layer_count=%u "
+            "router=open exact=1\n",
             (unsigned long long)state.base_bytes,
+            (unsigned long long)state.base_pinned_bytes,
+            (unsigned long long)state.base_pageable_bytes,
+            state.base_pinned_entries,
+            state.base_pageable_entries,
             state.cache_capacity,
-            (unsigned long long)state.cache_bytes);
+            (unsigned long long)state.cache_bytes,
+            (unsigned)state.cache_pageable,
+            (unsigned)state.cache_layer_partitioned,
+            (unsigned)state.all_layer_storage,
+            state.all_layer_first,
+            state.all_layer_last,
+            state.all_layer_count);
     return 1;
 }
 
@@ -24761,7 +25157,7 @@ static int cuda_nested_residual_resolve_exact(
     if (state.residual_cache_enabled) {
         fprintf(stderr,
                 "ds4: nested residual CPU resolver refused in residual-cache mode\n");
-        state.residual_cache_invariant_failures++;
+        cuda_nested_residual_note_cache_invariant_failure(state);
         state.failures++;
         state.hard_failure = 1;
         return -1;
@@ -24877,8 +25273,18 @@ static int cuda_nested_residual_resolve_exact(
         slot.valid = 0;
     }
 
-    const uint8_t *expert_base = state.base + layer.base_offset +
-        (uint64_t)expert * layer.base_expert_bytes;
+    uint8_t base_pageable = 0;
+    const uint8_t *expert_base = cuda_nested_residual_base_expert(
+        state, layer_index, expert, &base_pageable);
+    if (!expert_base) {
+        state.failures++;
+        return -1;
+    }
+    if (base_pageable) {
+        state.base_pageable_hits++;
+    } else {
+        state.base_pinned_hits++;
+    }
     uint8_t *native = state.cache +
         (uint64_t)victim * state.cache_slot_bytes;
     if (profile) state.profile_reconstruct_calls++;
@@ -24937,6 +25343,33 @@ static int cuda_nested_residual_resolve_exact(
     return 1;
 }
 
+static int cuda_nested_residual_cache_scan_range(
+        cuda_nested_residual_state &state,
+        uint32_t layer_index,
+        uint32_t *begin_out,
+        uint32_t *count_out) {
+    if (!begin_out || !count_out ||
+        layer_index >= CUDA_NESTED_RESIDUAL_LAYER_COUNT ||
+        state.cache_capacity == 0) {
+        cuda_nested_residual_note_cache_invariant_failure(state);
+        return 0;
+    }
+    uint32_t begin = 0;
+    uint32_t count = state.cache_capacity;
+    if (state.cache_layer_partitioned) {
+        begin = state.cache_layer_begin[layer_index];
+        count = state.cache_layer_capacity[layer_index];
+        if (count == 0 || begin > state.cache_capacity ||
+            count > state.cache_capacity - begin) {
+            cuda_nested_residual_note_cache_invariant_failure(state);
+            return 0;
+        }
+    }
+    *begin_out = begin;
+    *count_out = count;
+    return 1;
+}
+
 static int cuda_nested_residual_resolve_residual_slot_locked(
         uint32_t layer_index, uint32_t expert, uint32_t *slot_out) {
     cuda_nested_residual_state &state = g_nested_residual;
@@ -24944,7 +25377,7 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
         layer_index >= CUDA_NESTED_RESIDUAL_LAYER_COUNT ||
         expert >= CUDA_NESTED_RESIDUAL_EXPERT_COUNT ||
         !state.layers[layer_index].ready) {
-        state.residual_cache_invariant_failures++;
+        cuda_nested_residual_note_cache_invariant_failure(state);
         state.failures++;
         return -1;
     }
@@ -24955,7 +25388,15 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
         state.cache_by_layer_expert.size() <
             CUDA_NESTED_RESIDUAL_LAYER_COUNT *
                 CUDA_NESTED_RESIDUAL_EXPERT_COUNT) {
-        state.residual_cache_invariant_failures++;
+        cuda_nested_residual_note_cache_invariant_failure(state);
+        state.failures++;
+        return -1;
+    }
+
+    uint32_t scan_begin = 0;
+    uint32_t scan_count = 0;
+    if (!cuda_nested_residual_cache_scan_range(
+            state, layer_index, &scan_begin, &scan_count)) {
         state.failures++;
         return -1;
     }
@@ -24967,6 +25408,12 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
         CUDA_NESTED_RESIDUAL_EXPERT_COUNT + expert;
     const int32_t cached = state.cache_by_layer_expert[map_index];
     if (cached >= 0 && (uint32_t)cached < state.cache_capacity) {
+        if ((uint32_t)cached < scan_begin ||
+            (uint32_t)cached >= scan_begin + scan_count) {
+            cuda_nested_residual_note_cache_invariant_failure(state);
+            state.failures++;
+            return -1;
+        }
         cuda_nested_residual_cache_slot &slot =
             state.cache_slots[(uint32_t)cached];
         if (slot.valid && slot.layer == layer_index && slot.expert == expert) {
@@ -24984,7 +25431,7 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
         if (profile) {
             state.profile_lookup_seconds += cuda_wall_sec() - lookup_started;
         }
-        state.residual_cache_invariant_failures++;
+        cuda_nested_residual_note_cache_invariant_failure(state);
         state.reconstruction_mismatches++;
         state.failures++;
         return -1;
@@ -24992,7 +25439,8 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
 
     uint32_t victim = UINT32_MAX;
     uint64_t oldest = UINT64_MAX;
-    for (uint32_t i = 0; i < state.cache_capacity; i++) {
+    for (uint32_t offset = 0; offset < scan_count; offset++) {
+        const uint32_t i = scan_begin + offset;
         const cuda_nested_residual_cache_slot &slot = state.cache_slots[i];
         if (!slot.valid) {
             victim = i;
@@ -25007,7 +25455,7 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
         if (profile) {
             state.profile_lookup_seconds += cuda_wall_sec() - lookup_started;
         }
-        state.residual_cache_invariant_failures++;
+        cuda_nested_residual_note_cache_invariant_failure(state);
         state.failures++;
         return -1;
     }
@@ -25029,13 +25477,18 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
                     "ds4: nested residual residual-cache reuse wait failed: %s\n",
                     cudaGetErrorString(wait));
             (void)cudaGetLastError();
-            state.residual_cache_invariant_failures++;
+            cuda_nested_residual_note_cache_invariant_failure(state);
             state.failures++;
             return -1;
         }
         slot.copy_pending = 0;
     }
     if (slot.valid) {
+        if (state.cache_layer_partitioned && slot.layer != layer_index) {
+            cuda_nested_residual_note_cache_invariant_failure(state);
+            state.failures++;
+            return -1;
+        }
         const uint32_t old_index = slot.layer *
             CUDA_NESTED_RESIDUAL_EXPERT_COUNT + slot.expert;
         if (old_index < state.cache_by_layer_expert.size() &&
@@ -25051,7 +25504,7 @@ static int cuda_nested_residual_resolve_residual_slot_locked(
         (uint64_t)expert * layer.residual_expert_bytes;
     if (residual_offset > state.file_size ||
         layer.residual_expert_bytes > state.file_size - residual_offset) {
-        state.residual_cache_invariant_failures++;
+        cuda_nested_residual_note_cache_invariant_failure(state);
         state.failures++;
         return -1;
     }
@@ -25115,6 +25568,7 @@ static int cuda_nested_residual_join_to_device_exact(
     const cuda_nested_residual_record &down = layer.records[2];
     uint64_t residual_offset = 0;
     const uint8_t *expert_base = NULL;
+    uint8_t base_pageable = 0;
     const uint8_t *residual_host_source = state.gpu_join_residual_host;
     uint32_t residual_cache_slot = UINT32_MAX;
     double join_started = 0.0;
@@ -25208,8 +25662,13 @@ static int cuda_nested_residual_join_to_device_exact(
         state.residual_bytes += layer.residual_expert_bytes;
     }
 
-    expert_base = state.base + layer.base_offset +
-        (uint64_t)expert * layer.base_expert_bytes;
+    expert_base = cuda_nested_residual_base_expert(
+        state, layer_index, expert, &base_pageable);
+    if (!expert_base) {
+        state.gpu_join_failures++;
+        state.failures++;
+        goto fail_locked;
+    }
     join_started = cuda_wall_sec();
     err = cudaMemcpyAsync(
         state.gpu_join_base_device, expert_base,
@@ -25233,6 +25692,13 @@ static int cuda_nested_residual_join_to_device_exact(
     }
     state.gpu_join_base_h2d_bytes += layer.base_expert_bytes;
     state.gpu_join_residual_h2d_bytes += layer.residual_expert_bytes;
+    if (base_pageable) {
+        state.base_pageable_hits++;
+        state.base_pageable_h2d_bytes += layer.base_expert_bytes;
+    } else {
+        state.base_pinned_hits++;
+        state.base_pinned_h2d_bytes += layer.base_expert_bytes;
+    }
     if (state.residual_cache_enabled) {
         state.residual_cache_h2d_bytes += layer.residual_expert_bytes;
         state.residual_cache_cached_join_calls++;
