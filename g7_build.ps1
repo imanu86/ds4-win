@@ -11,6 +11,43 @@ $buildDir = Join-Path $repo "build"
 $outputDir = Join-Path $buildDir $Configuration
 $exe = Join-Path $outputDir "ds4_server.exe"
 $manifestPath = Join-Path $outputDir "g7_build_manifest.json"
+$vcvars64 = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
+
+function Initialize-G7BuildEnvironment {
+    if (-not (Test-Path -LiteralPath $vcvars64 -PathType Leaf)) {
+        throw "Visual Studio x64 environment script not found: $vcvars64"
+    }
+    $commandLine = 'call "' + $vcvars64 + '" >nul && set'
+    $environmentLines = @(& $env:ComSpec /d /s /c $commandLine)
+    if ($LASTEXITCODE -ne 0 -or $environmentLines.Count -eq 0) {
+        throw "Visual Studio x64 environment initialization failed"
+    }
+    $developerPathLine = @($environmentLines | Where-Object {
+        $_.StartsWith('PATH=', [StringComparison]::Ordinal)
+    } | Select-Object -First 1)
+    if ($developerPathLine.Count -ne 1) {
+        throw "Visual Studio x64 environment did not emit canonical PATH"
+    }
+    $developerPath = $developerPathLine[0].Substring(5)
+    foreach ($line in $environmentLines) {
+        $separator = $line.IndexOf('=')
+        if ($separator -le 0) { continue }
+        $name = $line.Substring(0, $separator)
+        if ($name.Equals('Path', [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        $value = $line.Substring($separator + 1)
+        [Environment]::SetEnvironmentVariable(
+            $name, $value, [EnvironmentVariableTarget]::Process)
+    }
+    [Environment]::SetEnvironmentVariable(
+        'PATH', $null, [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        'Path', $developerPath, [EnvironmentVariableTarget]::Process)
+    if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
+        throw "Visual Studio x64 environment did not expose cl.exe"
+    }
+}
 
 function Get-G7BuildInputPaths {
     $tracked = @(git -C $repo ls-files)
@@ -65,6 +102,7 @@ if (-not (Test-Path -LiteralPath $CMake -PathType Leaf)) {
 if (-not (Test-Path -LiteralPath $buildDir -PathType Container)) {
     throw "Configured build directory not found: $buildDir"
 }
+Initialize-G7BuildEnvironment
 
 $startedUtc = (Get-Date).ToUniversalTime()
 $inputsBefore = @(Get-G7BuildInputs)
