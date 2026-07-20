@@ -13,6 +13,56 @@ $exe = Join-Path $outputDir "ds4_server.exe"
 $manifestPath = Join-Path $outputDir "g7_build_manifest.json"
 $vcvars64 = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"
 
+function ConvertFrom-G7EnvironmentLines {
+    param([AllowEmptyCollection()][string[]]$EnvironmentLines)
+
+    $variables = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    $originalNames = [Collections.Generic.Dictionary[string,string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in @($EnvironmentLines)) {
+        if ($null -eq $line) { continue }
+        $separator = $line.IndexOf('=')
+        if ($separator -le 0) { continue }
+        $name = $line.Substring(0, $separator)
+        $value = $line.Substring($separator + 1)
+        if ($variables.ContainsKey($name)) {
+            throw "Visual Studio x64 environment emitted duplicate variable names: " +
+                "'$($originalNames[$name])' and '$name' (case-insensitive)"
+        }
+        $variables.Add($name, $value)
+        $originalNames.Add($name, $name)
+    }
+    if (-not $variables.ContainsKey('Path')) {
+        throw "Visual Studio x64 environment did not emit PATH"
+    }
+    $developerPath = $variables['Path']
+    if ([string]::IsNullOrWhiteSpace($developerPath)) {
+        throw "Visual Studio x64 environment emitted empty PATH"
+    }
+    return [pscustomobject]@{
+        Variables = $variables
+        DeveloperPath = $developerPath
+    }
+}
+
+function Import-G7ProcessEnvironment {
+    param([Parameter(Mandatory = $true)][object]$ParsedEnvironment)
+
+    foreach ($entry in $ParsedEnvironment.Variables.GetEnumerator()) {
+        if ($entry.Key.Equals('Path', [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        [Environment]::SetEnvironmentVariable(
+            $entry.Key, $entry.Value, [EnvironmentVariableTarget]::Process)
+    }
+    [Environment]::SetEnvironmentVariable(
+        'PATH', $null, [EnvironmentVariableTarget]::Process)
+    [Environment]::SetEnvironmentVariable(
+        'Path', $ParsedEnvironment.DeveloperPath,
+        [EnvironmentVariableTarget]::Process)
+}
+
 function Initialize-G7BuildEnvironment {
     if (-not (Test-Path -LiteralPath $vcvars64 -PathType Leaf)) {
         throw "Visual Studio x64 environment script not found: $vcvars64"
@@ -22,28 +72,8 @@ function Initialize-G7BuildEnvironment {
     if ($LASTEXITCODE -ne 0 -or $environmentLines.Count -eq 0) {
         throw "Visual Studio x64 environment initialization failed"
     }
-    $developerPathLine = @($environmentLines | Where-Object {
-        $_.StartsWith('PATH=', [StringComparison]::Ordinal)
-    } | Select-Object -First 1)
-    if ($developerPathLine.Count -ne 1) {
-        throw "Visual Studio x64 environment did not emit canonical PATH"
-    }
-    $developerPath = $developerPathLine[0].Substring(5)
-    foreach ($line in $environmentLines) {
-        $separator = $line.IndexOf('=')
-        if ($separator -le 0) { continue }
-        $name = $line.Substring(0, $separator)
-        if ($name.Equals('Path', [StringComparison]::OrdinalIgnoreCase)) {
-            continue
-        }
-        $value = $line.Substring($separator + 1)
-        [Environment]::SetEnvironmentVariable(
-            $name, $value, [EnvironmentVariableTarget]::Process)
-    }
-    [Environment]::SetEnvironmentVariable(
-        'PATH', $null, [EnvironmentVariableTarget]::Process)
-    [Environment]::SetEnvironmentVariable(
-        'Path', $developerPath, [EnvironmentVariableTarget]::Process)
+    $parsedEnvironment = ConvertFrom-G7EnvironmentLines $environmentLines
+    Import-G7ProcessEnvironment $parsedEnvironment
     if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
         throw "Visual Studio x64 environment did not expose cl.exe"
     }
