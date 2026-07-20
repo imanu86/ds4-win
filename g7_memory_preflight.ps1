@@ -164,6 +164,13 @@ function Get-G7MemorySnapshot {
         $systemCacheBytes = [UInt64]$native.system_cache_bytes
     }
 
+    $mockAvailableGiB = [Environment]::GetEnvironmentVariable("G7_TEST_MOCK_AVAILABLE_GIB")
+    if (-not [string]::IsNullOrWhiteSpace($mockAvailableGiB)) {
+        $availableBytes = [UInt64]([double]::Parse(
+                $mockAvailableGiB,
+                [Globalization.CultureInfo]::InvariantCulture) * 1GB)
+    }
+
     $workingSets = @()
     foreach ($process in @(Get-Process -ErrorAction SilentlyContinue)) {
         try {

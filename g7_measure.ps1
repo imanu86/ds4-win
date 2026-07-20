@@ -2079,6 +2079,92 @@ $WarmupPrompt = [string]::Concat($WarmupPrompt)
 $memoryPreflightHelper = Join-Path $PSScriptRoot "g7_memory_preflight.ps1"
 $runtimeMonitorHelper = Join-Path $PSScriptRoot "g7_runtime_monitor.ps1"
 . $memoryPreflightHelper
+
+function Get-G7PreflightRequiredRamGiB {
+    param(
+        [double]$MinimumAvailableGiB,
+        [double]$DynamicArenaGiB,
+        [double]$Q1_0ArenaGB,
+        [bool]$Q1_0DualSparseCompanion,
+        [bool]$Q1_0PromotionSsdWrap,
+        [double]$Q1_0Iq2PinnedGiB,
+        [bool]$NestedResidualAllLayerStorageRequested,
+        [double]$NestedResidualExpectedHostAllocationGiB
+    )
+
+    $required = 4.0
+    if ($DynamicArenaGiB -gt 0.0) {
+        $required = [math]::Max($required, $DynamicArenaGiB + 2.0)
+    }
+    if ($Q1_0DualSparseCompanion) {
+        $required = [math]::Max($required, ($DynamicArenaGiB * 1.5) + 2.0)
+    }
+    if ($NestedResidualAllLayerStorageRequested) {
+        $required = [math]::Max(
+            $required,
+            $NestedResidualExpectedHostAllocationGiB + 4.0)
+    }
+
+    $q1CommitGiB = 0.0
+    if ($DynamicArenaGiB -gt 0.0) { $q1CommitGiB += $DynamicArenaGiB }
+    if ($Q1_0ArenaGB -gt 0.0) { $q1CommitGiB += $Q1_0ArenaGB }
+    if ($Q1_0PromotionSsdWrap) { $q1CommitGiB += $Q1_0Iq2PinnedGiB }
+    if ($q1CommitGiB -gt 0.0) {
+        $required = [math]::Max($required, $q1CommitGiB + 2.0)
+    }
+    if ($MinimumAvailableGiB -gt 0.0) {
+        $required = [math]::Max($required, $MinimumAvailableGiB)
+    }
+    return [double]$required
+}
+
+function Test-G7PreflightRamAdmission {
+    param(
+        [Parameter(Mandatory = $true)]$MemoryPreflight,
+        [double]$RequiredGiB,
+        [double]$DynamicArenaGiB,
+        [double]$Q1_0ArenaGB,
+        [bool]$Q1_0PromotionSsdWrap,
+        [double]$Q1_0Iq2PinnedGiB
+    )
+
+    $availableGiB = $null
+    $decision = "refuse"
+    $failureMessage = $null
+    if ($null -ne $MemoryPreflight -and $MemoryPreflight.skipped) {
+        $decision = "skipped_by_operator"
+    } elseif ($null -eq $MemoryPreflight -or $null -eq $MemoryPreflight.after -or
+        $null -eq $MemoryPreflight.after.available_bytes) {
+        $decision = "unable-to-verify"
+    } else {
+        $availableGiB = [double]$MemoryPreflight.after.available_bytes / 1GB
+        if ($availableGiB -le 0.0) {
+            $decision = "unable-to-verify"
+        } elseif ($availableGiB -ge $RequiredGiB) {
+            $decision = "pass"
+        }
+    }
+    if ($decision -ne "pass" -and $decision -ne "skipped_by_operator") {
+        $availableText = "unverified"
+        if ($null -ne $availableGiB) {
+            $availableText = $availableGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture)
+        }
+        $failureMessage = ("RAM admission refused launch: required_gib={0} available_gib={1} dynamic_arena_gib={2} q1_0_arena_gb={3} q1_0_promotion_ssd_wrap={4} q1_0_iq2_pinned_gib={5}" -f `
+            $RequiredGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture),
+            $availableText,
+            $DynamicArenaGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture),
+            $Q1_0ArenaGB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture),
+            $Q1_0PromotionSsdWrap,
+            $Q1_0Iq2PinnedGiB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture))
+    }
+    return [pscustomobject][ordered]@{
+        required_gib = $RequiredGiB
+        available_gib = $availableGiB
+        decision = $decision
+        failure_message = $failureMessage
+    }
+}
+
 if (-not (Test-Path -LiteralPath $runtimeMonitorHelper)) {
     throw "Required runtime monitor not found: $runtimeMonitorHelper"
 }
@@ -2987,17 +3073,48 @@ function Write-G7MeasurementFailure {
         [Parameter(Mandatory=$true)][string]$Reason,
         [object]$Exception = $null,
         [object]$AbortSample = $null,
-        [object[]]$Evidence = @()
+        [object[]]$Evidence = @(),
+        [object]$PreflightRamAdmission = $null,
+        [object]$PreflightRamAdmissionParameters = $null
     )
 
     if ([string]::IsNullOrWhiteSpace($failurePath)) { return }
     if (Test-Path -LiteralPath $failurePath -PathType Leaf) { return }
     $message = if ($Exception) { [string]$Exception } else { "" }
+    $preflightRequiredGiB = $null
+    $preflightAvailableGiB = $null
+    $preflightDecision = $null
+    if ($null -ne $PreflightRamAdmission) {
+        $preflightRequiredGiB = $PreflightRamAdmission.required_gib
+        $preflightAvailableGiB = $PreflightRamAdmission.available_gib
+        $preflightDecision = $PreflightRamAdmission.decision
+    }
+    $preflightDynamicArenaGiB = $null
+    $preflightQ1_0ArenaGB = $null
+    $preflightQ1_0PromotionSsdWrap = $null
+    $preflightQ1_0Iq2PinnedGiB = $null
+    if ($null -ne $PreflightRamAdmissionParameters) {
+        $preflightDynamicArenaGiB =
+            $PreflightRamAdmissionParameters.dynamic_arena_gib
+        $preflightQ1_0ArenaGB =
+            $PreflightRamAdmissionParameters.q1_0_arena_gb
+        $preflightQ1_0PromotionSsdWrap =
+            $PreflightRamAdmissionParameters.q1_0_promotion_ssd_wrap
+        $preflightQ1_0Iq2PinnedGiB =
+            $PreflightRamAdmissionParameters.q1_0_iq2_pinned_gib
+    }
     [pscustomobject]@{
         schema = "g7_measurement_failure_v1"
         tag = $Tag
         reason = $Reason
         message = $message
+        required_gib = $preflightRequiredGiB
+        available_gib = $preflightAvailableGiB
+        decision = $preflightDecision
+        dynamic_arena_gib = $preflightDynamicArenaGiB
+        q1_0_arena_gb = $preflightQ1_0ArenaGB
+        q1_0_promotion_ssd_wrap = $preflightQ1_0PromotionSsdWrap
+        q1_0_iq2_pinned_gib = $preflightQ1_0Iq2PinnedGiB
         head = $headAtStart
         executable_sha256 = $exeHashAtStart
         harness_sha256 = $harnessHashAtStart
@@ -3860,28 +3977,61 @@ $_processEnvironment = [System.Environment]::GetEnvironmentVariables()
 foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | Where-Object { $_ -like "DS4_*" } | Sort-Object)) {
     $effectiveDs4Environment[$name] = [string]$_processEnvironment[$name]
 }
-$effectiveMinimumAvailableGiB = $MinimumAvailableGiB
-if ($effectiveMinimumAvailableGiB -eq 0.0) {
-    $effectiveMinimumAvailableGiB = 4.0
-    if ($DynamicArenaGiB -gt 0.0) {
-        $effectiveMinimumAvailableGiB = [math]::Max(4.0, $DynamicArenaGiB + 2.0)
-    }
-    if ($Q1_0DualSparseCompanion) {
-        # Q1_0 is exactly half the routed-expert bytes of the IQ2 primary
-        # snapshot. Reserve both snapshots plus 2 GiB before committing RAM.
-        $effectiveMinimumAvailableGiB = [math]::Max(
-            $effectiveMinimumAvailableGiB,
-            ($DynamicArenaGiB * 1.5) + 2.0)
-    }
-    if ($nestedResidualAllLayerStorageRequested) {
-        $effectiveMinimumAvailableGiB = [math]::Max(
-            $effectiveMinimumAvailableGiB,
-            $nestedResidualExpectedHostAllocationGiB + 4.0)
+$effectiveMinimumAvailableGiB = Get-G7PreflightRequiredRamGiB `
+    -MinimumAvailableGiB $MinimumAvailableGiB `
+    -DynamicArenaGiB $DynamicArenaGiB `
+    -Q1_0ArenaGB $Q1_0ArenaGB `
+    -Q1_0DualSparseCompanion ([bool]$Q1_0DualSparseCompanion) `
+    -Q1_0PromotionSsdWrap ([bool]$Q1_0PromotionSsdWrap) `
+    -Q1_0Iq2PinnedGiB $Q1_0Iq2PinnedGiB `
+    -NestedResidualAllLayerStorageRequested $nestedResidualAllLayerStorageRequested `
+    -NestedResidualExpectedHostAllocationGiB $nestedResidualExpectedHostAllocationGiB
+$memoryPreflight = $null
+try {
+    $memoryPreflight = Invoke-G7MemoryPreflight -Skip:$SkipMemoryPreflight `
+        -MinimumAvailableGiB $effectiveMinimumAvailableGiB -Label ("g7:" + $Tag)
+} catch {
+    $memoryPreflight = [pscustomobject][ordered]@{
+        schema = "g7_windows_memory_preflight_v1"
+        label = ("g7:" + $Tag)
+        skipped = [bool]$SkipMemoryPreflight
+        ready_to_launch = $false
+        failure_message = $_.Exception.Message
+        minimum_available_gib = $effectiveMinimumAvailableGiB
+        guard_passed = $false
+        before = $null
+        after = $null
     }
 }
-$memoryPreflight = Invoke-G7MemoryPreflight -Skip:$SkipMemoryPreflight `
-    -MinimumAvailableGiB $effectiveMinimumAvailableGiB -Label ("g7:" + $Tag)
+$preflightRamAdmission = Test-G7PreflightRamAdmission `
+    -MemoryPreflight $memoryPreflight `
+    -RequiredGiB $effectiveMinimumAvailableGiB `
+    -DynamicArenaGiB $DynamicArenaGiB `
+    -Q1_0ArenaGB $Q1_0ArenaGB `
+    -Q1_0PromotionSsdWrap ([bool]$Q1_0PromotionSsdWrap) `
+    -Q1_0Iq2PinnedGiB $Q1_0Iq2PinnedGiB
+$preflightRamAdmissionParameters = [pscustomobject][ordered]@{
+    dynamic_arena_gib = $DynamicArenaGiB
+    q1_0_arena_gb = $Q1_0ArenaGB
+    q1_0_promotion_ssd_wrap = [bool]$Q1_0PromotionSsdWrap
+    q1_0_iq2_pinned_gib = $Q1_0Iq2PinnedGiB
+}
+$memoryPreflight | Add-Member -NotePropertyName required_gib `
+    -NotePropertyValue $preflightRamAdmission.required_gib -Force
+$memoryPreflight | Add-Member -NotePropertyName available_gib `
+    -NotePropertyValue $preflightRamAdmission.available_gib -Force
+$memoryPreflight | Add-Member -NotePropertyName decision `
+    -NotePropertyValue $preflightRamAdmission.decision -Force
 Write-G7MemoryPreflightTelemetry -Telemetry $memoryPreflight -Path $memoryPreflightLog
+if ($preflightRamAdmission.decision -ne "pass" -and
+    $preflightRamAdmission.decision -ne "skipped_by_operator") {
+    Write-G7MeasurementFailure `
+        -Reason "ram-admission-refused" `
+        -Exception $preflightRamAdmission.failure_message `
+        -PreflightRamAdmission $preflightRamAdmission `
+        -PreflightRamAdmissionParameters $preflightRamAdmissionParameters
+    throw $preflightRamAdmission.failure_message
+}
 if (-not $memoryPreflight.ready_to_launch) {
     throw ("Memory preflight refused launch: " + $memoryPreflight.failure_message)
 }
@@ -4755,6 +4905,14 @@ if (-not $ready) {
         schema = "g7_measurement_failure_v1"
         tag = $Tag
         reason = $failureReason
+        required_gib = $preflightRamAdmission.required_gib
+        available_gib = $preflightRamAdmission.available_gib
+        decision = $preflightRamAdmission.decision
+        dynamic_arena_gib = $preflightRamAdmissionParameters.dynamic_arena_gib
+        q1_0_arena_gb = $preflightRamAdmissionParameters.q1_0_arena_gb
+        q1_0_promotion_ssd_wrap =
+            $preflightRamAdmissionParameters.q1_0_promotion_ssd_wrap
+        q1_0_iq2_pinned_gib = $preflightRamAdmissionParameters.q1_0_iq2_pinned_gib
         head = $headAtStart
         executable_sha256 = $exeHashAtStart
         harness_sha256 = $harnessHashAtStart
@@ -5075,6 +5233,9 @@ $runtimeTelemetry = [pscustomobject]@{
     contamination_consecutive_peak = if ($contaminationSamplesObserved.Count) { [int]($contaminationSamplesObserved | Measure-Object -Maximum).Maximum } else { 0 }
     contamination_abort_observed = [bool]$contaminationAbortObserved
     contamination_runtime_minimum_available_gib = $RuntimeMinimumAvailableGiB
+    contamination_preflight_required_gib = $preflightRamAdmission.required_gib
+    contamination_preflight_available_gib = $preflightRamAdmission.available_gib
+    contamination_preflight_decision = $preflightRamAdmission.decision
     contamination_runtime_maximum_disk_queue_length = $RuntimeMaximumDiskQueueLength
     contamination_runtime_hard_minimum_available_gib = $RuntimeHardMinimumAvailableGiB
     contamination_runtime_maximum_pages_output_per_second = $RuntimeMaximumPagesOutputPerSecond
@@ -5364,7 +5525,9 @@ if (Test-Path $stderrLog) {
         Write-G7MeasurementFailure `
             -Reason $runtimeFailureReason `
             -AbortSample $runtimeAbortSample `
-            -Evidence $runtimeFailureEvidence
+            -Evidence $runtimeFailureEvidence `
+            -PreflightRamAdmission $preflightRamAdmission `
+            -PreflightRamAdmissionParameters $preflightRamAdmissionParameters
         throw ("Measurement failed before runtime invariant parsing: " +
             "http_ok=$httpOk completed=$($results.Count) expected=$Repeats" +
             $runtimeFailureSuffix)
@@ -9571,6 +9734,9 @@ $rawOutputs = [pscustomobject]@{
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
     contamination_reason = $contaminationReason
+    preflight_required_gib = $preflightRamAdmission.required_gib
+    preflight_available_gib = $preflightRamAdmission.available_gib
+    preflight_decision = $preflightRamAdmission.decision
     allow_quality_verified_suite_receipt_requested =
         [bool]$AllowQualityVerifiedSuiteReceipt
     outer_quality_process_count_requested = $OuterQualityProcessCount
@@ -10121,6 +10287,9 @@ $summary = [pscustomobject]@{
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
     contamination_reason = $contaminationReason
+    preflight_required_gib = $preflightRamAdmission.required_gib
+    preflight_available_gib = $preflightRamAdmission.available_gib
+    preflight_decision = $preflightRamAdmission.decision
     allow_quality_verified_suite_receipt_requested =
         [bool]$AllowQualityVerifiedSuiteReceipt
     outer_quality_process_count_requested = $OuterQualityProcessCount
@@ -11382,7 +11551,9 @@ Write-Host "=================================================="
         -Reason $failureReason `
         -Exception $_.Exception.Message `
         -AbortSample $(if (Get-Variable -Name runtimeAbortSample -Scope Local -ErrorAction SilentlyContinue) { $runtimeAbortSample } else { $null }) `
-        -Evidence $(if (Get-Variable -Name runtimeFailureEvidence -Scope Local -ErrorAction SilentlyContinue) { @($runtimeFailureEvidence) } else { @() })
+        -Evidence $(if (Get-Variable -Name runtimeFailureEvidence -Scope Local -ErrorAction SilentlyContinue) { @($runtimeFailureEvidence) } else { @() }) `
+        -PreflightRamAdmission $preflightRamAdmission `
+        -PreflightRamAdmissionParameters $preflightRamAdmissionParameters
     throw
 } finally {
     if ($null -ne $modelLockStream) {
