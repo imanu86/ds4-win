@@ -230,6 +230,7 @@ $effectiveProcessPath = [Environment]::GetEnvironmentVariable(
     "Path", $effectiveProcessPath, [EnvironmentVariableTarget]::Process)
 . (Join-Path $PSScriptRoot "g7_process_isolation.ps1")
 . (Join-Path $PSScriptRoot "g7_system_counters.ps1")
+. (Join-Path $PSScriptRoot "g7_measure_meter.ps1")
 function Read-G7Q1_0SidecarTelemetry {
     param(
         [AllowEmptyString()][string]$LogText,
@@ -5422,44 +5423,7 @@ if (Test-Path $stderrLog) {
         throw "Request phase trace activated while not requested"
     }
 
-    # Keep server-reported decode throughput separate from HTTP wall time, which
-    # also includes prefill/TTFT. A request block starts at "prompt start" and
-    # the last decoding line in that block is the cumulative decode average.
-    $serverBlock = $null
-    foreach ($line in $lines) {
-        if ($line -match "prompt start") {
-            if ($null -ne $serverBlock -and $serverBlock.generated_tokens -gt 0) {
-                $serverRunsAll += $serverBlock
-            }
-            $serverBlock = [pscustomobject]@{
-                request_index = $serverRunsAll.Count + 1
-                generated_tokens = 0
-                server_decode_seconds = 0.0
-                server_chunk_tokens_per_second = 0.0
-                server_avg_tokens_per_second = 0.0
-                finish_reason = ""
-                server_total_seconds = 0.0
-                server_prefill_ttft_seconds = 0.0
-            }
-            continue
-        }
-        if ($null -eq $serverBlock) { continue }
-        if ($line -match "gen=(\d+) decoding chunk=([0-9.]+) t/s avg=([0-9.]+) t/s ([0-9.]+)s") {
-            $serverBlock.generated_tokens = [int]$Matches[1]
-            $serverBlock.server_chunk_tokens_per_second = [double]$Matches[2]
-            $serverBlock.server_avg_tokens_per_second = [double]$Matches[3]
-            $serverBlock.server_decode_seconds = [double]$Matches[4]
-        }
-        if ($line -match "gen=(\d+) finish=([^ ]+) ([0-9.]+)s") {
-            $serverBlock.generated_tokens = [int]$Matches[1]
-            $serverBlock.finish_reason = $Matches[2]
-            $serverBlock.server_total_seconds = [double]$Matches[3]
-            $serverBlock.server_prefill_ttft_seconds = [math]::Max(0.0, $serverBlock.server_total_seconds - $serverBlock.server_decode_seconds)
-        }
-    }
-    if ($null -ne $serverBlock -and $serverBlock.generated_tokens -gt 0) {
-        $serverRunsAll += $serverBlock
-    }
+    $serverRunsAll = @(ConvertFrom-G7ServerStderrLines -Lines $lines)
 
     $evLine = $lines | Where-Object { $_ -match "evicts=(\d+)" } | Select-Object -Last 1
     if ($evLine -and $evLine -match "evicts=(\d+)") { $evicts = [int]$Matches[1] }
@@ -9399,19 +9363,21 @@ if ($ArenaWrapUnlockSourceRanges) {
     throw "Arena WRAP source unlock measurement failed: unexpected source unlock telemetry while disabled"
 }
 
-$serverRuns = @($serverRunsAll | Select-Object -Last $Repeats)
-$serverDecodeTps = @($serverRuns | ForEach-Object { $_.server_avg_tokens_per_second } | Where-Object { $_ -gt 0 })
-$serverDecodeMeanTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Average).Average, 6) } else { 0.0 }
-$serverDecodeMinTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
-$serverDecodeMaxTps = if ($serverDecodeTps.Count) { [math]::Round(($serverDecodeTps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
-$serverPrefillTtft = @($serverRuns | ForEach-Object { $_.server_prefill_ttft_seconds } | Where-Object { $_ -gt 0 })
-$serverPrefillTtftMean = if ($serverPrefillTtft.Count) { [math]::Round(($serverPrefillTtft | Measure-Object -Average).Average, 6) } else { 0.0 }
+$measurementMetrics = Invoke-G7MeasurementAggregation `
+    -Results $results `
+    -ServerRunsAll $serverRunsAll `
+    -Repeats $Repeats `
+    -Warmup ([bool]$Warmup)
+$serverRuns = @($measurementMetrics.server_runs)
+$serverDecodeMeanTps = $measurementMetrics.server_decode_mean_tokens_per_second
+$serverDecodeMinTps = $measurementMetrics.server_decode_min_tokens_per_second
+$serverDecodeMaxTps = $measurementMetrics.server_decode_max_tokens_per_second
+$serverPrefillTtftMean = $measurementMetrics.server_prefill_ttft_mean_seconds
 $spexReadyCoverage = if ($spexScheduled -gt 0) { [math]::Round($spexReady / [double]$spexScheduled, 6) } else { $null }
 $spexRecallScope = if ($spexScheduled -gt 0) { "ready_predictions_only" } else { "not_applicable" }
-$tps = @($results | ForEach-Object { $_.tokens_per_second })
-$meanTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Average).Average, 6) } else { 0.0 }
-$minTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Minimum).Minimum, 6) } else { 0.0 }
-$maxTps = if ($tps.Count) { [math]::Round(($tps | Measure-Object -Maximum).Maximum, 6) } else { 0.0 }
+$meanTps = $measurementMetrics.client_wall_tps
+$minTps = $measurementMetrics.client_wall_min_tokens_per_second
+$maxTps = $measurementMetrics.client_wall_max_tokens_per_second
 $hashes = @($results | Select-Object -ExpandProperty content_sha256 -Unique)
 $expertTieringResult = [pscustomobject]@{
     requested_mode = $ExpertTiering
@@ -10092,6 +10058,25 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_mixed_profile_main_sync_ms = $iq1MixedProfileMainSyncMs
     iq1_s_mixed_profile_cold_submit_ms = $iq1MixedProfileColdSubmitMs
     iq1_s_mixed_profile_join_submit_ms = $iq1MixedProfileJoinSubmitMs
+    measurement_status = $measurementMetrics.status
+    measurement_valid = [bool]$measurementMetrics.valid
+    measurement_invalid_reason = $measurementMetrics.invalid_reason
+    decode_tps = $measurementMetrics.decode_tps
+    client_wall_tps = $measurementMetrics.client_wall_tps
+    tokens_per_second_deprecated = $true
+    tokens_per_second_deprecated_reason =
+        "client wall-clock includes prefill/TTFT; use decode_tps"
+    server_decode_samples_used = $measurementMetrics.samples_used
+    server_decode_samples_expected = $measurementMetrics.expected_samples
+    server_decode_warmup_excluded = $measurementMetrics.warmup_excluded
+    server_parsed_decode_mean_tokens_per_second =
+        $measurementMetrics.server_parsed_decode_mean_tokens_per_second
+    server_parsed_decode_tps_cross_check_ok =
+        $measurementMetrics.server_parsed_decode_tps_cross_check_ok
+    server_parsed_decode_tps_max_relative_delta =
+        $measurementMetrics.server_parsed_decode_tps_max_relative_delta
+    server_parsed_decode_tps_relative_tolerance =
+        $measurementMetrics.server_parsed_decode_tps_relative_tolerance
     warmup_result = $warmupResult
     output_hashes = $hashes
     outputs_identical = ($hashes.Count -eq 1)
@@ -11249,12 +11234,31 @@ $summary = [pscustomobject]@{
     expert_cache_direct_loads = $cacheDirect
     load_seconds = [math]::Round($loadSec, 6)
     warmup_seconds = [math]::Round($warmSec, 6)
+    measurement_status = $measurementMetrics.status
+    measurement_valid = [bool]$measurementMetrics.valid
+    measurement_invalid_reason = $measurementMetrics.invalid_reason
+    decode_tps = $measurementMetrics.decode_tps
+    client_wall_tps = $measurementMetrics.client_wall_tps
+    tokens_per_second_deprecated = $true
+    tokens_per_second_deprecated_reason =
+        "client wall-clock includes prefill/TTFT; use decode_tps"
     mean_tokens_per_second = $meanTps
     min_tokens_per_second = $minTps
     max_tokens_per_second = $maxTps
     server_decode_mean_tokens_per_second = $serverDecodeMeanTps
     server_decode_min_tokens_per_second = $serverDecodeMinTps
     server_decode_max_tokens_per_second = $serverDecodeMaxTps
+    server_decode_samples_used = $measurementMetrics.samples_used
+    server_decode_samples_expected = $measurementMetrics.expected_samples
+    server_decode_warmup_excluded = $measurementMetrics.warmup_excluded
+    server_parsed_decode_mean_tokens_per_second =
+        $measurementMetrics.server_parsed_decode_mean_tokens_per_second
+    server_parsed_decode_tps_cross_check_ok =
+        $measurementMetrics.server_parsed_decode_tps_cross_check_ok
+    server_parsed_decode_tps_max_relative_delta =
+        $measurementMetrics.server_parsed_decode_tps_max_relative_delta
+    server_parsed_decode_tps_relative_tolerance =
+        $measurementMetrics.server_parsed_decode_tps_relative_tolerance
     server_prefill_ttft_mean_seconds = $serverPrefillTtftMean
     server_runs = $serverRuns
     outputs_identical = ($hashes.Count -eq 1)
@@ -11263,6 +11267,12 @@ $summary = [pscustomobject]@{
 $summary | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $resultPath
 $systemQuiescenceJson |
     Set-Content -LiteralPath $systemQuiescenceLog -Encoding UTF8
+if (-not [bool]$measurementMetrics.valid) {
+    Write-G7MeasurementFailure `
+        -Reason "invalid-measurement-metrics" `
+        -Evidence @($measurementMetrics)
+    throw ("Measurement INVALID: " + $measurementMetrics.invalid_reason)
+}
 
 Write-Host ""
 Write-Host "================ G7 RESULT ($Tag) ================"
@@ -11271,8 +11281,8 @@ Write-Host ("repeats       : " + $Repeats)
 Write-Host ("content       : [" + $(if ($results.Count) { $results[-1].content } else { "" }) + "]")
 Write-Host ("load_sec      : " + [math]::Round($loadSec,1))
 Write-Host ("warm_sec      : " + [math]::Round($warmSec,2) + "  (warmup pass, discarded)")
-Write-Host ("t/s mean/min/max: " + $meanTps + " / " + $minTps + " / " + $maxTps)
-Write-Host ("server decode t/s mean/min/max: " + $serverDecodeMeanTps + " / " + $serverDecodeMinTps + " / " + $serverDecodeMaxTps)
+Write-Host ("decode_tps mean/min/max: " + $serverDecodeMeanTps + " / " + $serverDecodeMinTps + " / " + $serverDecodeMaxTps)
+Write-Host ("client wall t/s mean/min/max: " + $meanTps + " / " + $minTps + " / " + $maxTps)
 Write-Host ("server prefill/TTFT mean sec: " + $serverPrefillTtftMean)
 Write-Host ("outputs_identical: " + ($hashes.Count -eq 1))
 Write-Host ("ctx requested/observed, prefill chunk, raw/compressed KV rows: " + $Context + " / " + $contextObserved + " / " + $prefillChunkObserved + " / " + $rawKvRowsObserved + " / " + $compressedKvRowsObserved)
