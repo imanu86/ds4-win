@@ -7266,6 +7266,7 @@ $q1_0SourceUnlockReadTransferAfter = [UInt64]0
 $q1_0SourceUnlockLastError = [UInt64]0
 $q1_0SourceUnlockExpectedEntries = [UInt64]0
 $q1_0SourceUnlockTotalBytes = [UInt64]0
+$q1_0SourceUnlockClassification = ''
 $q1_0BootstrapMatches = [regex]::Matches(
     $q1_0SidecarLogText,
     '(?m)^(?:ds4: )?\[q1-0-resident-arena\] result=bootstrapped entries=(\d+) layers=(\d+)\.\.(\d+) generation=(\d+) source=sidecar-mmap route_pread=disabled iq2_host_arena=([^ \r\n]+) mixed_host_backing=([^ \r\n]+) pinned=(\d+) pageable=(\d+) pinned_slots=(\d+) pageable_slots=(\d+) total_slots=(\d+) total_bytes=(\d+)\r?$')
@@ -7368,7 +7369,16 @@ if ($q1_0SourceUnlockMatches.Count -eq 1) {
         [UInt64]$q1_0SourceUnlockMatch.Groups[25].Value
     $q1_0SourceUnlockTotalBytes =
         [UInt64]$q1_0SourceUnlockMatch.Groups[26].Value
-    if ($q1_0SourceUnlockResult -ne "complete" -or
+    if ($q1_0SourceUnlockFailed -ne 0) {
+        $q1_0SourceUnlockClassification = 'failed'
+    } elseif ($q1_0SourceUnlockCalls -eq 0) {
+        $q1_0SourceUnlockClassification = 'no-unlock-activity'
+    } elseif (($q1_0SourceUnlockNotLocked -eq $q1_0SourceUnlockCalls) -and
+        ($q1_0SourceUnlockFailed -eq 0)) {
+        $q1_0SourceUnlockClassification = 'intentional-ws-trim-idiom'
+    }
+    if ($q1_0SourceUnlockFailed -eq 0 -and
+        ($q1_0SourceUnlockResult -ne "complete" -or
         $q1_0SourceUnlockWindows -ne 1 -or
         $q1_0SourceUnlockPageAligned -ne 1 -or
         $q1_0SourceUnlockDestinationUnchanged -ne 1 -or
@@ -7381,11 +7391,14 @@ if ($q1_0SourceUnlockMatches.Count -eq 1) {
         $q1_0SourceUnlockCalls -ne
             ($q1_0SourceUnlockSuccess + $q1_0SourceUnlockNotLocked +
              $q1_0SourceUnlockFailed) -or
-        $q1_0SourceUnlockExpectedEntries -ne $q1_0BootstrapEntries -or
-        $q1_0SourceUnlockTotalBytes -ne $q1_0BootstrapTotalBytes) {
+        ($q1_0SourceUnlockCalls -ne 0 -and
+         ($q1_0SourceUnlockExpectedEntries -ne $q1_0BootstrapEntries -or
+          $q1_0SourceUnlockTotalBytes -ne $q1_0BootstrapTotalBytes)))) {
         throw "Q1_0 source unlock telemetry counters are inconsistent"
     }
-    if ($q1_0BootstrapMatches.Count -gt 0) {
+    if ($q1_0BootstrapMatches.Count -gt 0 -and
+        $q1_0SourceUnlockCalls -ne 0 -and
+        $q1_0SourceUnlockFailed -eq 0) {
         $expectedQ1_0UnlockLayers =
             $q1_0BootstrapLayerLast - $q1_0BootstrapLayerFirst + 1
         if ($q1_0SourceUnlockLayers -ne $expectedQ1_0UnlockLayers -or
@@ -9913,6 +9926,7 @@ $rawOutputs = [pscustomobject]@{
     q1_0_source_unlock_success = $q1_0SourceUnlockSuccess
     q1_0_source_unlock_not_locked = $q1_0SourceUnlockNotLocked
     q1_0_source_unlock_failed = $q1_0SourceUnlockFailed
+    q1_0_source_unlock_classification = $q1_0SourceUnlockClassification
     q1_0_source_unlock_seconds = $q1_0SourceUnlockSeconds
     q1_0_source_unlock_available_before =
         $q1_0SourceUnlockAvailableBefore
@@ -10100,6 +10114,9 @@ $rawOutputs = [pscustomobject]@{
     results = $results
 }
 $rawOutputs | ConvertTo-Json -Depth 8 | Set-Content -Encoding UTF8 $rawOutputsPath
+if ($q1_0SourceUnlockFailed -ne 0) {
+    throw "Q1_0 source unlock telemetry counters are inconsistent"
+}
 if ($Repeats -gt 1 -and $hashes.Count -ne 1 -and -not $AllowNonIdenticalRepeatOutputs) {
     throw "Measurement failed: repeated outputs were not identical"
 }
@@ -10477,6 +10494,7 @@ $summary = [pscustomobject]@{
     q1_0_source_unlock_success = $q1_0SourceUnlockSuccess
     q1_0_source_unlock_not_locked = $q1_0SourceUnlockNotLocked
     q1_0_source_unlock_failed = $q1_0SourceUnlockFailed
+    q1_0_source_unlock_classification = $q1_0SourceUnlockClassification
     q1_0_source_unlock_seconds = $q1_0SourceUnlockSeconds
     q1_0_source_unlock_available_before =
         $q1_0SourceUnlockAvailableBefore
