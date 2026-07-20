@@ -35,6 +35,7 @@ function Get-G130U1Constants {
         ttft_cap_seconds = 180
         startup_stall_seconds = 180
         application_data_stall_seconds = 60
+        page_out_delta_abort_pages = 100000
         watchdog_heartbeat_stall_seconds = 5
         watchdog_cadence_seconds = 1
         quiet_window_interval_seconds = 2
@@ -224,6 +225,7 @@ function Get-G130U1WhatIfPlan {
             warm_tokens=$c.throughput_warm_tokens
             consecutive_tokens=$c.throughput_consecutive_tokens
             application_data_stall_seconds=$c.application_data_stall_seconds
+            page_out_delta_abort_pages=$c.page_out_delta_abort_pages
             watchdog_heartbeat_stall_seconds=$c.watchdog_heartbeat_stall_seconds
             watchdog_cadence_seconds=$c.watchdog_cadence_seconds
             quiet_window_interval_seconds=$c.quiet_window_interval_seconds
