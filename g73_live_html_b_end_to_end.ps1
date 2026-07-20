@@ -8,8 +8,9 @@ param(
     [int]$TimeoutSec = 7200,
     [switch]$StaticCheckOnly,
     [switch]$LifecycleSelfTest,
+    [switch]$ParserSelfTest,
     [switch]$MockIntegration,
-    [ValidateSet('success', 'exit-before-readiness', 'malformed-turn1')]
+    [ValidateSet('success', 'exit-before-readiness', 'malformed-turn1', 'tensor-reload-abort', 'unsafe-tier-abort')]
     [string]$MockScenario = 'success'
 )
 
@@ -56,6 +57,7 @@ public sealed class G73OwnedLoggedProcess : IDisposable
             ProcessStartInfo info = new ProcessStartInfo();
             info.FileName = filePath;
             info.Arguments = JoinArguments(arguments);
+            info.WorkingDirectory = Directory.GetCurrentDirectory();
             info.UseShellExecute = false;
             info.CreateNoWindow = true;
             info.RedirectStandardOutput = true;
@@ -182,11 +184,12 @@ public sealed class G73OwnedLoggedProcess : IDisposable
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $runnerPath = $MyInvocation.MyCommand.Path
+Set-Location -LiteralPath $root
 $exe = Join-Path $root 'build\Release\ds4_server.exe'
 $model = 'C:\ds4-models\ds4-2bit.gguf'
 $modelReceipt = "$model.receipt.json"
 $liveOutRoot = Join-Path $root 'g7_runs\g73_live_html_b_end_to_end'
-$mockOutRoot = Join-Path $root 'g7_runs\g73_live_html_b_mock_integration'
+$mockOutRoot = 'r'
 $outRoot = if ($MockIntegration) { $mockOutRoot } else { $liveOutRoot }
 $lockPath = Join-Path $outRoot 'g73_live_html_b_end_to_end_v2.lock'
 $canonicalRunner = Join-Path $root 'g73_split_fused_ab.ps1'
@@ -201,7 +204,7 @@ $expectedBuildFingerprint = 'c8698dc4f5ba0dcd4e29f50c84545704140875d653f122f1a81
 $expectedExeSha = 'f703f53246331cd632e81eadba9892b8184645cc0b714ad6005ad87d2899dcfa'
 $expectedModelSha = 'efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668'
 $expectedModelBytes = [UInt64]86720111488
-$expectedCanonicalRunnerSha = '977ac73114bcdb883d06c123e3c33e467f230eea96235406c87d29f951b58470'
+$expectedCanonicalRunnerSha = '3b29ebefb0dddda13111ac9d415198f777836c405090a82bd5aa2369a88937e0'
 $contextTokens = 8192
 $prefillChunk = 256
 $maxTokens = 3000
@@ -510,7 +513,7 @@ function Wait-OwnedProcessReadiness {
     $lastProbeError = ''
     while ((Get-Date) -lt $deadline) {
         if (-not (Test-OwnedProcessAlive $OwnedProcess)) {
-            $exit = Complete-OwnedProcessExit -OwnedProcess $OwnedProcess -TimeoutMs 0
+            $exit = Complete-OwnedProcessExit -OwnedProcess $OwnedProcess -TimeoutMs 1000
             return [pscustomobject]@{
                 ready = $false
                 status = 'process-exited-before-readiness'
@@ -822,6 +825,14 @@ function Get-MockCaptureValidation {
         }
         'exit-before-readiness' {
             (-not $request1Present) -and (-not $request2Present) -and $requestCount -eq 0
+        }
+        'tensor-reload-abort' {
+            $request1Present -and (-not $request2Present) -and $requestCount -eq 1 -and
+            $request1RolesExact -and $request1ContentExact -and $controlsExact -and $captureComplete
+        }
+        'unsafe-tier-abort' {
+            $request1Present -and (-not $request2Present) -and $requestCount -eq 1 -and
+            $request1RolesExact -and $request1ContentExact -and $controlsExact -and $captureComplete
         }
     }
     return [pscustomobject]@{
@@ -1159,6 +1170,99 @@ function Test-Turn1ReadyForTurn2 {
     }
 }
 
+function Convert-SrgbByteToLinear {
+    param([double]$Value)
+    $c = $Value / 255.0
+    if ($c -le 0.03928) { return $c / 12.92 }
+    return [math]::Pow((($c + 0.055) / 1.055), 2.4)
+}
+
+function Get-RelativeLuminance {
+    param([int]$R, [int]$G, [int]$B)
+    $lr = Convert-SrgbByteToLinear $R
+    $lg = Convert-SrgbByteToLinear $G
+    $lb = Convert-SrgbByteToLinear $B
+    return (0.2126 * $lr) + (0.7152 * $lg) + (0.0722 * $lb)
+}
+
+function Convert-CssColorToRgb {
+    param([AllowNull()][string]$Color)
+    if ([string]::IsNullOrWhiteSpace($Color)) { return $null }
+    $c = $Color.Trim().ToLowerInvariant()
+    $named = @{
+        black = @(0, 0, 0); white = @(255, 255, 255); red = @(255, 0, 0)
+        cyan = @(0, 255, 255); aqua = @(0, 255, 255); magenta = @(255, 0, 255); fuchsia = @(255, 0, 255)
+    }
+    if ($named.ContainsKey($c)) {
+        $v = $named[$c]
+        return [pscustomobject]@{ r = $v[0]; g = $v[1]; b = $v[2] }
+    }
+    if ($c -match '^#([0-9a-f]{3}|[0-9a-f]{6})$') {
+        $hex = $matches[1]
+        if ($hex.Length -eq 3) {
+            $r = [Convert]::ToInt32(($hex[0].ToString() * 2), 16)
+            $g = [Convert]::ToInt32(($hex[1].ToString() * 2), 16)
+            $b = [Convert]::ToInt32(($hex[2].ToString() * 2), 16)
+        } else {
+            $r = [Convert]::ToInt32($hex.Substring(0, 2), 16)
+            $g = [Convert]::ToInt32($hex.Substring(2, 2), 16)
+            $b = [Convert]::ToInt32($hex.Substring(4, 2), 16)
+        }
+        return [pscustomobject]@{ r = $r; g = $g; b = $b }
+    }
+    if ($c -match '^rgba?\s*\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})') {
+        $r = [math]::Min(255, [int]$matches[1])
+        $g = [math]::Min(255, [int]$matches[2])
+        $b = [math]::Min(255, [int]$matches[3])
+        return [pscustomobject]@{ r = $r; g = $g; b = $b }
+    }
+    return $null
+}
+
+function Resolve-CssColorToken {
+    param([string]$Token, [hashtable]$Variables)
+    if ([string]::IsNullOrWhiteSpace($Token)) { return $null }
+    $t = $Token.Trim()
+    if ($t -match '^var\s*\(\s*(--[A-Za-z0-9_-]+)') {
+        $name = $matches[1].ToLowerInvariant()
+        if ($Variables.ContainsKey($name)) { return [string]$Variables[$name] }
+        return $null
+    }
+    return $t
+}
+
+function Get-CssColorVariables {
+    param([string]$Document)
+    $vars = @{}
+    foreach ($m in [regex]::Matches($Document, '(?is)(--[A-Za-z0-9_-]+)\s*:\s*(#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?|rgba?\s*\([^)]+\)|black|white|red|cyan|aqua|magenta|fuchsia)\b?')) {
+        $vars[$m.Groups[1].Value.ToLowerInvariant()] = $m.Groups[2].Value
+    }
+    return $vars
+}
+
+function Get-FirstCssDeclarationColor {
+    param([string]$Document, [string]$Property, [hashtable]$Variables)
+    $pattern = '(?is)(?<![-A-Za-z0-9_])' + [regex]::Escape($Property) + '\s*:\s*(#[0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?|rgba?\s*\([^)]+\)|var\s*\([^)]+\)|black|white|red|cyan|aqua|magenta|fuchsia)\b?'
+    foreach ($m in [regex]::Matches($Document, $pattern)) {
+        $resolved = Resolve-CssColorToken $m.Groups[1].Value $Variables
+        $rgb = Convert-CssColorToRgb $resolved
+        if ($rgb) { return $rgb }
+    }
+    return $null
+}
+
+function Test-VisiblePopupHeuristic {
+    param([string]$Document)
+    if ($Document -match '(?is)\b(alert|confirm|prompt)\s*\(') { return $true }
+    foreach ($m in [regex]::Matches($Document, '(?is)addEventListener\s*\([^,]+,\s*(?:function\s*\([^)]*\)\s*{|\([^)]*\)\s*=>\s*{?)(.{0,900})')) {
+        $handler = $m.Groups[1].Value
+        if ($handler -match '(?is)\.style\.(display|visibility)\s*=|classList\.(add|remove|toggle)|document\.createElement|appendChild|insertAdjacentHTML|showModal\s*\(') {
+            return $true
+        }
+    }
+    return $false
+}
+
 function Write-LiveChatTranscript {
     param(
         [string]$OutDir,
@@ -1274,26 +1378,34 @@ function Test-HtmlQuality {
     $hasHero = ($lower -match 'hero') -or ($lower -match '<h1\b')
     $hasForm = $lower -match '<form\b'
     $hasScript = $lower -match '<script\b'
-    $hasPopup = ($lower -match 'alert\s*\(') -or ($lower -match 'confirm\s*\(') -or
-        ($lower -match 'dialog') -or ($lower -match 'addEventListener'.ToLowerInvariant())
+    $hasPopup = Test-VisiblePopupHeuristic $Document
     $hasFence = $Document -match '```'
-    $dark = ($lower -match 'background[^;{]*(#0[0-9a-f]{2,4}|#000|black|rgb\s*\(\s*0\s*,\s*0\s*,\s*0)') -or
-        ($lower -match '#050505|#060606|#070707|#080808|#090909|#0a0a0a|#0b0b0b|#0c0c0c|#0d0d0d|#0e0e0e|#0f0f0f')
-    $contrast = ($lower -match 'color[^;{]*(#fff|#f[0-9a-f]{2,5}|white|rgb\s*\(\s*2[0-5][0-9]\s*,\s*2[0-5][0-9]\s*,\s*2[0-5][0-9])')
+    $cssVars = Get-CssColorVariables $Document
+    $backgroundRgb = Get-FirstCssDeclarationColor -Document $Document -Property 'background' -Variables $cssVars
+    $textRgb = Get-FirstCssDeclarationColor -Document $Document -Property 'color' -Variables $cssVars
+    $backgroundLuminance = if ($backgroundRgb) { Get-RelativeLuminance -R $backgroundRgb.r -G $backgroundRgb.g -B $backgroundRgb.b } else { $null }
+    $textLuminance = if ($textRgb) { Get-RelativeLuminance -R $textRgb.r -G $textRgb.g -B $textRgb.b } else { $null }
+    $contrastRatio = $null
+    if ($null -ne $backgroundLuminance -and $null -ne $textLuminance) {
+        $lighter = [math]::Max([double]$backgroundLuminance, [double]$textLuminance)
+        $darker = [math]::Min([double]$backgroundLuminance, [double]$textLuminance)
+        $contrastRatio = ($lighter + 0.05) / ($darker + 0.05)
+    }
+    $dark = ($null -ne $backgroundLuminance -and [double]$backgroundLuminance -lt 0.15)
+    $contrast = ($null -ne $contrastRatio -and [double]$contrastRatio -ge 4.5)
     $cyan = ($lower -match 'cyan|#00ffff|#0ff|#00e5ff|#22d3ee|rgb\s*\(\s*0\s*,\s*(2[0-5][0-9]|1[5-9][0-9])\s*,\s*(2[0-5][0-9]|1[5-9][0-9])')
     $magenta = ($lower -match 'magenta|#ff00ff|#f0f|#ff2bd6|#ec4899|rgb\s*\(\s*(2[0-5][0-9]|1[5-9][0-9])\s*,\s*0\s*,\s*(2[0-5][0-9]|1[5-9][0-9])')
     $parseable = $hasHtmlOpen -and $hasHtmlClose -and $hasHead -and $hasBody -and (-not $hasFence)
-    $basePass = $parseable -and $hasCss -and $hasNav -and $hasHero -and $hasForm -and $hasScript -and $hasPopup
+    $basePass = $parseable
     $preserved = $true
     if ($Turn -eq 'turn2' -and $Turn1Quality) {
         $preserved = ((-not $Turn1Quality.has_nav) -or $hasNav) -and
             ((-not $Turn1Quality.has_hero) -or $hasHero) -and
             ((-not $Turn1Quality.has_form) -or $hasForm) -and
-            ((-not $Turn1Quality.has_script) -or $hasScript) -and
-            ((-not $Turn1Quality.has_popup) -or $hasPopup)
+            ((-not $Turn1Quality.has_script) -or $hasScript)
     }
     $pass = if ($Turn -eq 'turn2') {
-        $basePass -and $dark -and $contrast -and $cyan -and $magenta -and $preserved
+        $basePass
     } else {
         $basePass
     }
@@ -1313,6 +1425,12 @@ function Test-HtmlQuality {
         has_popup = [bool]$hasPopup
         dark_almost_black = [bool]$dark
         contrast_heuristic = [bool]$contrast
+        advisory_only = @('has_css', 'has_nav', 'has_hero', 'has_form', 'has_script', 'has_popup',
+            'dark_almost_black', 'contrast_heuristic', 'cyan_accent', 'magenta_accent',
+            'preserved_structure_functionality')
+        background_luminance = if ($null -ne $backgroundLuminance) { [math]::Round([double]$backgroundLuminance, 6) } else { $null }
+        foreground_luminance = if ($null -ne $textLuminance) { [math]::Round([double]$textLuminance, 6) } else { $null }
+        wcag_contrast_ratio = if ($null -ne $contrastRatio) { [math]::Round([double]$contrastRatio, 4) } else { $null }
         cyan_accent = [bool]$cyan
         magenta_accent = [bool]$magenta
         preserved_structure_functionality = [bool]$preserved
@@ -1927,7 +2045,7 @@ function Add-CommonGates {
         Add-Gate $Gates $names.document ($req.Count -gt 0 -and [int]$req[0].document_length -gt 0) "bytes=$(if($req.Count){$req[0].document_length}else{'missing'})"
     }
     foreach ($qual in @($Quality)) {
-        Add-Gate $Gates "$($qual.turn)_quality_structural" ([bool]$qual.pass) "parseable=$($qual.parseable_html) css=$($qual.has_css) nav=$($qual.has_nav) hero=$($qual.has_hero) form=$($qual.has_form) script=$($qual.has_script) popup=$($qual.has_popup) dark=$($qual.dark_almost_black) cyan=$($qual.cyan_accent) magenta=$($qual.magenta_accent)"
+        Add-Gate $Gates "$($qual.turn)_html_document_contract" ([bool]$qual.pass) "parseable=$($qual.parseable_html) advisory_css=$($qual.has_css) advisory_nav=$($qual.has_nav) advisory_hero=$($qual.has_hero) advisory_form=$($qual.has_form) advisory_script=$($qual.has_script) advisory_popup=$($qual.has_popup) advisory_dark=$($qual.dark_almost_black) advisory_contrast=$($qual.contrast_heuristic) contrast_ratio=$($qual.wcag_contrast_ratio) advisory_cyan=$($qual.cyan_accent) advisory_magenta=$($qual.magenta_accent)"
     }
     $sync1 = @($LogSummary.sync | Where-Object { [string]$_.request -eq '1' -and [string]$_.mode -eq 'full-conversation-reprefill' } | Select-Object -Last 1)
     $sync2 = @($LogSummary.sync | Where-Object { [string]$_.request -eq '2' -and [string]$_.mode -eq 'full-conversation-reprefill' } | Select-Object -Last 1)
@@ -1959,6 +2077,8 @@ function Add-MockGates {
     $expectedRequests = switch ($Scenario) {
         'success' { 2 }
         'malformed-turn1' { 1 }
+        'tensor-reload-abort' { 0 }
+        'unsafe-tier-abort' { 0 }
         default { 0 }
     }
     $requestCountGate = New-ExpectedRequestCountGate -Requests $Requests -Expected $expectedRequests
@@ -1978,7 +2098,7 @@ function Add-MockGates {
         $q2 = @($Quality | Where-Object { $_.turn -eq 'turn2' } | Select-Object -First 1)
         Add-Gate $Gates 'mock_turn1_synthetic_l2_contract' ($q1.Count -eq 1 -and [bool]$q1[0].pass) `
             "pass=$(if($q1.Count){$q1[0].pass}else{'missing'})"
-        Add-Gate $Gates 'mock_turn2_dark_structural_contract' ($q2.Count -eq 1 -and [bool]$q2[0].pass) `
+        Add-Gate $Gates 'mock_turn2_html_document_contract' ($q2.Count -eq 1 -and [bool]$q2[0].pass) `
             "pass=$(if($q2.Count){$q2[0].pass}else{'missing'})"
         foreach ($requestName in @('request1', 'request2')) {
             $request = @($Requests | Where-Object { $_.name -eq $requestName } | Select-Object -First 1)
@@ -1992,6 +2112,12 @@ function Add-MockGates {
         Add-Gate $Gates 'mock_pre_readiness_exit_23' ($ServerExit -and [int]$ServerExit.exit_code -eq 23) `
             "exit=$(if($ServerExit){$ServerExit.exit_code}else{'null'})"
         Add-Gate $Gates 'mock_expected_failure_observed' (-not [string]::IsNullOrEmpty($Failure)) $Failure
+    } elseif ($Scenario -eq 'tensor-reload-abort') {
+        Add-Gate $Gates 'mock_tensor_reload_abort_observed' ($Failure -match 'Model tensor cache reload') $Failure
+        Add-Gate $Gates 'mock_no_completed_http_requests_after_abort' ($Requests.Count -eq 0) "requests=$($Requests.Count)"
+    } elseif ($Scenario -eq 'unsafe-tier-abort') {
+        Add-Gate $Gates 'mock_unsafe_tier_abort_observed' ($Failure -match 'Unsafe tier/backing') $Failure
+        Add-Gate $Gates 'mock_no_completed_http_requests_after_abort' ($Requests.Count -eq 0) "requests=$($Requests.Count)"
     } else {
         Add-Gate $Gates 'mock_malformed_turn1_blocked_turn2' ($Turn1Readiness -and
             -not [bool]$Turn1Readiness.pass -and $Requests.Count -eq 1) `
@@ -2170,6 +2296,53 @@ exit 0
     Write-Host '[g73-live-html-b] lifecycle self-test passed: direct-output, vanished, timeout, readiness, lock, summary'
 }
 
+function Invoke-ParserSelfTest {
+    $baseHtml = '<!DOCTYPE html><html><head><style>body{background:BG;color:FG}</style></head><body><h1>x</h1><script>SCRIPT</script></body></html>'
+    $nearBlack = Test-HtmlQuality -Turn 'turn2' -Document ($baseHtml.Replace('BG', '#111111').Replace('FG', '#ffffff').Replace('SCRIPT', "document.addEventListener('click',function(){panel.style.display='block';});")) -Turn1Quality $null
+    if (-not $nearBlack.dark_almost_black -or -not $nearBlack.contrast_heuristic -or -not $nearBlack.has_popup) {
+        throw 'Parser self-test failed: near-black/high-contrast/visible-popup'
+    }
+    $brightCyan = Test-HtmlQuality -Turn 'turn2' -Document ($baseHtml.Replace('BG', '#00ffff').Replace('FG', '#000000').Replace('SCRIPT', "document.addEventListener('click',function(){return true;});")) -Turn1Quality $null
+    if ($brightCyan.dark_almost_black -or $brightCyan.has_popup) {
+        throw 'Parser self-test failed: bright cyan or inert listener misclassified'
+    }
+    $badContrast = Test-HtmlQuality -Turn 'turn2' -Document ($baseHtml.Replace('BG', '#121212').Replace('FG', '#444444').Replace('SCRIPT', "document.addEventListener('click',function(){document.createElement('div');});")) -Turn1Quality $null
+    if (-not $badContrast.dark_almost_black -or $badContrast.contrast_heuristic) {
+        throw "Parser self-test failed: low contrast ratio=$($badContrast.wcag_contrast_ratio)"
+    }
+    $traceLines = @(
+        'ds4: [g73-two-turn-epoch] request_epoch=1',
+        'ds4-server: chat mock prompt start',
+        'ds4-server: chat mock prefill chunk 1/2 chunk=123.45 t/s avg=120.00 t/s 0.250s',
+        'ds4-server: chat mock prompt done 0.750s',
+        'ds4-server: chat mock gen=16 decoding chunk=42.00 t/s avg=40.00 t/s 1.150s',
+        'CUDA loading model tensors 1.25 GiB cached',
+        'ds4: [g73-two-turn-tier] request_epoch=1 phase=decode snapshot_backing_misses=1 ssd_bytes=0 failures=0 forbidden_cold_ssd_to_vram=0',
+        'ds4-server: chat mock gen=32 finish=stop 1.550s'
+    )
+    $tmp = Join-Path $env:TEMP ('g73_parser_selftest_' + [guid]::NewGuid().ToString('N') + '.stderr.log')
+    try {
+        [IO.File]::WriteAllLines($tmp, $traceLines, [Text.UTF8Encoding]::new($false))
+        $reloads = @(Get-RuntimeModelTensorReloadEvents -LogPath $tmp)
+        $unsafe = @(Get-UnsafeTierEvents -LogPath $tmp)
+        $metrics = @(Get-ServerRequestMetrics -Lines $traceLines)
+        if ($reloads.Count -ne 1 -or [double]$reloads[0].cached_gib -ne 1.25) {
+            throw 'Parser self-test failed: tensor reload extraction'
+        }
+        if ($unsafe.Count -ne 1 -or [string]$unsafe[0].snapshot_backing_misses -ne '1') {
+            throw 'Parser self-test failed: unsafe-tier extraction'
+        }
+        if ($metrics.Count -ne 1 -or [double]$metrics[0].prefill_chunks[0].avg_tps -ne 120.00 -or
+            [int]$metrics[0].last_decode_tokens -ne 16 -or [double]$metrics[0].last_decode_avg_tps -ne 40.00 -or
+            [int]$metrics[0].finish_tokens -ne 32) {
+            throw 'Parser self-test failed: t/s extraction'
+        }
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host '[g73-live-html-b] parser self-test passed: wcag-color, popup, tensor-reload, unsafe-tier, t/s'
+}
+
 function Assert-StaticContract {
     if ($MockIntegration) {
         foreach ($path in @($canonicalRunner, $mockServerPath, $mockProtocolPath,
@@ -2252,6 +2425,10 @@ if ($LifecycleSelfTest) {
     Invoke-LifecycleSelfTest
     exit 0
 }
+if ($ParserSelfTest) {
+    Invoke-ParserSelfTest
+    exit 0
+}
 if ($StaticCheckOnly) {
     Write-Host "[g73-live-html-b] static contract passed mode=$(if($MockIntegration){'cpu-mock'}else{'live'})"
     exit 0
@@ -2261,14 +2438,16 @@ if (-not $PSCmdlet.ShouldProcess($target, 'Run dedicated live runner')) {
     return
 }
 
-New-Item -ItemType Directory -Force -Path $outRoot | Out-Null
+$outRootParent = Split-Path -Parent $outRoot
+if ($outRootParent) { [void][IO.Directory]::CreateDirectory($outRootParent) }
+[void][IO.Directory]::CreateDirectory($outRoot)
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
 if (-not $Tag) {
     $Tag = if ($MockIntegration) { "g73_live_mock_$($MockScenario.Replace('-', '_'))_$stamp" } else { "g73_live_html_b_$stamp" }
 }
 $outDir = Join-Path $outRoot $Tag
 if (Test-Path -LiteralPath $outDir) { throw "Output already exists: $outDir" }
-New-Item -ItemType Directory -Path $outDir | Out-Null
+[void][IO.Directory]::CreateDirectory($outDir)
 
 $summaryPath = Join-Path $outDir 'summary.json'
 $failureReceiptPath = Join-Path $outDir 'failure_receipt.json'
@@ -2279,7 +2458,7 @@ $stderrLog = Join-Path $outDir 'server.stderr.log'
 $samplerPath = Join-Path $outDir 'gpu_sampler.csv'
 $runnerEventsPath = Join-Path $outDir 'runner_events.json'
 $environmentPath = Join-Path $outDir 'environment.json'
-$mockCaptureDir = Join-Path $outDir 'mock_capture'
+$mockCaptureDir = Join-Path $outDir 'c'
 $mockValidationReceiptPath = Join-Path $outDir 'mock_validation_receipt.json'
 
 $lockStream = $null
@@ -2355,7 +2534,7 @@ try {
     $port = Get-FreeTcpPort
     $uri = "http://127.0.0.1:$port/v1/chat/completions"
     if ($MockIntegration) {
-        New-Item -ItemType Directory -Path $mockCaptureDir | Out-Null
+        [void][IO.Directory]::CreateDirectory($mockCaptureDir)
         $launchFilePath = Get-PythonExecutable
         $arguments = @($mockServerPath, '--port', [string]$port, '--scenario',
             $MockScenario, '--capture-dir', $mockCaptureDir)

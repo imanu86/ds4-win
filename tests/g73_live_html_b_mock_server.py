@@ -8,6 +8,7 @@ import hashlib
 import json
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -66,6 +67,35 @@ MALFORMED_TURN1 = "```html\n<html><body><h1>cut off"
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def emit_ds4_trace(index: int) -> None:
+    sys.stderr.write(f"ds4: [g73-two-turn-epoch] request_epoch={index}\n")
+    sys.stderr.write(f"ds4-server: chat mock-{index} prompt start\n")
+    sys.stderr.write("ds4-server: chat mock prefill chunk 1/2 chunk=123.45 t/s avg=120.00 t/s 0.250s\n")
+    sys.stderr.write("ds4-server: chat mock prefill chunk 2/2 chunk=130.00 t/s avg=126.72 t/s 0.500s\n")
+    sys.stderr.write("ds4-server: chat mock prompt done 0.750s\n")
+    sys.stderr.write("ds4-server: chat mock gen=16 decoding chunk=42.00 t/s avg=40.00 t/s 1.150s\n")
+    sys.stderr.write("ds4-server: chat mock gen=32 finish=stop 1.550s\n")
+    sys.stderr.flush()
+
+
+def emit_tensor_reload_abort_trace(index: int) -> None:
+    sys.stderr.write(f"ds4: [g73-two-turn-epoch] request_epoch={index}\n")
+    sys.stderr.write(f"ds4-server: chat mock-{index} prompt start\n")
+    sys.stderr.write("CUDA loading model tensors 1.25 GiB cached\n")
+    sys.stderr.flush()
+
+
+def emit_unsafe_tier_abort_trace(index: int) -> None:
+    sys.stderr.write(f"ds4: [g73-two-turn-epoch] request_epoch={index}\n")
+    sys.stderr.write(f"ds4-server: chat mock-{index} prompt start\n")
+    sys.stderr.write(
+        "ds4: [g73-two-turn-tier] request_epoch=1 phase=decode "
+        "snapshot_backing_misses=1 ssd_bytes=4096 failures=0 "
+        "forbidden_cold_ssd_to_vram=0\n"
+    )
+    sys.stderr.flush()
 
 
 class MockState:
@@ -142,6 +172,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(400, {"error": f"invalid-request:{exc}"})
             return
 
+        if self.state.scenario == "tensor-reload-abort":
+            emit_tensor_reload_abort_trace(index)
+            time.sleep(2.0)
+            return
+        if self.state.scenario == "unsafe-tier-abort":
+            emit_unsafe_tier_abort_trace(index)
+            time.sleep(2.0)
+            return
+
+        emit_ds4_trace(index)
         if self.state.scenario == "malformed-turn1":
             content = MALFORMED_TURN1
             finish_reason = "stop"
@@ -183,7 +223,13 @@ def main() -> int:
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument(
         "--scenario",
-        choices=("success", "exit-before-readiness", "malformed-turn1"),
+        choices=(
+            "success",
+            "exit-before-readiness",
+            "malformed-turn1",
+            "tensor-reload-abort",
+            "unsafe-tier-abort",
+        ),
         required=True,
     )
     parser.add_argument("--capture-dir", type=Path, required=True)
