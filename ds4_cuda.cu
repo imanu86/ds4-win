@@ -5519,7 +5519,8 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     const cudaError_t cleanup_sync_error = cudaDeviceSynchronize();
-    if (cleanup_sync_error != cudaSuccess) {
+    if (cleanup_sync_error != cudaSuccess &&
+            cuda_q1_0_profile_requested()) {
         fprintf(stderr,
                 "ds4: CUDA mixed-Q1 cleanup synchronize failed: "
                 "code=%d error=%s\n",
