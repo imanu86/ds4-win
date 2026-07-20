@@ -117,8 +117,31 @@ param(
     [switch]$Q1_0MixedColdOne,
     [switch]$Q1_0SnapshotBacking,
     [switch]$Q1_0PageableOverflow,
+    [ValidateRange(0.0, 64.0)][double]$Q1_0ArenaGB = 0.0,
+    [switch]$Q1_0DynamicPromotion,
+    [switch]$Q1_0PromotionSsdWrap,
+    [ValidateRange(0.125, 5.5)][double]$Q1_0Iq2PinnedGiB = 1.5,
+    [switch]$Q1_0SsdWrapParserSelfTest,
+    [switch]$Q1_0Profile,
+    [switch]$Q1_0ProfileParserSelfTest,
+    [switch]$ExpertRecoveryTrace,
+    [ValidateRange(0, 42)][int]$ExpertRecoveryTraceLayer = 0,
+    [ValidateRange(0, 255)][int]$ExpertRecoveryTraceExpert = 0,
+    [ValidateRange(1, 256)][int]$ExpertRecoveryTraceMaxSamples = 256,
+    [ValidateRange(4096, 16777216)]
+    [UInt64]$ExpertRecoveryTraceByteBudget = 8388608,
+    [string]$ExpertRecoveryTraceOutputPath = "",
+    [switch]$ExpertRecoveryTraceParserSelfTest,
+    [ValidateRange(1, 512)][int]$Q1_0PromotionProbationSlots = 16,
+    [ValidateRange(1, 1000000)][int]$Q1_0PromotionMinTouches = 1,
+    [ValidateRange(0.0, 1000000.0)][double]$Q1_0PromotionMinWeight = 0.0,
+    [ValidateRange(0.0, 1000000.0)][double]$Q1_0PromotionMinMass = 0.0,
+    [ValidateRange(0, 1000000)][int]$Q1_0PromotionRequestBudget = 0,
+    [ValidateRange(0, 1000000)][int]$Q1_0PromotionWindowCalls = 0,
+    [ValidateRange(0, 1000000)][int]$Q1_0PromotionWindowBudget = 0,
     [switch]$Q1_0PureResident,
     [ValidateRange(0, 11008)][int]$ExpectedQ1_0SnapshotEntries = 0,
+    [ValidateRange(0, 11008)][int]$ExpectedQ1_0ResidentEntries = 0,
     [switch]$Q1_0MixedTrace,
     [string]$NestedResidualSidecar = "",
     [string]$ExpectedNestedResidualSidecarSHA256 = "",
@@ -215,7 +238,7 @@ function Read-G7Q1_0SidecarTelemetry {
         [bool]$ResidentArenaRequested,
         [bool]$SnapshotBackingRequested,
         [bool]$DualSparseRequested,
-        [UInt64]$ExpectedSnapshotEntries,
+        [UInt64]$ExpectedResidentEntries,
         [AllowEmptyString()][string]$SidecarPath
     )
 
@@ -223,7 +246,7 @@ function Read-G7Q1_0SidecarTelemetry {
         $LogText,
         '(?m)^(?:ds4: )?\[q1-0-sidecar\] result=summary calls=(\d+) slots=(\d+) selected_loads=(\d+) failures=(\d+)((?: [A-Za-z0-9_]+=[^ \x0d\x0a]+)*)\x0d?$')
     $runtimeMarkerPattern =
-        'Q1_0 (?:routed-expert sidecar validated|expert sidecar source:|routed-expert sidecar installed)|\[q1-0-sidecar\]'
+        'Q1_0 (?:routed-expert sidecar validated|expert sidecar source:|routed-expert sidecar installed)|\[q1-0-(?:sidecar|source-unlock)\]'
 
     if (-not $SidecarConfigured) {
         if ($LogText -match $runtimeMarkerPattern) {
@@ -314,10 +337,10 @@ function Read-G7Q1_0SidecarTelemetry {
             if ($residentMode -ne 1 -or $residentHits -eq 0 -or
                 $residentMisses -ne 0 -or $directPreadFallbacks -ne 0 -or
                 $directPreadBytes -ne 0 -or
-                ($SnapshotBackingRequested -and
-                 ($ExpectedSnapshotEntries -eq 0 -or
-                  $bootstrapEntries -ne $ExpectedSnapshotEntries)) -or
-                (-not $SnapshotBackingRequested -and
+                ($ExpectedResidentEntries -gt 0 -and
+                 $bootstrapEntries -ne $ExpectedResidentEntries) -or
+                ($ExpectedResidentEntries -eq 0 -and
+                 -not $SnapshotBackingRequested -and
                  -not $DualSparseRequested -and
                  $bootstrapEntries -ne 256)) {
                 throw "Q1_0 resident arena structural counters are inconsistent"
@@ -358,12 +381,13 @@ function Read-G7Q1_0SidecarTelemetry {
 function Read-G7Q1_0MixedTelemetry {
     param(
         [AllowEmptyString()][string]$LogText,
-        [bool]$Required
+        [bool]$Required,
+        [AllowEmptyString()][string]$ExpectedRouter = ""
     )
 
     $matches = [regex]::Matches(
         $LogText,
-        '(?m)^(?:ds4: )?\[q1-0-mixed\] result=summary calls=(\d+) all_iq2=(\d+) iq2_vram=(\d+) iq2_snapshot_ram=(\d+) iq2_tier_ram=(\d+) q1_resident=(\d+) joins=(\d+) trace_rows=(\d+) iq2_ssd_bytes=(\d+) iq2_ssd_violations=(\d+) failures=(\d+)(?: cold_one_calls=(\d+) cold_one_hot_routes=(\d+) cold_one_q1_routes=(\d+) cold_one_invariant_failures=(\d+))? router=([^ \x0d\x0a]+) promotion=([^ \x0d\x0a]+)\x0d?$')
+        '(?m)^(?:ds4: )?\[q1-0-mixed\] result=summary calls=(\d+) all_iq2=(\d+) iq2_vram=(\d+) iq2_snapshot_ram=(\d+) iq2_tier_ram=(\d+) q1_resident=(\d+) joins=(\d+) trace_rows=(\d+)(?: tier_route_entries=(\d+))? iq2_ssd_bytes=(\d+) iq2_ssd_violations=(\d+) failures=(\d+)(?: cold_one_calls=(\d+) cold_one_hot_routes=(\d+) cold_one_q1_routes=(\d+) cold_one_invariant_failures=(\d+))? router=([^ \x0d\x0a]+)(?: router_mode=([^ \x0d\x0a]+))? promotion=([^ \x0d\x0a]+)\x0d?$')
     if ($matches.Count -eq 0) {
         if ($Required) {
             throw "Q1_0 mixed resolver summary is required but missing"
@@ -378,6 +402,7 @@ function Read-G7Q1_0MixedTelemetry {
             q1_resident = [UInt64]0
             joins = [UInt64]0
             trace_rows = [UInt64]0
+            tier_route_entries = [UInt64]0
             iq2_ssd_bytes = [UInt64]0
             iq2_ssd_violations = [UInt64]0
             failures = [UInt64]0
@@ -386,6 +411,7 @@ function Read-G7Q1_0MixedTelemetry {
             cold_one_q1_routes = [UInt64]0
             cold_one_invariant_failures = [UInt64]0
             router = "not_observed"
+            router_mode = "not_observed"
             promotion = "not_observed"
         }
     }
@@ -404,24 +430,1431 @@ function Read-G7Q1_0MixedTelemetry {
         q1_resident = [UInt64]$match.Groups[6].Value
         joins = [UInt64]$match.Groups[7].Value
         trace_rows = [UInt64]$match.Groups[8].Value
-        iq2_ssd_bytes = [UInt64]$match.Groups[9].Value
-        iq2_ssd_violations = [UInt64]$match.Groups[10].Value
-        failures = [UInt64]$match.Groups[11].Value
-        cold_one_calls = $(if ($match.Groups[12].Success) { [UInt64]$match.Groups[12].Value } else { [UInt64]0 })
-        cold_one_hot_routes = $(if ($match.Groups[13].Success) { [UInt64]$match.Groups[13].Value } else { [UInt64]0 })
-        cold_one_q1_routes = $(if ($match.Groups[14].Success) { [UInt64]$match.Groups[14].Value } else { [UInt64]0 })
-        cold_one_invariant_failures = $(if ($match.Groups[15].Success) { [UInt64]$match.Groups[15].Value } else { [UInt64]0 })
-        router = [string]$match.Groups[16].Value
-        promotion = [string]$match.Groups[17].Value
+        tier_route_entries = $(if ($match.Groups[9].Success) { [UInt64]$match.Groups[9].Value } else { [UInt64]0 })
+        iq2_ssd_bytes = [UInt64]$match.Groups[10].Value
+        iq2_ssd_violations = [UInt64]$match.Groups[11].Value
+        failures = [UInt64]$match.Groups[12].Value
+        cold_one_calls = $(if ($match.Groups[13].Success) { [UInt64]$match.Groups[13].Value } else { [UInt64]0 })
+        cold_one_hot_routes = $(if ($match.Groups[14].Success) { [UInt64]$match.Groups[14].Value } else { [UInt64]0 })
+        cold_one_q1_routes = $(if ($match.Groups[15].Success) { [UInt64]$match.Groups[15].Value } else { [UInt64]0 })
+        cold_one_invariant_failures = $(if ($match.Groups[16].Success) { [UInt64]$match.Groups[16].Value } else { [UInt64]0 })
+        router = [string]$match.Groups[17].Value
+        router_mode = $(if ($match.Groups[18].Success -and
+                            -not [string]::IsNullOrEmpty($match.Groups[18].Value)) {
+            [string]$match.Groups[18].Value
+        } else {
+            [string]$match.Groups[17].Value
+        })
+        promotion = [string]$match.Groups[19].Value
     }
     if ($Required -and
         ($telemetry.calls -eq 0 -or $telemetry.q1_resident -eq 0 -or
          $telemetry.failures -ne 0 -or $telemetry.iq2_ssd_bytes -ne 0 -or
          $telemetry.iq2_ssd_violations -ne 0 -or
-         $telemetry.router -ne "unchanged")) {
+         ($ExpectedRouter -and $telemetry.router_mode -ne $ExpectedRouter) -or
+         (-not $ExpectedRouter -and
+          ($telemetry.router_mode -ne "unchanged" -and
+           $telemetry.router_mode -ne "open")))) {
         throw "Q1_0 mixed resolver counters violate the snapshot contract"
     }
     return $telemetry
+}
+function Read-G7Q1_0MixedRouteTraceTelemetry {
+    param(
+        [AllowEmptyString()][string]$LogText,
+        [bool]$Required
+    )
+
+    $telemetry = [pscustomobject]@{
+        observed = $false
+        rows = [UInt64]0
+        iq2_vram = [UInt64]0
+        iq2_snapshot_ram = [UInt64]0
+        iq2_tier_ram = [UInt64]0
+        q1_resident = [UInt64]0
+        iq2_total = [UInt64]0
+        accounted_routes = [UInt64]0
+        allowed_iq2_representations = @(
+            "iq2_vram", "iq2_snapshot_ram", "iq2_tier_ram")
+        allowed_q1_representations = @("q1_resident")
+    }
+
+    $matches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-mixed-route\] layer=(\d+) route=(\d+) expert=(-?\d+) weight=([^ ]+) representation=([^ ]+) tier=(\d+) has_2bit_ram=(\d+) primary_snapshot=(\d+) q1_snapshot=(\d+)\x0d?$')
+    if ($matches.Count -eq 0) {
+        if ($Required) {
+            throw "Q1_0 mixed route trace is required but missing"
+        }
+        return $telemetry
+    }
+
+    $telemetry.observed = $true
+    foreach ($match in $matches) {
+        $telemetry.rows++
+        switch ([string]$match.Groups[5].Value) {
+            "iq2_vram" { $telemetry.iq2_vram++ }
+            "iq2_snapshot_ram" { $telemetry.iq2_snapshot_ram++ }
+            "iq2_tier_ram" { $telemetry.iq2_tier_ram++ }
+            "q1_resident" { $telemetry.q1_resident++ }
+            default {
+                throw ("Q1_0 mixed route trace used unknown " +
+                    "representation: $($match.Groups[5].Value)")
+            }
+        }
+    }
+    $telemetry.iq2_total = [UInt64](
+        [UInt64]$telemetry.iq2_vram +
+        [UInt64]$telemetry.iq2_snapshot_ram +
+        [UInt64]$telemetry.iq2_tier_ram)
+    $telemetry.accounted_routes = [UInt64](
+        [UInt64]$telemetry.iq2_total +
+        [UInt64]$telemetry.q1_resident)
+    return $telemetry
+}
+function Convert-G7StrictUInt64 {
+    param([Parameter(Mandatory=$true)][string]$Value,
+          [Parameter(Mandatory=$true)][string]$Name)
+
+    if ($Value -notmatch '^(0|[1-9][0-9]*)$') {
+        throw "Strict UInt64 parse rejected $Name=$Value"
+    }
+    try {
+        return [UInt64]::Parse(
+            $Value, [Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        throw "Strict UInt64 parse overflow for $Name=$Value"
+    }
+}
+function Convert-G7StrictUInt32 {
+    param([Parameter(Mandatory=$true)][string]$Value,
+          [Parameter(Mandatory=$true)][string]$Name)
+
+    $parsed = Convert-G7StrictUInt64 $Value $Name
+    if ($parsed -gt [UInt64][UInt32]::MaxValue) {
+        throw "Strict UInt32 parse overflow for $Name=$Value"
+    }
+    return [UInt32]$parsed
+}
+function Convert-G7StrictFlag01 {
+    param([Parameter(Mandatory=$true)][string]$Value,
+          [Parameter(Mandatory=$true)][string]$Name)
+
+    if ($Value -notmatch '^[01]$') {
+        throw "Strict flag parse rejected $Name=$Value"
+    }
+    return [int]$Value
+}
+function Convert-G7StrictDouble {
+    param([Parameter(Mandatory=$true)][string]$Value,
+          [Parameter(Mandatory=$true)][string]$Name)
+
+    if ($Value -notmatch '^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$') {
+        throw "Strict double parse rejected $Name=$Value"
+    }
+    $parsed = [double]::Parse(
+        $Value, [Globalization.CultureInfo]::InvariantCulture)
+    if ([double]::IsNaN($parsed) -or [double]::IsInfinity($parsed)) {
+        throw "Strict double parse rejected non-finite $Name=$Value"
+    }
+    return $parsed
+}
+function Convert-G7Q1_0ProfileKeyValues {
+    param(
+        [Parameter(Mandatory=$true)][string]$Suffix,
+        [Parameter(Mandatory=$true)][string[]]$Schema,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+
+    $values = [ordered]@{}
+    foreach ($token in @($Suffix -split ' ' | Where-Object { $_ })) {
+        $match = [regex]::Match($token, '^([a-z0-9_]+)=([^ ]+)$')
+        if (-not $match.Success) {
+            throw "Q1_0 profile $Kind contains malformed field: $token"
+        }
+        $name = [string]$match.Groups[1].Value
+        if ($Schema -notcontains $name) {
+            throw "Q1_0 profile $Kind contains unknown field: $name"
+        }
+        if ($values.Contains($name)) {
+            throw "Q1_0 profile $Kind contains duplicate field: $name"
+        }
+        $values[$name] = [string]$match.Groups[2].Value
+    }
+    foreach ($name in $Schema) {
+        if (-not $values.Contains($name)) {
+            throw "Q1_0 profile $Kind missing field: $name"
+        }
+    }
+    return $values
+}
+function Read-G7Q1_0ProfileTelemetry {
+    param(
+        [AllowEmptyString()][string]$LogText,
+        [bool]$Required,
+        [bool]$Windows,
+        [UInt64]$ExpectedMappingBytes,
+        [UInt64]$ExpectedResidentHits,
+        [UInt64]$ExpectedResidentH2DBytes,
+        [UInt64]$ExpectedMixedJoinCalls
+    )
+
+    $profileMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-profile\] result=summary ([^\r\n]+)\r?$')
+    $workingSetMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-source-working-set\] result=([^ ]+) phase=([^ ]+) ([^\r\n]+)\r?$')
+    if (-not $Required) {
+        if ($profileMatches.Count -ne 0 -or $workingSetMatches.Count -ne 0) {
+            throw "Q1_0 profile telemetry appeared while Q1_0Profile was disabled"
+        }
+        return [pscustomobject]@{
+            requested = $false
+            observed = $false
+            valid = $true
+            resident_hits_total = [UInt64]0
+            pinned_route_hits = [UInt64]0
+            pageable_route_hits = [UInt64]0
+            resident_h2d_bytes_total = [UInt64]0
+            pinned_h2d_bytes = [UInt64]0
+            pageable_h2d_bytes = [UInt64]0
+            h2d_enqueue_seconds_total = [double]0
+            pinned_h2d_enqueue_seconds = [double]0
+            pageable_h2d_enqueue_seconds = [double]0
+            upload_sync_calls = [UInt64]0
+            upload_sync_seconds_total = [double]0
+            pinned_upload_sync_seconds = [double]0
+            pageable_upload_sync_seconds = [double]0
+            sync_attribution = "not_requested"
+            q1_kernel_calls = [UInt64]0
+            q1_kernel_seconds = [double]0
+            mixed_join_calls = [UInt64]0
+            mixed_join_seconds = [double]0
+            timer_failures = [UInt64]0
+            source_working_set = @()
+        }
+    }
+    if ($profileMatches.Count -ne 1) {
+        throw "Q1_0 profile summary required exactly once; observed $($profileMatches.Count)"
+    }
+    if ($workingSetMatches.Count -ne 3) {
+        throw "Q1_0 profile source working-set phases required exactly three times; observed $($workingSetMatches.Count)"
+    }
+    if ($ExpectedMappingBytes -eq 0) {
+        throw "Q1_0 profile requires a nonzero sidecar mapping size"
+    }
+
+    $u64Fields = @(
+        "resident_hits_total", "pinned_route_hits", "pageable_route_hits",
+        "resident_h2d_bytes_total", "pinned_h2d_bytes",
+        "pageable_h2d_bytes", "upload_sync_calls", "q1_kernel_calls",
+        "mixed_join_calls", "timer_failures")
+    $doubleFields = @(
+        "h2d_enqueue_seconds_total", "pinned_h2d_enqueue_seconds",
+        "pageable_h2d_enqueue_seconds", "upload_sync_seconds_total",
+        "pinned_upload_sync_seconds", "pageable_upload_sync_seconds",
+        "q1_kernel_seconds", "mixed_join_seconds")
+    $profileSchema = @("enabled") + $u64Fields + $doubleFields +
+        @("sync_attribution")
+    $profileValues = Convert-G7Q1_0ProfileKeyValues `
+        -Suffix $profileMatches[0].Groups[1].Value `
+        -Schema $profileSchema -Kind "summary"
+    if ((Convert-G7StrictFlag01 $profileValues.enabled "q1_profile.enabled") -ne 1 -or
+        $profileValues.sync_attribution -ne "bytes") {
+        throw "Q1_0 profile summary mode is inconsistent"
+    }
+    $parsed = [ordered]@{}
+    foreach ($name in $u64Fields) {
+        $parsed[$name] = Convert-G7StrictUInt64 `
+            $profileValues[$name] "q1_profile.$name"
+    }
+    foreach ($name in $doubleFields) {
+        $value = Convert-G7StrictDouble `
+            $profileValues[$name] "q1_profile.$name"
+        if ($value -lt 0.0) {
+            throw "Q1_0 profile summary has negative field: $name"
+        }
+        $parsed[$name] = [double]$value
+    }
+
+    $hitsSum = [decimal]$parsed.pinned_route_hits +
+        [decimal]$parsed.pageable_route_hits
+    $bytesSum = [decimal]$parsed.pinned_h2d_bytes +
+        [decimal]$parsed.pageable_h2d_bytes
+    $enqueueSum = [double]$parsed.pinned_h2d_enqueue_seconds +
+        [double]$parsed.pageable_h2d_enqueue_seconds
+    $syncSum = [double]$parsed.pinned_upload_sync_seconds +
+        [double]$parsed.pageable_upload_sync_seconds
+    $enqueueTolerance = [math]::Max(
+        0.00000001,
+        [math]::Abs([double]$parsed.h2d_enqueue_seconds_total) * 0.000001)
+    $syncTolerance = [math]::Max(
+        0.00000001,
+        [math]::Abs([double]$parsed.upload_sync_seconds_total) * 0.000001)
+    if ($hitsSum -ne [decimal]$parsed.resident_hits_total -or
+        $bytesSum -ne [decimal]$parsed.resident_h2d_bytes_total -or
+        [math]::Abs($enqueueSum -
+            [double]$parsed.h2d_enqueue_seconds_total) -gt $enqueueTolerance -or
+        [math]::Abs($syncSum -
+            [double]$parsed.upload_sync_seconds_total) -gt $syncTolerance) {
+        throw "Q1_0 profile pinned/pageable accounting is inconsistent"
+    }
+    if ($parsed.resident_hits_total -ne $ExpectedResidentHits -or
+        $parsed.resident_h2d_bytes_total -ne $ExpectedResidentH2DBytes -or
+        $parsed.timer_failures -ne 0 -or
+        ($parsed.resident_hits_total -gt 0 -and
+         ($parsed.upload_sync_calls -eq 0 -or
+          $parsed.q1_kernel_calls -eq 0)) -or
+        ($ExpectedMixedJoinCalls -gt 0 -and
+         $parsed.mixed_join_calls -ne $ExpectedMixedJoinCalls)) {
+        throw "Q1_0 profile runtime accounting is inconsistent"
+    }
+
+    $workingSetSchema = @(
+        "windows", "page_size", "mapping_bytes", "queried_pages",
+        "resident_pages", "resident_bytes", "shared_pages", "shared_bytes",
+        "not_shared_pages", "not_shared_bytes", "file_backed_pages",
+        "file_backed_bytes", "query_calls", "last_error",
+        "file_backed_basis")
+    $expectedPhases = @("pre-copy", "post-bootstrap", "post-unlock-settle")
+    $seenPhases = @{}
+    $workingSetRows = @()
+    foreach ($match in $workingSetMatches) {
+        $result = [string]$match.Groups[1].Value
+        $phase = [string]$match.Groups[2].Value
+        if ($expectedPhases -notcontains $phase -or
+            $seenPhases.ContainsKey($phase)) {
+            throw "Q1_0 profile source working-set phase is invalid: $phase"
+        }
+        $seenPhases[$phase] = $true
+        $values = Convert-G7Q1_0ProfileKeyValues `
+            -Suffix $match.Groups[3].Value `
+            -Schema $workingSetSchema -Kind "source-working-set"
+        $row = [ordered]@{ result = $result; phase = $phase }
+        foreach ($name in @($workingSetSchema | Where-Object {
+                    $_ -ne "file_backed_basis" })) {
+            $row[$name] = Convert-G7StrictUInt64 `
+                $values[$name] "q1_profile.$phase.$name"
+        }
+        $row.file_backed_basis = [string]$values.file_backed_basis
+        if ($row.mapping_bytes -ne $ExpectedMappingBytes) {
+            throw "Q1_0 profile source mapping size is inconsistent"
+        }
+        if ($Windows) {
+            if ($row.page_size -eq 0) {
+                throw "Q1_0 profile source working-set page size is invalid"
+            }
+            $expectedPages = [UInt64]([math]::Ceiling(
+                [decimal]$ExpectedMappingBytes / [decimal]$row.page_size))
+            if ($result -ne "ok" -or $row.windows -ne 1 -or
+                $row.last_error -ne 0 -or
+                $row.queried_pages -ne $expectedPages -or
+                $row.query_calls -eq 0 -or
+                $row.resident_pages -gt $row.queried_pages -or
+                ([decimal]$row.shared_pages +
+                 [decimal]$row.not_shared_pages) -ne
+                    [decimal]$row.resident_pages -or
+                $row.file_backed_pages -ne $row.resident_pages -or
+                $row.file_backed_basis -ne "sidecar-file-mapping" -or
+                [decimal]$row.resident_bytes -ne
+                    ([decimal]$row.resident_pages * [decimal]$row.page_size) -or
+                [decimal]$row.shared_bytes -ne
+                    ([decimal]$row.shared_pages * [decimal]$row.page_size) -or
+                [decimal]$row.not_shared_bytes -ne
+                    ([decimal]$row.not_shared_pages *
+                     [decimal]$row.page_size) -or
+                $row.file_backed_bytes -ne $row.resident_bytes) {
+                throw "Q1_0 profile source working-set accounting is inconsistent for phase $phase"
+            }
+        } elseif ($result -ne "unsupported" -or $row.windows -ne 0 -or
+                  $row.queried_pages -ne 0 -or $row.query_calls -ne 0 -or
+                  $row.file_backed_basis -ne "unavailable") {
+            throw "Q1_0 profile non-Windows source working-set contract is inconsistent"
+        }
+        $workingSetRows += [pscustomobject]$row
+    }
+    foreach ($phase in $expectedPhases) {
+        if (-not $seenPhases.ContainsKey($phase)) {
+            throw "Q1_0 profile source working-set phase missing: $phase"
+        }
+    }
+
+    return [pscustomobject]@{
+        requested = $true
+        observed = $true
+        valid = $true
+        resident_hits_total = [UInt64]$parsed.resident_hits_total
+        pinned_route_hits = [UInt64]$parsed.pinned_route_hits
+        pageable_route_hits = [UInt64]$parsed.pageable_route_hits
+        resident_h2d_bytes_total = [UInt64]$parsed.resident_h2d_bytes_total
+        pinned_h2d_bytes = [UInt64]$parsed.pinned_h2d_bytes
+        pageable_h2d_bytes = [UInt64]$parsed.pageable_h2d_bytes
+        h2d_enqueue_seconds_total = [double]$parsed.h2d_enqueue_seconds_total
+        pinned_h2d_enqueue_seconds = [double]$parsed.pinned_h2d_enqueue_seconds
+        pageable_h2d_enqueue_seconds = [double]$parsed.pageable_h2d_enqueue_seconds
+        upload_sync_calls = [UInt64]$parsed.upload_sync_calls
+        upload_sync_seconds_total = [double]$parsed.upload_sync_seconds_total
+        pinned_upload_sync_seconds = [double]$parsed.pinned_upload_sync_seconds
+        pageable_upload_sync_seconds = [double]$parsed.pageable_upload_sync_seconds
+        sync_attribution = "bytes"
+        q1_kernel_calls = [UInt64]$parsed.q1_kernel_calls
+        q1_kernel_seconds = [double]$parsed.q1_kernel_seconds
+        mixed_join_calls = [UInt64]$parsed.mixed_join_calls
+        mixed_join_seconds = [double]$parsed.mixed_join_seconds
+        timer_failures = [UInt64]$parsed.timer_failures
+        source_working_set = @($workingSetRows)
+    }
+}
+function Invoke-G7Q1_0ProfileParserSelfTest {
+    $off = Read-G7Q1_0ProfileTelemetry `
+        -LogText "legacy output without Q1 profile markers" `
+        -Required $false -Windows $true -ExpectedMappingBytes 0 `
+        -ExpectedResidentHits 0 -ExpectedResidentH2DBytes 0 `
+        -ExpectedMixedJoinCalls 0
+    if (-not $off.valid -or $off.observed) {
+        throw "Q1_0 profile OFF self-test failed"
+    }
+    $valid = @'
+ds4: [q1-0-profile] result=summary enabled=1 resident_hits_total=3 pinned_route_hits=2 pageable_route_hits=1 resident_h2d_bytes_total=300 pinned_h2d_bytes=200 pageable_h2d_bytes=100 upload_sync_calls=2 q1_kernel_calls=2 mixed_join_calls=1 timer_failures=0 h2d_enqueue_seconds_total=0.300000000 pinned_h2d_enqueue_seconds=0.200000000 pageable_h2d_enqueue_seconds=0.100000000 upload_sync_seconds_total=0.600000000 pinned_upload_sync_seconds=0.400000000 pageable_upload_sync_seconds=0.200000000 q1_kernel_seconds=1.000000000 mixed_join_seconds=0.100000000 sync_attribution=bytes
+ds4: [q1-0-source-working-set] result=ok phase=pre-copy windows=1 page_size=4096 mapping_bytes=8192 queried_pages=2 resident_pages=1 resident_bytes=4096 shared_pages=1 shared_bytes=4096 not_shared_pages=0 not_shared_bytes=0 file_backed_pages=1 file_backed_bytes=4096 query_calls=1 last_error=0 file_backed_basis=sidecar-file-mapping
+ds4: [q1-0-source-working-set] result=ok phase=post-bootstrap windows=1 page_size=4096 mapping_bytes=8192 queried_pages=2 resident_pages=2 resident_bytes=8192 shared_pages=1 shared_bytes=4096 not_shared_pages=1 not_shared_bytes=4096 file_backed_pages=2 file_backed_bytes=8192 query_calls=1 last_error=0 file_backed_basis=sidecar-file-mapping
+ds4: [q1-0-source-working-set] result=ok phase=post-unlock-settle windows=1 page_size=4096 mapping_bytes=8192 queried_pages=2 resident_pages=2 resident_bytes=8192 shared_pages=1 shared_bytes=4096 not_shared_pages=1 not_shared_bytes=4096 file_backed_pages=2 file_backed_bytes=8192 query_calls=1 last_error=0 file_backed_basis=sidecar-file-mapping
+'@
+    $positive = Read-G7Q1_0ProfileTelemetry `
+        -LogText $valid -Required $true -Windows $true `
+        -ExpectedMappingBytes 8192 -ExpectedResidentHits 3 `
+        -ExpectedResidentH2DBytes 300 -ExpectedMixedJoinCalls 1
+    if (-not $positive.valid) { throw "Q1_0 profile positive self-test failed" }
+
+    $negativeCases = @()
+    try {
+        [void](Read-G7Q1_0ProfileTelemetry `
+            -LogText $valid.Replace(" pageable_h2d_bytes=100", "") `
+            -Required $true -Windows $true -ExpectedMappingBytes 8192 `
+            -ExpectedResidentHits 3 -ExpectedResidentH2DBytes 300 `
+            -ExpectedMixedJoinCalls 1)
+        throw "Q1_0 profile missing-field fixture was accepted"
+    } catch {
+        if ($_.Exception.Message -notmatch 'missing field: pageable_h2d_bytes') {
+            throw
+        }
+        $negativeCases += "missing field"
+    }
+    try {
+        [void](Read-G7Q1_0ProfileTelemetry `
+            -LogText $valid.Replace("resident_h2d_bytes_total=300", `
+                                    "resident_h2d_bytes_total=301") `
+            -Required $true -Windows $true -ExpectedMappingBytes 8192 `
+            -ExpectedResidentHits 3 -ExpectedResidentH2DBytes 301 `
+            -ExpectedMixedJoinCalls 1)
+        throw "Q1_0 profile incoherent-split fixture was accepted"
+    } catch {
+        if ($_.Exception.Message -notmatch 'pinned/pageable accounting') {
+            throw
+        }
+        $negativeCases += "incoherent pinned/pageable split"
+    }
+    [pscustomobject]@{
+        status = "pass"
+        off_default = "pass"
+        positive = "pass"
+        negative_cases = @($negativeCases)
+    } | ConvertTo-Json -Compress
+}
+
+function Read-G7Q1_0SsdWrapTelemetry {
+    param(
+        [AllowEmptyString()][string]$LogText,
+        [bool]$Required,
+        [UInt64]$ExpectedHostBudgetBytes,
+        [double]$ExpectedPinnedGiB
+    )
+
+    $allMarkers = [regex]::Matches(
+        $LogText, '(?m)^(?:ds4: )?\[q1-0-ssd-wrap(?:-wave|-working-set)?\] .+$')
+    if (-not $Required) {
+        if ($allMarkers.Count -ne 0) {
+            throw "Q1_0 SSD-WRAP telemetry appeared while disabled"
+        }
+        return [pscustomobject]@{
+            requested = $false; observed = $false; valid = $true
+            attempts = [UInt64]0; successes = [UInt64]0
+            failures = [UInt64]0; host_budget_bytes = [UInt64]0
+            waves = @(); working_set = @()
+        }
+    }
+    $readyMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-ssd-wrap\] result=ready ([^\r\n]+)\r?$')
+    $finalMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-ssd-wrap\] result=([^ ]+) ([^\r\n]+)\r?$')
+    $finalMatches = @($finalMatches | Where-Object {
+        $_.Groups[1].Value -ne 'ready'
+    })
+    $waveMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-ssd-wrap-wave\] result=([^ ]+) ([^\r\n]+)\r?$')
+    $workingSetMatches = [regex]::Matches(
+        $LogText,
+        '(?m)^(?:ds4: )?\[q1-0-ssd-wrap-working-set\] result=([^ ]+) phase=([^ ]+) ([^\r\n]+)\r?$')
+    if ($readyMatches.Count -ne 1 -or $finalMatches.Count -ne 1) {
+        throw "Q1_0 SSD-WRAP requires exactly one ready and final record"
+    }
+    if ($workingSetMatches.Count -lt 3) {
+        throw "Q1_0 SSD-WRAP requires working-set samples for lifecycle phases"
+    }
+
+    $readySchema = @(
+        'enabled', 'queue_capacity', 'prefill_wave_count',
+        'prefill_wave_bytes', 'decode_wave_count', 'decode_wave_bytes',
+        'max_age_calls', 'pinned_min_touches', 'pinned_min_mass',
+        'pinned_min_weight', 'pinned_deadline_calls', 'host_budget_bytes',
+        'pinned_resident_slots', 'pageable_resident_slots',
+        'ssd_ring_slots', 'h2d_ring_slots', 'slot_bytes', 'ownership')
+    $ready = Convert-G7Q1_0ProfileKeyValues `
+        -Suffix $readyMatches[0].Groups[1].Value `
+        -Schema $readySchema -Kind 'ssd-wrap-ready'
+    if ((Convert-G7StrictFlag01 $ready.enabled 'ssd_wrap.enabled') -ne 1 -or
+        $ready.ownership -ne 'exclusive-transition-bounded') {
+        throw "Q1_0 SSD-WRAP ready mode is invalid"
+    }
+    $readyU64Names = @($readySchema | Where-Object {
+        $_ -notin @('enabled', 'pinned_min_mass', 'pinned_min_weight',
+                    'ownership')
+    })
+    $readyParsed = [ordered]@{}
+    foreach ($name in $readyU64Names) {
+        $readyParsed[$name] = Convert-G7StrictUInt64 `
+            $ready[$name] "ssd_wrap.ready.$name"
+    }
+    foreach ($name in @('pinned_min_mass', 'pinned_min_weight')) {
+        $value = Convert-G7StrictDouble $ready[$name] "ssd_wrap.ready.$name"
+        if ($value -lt 0) { throw "Q1_0 SSD-WRAP ready has negative $name" }
+        $readyParsed[$name] = $value
+    }
+    if ($readyParsed.slot_bytes -eq 0 -or
+        $readyParsed.ssd_ring_slots -ne 2 -or
+        $readyParsed.h2d_ring_slots -ne 2) {
+        throw "Q1_0 SSD-WRAP fixed-ring contract is invalid"
+    }
+    $totalSlots = [decimal]$readyParsed.pinned_resident_slots +
+        [decimal]$readyParsed.pageable_resident_slots +
+        [decimal]$readyParsed.ssd_ring_slots +
+        [decimal]$readyParsed.h2d_ring_slots
+    if (($totalSlots * [decimal]$readyParsed.slot_bytes) -ne
+            [decimal]$readyParsed.host_budget_bytes -or
+        ($ExpectedHostBudgetBytes -ne 0 -and
+         $readyParsed.host_budget_bytes -ne $ExpectedHostBudgetBytes)) {
+        throw "Q1_0 SSD-WRAP host budget accounting is inconsistent"
+    }
+    $pinnedAllocationBytes =
+        ([decimal]$readyParsed.pinned_resident_slots +
+         [decimal]$readyParsed.ssd_ring_slots +
+         [decimal]$readyParsed.h2d_ring_slots) *
+        [decimal]$readyParsed.slot_bytes
+    $requestedPinnedBytes = [decimal]$ExpectedPinnedGiB * [decimal]1GB
+    if ($requestedPinnedBytes -gt [decimal]$readyParsed.host_budget_bytes) {
+        $requestedPinnedBytes = [decimal]$readyParsed.host_budget_bytes
+    }
+    if ($pinnedAllocationBytes -gt $requestedPinnedBytes -or
+        $requestedPinnedBytes - $pinnedAllocationBytes -ge
+            [decimal]$readyParsed.slot_bytes) {
+        throw "Q1_0 SSD-WRAP pinned/pageable split is inconsistent"
+    }
+
+    $finalResult = [string]$finalMatches[0].Groups[1].Value
+    $finalU64 = @(
+        'requested', 'deduplicated', 'backpressure', 'attempts',
+        'successes', 'failures', 'structural_rejects', 'bytes_requested',
+        'bytes_read', 'bytes_useful', 'ranges_requested', 'ranges_read',
+        'coalesced_ranges', 'max_queue_depth', 'waves_prefill',
+        'waves_decode', 'ram_ready', 'pinned_ready', 'pageable_ready',
+        'pinned_hits', 'pageable_hits', 'stale', 'dropped',
+        'host_copy_bytes', 'h2d_waits',
+        'pageable_paged_out_before_copy', 'first_use', 'wasted')
+    $finalDouble = @(
+        'host_copy_seconds', 'h2d_wait_seconds', 'service_seconds')
+    $finalValues = Convert-G7Q1_0ProfileKeyValues `
+        -Suffix $finalMatches[0].Groups[2].Value `
+        -Schema @($finalU64 + $finalDouble) -Kind 'ssd-wrap-final'
+    $final = [ordered]@{}
+    foreach ($name in $finalU64) {
+        $final[$name] = Convert-G7StrictUInt64 `
+            $finalValues[$name] "ssd_wrap.final.$name"
+    }
+    foreach ($name in $finalDouble) {
+        $value = Convert-G7StrictDouble `
+            $finalValues[$name] "ssd_wrap.final.$name"
+        if ($value -lt 0) { throw "Q1_0 SSD-WRAP final has negative $name" }
+        $final[$name] = $value
+    }
+    if ($finalResult -ne 'complete' -or $final.failures -ne 0 -or
+        $final.structural_rejects -gt 16 -or $final.stale -ne 0 -or
+        $final.dropped -ne 0 -or $final.requested -ne $final.attempts -or
+        [decimal]$final.attempts -ne
+            ([decimal]$final.successes + [decimal]$final.failures) -or
+        [decimal]$final.pinned_ready + [decimal]$final.pageable_ready -ne
+            [decimal]$final.successes -or
+        $final.bytes_read -ne $final.bytes_useful -or
+        $final.bytes_read -gt $final.bytes_requested -or
+        [decimal]$final.ranges_requested -ne
+            ([decimal]$final.attempts * 3) -or
+        [decimal]$final.ranges_read + [decimal]$final.coalesced_ranges -ne
+            ([decimal]$final.successes * 3)) {
+        throw "Q1_0 SSD-WRAP final accounting is inconsistent"
+    }
+
+    $waveSchema = @(
+        'wave_id', 'regime', 'requests', 'ranges_requested', 'ranges_read',
+        'coalesced_ranges', 'bytes_requested', 'bytes_read', 'bytes_useful',
+        'queue_depth', 'service_seconds', 'ram_ready', 'failures',
+        'coalesce_ratio')
+    $waves = @()
+    [decimal]$waveRequests = 0
+    [decimal]$waveBytesRequested = 0
+    foreach ($match in $waveMatches) {
+        $values = Convert-G7Q1_0ProfileKeyValues `
+            -Suffix $match.Groups[2].Value -Schema $waveSchema `
+            -Kind 'ssd-wrap-wave'
+        if ($match.Groups[1].Value -ne 'ready' -or
+            $values.regime -notin @('prefill-rebuild', 'decode-micro')) {
+            throw "Q1_0 SSD-WRAP wave result/regime is invalid"
+        }
+        $row = [ordered]@{ result = 'ready'; regime = $values.regime }
+        foreach ($name in @($waveSchema | Where-Object {
+                    $_ -notin @('regime', 'service_seconds', 'coalesce_ratio')
+                })) {
+            $row[$name] = Convert-G7StrictUInt64 `
+                $values[$name] "ssd_wrap.wave.$name"
+        }
+        foreach ($name in @('service_seconds', 'coalesce_ratio')) {
+            $row[$name] = Convert-G7StrictDouble `
+                $values[$name] "ssd_wrap.wave.$name"
+            if ($row[$name] -lt 0) {
+                throw "Q1_0 SSD-WRAP wave has negative $name"
+            }
+        }
+        if ($row.failures -ne 0 -or $row.bytes_read -ne $row.bytes_useful -or
+            $row.bytes_read -gt $row.bytes_requested -or
+            [decimal]$row.ranges_read + [decimal]$row.coalesced_ranges -ne
+                [decimal]$row.ranges_requested) {
+            throw "Q1_0 SSD-WRAP wave accounting is inconsistent"
+        }
+        $waveRequests += [decimal]$row.requests
+        $waveBytesRequested += [decimal]$row.bytes_requested
+        $waves += [pscustomobject]$row
+    }
+    if (($final.attempts -gt 0 -and $waves.Count -eq 0) -or
+        $waveRequests -ne [decimal]$final.attempts -or
+        $waveBytesRequested -ne [decimal]$final.bytes_requested) {
+        throw "Q1_0 SSD-WRAP wave totals are inconsistent"
+    }
+
+    $workingSetSchema = @(
+        'page_size', 'pages', 'queried_pages', 'resident_pages',
+        'resident_bytes', 'paged_out_pages', 'paged_out_bytes',
+        'shared_pages', 'shared_bytes', 'locked_pages', 'locked_bytes',
+        'page_fault_count', 'hard_fault_source')
+    $workingSet = @()
+    $phases = @{}
+    foreach ($match in $workingSetMatches) {
+        if ($match.Groups[1].Value -ne 'sample') {
+            throw "Q1_0 SSD-WRAP working-set sample failed"
+        }
+        $values = Convert-G7Q1_0ProfileKeyValues `
+            -Suffix $match.Groups[3].Value -Schema $workingSetSchema `
+            -Kind 'ssd-wrap-working-set'
+        $row = [ordered]@{ phase = [string]$match.Groups[2].Value }
+        foreach ($name in @($workingSetSchema | Where-Object {
+                    $_ -ne 'hard_fault_source' })) {
+            $row[$name] = Convert-G7StrictUInt64 `
+                $values[$name] "ssd_wrap.working_set.$name"
+        }
+        $row.hard_fault_source = [string]$values.hard_fault_source
+        if ($row.page_size -eq 0 -or $row.queried_pages -ne $row.pages -or
+            [decimal]$row.resident_pages + [decimal]$row.paged_out_pages -ne
+                [decimal]$row.pages -or
+            [decimal]$row.resident_bytes -ne
+                ([decimal]$row.resident_pages * [decimal]$row.page_size) -or
+            [decimal]$row.paged_out_bytes -ne
+                ([decimal]$row.paged_out_pages * [decimal]$row.page_size) -or
+            $row.hard_fault_source -ne 'external-sampler') {
+            throw "Q1_0 SSD-WRAP working-set accounting is inconsistent"
+        }
+        $phases[$row.phase] = $true
+        $workingSet += [pscustomobject]$row
+    }
+    foreach ($phase in @('init', 'flush', 'release')) {
+        if (-not $phases.ContainsKey($phase)) {
+            throw "Q1_0 SSD-WRAP working-set phase missing: $phase"
+        }
+    }
+    return [pscustomobject]@{
+        requested = $true; observed = $true; valid = $true
+        attempts = [UInt64]$final.attempts
+        successes = [UInt64]$final.successes
+        failures = [UInt64]$final.failures
+        host_budget_bytes = [UInt64]$readyParsed.host_budget_bytes
+        pinned_resident_slots = [UInt64]$readyParsed.pinned_resident_slots
+        pageable_resident_slots = [UInt64]$readyParsed.pageable_resident_slots
+        slot_bytes = [UInt64]$readyParsed.slot_bytes
+        final = [pscustomobject]$final
+        waves = @($waves)
+        working_set = @($workingSet)
+    }
+}
+
+function Invoke-G7Q1_0SsdWrapParserSelfTest {
+    $off = Read-G7Q1_0SsdWrapTelemetry -LogText 'legacy' `
+        -Required $false -ExpectedHostBudgetBytes 0 -ExpectedPinnedGiB 1.5
+    if (-not $off.valid -or $off.observed) {
+        throw 'Q1_0 SSD-WRAP OFF self-test failed'
+    }
+    $valid = @'
+ds4: [q1-0-ssd-wrap] result=ready enabled=1 queue_capacity=2 prefill_wave_count=2 prefill_wave_bytes=1000 decode_wave_count=1 decode_wave_bytes=1000 max_age_calls=40 pinned_min_touches=3 pinned_min_mass=0.05 pinned_min_weight=0.02 pinned_deadline_calls=1 host_budget_bytes=1000 pinned_resident_slots=6 pageable_resident_slots=0 ssd_ring_slots=2 h2d_ring_slots=2 slot_bytes=100 ownership=exclusive-transition-bounded
+ds4: [q1-0-ssd-wrap-wave] result=ready wave_id=1 regime=decode-micro requests=1 ranges_requested=3 ranges_read=3 coalesced_ranges=0 bytes_requested=100 bytes_read=100 bytes_useful=100 queue_depth=1 service_seconds=0.1 ram_ready=1 failures=0 coalesce_ratio=1
+ds4: [q1-0-ssd-wrap-working-set] result=sample phase=init page_size=4096 pages=0 queried_pages=0 resident_pages=0 resident_bytes=0 paged_out_pages=0 paged_out_bytes=0 shared_pages=0 shared_bytes=0 locked_pages=0 locked_bytes=0 page_fault_count=1 hard_fault_source=external-sampler
+ds4: [q1-0-ssd-wrap-working-set] result=sample phase=flush page_size=4096 pages=0 queried_pages=0 resident_pages=0 resident_bytes=0 paged_out_pages=0 paged_out_bytes=0 shared_pages=0 shared_bytes=0 locked_pages=0 locked_bytes=0 page_fault_count=1 hard_fault_source=external-sampler
+ds4: [q1-0-ssd-wrap-working-set] result=sample phase=release page_size=4096 pages=0 queried_pages=0 resident_pages=0 resident_bytes=0 paged_out_pages=0 paged_out_bytes=0 shared_pages=0 shared_bytes=0 locked_pages=0 locked_bytes=0 page_fault_count=1 hard_fault_source=external-sampler
+ds4: [q1-0-ssd-wrap] result=complete requested=1 deduplicated=0 backpressure=0 attempts=1 successes=1 failures=0 structural_rejects=0 bytes_requested=100 bytes_read=100 bytes_useful=100 ranges_requested=3 ranges_read=3 coalesced_ranges=0 max_queue_depth=1 waves_prefill=0 waves_decode=1 ram_ready=1 pinned_ready=1 pageable_ready=0 pinned_hits=1 pageable_hits=0 stale=0 dropped=0 host_copy_bytes=0 host_copy_seconds=0 h2d_waits=0 h2d_wait_seconds=0 pageable_paged_out_before_copy=0 first_use=1 wasted=0 service_seconds=0.1
+'@
+    $positive = Read-G7Q1_0SsdWrapTelemetry -LogText $valid `
+        -Required $true -ExpectedHostBudgetBytes 1000 -ExpectedPinnedGiB 0.125
+    if (-not $positive.valid -or $positive.attempts -ne 1) {
+        throw 'Q1_0 SSD-WRAP positive self-test failed'
+    }
+    $negative = @()
+    try {
+        [void](Read-G7Q1_0SsdWrapTelemetry `
+            -LogText $valid.Replace(' pageable_ready=0', '') `
+            -Required $true -ExpectedHostBudgetBytes 1000 `
+            -ExpectedPinnedGiB 0.125)
+        throw 'Q1_0 SSD-WRAP missing-field fixture was accepted'
+    } catch {
+        if ($_.Exception.Message -notmatch 'missing field: pageable_ready') { throw }
+        $negative += 'missing-field'
+    }
+    try {
+        [void](Read-G7Q1_0SsdWrapTelemetry `
+            -LogText $valid.Replace('pinned_resident_slots=6', `
+                                    'pinned_resident_slots=5') `
+            -Required $true -ExpectedHostBudgetBytes 1000 `
+            -ExpectedPinnedGiB 0.125)
+        throw 'Q1_0 SSD-WRAP split fixture was accepted'
+    } catch {
+        if ($_.Exception.Message -notmatch 'host budget accounting') { throw }
+        $negative += 'incoherent-split'
+    }
+    [pscustomobject]@{
+        status = 'pass'; off_default = 'pass'; positive = 'pass'
+        negative_cases = $negative
+    } | ConvertTo-Json -Compress
+}
+
+function Assert-G7ExpertRecoveryExactProperties {
+    param(
+        [Parameter(Mandatory=$true)][object]$Object,
+        [Parameter(Mandatory=$true)][string[]]$Names,
+        [Parameter(Mandatory=$true)][string]$Kind
+    )
+    if ($null -eq $Object -or $Object -is [array]) {
+        throw "Expert recovery $Kind must be exactly one JSON object"
+    }
+    $observed = @($Object.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($observed.Count -ne $Names.Count -or
+        (Compare-Object $Names $observed).Count -ne 0) {
+        throw "Expert recovery $Kind schema has missing or extra fields"
+    }
+}
+
+function Get-G7ExpertRecoveryConfinedPaths {
+    param(
+        [Parameter(Mandatory=$true)][string]$RootPath,
+        [Parameter(Mandatory=$true)][string]$OutputPrefix
+    )
+    $root = [IO.Path]::GetFullPath($RootPath).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $prefix = [IO.Path]::GetFullPath($OutputPrefix)
+    $parent = [IO.Path]::GetDirectoryName($prefix).TrimEnd(
+        [IO.Path]::DirectorySeparatorChar,
+        [IO.Path]::AltDirectorySeparatorChar)
+    $leaf = [IO.Path]::GetFileName($prefix)
+    if (-not [string]::Equals(
+            $parent, $root, [StringComparison]::OrdinalIgnoreCase) -or
+        $leaf -notmatch '^[A-Za-z0-9_.-]+$') {
+        throw "Expert recovery output path is outside the canonical root"
+    }
+    $rootInfo = Get-Item -LiteralPath $root -ErrorAction Stop
+    if (-not $rootInfo.PSIsContainer -or
+        ($rootInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Expert recovery output root must be a non-reparse directory"
+    }
+    [pscustomobject]@{
+        root = $root
+        prefix = $prefix
+        leaf = $leaf
+        binary = $prefix + ".vectors.f32le"
+        jsonl = $prefix + ".samples.jsonl"
+        manifest = $prefix + ".manifest.json"
+        binary_partial = $prefix + ".vectors.f32le.partial"
+        jsonl_partial = $prefix + ".samples.jsonl.partial"
+        manifest_partial = $prefix + ".manifest.json.partial"
+    }
+}
+
+function ConvertTo-G7ExpertRecoveryCanonicalSample {
+    param([Parameter(Mandatory=$true)][object]$Record)
+    [pscustomobject][ordered]@{
+        schema = [string]$Record.schema
+        sample_index = [UInt64]$Record.sample_index
+        request_epoch = [UInt64]$Record.request_epoch
+        call_tick = [UInt64]$Record.call_tick
+        token_index = [UInt64]$Record.token_index
+        layer = [UInt64]$Record.layer
+        expert = [UInt64]$Record.expert
+        topk_rank = [UInt64]$Record.topk_rank
+        gate_weight_decimal = [string]$Record.gate_weight_decimal
+        gate_weight_f32_le_hex = [string]$Record.gate_weight_f32_le_hex
+        representation = [string]$Record.representation
+        dtype = [string]$Record.dtype
+        shape = @([UInt64]$Record.shape[0])
+        vector_offset = [UInt64]$Record.vector_offset
+        vector_bytes = [UInt64]$Record.vector_bytes
+        model_sha256 = [string]$Record.model_sha256
+        model_bytes = [UInt64]$Record.model_bytes
+        sidecar_sha256 = [string]$Record.sidecar_sha256
+        sidecar_bytes = [UInt64]$Record.sidecar_bytes
+        build_manifest_sha256 = [string]$Record.build_manifest_sha256
+        build_input_fingerprint_sha256 =
+            [string]$Record.build_input_fingerprint_sha256
+        executable_sha256 = [string]$Record.executable_sha256
+    } | ConvertTo-Json -Compress -Depth 5
+}
+
+function ConvertTo-G7ExpertRecoveryCanonicalManifest {
+    param([Parameter(Mandatory=$true)][object]$Manifest)
+    [pscustomobject][ordered]@{
+        schema = [string]$Manifest.schema
+        status = [string]$Manifest.status
+        input_only = [bool]$Manifest.input_only
+        teacher_output_captured = [bool]$Manifest.teacher_output_captured
+        teacher_output_reconstruction =
+            [string]$Manifest.teacher_output_reconstruction
+        dtype = [string]$Manifest.dtype
+        shape = @([UInt64]$Manifest.shape[0], [UInt64]$Manifest.shape[1])
+        header_bytes = [UInt64]$Manifest.header_bytes
+        sample_count = [UInt64]$Manifest.sample_count
+        max_samples = [UInt64]$Manifest.max_samples
+        capped_samples = [UInt64]$Manifest.capped_samples
+        vector_dim = [UInt64]$Manifest.vector_dim
+        vector_bytes_per_sample = [UInt64]$Manifest.vector_bytes_per_sample
+        binary_bytes = [UInt64]$Manifest.binary_bytes
+        byte_budget = [UInt64]$Manifest.byte_budget
+        layer = [UInt64]$Manifest.layer
+        expert = [UInt64]$Manifest.expert
+        request_epoch_min = [UInt64]$Manifest.request_epoch_min
+        request_epoch_max = [UInt64]$Manifest.request_epoch_max
+        call_tick_min = [UInt64]$Manifest.call_tick_min
+        call_tick_max = [UInt64]$Manifest.call_tick_max
+        binary_file = [string]$Manifest.binary_file
+        binary_sha256 = [string]$Manifest.binary_sha256
+        jsonl_file = [string]$Manifest.jsonl_file
+        jsonl_bytes = [UInt64]$Manifest.jsonl_bytes
+        jsonl_sha256 = [string]$Manifest.jsonl_sha256
+        model_sha256 = [string]$Manifest.model_sha256
+        model_bytes = [UInt64]$Manifest.model_bytes
+        sidecar_sha256 = [string]$Manifest.sidecar_sha256
+        sidecar_bytes = [UInt64]$Manifest.sidecar_bytes
+        build_manifest_sha256 = [string]$Manifest.build_manifest_sha256
+        build_input_fingerprint_sha256 =
+            [string]$Manifest.build_input_fingerprint_sha256
+        executable_sha256 = [string]$Manifest.executable_sha256
+    } | ConvertTo-Json -Compress -Depth 5
+}
+
+function Read-G7ExpertRecoveryTraceArtifact {
+    param(
+        [Parameter(Mandatory=$true)][bool]$Required,
+        [Parameter(Mandatory=$true)][string]$RootPath,
+        [Parameter(Mandatory=$true)][string]$OutputPrefix,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedLayer,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedExpert,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedMaxSamples,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedByteBudget,
+        [Parameter(Mandatory=$true)][string]$ExpectedModelSHA256,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedModelBytes,
+        [Parameter(Mandatory=$true)][string]$ExpectedSidecarSHA256,
+        [Parameter(Mandatory=$true)][UInt64]$ExpectedSidecarBytes,
+        [Parameter(Mandatory=$true)][string]$ExpectedBuildManifestSHA256,
+        [Parameter(Mandatory=$true)][string]$ExpectedBuildFingerprintSHA256,
+        [Parameter(Mandatory=$true)][string]$ExpectedExecutableSHA256
+    )
+    $paths = Get-G7ExpertRecoveryConfinedPaths `
+        -RootPath $RootPath -OutputPrefix $OutputPrefix
+    $allPaths = @($paths.binary, $paths.jsonl, $paths.manifest,
+                  $paths.binary_partial, $paths.jsonl_partial,
+                  $paths.manifest_partial)
+    if (-not $Required) {
+        if (@($allPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -ne 0) {
+            throw "Expert recovery artifacts appeared while tracing was disabled"
+        }
+        return [pscustomobject]@{ requested = $false; observed = $false; valid = $true }
+    }
+    if ((Test-Path -LiteralPath $paths.binary_partial) -or
+        (Test-Path -LiteralPath $paths.jsonl_partial) -or
+        (Test-Path -LiteralPath $paths.manifest_partial)) {
+        throw "Expert recovery partial artifact is not acceptable"
+    }
+    foreach ($requiredPath in @($paths.binary, $paths.jsonl, $paths.manifest)) {
+        if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+            throw "Expert recovery committed artifact is missing: $requiredPath"
+        }
+        if (((Get-Item -LiteralPath $requiredPath).Attributes -band
+             [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Expert recovery committed artifact cannot be a reparse point"
+        }
+    }
+    $utf8NoBom = [Text.UTF8Encoding]::new($false, $true)
+    $manifestRaw = [IO.File]::ReadAllText($paths.manifest, $utf8NoBom)
+    $manifestHasBom = ($manifestRaw.Length -gt 0 -and
+        [int]$manifestRaw[0] -eq 0xfeff)
+    if (-not $manifestRaw.EndsWith("`n") -or $manifestRaw.Contains("`r") -or
+        $manifestHasBom) {
+        throw ("Expert recovery manifest is not canonical UTF-8 LF JSON " +
+            "(ends_lf={0}, has_cr={1}, starts_bom={2}, chars={3})" -f
+            $manifestRaw.EndsWith("`n"), $manifestRaw.Contains("`r"),
+            $manifestHasBom, $manifestRaw.Length)
+    }
+    try { $manifest = $manifestRaw | ConvertFrom-Json }
+    catch { throw "Expert recovery manifest is invalid JSON" }
+    $manifestFields = @(
+        "schema", "status", "input_only", "teacher_output_captured",
+        "teacher_output_reconstruction", "dtype", "shape", "header_bytes",
+        "sample_count", "max_samples", "capped_samples", "vector_dim",
+        "vector_bytes_per_sample", "binary_bytes", "byte_budget", "layer",
+        "expert", "request_epoch_min", "request_epoch_max", "call_tick_min",
+        "call_tick_max", "binary_file", "binary_sha256", "jsonl_file",
+        "jsonl_bytes", "jsonl_sha256", "model_sha256", "model_bytes",
+        "sidecar_sha256", "sidecar_bytes", "build_manifest_sha256",
+        "build_input_fingerprint_sha256", "executable_sha256")
+    Assert-G7ExpertRecoveryExactProperties `
+        -Object $manifest -Names $manifestFields -Kind "manifest"
+    $canonicalManifest = ConvertTo-G7ExpertRecoveryCanonicalManifest $manifest
+    if ($manifestRaw -cne ($canonicalManifest + "`n")) {
+        throw "Expert recovery manifest failed canonical roundtrip"
+    }
+    $sampleCount = [UInt64]$manifest.sample_count
+    $vectorDim = [UInt64]$manifest.vector_dim
+    $vectorBytes = [UInt64]$manifest.vector_bytes_per_sample
+    $binaryBytes = [UInt64]$manifest.binary_bytes
+    if ($manifest.schema -ne "ds4_expert_recovery_manifest_v1" -or
+        $manifest.status -ne "complete" -or
+        -not [bool]$manifest.input_only -or
+        [bool]$manifest.teacher_output_captured -or
+        $manifest.teacher_output_reconstruction -ne
+            "offline_exact_iq2_from_captured_input" -or
+        $manifest.dtype -ne "float32-le" -or
+        @($manifest.shape).Count -ne 2 -or
+        [UInt64]$manifest.shape[0] -ne $sampleCount -or
+        [UInt64]$manifest.shape[1] -ne $vectorDim -or
+        [UInt64]$manifest.header_bytes -ne 64 -or
+        $sampleCount -eq 0 -or $sampleCount -gt $ExpectedMaxSamples -or
+        [UInt64]$manifest.max_samples -ne $ExpectedMaxSamples -or
+        $ExpectedMaxSamples -gt 256 -or $vectorDim -eq 0 -or
+        $vectorDim -gt ([UInt64]::MaxValue / 4) -or
+        $vectorBytes -ne $vectorDim * 4 -or
+        $binaryBytes -ne 64 + $sampleCount * $vectorBytes -or
+        [UInt64]$manifest.byte_budget -ne $ExpectedByteBudget -or
+        $binaryBytes -gt $ExpectedByteBudget -or
+        [UInt64]$manifest.layer -ne $ExpectedLayer -or
+        [UInt64]$manifest.expert -ne $ExpectedExpert -or
+        [UInt64]$manifest.request_epoch_min -eq 0 -or
+        [UInt64]$manifest.request_epoch_min -gt
+            [UInt64]$manifest.request_epoch_max -or
+        [UInt64]$manifest.call_tick_min -eq 0 -or
+        [UInt64]$manifest.call_tick_min -gt [UInt64]$manifest.call_tick_max) {
+        throw "Expert recovery manifest contract is inconsistent"
+    }
+    $expectedBinaryFile = $paths.leaf + ".vectors.f32le"
+    $expectedJsonlFile = $paths.leaf + ".samples.jsonl"
+    if ($manifest.binary_file -cne $expectedBinaryFile -or
+        $manifest.jsonl_file -cne $expectedJsonlFile -or
+        [IO.Path]::GetFullPath((Join-Path $paths.root $manifest.binary_file)) -ine
+            [IO.Path]::GetFullPath($paths.binary) -or
+        [IO.Path]::GetFullPath((Join-Path $paths.root $manifest.jsonl_file)) -ine
+            [IO.Path]::GetFullPath($paths.jsonl)) {
+        throw "Expert recovery manifest artifact paths are not confined"
+    }
+    foreach ($shaProperty in @("binary_sha256", "jsonl_sha256",
+            "model_sha256", "sidecar_sha256", "build_manifest_sha256",
+            "build_input_fingerprint_sha256", "executable_sha256")) {
+        if ([string]$manifest.$shaProperty -cnotmatch '^[0-9a-f]{64}$') {
+            throw "Expert recovery manifest has invalid SHA-256: $shaProperty"
+        }
+    }
+    $binaryInfo = Get-Item -LiteralPath $paths.binary
+    $jsonlInfo = Get-Item -LiteralPath $paths.jsonl
+    $manifestInfo = Get-Item -LiteralPath $paths.manifest
+    $binarySHA = (Get-FileHash -LiteralPath $paths.binary -Algorithm SHA256).
+        Hash.ToLowerInvariant()
+    $jsonlSHA = (Get-FileHash -LiteralPath $paths.jsonl -Algorithm SHA256).
+        Hash.ToLowerInvariant()
+    if ([UInt64]$binaryInfo.Length -ne $binaryBytes -or
+        [UInt64]$jsonlInfo.Length -ne [UInt64]$manifest.jsonl_bytes -or
+        [UInt64]$binaryInfo.Length -gt $ExpectedByteBudget -or
+        [UInt64]$jsonlInfo.Length -gt
+            $ExpectedByteBudget - [UInt64]$binaryInfo.Length -or
+        [UInt64]$manifestInfo.Length -gt $ExpectedByteBudget -
+            [UInt64]$binaryInfo.Length - [UInt64]$jsonlInfo.Length -or
+        $binarySHA -cne [string]$manifest.binary_sha256 -or
+        $jsonlSHA -cne [string]$manifest.jsonl_sha256 -or
+        [string]$manifest.model_sha256 -ine $ExpectedModelSHA256 -or
+        [UInt64]$manifest.model_bytes -ne $ExpectedModelBytes -or
+        [string]$manifest.sidecar_sha256 -ine $ExpectedSidecarSHA256 -or
+        [UInt64]$manifest.sidecar_bytes -ne $ExpectedSidecarBytes -or
+        [string]$manifest.build_manifest_sha256 -ine
+            $ExpectedBuildManifestSHA256 -or
+        [string]$manifest.build_input_fingerprint_sha256 -ine
+            $ExpectedBuildFingerprintSHA256 -or
+        [string]$manifest.executable_sha256 -ine $ExpectedExecutableSHA256) {
+        throw "Expert recovery artifact SHA, size, or provenance mismatch"
+    }
+    $binary = [IO.File]::ReadAllBytes($paths.binary)
+    if ([Text.Encoding]::ASCII.GetString($binary, 0, 8) -cne "DS4ERTR1" -or
+        [BitConverter]::ToUInt32($binary, 8) -ne 1 -or
+        [BitConverter]::ToUInt32($binary, 12) -ne 64 -or
+        [BitConverter]::ToUInt32($binary, 16) -ne 1 -or
+        [BitConverter]::ToUInt32($binary, 20) -ne $vectorDim -or
+        [BitConverter]::ToUInt32($binary, 24) -ne $ExpectedMaxSamples -or
+        [BitConverter]::ToUInt32($binary, 28) -ne $sampleCount -or
+        [BitConverter]::ToUInt64($binary, 32) -ne $vectorBytes -or
+        [BitConverter]::ToUInt64($binary, 40) -ne $sampleCount * $vectorBytes -or
+        [BitConverter]::ToUInt64($binary, 48) -ne $ExpectedByteBudget -or
+        @($binary[56..63] | Where-Object { $_ -ne 0 }).Count -ne 0) {
+        throw "Expert recovery binary header is inconsistent"
+    }
+    $jsonlRaw = [IO.File]::ReadAllText($paths.jsonl, $utf8NoBom)
+    $jsonlHasBom = ($jsonlRaw.Length -gt 0 -and [int]$jsonlRaw[0] -eq 0xfeff)
+    if (-not $jsonlRaw.EndsWith("`n") -or $jsonlRaw.Contains("`r") -or
+        $jsonlHasBom) {
+        throw "Expert recovery JSONL is not canonical UTF-8 LF"
+    }
+    $physicalLines = @($jsonlRaw.Substring(0, $jsonlRaw.Length - 1).Split("`n"))
+    if ($physicalLines.Count -ne $sampleCount -or
+        @($physicalLines | Where-Object { -not $_ }).Count -ne 0) {
+        throw "Expert recovery JSONL physical-line count is inconsistent"
+    }
+    $sampleFields = @(
+        "schema", "sample_index", "request_epoch", "call_tick", "token_index",
+        "layer", "expert", "topk_rank", "gate_weight_decimal",
+        "gate_weight_f32_le_hex", "representation", "dtype", "shape",
+        "vector_offset", "vector_bytes", "model_sha256", "model_bytes",
+        "sidecar_sha256", "sidecar_bytes", "build_manifest_sha256",
+        "build_input_fingerprint_sha256", "executable_sha256")
+    $records = @()
+    $lastTokenByRequest = @{}
+    $lastCallByRequest = @{}
+    $requestMin = [UInt64]::MaxValue
+    $requestMax = [UInt64]0
+    $callMin = [UInt64]::MaxValue
+    $callMax = [UInt64]0
+    for ($i = 0; $i -lt $physicalLines.Count; $i++) {
+        $line = $physicalLines[$i]
+        try { $record = $line | ConvertFrom-Json }
+        catch { throw "Expert recovery JSONL line $i is invalid JSON" }
+        Assert-G7ExpertRecoveryExactProperties `
+            -Object $record -Names $sampleFields -Kind "sample"
+        if ($line -cne (ConvertTo-G7ExpertRecoveryCanonicalSample $record)) {
+            throw "Expert recovery JSONL line $i failed canonical roundtrip"
+        }
+        $requestEpoch = [UInt64]$record.request_epoch
+        $callTick = [UInt64]$record.call_tick
+        $tokenIndex = [UInt64]$record.token_index
+        $weightText = [string]$record.gate_weight_decimal
+        if ($weightText -cnotmatch '^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?$') {
+            throw "Expert recovery sample gate weight is not canonical"
+        }
+        try {
+            $weight = [Single]::Parse(
+                $weightText, [Globalization.NumberStyles]::Float,
+                [Globalization.CultureInfo]::InvariantCulture)
+        } catch { throw "Expert recovery sample gate weight is invalid" }
+        $weightBits = [BitConverter]::ToUInt32(
+            [BitConverter]::GetBytes($weight), 0).ToString("x8")
+        $requestKey = [string]$requestEpoch
+        if ($record.schema -ne "ds4_expert_recovery_sample_v1" -or
+            [UInt64]$record.sample_index -ne [UInt64]$i -or
+            $requestEpoch -eq 0 -or $requestEpoch -eq [UInt64]::MaxValue -or
+            $callTick -eq 0 -or
+            $callTick -eq [UInt64]::MaxValue -or
+            [UInt64]$record.layer -ne $ExpectedLayer -or
+            [UInt64]$record.expert -ne $ExpectedExpert -or
+            [UInt64]$record.topk_rank -gt 5 -or
+            [string]$record.gate_weight_f32_le_hex -cne $weightBits -or
+            [string]$record.representation -notin @(
+                "iq2_vram", "iq2_snapshot_ram", "iq2_tier_ram", "q1_resident") -or
+            $record.dtype -ne "float32-le" -or
+            @($record.shape).Count -ne 1 -or
+            [UInt64]$record.shape[0] -ne $vectorDim -or
+            [UInt64]$record.vector_offset -ne 64 + [UInt64]$i * $vectorBytes -or
+            [UInt64]$record.vector_bytes -ne $vectorBytes -or
+            [string]$record.model_sha256 -ine $ExpectedModelSHA256 -or
+            [UInt64]$record.model_bytes -ne $ExpectedModelBytes -or
+            [string]$record.sidecar_sha256 -ine $ExpectedSidecarSHA256 -or
+            [UInt64]$record.sidecar_bytes -ne $ExpectedSidecarBytes -or
+            [string]$record.build_manifest_sha256 -ine
+                $ExpectedBuildManifestSHA256 -or
+            [string]$record.build_input_fingerprint_sha256 -ine
+                $ExpectedBuildFingerprintSHA256 -or
+            [string]$record.executable_sha256 -ine $ExpectedExecutableSHA256) {
+            throw "Expert recovery sample $i contract is inconsistent"
+        }
+        if ($lastTokenByRequest.ContainsKey($requestKey) -and
+            ($tokenIndex -le [UInt64]$lastTokenByRequest[$requestKey] -or
+             $callTick -le [UInt64]$lastCallByRequest[$requestKey])) {
+            throw "Expert recovery request-local token/call ordering is invalid"
+        }
+        $lastTokenByRequest[$requestKey] = $tokenIndex
+        $lastCallByRequest[$requestKey] = $callTick
+        $requestMin = [math]::Min([decimal]$requestMin, [decimal]$requestEpoch)
+        $requestMax = [math]::Max([decimal]$requestMax, [decimal]$requestEpoch)
+        $callMin = [math]::Min([decimal]$callMin, [decimal]$callTick)
+        $callMax = [math]::Max([decimal]$callMax, [decimal]$callTick)
+        $records += $record
+    }
+    if ([UInt64]$requestMin -ne [UInt64]$manifest.request_epoch_min -or
+        [UInt64]$requestMax -ne [UInt64]$manifest.request_epoch_max -or
+        [UInt64]$callMin -ne [UInt64]$manifest.call_tick_min -or
+        [UInt64]$callMax -ne [UInt64]$manifest.call_tick_max) {
+        throw "Expert recovery manifest epoch range is inconsistent with JSONL"
+    }
+    [pscustomobject]@{
+        requested = $true
+        observed = $true
+        valid = $true
+        input_only = $true
+        teacher_output_reconstruction =
+            "offline_exact_iq2_from_captured_input"
+        layer = $ExpectedLayer
+        expert = $ExpectedExpert
+        sample_count = $sampleCount
+        max_samples = $ExpectedMaxSamples
+        capped_samples = [UInt64]$manifest.capped_samples
+        vector_dim = $vectorDim
+        vector_bytes_per_sample = $vectorBytes
+        binary_bytes = $binaryBytes
+        artifact_bytes_total = [UInt64]$binaryInfo.Length +
+            [UInt64]$jsonlInfo.Length + [UInt64]$manifestInfo.Length
+        byte_budget = $ExpectedByteBudget
+        binary_path = $paths.binary
+        binary_sha256 = $binarySHA
+        jsonl_path = $paths.jsonl
+        jsonl_sha256 = $jsonlSHA
+        jsonl_physical_lines = [UInt64]$physicalLines.Count
+        manifest_path = $paths.manifest
+        manifest_sha256 = (Get-FileHash -LiteralPath $paths.manifest `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+}
+
+function New-G7ExpertRecoverySelfTestFixture {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][string]$Prefix,
+        [string]$Case = "positive"
+    )
+    New-Item -ItemType Directory -Path $Root -Force | Out-Null
+    $modelSHA = "a" * 64
+    $sidecarSHA = "b" * 64
+    $buildSHA = "c" * 64
+    $fingerprint = "d" * 64
+    $exeSHA = "e" * 64
+    $binaryPath = $Prefix + ".vectors.f32le"
+    $jsonlPath = $Prefix + ".samples.jsonl"
+    $manifestPath = $Prefix + ".manifest.json"
+    $stream = New-Object IO.MemoryStream
+    $writer = New-Object IO.BinaryWriter($stream)
+    $writer.Write([Text.Encoding]::ASCII.GetBytes("DS4ERTR1"))
+    $writer.Write([UInt32]1); $writer.Write([UInt32]64)
+    $writer.Write([UInt32]1); $writer.Write([UInt32]4)
+    $writer.Write([UInt32]3); $writer.Write([UInt32]2)
+    $writer.Write([UInt64]16); $writer.Write([UInt64]32)
+    $writer.Write([UInt64]4096); $writer.Write([UInt64]0)
+    foreach ($value in @([Single]1, [Single]2, [Single]3, [Single]4,
+                          [Single]5, [Single]6, [Single]7, [Single]8)) {
+        $writer.Write($value)
+    }
+    $writer.Flush()
+    [IO.File]::WriteAllBytes($binaryPath, $stream.ToArray())
+    $writer.Dispose(); $stream.Dispose()
+    $records = @()
+    for ($i = 0; $i -lt 2; $i++) {
+        $records += [pscustomobject][ordered]@{
+            schema = "ds4_expert_recovery_sample_v1"
+            sample_index = [UInt64]$i
+            request_epoch = [UInt64]1
+            call_tick = [UInt64](10 + $i)
+            token_index = [UInt64]$i
+            layer = [UInt64]3
+            expert = [UInt64]0
+            topk_rank = [UInt64]$i
+            gate_weight_decimal = "0.5"
+            gate_weight_f32_le_hex = "3f000000"
+            representation = $(if ($i -eq 0) { "q1_resident" } else { "iq2_vram" })
+            dtype = "float32-le"
+            shape = @([UInt64]4)
+            vector_offset = [UInt64](64 + 16 * $i)
+            vector_bytes = [UInt64]16
+            model_sha256 = $modelSHA
+            model_bytes = [UInt64]1000
+            sidecar_sha256 = $sidecarSHA
+            sidecar_bytes = [UInt64]2000
+            build_manifest_sha256 = $buildSHA
+            build_input_fingerprint_sha256 = $fingerprint
+            executable_sha256 = $exeSHA
+        }
+    }
+    $lines = @($records | ForEach-Object {
+        ConvertTo-G7ExpertRecoveryCanonicalSample $_
+    })
+    switch ($Case) {
+        "missing-field" {
+            $lines[0] = $lines[0].Replace(',"call_tick":10', '')
+        }
+        "offset" {
+            $lines[0] = $lines[0].Replace('"vector_offset":64',
+                                          '"vector_offset":65')
+        }
+        "duplicate-key" {
+            $lines[0] = $lines[0].Replace('"sample_index":0',
+                '"sample_index":0,"sample_index":0')
+        }
+        "array" { $lines[0] = "[" + $lines[0] + "]" }
+        "wrong-expert" {
+            $lines[0] = $lines[0].Replace('"expert":0', '"expert":1')
+        }
+    }
+    $jsonlText = ($lines -join "`n") + "`n"
+    if ($Case -eq "blank-line") { $jsonlText = $lines[0] + "`n`n" + $lines[1] + "`n" }
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    [IO.File]::WriteAllText($jsonlPath, $jsonlText, $utf8NoBom)
+    $binarySHA = (Get-FileHash $binaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $jsonlSHA = (Get-FileHash $jsonlPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $manifest = [pscustomobject][ordered]@{
+        schema = "ds4_expert_recovery_manifest_v1"
+        status = "complete"
+        input_only = $true
+        teacher_output_captured = $false
+        teacher_output_reconstruction = "offline_exact_iq2_from_captured_input"
+        dtype = "float32-le"
+        shape = @([UInt64]2, [UInt64]4)
+        header_bytes = [UInt64]64
+        sample_count = [UInt64]2
+        max_samples = [UInt64]$(if ($Case -eq "cap-overflow") { 257 } else { 3 })
+        capped_samples = [UInt64]0
+        vector_dim = [UInt64]4
+        vector_bytes_per_sample = [UInt64]16
+        binary_bytes = [UInt64]96
+        byte_budget = [UInt64]4096
+        layer = [UInt64]3
+        expert = [UInt64]0
+        request_epoch_min = [UInt64]1
+        request_epoch_max = [UInt64]1
+        call_tick_min = [UInt64]10
+        call_tick_max = [UInt64]11
+        binary_file = [IO.Path]::GetFileName($binaryPath)
+        binary_sha256 = $binarySHA
+        jsonl_file = [IO.Path]::GetFileName($jsonlPath)
+        jsonl_bytes = [UInt64](Get-Item $jsonlPath).Length
+        jsonl_sha256 = $jsonlSHA
+        model_sha256 = $modelSHA
+        model_bytes = [UInt64]1000
+        sidecar_sha256 = $sidecarSHA
+        sidecar_bytes = [UInt64]2000
+        build_manifest_sha256 = $buildSHA
+        build_input_fingerprint_sha256 = $fingerprint
+        executable_sha256 = $exeSHA
+    }
+    [IO.File]::WriteAllText(
+        $manifestPath,
+        (ConvertTo-G7ExpertRecoveryCanonicalManifest $manifest) + "`n",
+        $utf8NoBom)
+    if ($Case -eq "stale-sha") {
+        [IO.File]::AppendAllText($jsonlPath, " ", $utf8NoBom)
+    } elseif ($Case -eq "partial-only") {
+        Move-Item -LiteralPath $manifestPath -Destination ($manifestPath + ".partial")
+    }
+    [pscustomobject]@{
+        model_sha = $modelSHA; sidecar_sha = $sidecarSHA
+        build_sha = $buildSHA; fingerprint = $fingerprint; exe_sha = $exeSHA
+    }
+}
+
+function Invoke-G7ExpertRecoveryTraceParserSelfTest {
+    $base = Join-Path ([IO.Path]::GetTempPath()) `
+        ("g7_expert_recovery_" + [Guid]::NewGuid().ToString("N"))
+    $negativeCases = @("missing-field", "offset", "duplicate-key", "array",
+        "wrong-expert", "blank-line", "cap-overflow", "stale-sha",
+        "partial-only")
+    try {
+        $positiveRoot = Join-Path $base "positive"
+        $positivePrefix = Join-Path $positiveRoot "trace"
+        $ids = New-G7ExpertRecoverySelfTestFixture `
+            -Root $positiveRoot -Prefix $positivePrefix
+        $positive = Read-G7ExpertRecoveryTraceArtifact -Required $true `
+            -RootPath $positiveRoot -OutputPrefix $positivePrefix `
+            -ExpectedLayer 3 -ExpectedExpert 0 -ExpectedMaxSamples 3 `
+            -ExpectedByteBudget 4096 -ExpectedModelSHA256 $ids.model_sha `
+            -ExpectedModelBytes 1000 -ExpectedSidecarSHA256 $ids.sidecar_sha `
+            -ExpectedSidecarBytes 2000 `
+            -ExpectedBuildManifestSHA256 $ids.build_sha `
+            -ExpectedBuildFingerprintSHA256 $ids.fingerprint `
+            -ExpectedExecutableSHA256 $ids.exe_sha
+        if (-not $positive.valid -or $positive.sample_count -ne 2) {
+            throw "Expert recovery positive fixture failed"
+        }
+        $observedNegatives = @()
+        foreach ($case in $negativeCases) {
+            $root = Join-Path $base $case
+            $prefix = Join-Path $root "trace"
+            $caseIds = New-G7ExpertRecoverySelfTestFixture `
+                -Root $root -Prefix $prefix -Case $case
+            try {
+                [void](Read-G7ExpertRecoveryTraceArtifact -Required $true `
+                    -RootPath $root -OutputPrefix $prefix `
+                    -ExpectedLayer 3 -ExpectedExpert 0 -ExpectedMaxSamples 3 `
+                    -ExpectedByteBudget 4096 `
+                    -ExpectedModelSHA256 $caseIds.model_sha `
+                    -ExpectedModelBytes 1000 `
+                    -ExpectedSidecarSHA256 $caseIds.sidecar_sha `
+                    -ExpectedSidecarBytes 2000 `
+                    -ExpectedBuildManifestSHA256 $caseIds.build_sha `
+                    -ExpectedBuildFingerprintSHA256 $caseIds.fingerprint `
+                    -ExpectedExecutableSHA256 $caseIds.exe_sha)
+                throw "Expert recovery negative fixture was accepted: $case"
+            } catch {
+                if ($_.Exception.Message -like
+                    "Expert recovery negative fixture was accepted:*") { throw }
+                $observedNegatives += $case
+            }
+        }
+        $siblingRoot = Join-Path $base "root"
+        $sibling = Join-Path $base "root_evil"
+        New-Item -ItemType Directory -Path $siblingRoot -Force | Out-Null
+        $siblingPrefix = Join-Path $sibling "trace"
+        $siblingIds = New-G7ExpertRecoverySelfTestFixture `
+            -Root $sibling -Prefix $siblingPrefix
+        try {
+            [void](Read-G7ExpertRecoveryTraceArtifact -Required $true `
+                -RootPath $siblingRoot -OutputPrefix $siblingPrefix `
+                -ExpectedLayer 3 -ExpectedExpert 0 -ExpectedMaxSamples 3 `
+                -ExpectedByteBudget 4096 `
+                -ExpectedModelSHA256 $siblingIds.model_sha `
+                -ExpectedModelBytes 1000 `
+                -ExpectedSidecarSHA256 $siblingIds.sidecar_sha `
+                -ExpectedSidecarBytes 2000 `
+                -ExpectedBuildManifestSHA256 $siblingIds.build_sha `
+                -ExpectedBuildFingerprintSHA256 $siblingIds.fingerprint `
+                -ExpectedExecutableSHA256 $siblingIds.exe_sha)
+            throw "Expert recovery sibling path fixture was accepted"
+        } catch {
+            if ($_.Exception.Message -eq
+                "Expert recovery sibling path fixture was accepted") { throw }
+            $observedNegatives += "path-sibling"
+        }
+        [pscustomobject]@{
+            schema = "g7_expert_recovery_trace_parser_selftest_v1"
+            status = "pass"
+            positive_samples = 2
+            negative_cases = @($observedNegatives)
+        } | ConvertTo-Json -Compress
+    } finally {
+        if (Test-Path -LiteralPath $base) {
+            Remove-Item -LiteralPath $base -Recurse -Force
+        }
+    }
+}
+
+if ($Q1_0SsdWrapParserSelfTest) {
+    Invoke-G7Q1_0SsdWrapParserSelfTest
+    exit 0
+}
+if ($Q1_0ProfileParserSelfTest) {
+    Invoke-G7Q1_0ProfileParserSelfTest
+    exit 0
+}
+if ($ExpertRecoveryTraceParserSelfTest) {
+    Invoke-G7ExpertRecoveryTraceParserSelfTest
+    exit 0
+}
+function Assert-G7U64Sum3 {
+    param([UInt64]$A, [UInt64]$B, [UInt64]$C, [UInt64]$Expected,
+          [string]$Label)
+
+    $sum = [decimal]$A + [decimal]$B + [decimal]$C
+    if ($sum -gt [decimal][UInt64]::MaxValue -or
+        [UInt64]$sum -ne $Expected) {
+        throw "Q1_0 promotion $Label byte sum is invalid"
+    }
+}
+function Assert-G7PromotionOffsetFormula {
+    param(
+        [UInt64]$BaseOffset,
+        [UInt64]$Stride,
+        [UInt32]$Expert,
+        [UInt64]$Bytes,
+        [UInt64]$ObservedOffset,
+        [UInt64]$ModelSize,
+        [string]$Label
+    )
+
+    $expected = [decimal]$BaseOffset + ([decimal]$Expert * [decimal]$Stride)
+    $end = [decimal]$ObservedOffset + [decimal]$Bytes
+    if ($Stride -eq 0 -or $Bytes -eq 0 -or $ModelSize -eq 0 -or
+        $expected -gt [decimal][UInt64]::MaxValue -or
+        [UInt64]$expected -ne $ObservedOffset -or
+        $end -gt [decimal]$ModelSize) {
+        throw "Q1_0 promotion $Label offset formula/range is invalid"
+    }
+}
+function Get-G7PromotionRecordKey {
+    param([Parameter(Mandatory=$true)][object]$Row)
+
+    return ("{0}:{1}" -f [UInt64]$Row.request_epoch, [UInt64]$Row.record_id)
+}
+function Get-G7PromotionRecordIdentity {
+    param([Parameter(Mandatory=$true)][object]$Row)
+
+    return ("{0}:{1}:{2}:{3}:{4}:{5}" -f
+        [UInt64]$Row.request_epoch, [UInt64]$Row.record_id,
+        [UInt32]$Row.layer, [UInt32]$Row.expert,
+        [UInt64]$Row.observation_call,
+        [UInt64]$Row.first_eligible_call)
+}
+function Get-G7PromotionRecordImmutableIdentity {
+    param([Parameter(Mandatory=$true)][object]$Row)
+
+    $mutable = @{
+        line_index = $true
+        physical_line = $true
+        kind = $true
+        result = $true
+        reason = $true
+        destination_kind = $true
+        destination_ram_slot = $true
+        destination_ram_generation = $true
+    }
+    $parts = @()
+    foreach ($property in @($Row.PSObject.Properties.Name | Sort-Object)) {
+        if ($mutable.ContainsKey($property)) { continue }
+        $value = $Row.PSObject.Properties[$property].Value
+        $parts += ('{0}={1}' -f $property, [Convert]::ToString(
+            $value, [Globalization.CultureInfo]::InvariantCulture))
+    }
+    return ($parts -join "`n")
 }
 function Get-G7PreflightMedian([double[]]$Values) {
     if ($null -eq $Values -or $Values.Count -eq 0) { return $null }
@@ -939,8 +2372,9 @@ if (-not $Q1_0ExpertSidecar -and
       $Q1_0DualArena -or $Q1_0DualSparseCompanion -or
       $Q1_0MixedColdOne -or $Q1_0SnapshotBacking -or
       $Q1_0PageableOverflow -or
-      $Q1_0PureResident -or
-      $ExpectedQ1_0SnapshotEntries -ne 0 -or
+      $Q1_0PureResident -or $Q1_0Profile -or $ExpertRecoveryTrace -or
+       $ExpectedQ1_0SnapshotEntries -ne 0 -or
+       $ExpectedQ1_0ResidentEntries -ne 0 -or
       $ReuseVerifiedQ1_0Receipt)) {
     throw "Q1_0 selected-load and provenance options require Q1_0ExpertSidecar"
 }
@@ -1106,6 +2540,33 @@ if ($Q1_0ExpertSidecar) {
         (-not $Q1_0SelectedLoad -or $DynamicArenaGiB -le 0.0)) {
         throw "Q1_0ResidentArena requires Q1_0ExpertSidecar, Q1_0SelectedLoad, structural-safety, Repeats=1, no warmup, and DynamicArenaGiB > 0"
     }
+    if ($Q1_0Profile -and
+        (-not $Q1_0SelectedLoad -or -not $Q1_0ResidentArena)) {
+        throw "Q1_0Profile requires Q1_0SelectedLoad and Q1_0ResidentArena"
+    }
+    if ($ExpertRecoveryTrace) {
+        if (-not $Q1_0SelectedLoad -or -not $Q1_0ResidentArena -or
+            -not $Q1_0DualArena -or $Q1_0DualSparseCompanion -or
+            -not $Q1_0MixedTrace) {
+            throw "ExpertRecoveryTrace requires the G129 resident dual-arena mixed resolver and Q1_0MixedTrace"
+        }
+        if ($GateKind -ne "structural-safety" -or $Repeats -ne 1 -or $Warmup) {
+            throw "ExpertRecoveryTrace requires one structural-safety request and no warmup"
+        }
+        if (-not $ForceOpenRouter -or -not $ComposePrefillMassOpenRouter -or
+            $ReapMaskFile -or $AllowEmbeddedBakeMask) {
+            throw "ExpertRecoveryTrace requires authoritative full/open routing with no static or embedded mask"
+        }
+        if ($ExpertRecoveryTraceLayer -lt $Q1_0LayerFirst -or
+            $ExpertRecoveryTraceLayer -gt $Q1_0LayerLast) {
+            throw "ExpertRecoveryTrace target layer is outside the verified Q1_0 sidecar range"
+        }
+        if (-not $ExpectedModelSHA256 -or
+            -not $ExpectedQ1_0ExpertSidecarSHA256 -or
+            $ExpectedQ1_0ExpertSidecarBytes -eq 0) {
+            throw "ExpertRecoveryTrace requires exact model and Q1_0 sidecar provenance"
+        }
+    }
     if ($Q1_0DualArena -and -not $Q1_0ResidentArena) {
         throw "Q1_0DualArena requires Q1_0ResidentArena"
     }
@@ -1126,6 +2587,7 @@ if ($Q1_0ExpertSidecar) {
          (-not $ComposePrefillMassTiering -and -not $Q1_0PureResident) -or
          $Q1_0LayerFirst -ne 0 -or $Q1_0LayerLast -ne 42 -or
          $ExpectedQ1_0SnapshotEntries -le 0 -or
+         $ExpectedQ1_0ResidentEntries -ne 0 -or
          -not $ReuseVerifiedQ1_0Receipt -or
          -not $ExpectedModelSHA256)) {
         throw "Q1_0SnapshotBacking is exclusive and requires selected load, DynamicArenaGiB > 0, PrefillMassWrap, ComposePrefillMass or Q1_0PureResident, layers 0..42, ExpectedQ1_0SnapshotEntries > 0, and verified model/Q1 receipts"
@@ -1139,11 +2601,17 @@ if ($Q1_0ExpertSidecar) {
          $ExpertTiering -ne "off")) {
         throw "Q1_0PureResident requires snapshot backing with pageable overflow and forbids composed tiering, VRAM seed, expert cache, GPU-resident IQ2 routes, and expert tiering"
     }
-    if ($Q1_0PageableOverflow -and -not $Q1_0SnapshotBacking) {
-        throw "Q1_0PageableOverflow requires Q1_0SnapshotBacking"
+    if ($Q1_0PageableOverflow -and
+        -not ($Q1_0SnapshotBacking -or
+              ($Q1_0ResidentArena -and $Q1_0DualArena))) {
+        throw "Q1_0PageableOverflow requires snapshot backing or resident dual-arena mode"
     }
     if (-not $Q1_0SnapshotBacking -and $ExpectedQ1_0SnapshotEntries -ne 0) {
         throw "ExpectedQ1_0SnapshotEntries requires Q1_0SnapshotBacking"
+    }
+    if ($ExpectedQ1_0ResidentEntries -ne 0 -and
+        (-not $Q1_0ResidentArena -or $Q1_0SnapshotBacking)) {
+        throw "ExpectedQ1_0ResidentEntries requires non-snapshot Q1_0ResidentArena"
     }
     if (-not (Test-Path -LiteralPath $Q1_0ExpertSidecar -PathType Leaf)) {
         throw "Q1_0 sidecar missing: $Q1_0ExpertSidecar"
@@ -1269,6 +2737,46 @@ if ($Iq1Promotion) {
     if (-not $ComposePrefillMassTiering) { throw "Iq1Promotion requires ComposePrefillMassTiering" }
     if ($ExpertTiering -ne "enforce") { throw "Iq1Promotion requires ExpertTiering enforce" }
 }
+if ($Q1_0ArenaGB -gt 0.0 -and -not $Q1_0ExpertSidecar) {
+    throw "Q1_0ArenaGB requires Q1_0ExpertSidecar"
+}
+if ($Q1_0DynamicPromotion) {
+    if (-not $Q1_0ExpertSidecar) { throw "Q1_0DynamicPromotion requires Q1_0ExpertSidecar" }
+    if (-not $Q1_0DualArena) { throw "Q1_0DynamicPromotion requires Q1_0DualArena" }
+    if ($Q1_0SnapshotBacking) { throw "Q1_0DynamicPromotion forbids Q1_0SnapshotBacking" }
+    if (-not $Q1_0PageableOverflow) { throw "Q1_0DynamicPromotion requires Q1_0PageableOverflow" }
+    if ($Iq1Promotion) { throw "Q1_0DynamicPromotion is isolated from legacy Iq1Promotion" }
+    if ($Q1_0ArenaGB -le 0.0) { throw "Q1_0DynamicPromotion requires Q1_0ArenaGB > 0" }
+    if (-not $ComposePrefillMassTiering) { throw "Q1_0DynamicPromotion requires ComposePrefillMassTiering" }
+    if ($ExpertTiering -ne "enforce") { throw "Q1_0DynamicPromotion requires ExpertTiering enforce" }
+}
+if ($Q1_0PromotionSsdWrap) {
+    if (-not $Q1_0DynamicPromotion) {
+        throw "Q1_0PromotionSsdWrap requires Q1_0DynamicPromotion"
+    }
+    if ([math]::Abs($DynamicArenaGiB - 5.5) -gt 0.000000001) {
+        throw "Q1_0PromotionSsdWrap requires the unchanged 5.5 GiB exact-IQ2 host budget"
+    }
+    if (-not $Q1_0DualArena -or $Q1_0SnapshotBacking) {
+        throw "Q1_0PromotionSsdWrap requires full/open dual arena without snapshot backing"
+    }
+} elseif ([math]::Abs($Q1_0Iq2PinnedGiB - 1.5) -gt 0.000000001) {
+    throw "Q1_0Iq2PinnedGiB is configurable only with Q1_0PromotionSsdWrap"
+}
+$quantPromotionRequested = [bool]($Iq1Promotion -or $Q1_0DynamicPromotion)
+if (($Q1_0PromotionWindowCalls -eq 0) -ne ($Q1_0PromotionWindowBudget -eq 0)) {
+    throw "Q1_0PromotionWindowCalls and Q1_0PromotionWindowBudget must both be zero or both be greater than zero"
+}
+if (-not $Q1_0DynamicPromotion -and
+    ($Q1_0PromotionMinTouches -ne 1 -or
+     $Q1_0PromotionMinWeight -ne 0.0 -or
+     $Q1_0PromotionMinMass -ne 0.0 -or
+     $Q1_0PromotionRequestBudget -ne 0 -or
+     $Q1_0PromotionWindowCalls -ne 0 -or
+     $Q1_0PromotionWindowBudget -ne 0 -or
+     $Q1_0PromotionProbationSlots -ne 16)) {
+    throw "Non-default Q1_0 promotion knobs require -Q1_0DynamicPromotion"
+}
 if (($Iq1PromotionWindowCalls -eq 0) -ne ($Iq1PromotionWindowBudget -eq 0)) {
     throw "Iq1PromotionWindowCalls and Iq1PromotionWindowBudget must both be zero or both be greater than zero"
 }
@@ -1336,10 +2844,45 @@ if ($ReuseVerifiedSuiteReceipt -and
 if ($ComposePrefillMassOpenRouter) {
     if (-not $ComposePrefillMassTiering) { throw "ComposePrefillMassOpenRouter requires ComposePrefillMassTiering" }
     if (-not $PrefillMassWrap) { throw "ComposePrefillMassOpenRouter requires PrefillMassWrap" }
-    if (-not $Iq1Promotion -and $ComposePrefillMassReserveSlots -le 0) { throw "ComposePrefillMassOpenRouter requires Iq1Promotion or ComposePrefillMassReserveSlots > 0" }
+    if (-not $quantPromotionRequested -and $ComposePrefillMassReserveSlots -le 0) { throw "ComposePrefillMassOpenRouter requires quant promotion or ComposePrefillMassReserveSlots > 0" }
 }
 if ($ComposePrefillMassReserveSlots -gt 0 -and -not $ComposePrefillMassOpenRouter) {
     throw "ComposePrefillMassReserveSlots requires ComposePrefillMassOpenRouter"
+}
+$promotionProbationSlotsExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionProbationSlots
+} else {
+    $Iq1PromotionProbationSlots
+}
+$promotionMinTouchesExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionMinTouches
+} else {
+    $Iq1PromotionMinTouches
+}
+$promotionMinWeightExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionMinWeight
+} else {
+    $Iq1PromotionMinWeight
+}
+$promotionMinMassExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionMinMass
+} else {
+    $Iq1PromotionMinMass
+}
+$promotionRequestBudgetExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionRequestBudget
+} else {
+    $Iq1PromotionRequestBudget
+}
+$promotionWindowCallsExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionWindowCalls
+} else {
+    $Iq1PromotionWindowCalls
+}
+$promotionWindowBudgetExpected = if ($Q1_0DynamicPromotion) {
+    $Q1_0PromotionWindowBudget
+} else {
+    $Iq1PromotionWindowBudget
 }
 if ($Iq1SRamCacheGiB -gt 0.0 -and -not $Iq1SExpertSidecar) {
     throw "Iq1SRamCacheGiB requires Iq1SExpertSidecar"
@@ -1373,8 +2916,34 @@ if ($Iq1SVramCachePerLayer -gt 0 -and
 if ($Iq1SVramCachePerLayer -gt 0 -and $Iq1SPackedH2D) {
     throw "Iq1SVramCachePerLayer and Iq1SPackedH2D are mutually exclusive"
 }
+if (-not $ExpertRecoveryTrace -and $ExpertRecoveryTraceOutputPath) {
+    throw "ExpertRecoveryTraceOutputPath requires ExpertRecoveryTrace"
+}
 $outdir = Join-Path $PSScriptRoot "g7_runs"
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
+$expertRecoveryTraceRoot = [IO.Path]::GetFullPath($outdir)
+$expertRecoveryTracePrefix = if ($ExpertRecoveryTraceOutputPath) {
+    [IO.Path]::GetFullPath($ExpertRecoveryTraceOutputPath)
+} else {
+    Join-Path $expertRecoveryTraceRoot (
+        "g7_" + $Tag + "_expert_recovery")
+}
+$expertRecoveryTracePaths = Get-G7ExpertRecoveryConfinedPaths `
+    -RootPath $expertRecoveryTraceRoot `
+    -OutputPrefix $expertRecoveryTracePrefix
+if ($ExpertRecoveryTrace) {
+    foreach ($tracePath in @(
+            $expertRecoveryTracePaths.binary,
+            $expertRecoveryTracePaths.jsonl,
+            $expertRecoveryTracePaths.manifest,
+            $expertRecoveryTracePaths.binary_partial,
+            $expertRecoveryTracePaths.jsonl_partial,
+            $expertRecoveryTracePaths.manifest_partial)) {
+        if (Test-Path -LiteralPath $tracePath) {
+            throw "Expert recovery output already exists: $tracePath"
+        }
+    }
+}
 $processIsolationLog = Join-Path $outdir ("g7_" + $Tag + "_process_isolation_preflight.json")
 $systemQuiescenceLog = Join-Path $outdir ("g7_" + $Tag + "_system_quiescence_preflight.json")
 $measurementMutexName = "Local\DS4_G7_MEASUREMENT_LOCK"
@@ -1413,6 +2982,44 @@ $runtimeTelemetryLog = Join-Path $outdir ("g7_" + $Tag + "_runtime_telemetry.jso
 $failurePath = Join-Path $outdir ("g7_" + $Tag + "_failure.json")
 $rawOutputsPath = Join-Path $outdir ("g7_" + $Tag + "_raw_outputs.json")
 $resultPath = Join-Path $outdir ("g7_" + $Tag + "_result.json")
+function Write-G7MeasurementFailure {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [object]$Exception = $null,
+        [object]$AbortSample = $null,
+        [object[]]$Evidence = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($failurePath)) { return }
+    if (Test-Path -LiteralPath $failurePath -PathType Leaf) { return }
+    $message = if ($Exception) { [string]$Exception } else { "" }
+    [pscustomobject]@{
+        schema = "g7_measurement_failure_v1"
+        tag = $Tag
+        reason = $Reason
+        message = $message
+        head = $headAtStart
+        executable_sha256 = $exeHashAtStart
+        harness_sha256 = $harnessHashAtStart
+        runtime_monitor_harness_sha256 = $runtimeMonitorHashAtStart
+        stderr_path = $stderrLog
+        stdout_path = $stdoutLog
+        raw_outputs_path = $rawOutputsPath
+        result_path = $resultPath
+        runtime_telemetry_path = $runtimeTelemetryLog
+        expert_recovery_trace_requested = [bool]$ExpertRecoveryTrace
+        expert_recovery_trace_output_prefix = $expertRecoveryTracePrefix
+        expert_recovery_trace_manifest_path =
+            $expertRecoveryTracePaths.manifest
+        http_ok = $httpOk
+        completed_results = @($results).Count
+        expected_results = $Repeats
+        server_exit_code = $serverExitCode
+        runtime_failure_evidence = @($Evidence)
+        contamination_abort_sample = $AbortSample
+    } | ConvertTo-Json -Depth 8 |
+        Set-Content -LiteralPath $failurePath -Encoding UTF8
+}
 if (Test-Path $stderrLog) { Remove-Item $stderrLog -Force }
 if (Test-Path $stdoutLog) { Remove-Item $stdoutLog -Force }
 if (Test-Path $memoryPreflightLog) { Remove-Item $memoryPreflightLog -Force }
@@ -1499,10 +3106,25 @@ foreach ($name in @($_processEnvironment.Keys | ForEach-Object { [string]$_ } | 
     $inheritedDs4Environment[$name] = [string]$_processEnvironment[$name]
     [System.Environment]::SetEnvironmentVariable($name, $null, [System.EnvironmentVariableTarget]::Process)
 }
+if ($ExpectedModelSHA256) {
+    $env:DS4_MODEL_SHA256 = $ExpectedModelSHA256.ToLowerInvariant()
+    if (Test-Path -LiteralPath $model -PathType Leaf) {
+        $env:DS4_MODEL_BYTES = [string][UInt64](Get-Item -LiteralPath $model).Length
+    } else {
+        Remove-Item Env:\DS4_MODEL_BYTES -ErrorAction SilentlyContinue
+    }
+} else {
+    Remove-Item Env:\DS4_MODEL_SHA256 -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_MODEL_BYTES -ErrorAction SilentlyContinue
+}
 $env:DS4_CUDA_STREAM_FROM_RAM_MASKED_BUDGET_GB = "$BudgetGB"
 $env:DS4_CUDA_STREAM_RESERVE_MB = "$ReserveMB"
 if ($Q1_0ExpertSidecar) {
     $env:DS4_Q1_0_EXPERT_SIDECAR = $Q1_0ExpertSidecar
+    $env:DS4_Q1_0_EXPERT_SIDECAR_SHA256 =
+        $ExpectedQ1_0ExpertSidecarSHA256.ToLowerInvariant()
+    $env:DS4_Q1_0_EXPERT_SIDECAR_BYTES =
+        [string]$ExpectedQ1_0ExpertSidecarBytes
     $env:DS4_Q1_0_LAYER_FIRST = [string]$Q1_0LayerFirst
     $env:DS4_Q1_0_LAYER_LAST = [string]$Q1_0LayerLast
     if ($Q1_0SelectedLoad) {
@@ -1540,6 +3162,22 @@ if ($Q1_0ExpertSidecar) {
     } else {
         Remove-Item Env:\DS4_Q1_0_PAGEABLE_OVERFLOW -ErrorAction SilentlyContinue
     }
+    if ($Q1_0ArenaGB -gt 0.0) {
+        $env:DS4_Q1_0_DYNAMIC_ARENA_GB = $Q1_0ArenaGB.ToString(
+            "0.###", [Globalization.CultureInfo]::InvariantCulture)
+    } else {
+        Remove-Item Env:\DS4_Q1_0_DYNAMIC_ARENA_GB -ErrorAction SilentlyContinue
+    }
+    if ($Q1_0DynamicPromotion) {
+        $env:DS4_Q1_0_DYNAMIC_PROMOTION = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_DYNAMIC_PROMOTION -ErrorAction SilentlyContinue
+    }
+    if ($Q1_0Profile) {
+        $env:DS4_Q1_0_PROFILE = "1"
+    } else {
+        Remove-Item Env:\DS4_Q1_0_PROFILE -ErrorAction SilentlyContinue
+    }
     if ($Q1_0MixedTrace) {
         $env:DS4_Q1_0_MIXED_TRACE = "1"
     } else {
@@ -1547,6 +3185,8 @@ if ($Q1_0ExpertSidecar) {
     }
 } else {
     Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR_SHA256 -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR_BYTES -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_RESIDENT_ARENA -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_DUAL_ARENA -ErrorAction SilentlyContinue
@@ -1554,6 +3194,9 @@ if ($Q1_0ExpertSidecar) {
     Remove-Item Env:\DS4_Q1_0_MIXED_COLD_ONE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_SNAPSHOT_BACKING -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_PAGEABLE_OVERFLOW -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_DYNAMIC_ARENA_GB -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_DYNAMIC_PROMOTION -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROFILE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_MIXED_TRACE -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_LAYER_FIRST -ErrorAction SilentlyContinue
     Remove-Item Env:\DS4_Q1_0_LAYER_LAST -ErrorAction SilentlyContinue
@@ -1648,7 +3291,34 @@ if ($Iq1SMixedGpuPlan) {
 } else {
     Remove-Item Env:\DS4_IQ1_MIXED_GPU_PLAN -ErrorAction SilentlyContinue
 }
-if ($Iq1Promotion) {
+if ($Q1_0DynamicPromotion) {
+    $env:DS4_Q1_0_PROMOTION_PROBATION_SLOTS = "$Q1_0PromotionProbationSlots"
+    $env:DS4_Q1_0_PROMOTION_MIN_TOUCHES = "$Q1_0PromotionMinTouches"
+    $env:DS4_Q1_0_PROMOTION_MIN_WEIGHT =
+        $Q1_0PromotionMinWeight.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+    $env:DS4_Q1_0_PROMOTION_MIN_MASS =
+        $Q1_0PromotionMinMass.ToString("R", [Globalization.CultureInfo]::InvariantCulture)
+    $env:DS4_Q1_0_PROMOTION_REQUEST_BUDGET = "$Q1_0PromotionRequestBudget"
+    $env:DS4_Q1_0_PROMOTION_WINDOW_CALLS = "$Q1_0PromotionWindowCalls"
+    $env:DS4_Q1_0_PROMOTION_WINDOW_BUDGET = "$Q1_0PromotionWindowBudget"
+} else {
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_PROBATION_SLOTS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_MIN_TOUCHES -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_MIN_WEIGHT -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_MIN_MASS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_REQUEST_BUDGET -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_WINDOW_CALLS -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_WINDOW_BUDGET -ErrorAction SilentlyContinue
+}
+if ($Q1_0PromotionSsdWrap) {
+    $env:DS4_Q1_0_PROMOTION_SSD_WRAP = '1'
+    $env:DS4_Q1_0_IQ2_PINNED_GIB = $Q1_0Iq2PinnedGiB.ToString(
+        'R', [Globalization.CultureInfo]::InvariantCulture)
+} else {
+    Remove-Item Env:\DS4_Q1_0_PROMOTION_SSD_WRAP -ErrorAction SilentlyContinue
+    Remove-Item Env:\DS4_Q1_0_IQ2_PINNED_GIB -ErrorAction SilentlyContinue
+}
+if ($Iq1Promotion -and -not $Q1_0DynamicPromotion) {
     $env:DS4_IQ1_PROMOTION_PROBATION_SLOTS = "$Iq1PromotionProbationSlots"
     $env:DS4_IQ1_PROMOTION_MIN_TOUCHES = "$Iq1PromotionMinTouches"
     $env:DS4_IQ1_PROMOTION_MIN_WEIGHT =
@@ -2486,6 +4156,46 @@ foreach ($input in @($buildManifest.inputs)) {
         throw "Build provenance failed closed: input hash changed $($input.path)"
     }
 }
+$expertRecoveryTraceEnvironmentNames = @(
+    "DS4_EXPERT_RECOVERY_TRACE",
+    "DS4_EXPERT_RECOVERY_TRACE_LAYER",
+    "DS4_EXPERT_RECOVERY_TRACE_EXPERT",
+    "DS4_EXPERT_RECOVERY_TRACE_MAX_SAMPLES",
+    "DS4_EXPERT_RECOVERY_TRACE_MAX_BYTES",
+    "DS4_EXPERT_RECOVERY_TRACE_ROOT",
+    "DS4_EXPERT_RECOVERY_TRACE_OUTPUT_PREFIX",
+    "DS4_EXPERT_RECOVERY_BUILD_MANIFEST_SHA256",
+    "DS4_EXPERT_RECOVERY_BUILD_INPUT_FINGERPRINT_SHA256",
+    "DS4_EXPERT_RECOVERY_EXECUTABLE_SHA256")
+if ($ExpertRecoveryTrace) {
+    if ($buildManifestHashAtStart -cnotmatch '^[0-9a-f]{64}$' -or
+        [string]$buildManifest.input_fingerprint_sha256 -cnotmatch
+            '^[0-9a-f]{64}$' -or
+        $exeHashAtStart -cnotmatch '^[0-9a-f]{64}$') {
+        throw "ExpertRecoveryTrace build provenance is incomplete"
+    }
+    $env:DS4_EXPERT_RECOVERY_TRACE = "1"
+    $env:DS4_EXPERT_RECOVERY_TRACE_LAYER = [string]$ExpertRecoveryTraceLayer
+    $env:DS4_EXPERT_RECOVERY_TRACE_EXPERT = [string]$ExpertRecoveryTraceExpert
+    $env:DS4_EXPERT_RECOVERY_TRACE_MAX_SAMPLES =
+        [string]$ExpertRecoveryTraceMaxSamples
+    $env:DS4_EXPERT_RECOVERY_TRACE_MAX_BYTES =
+        [string]$ExpertRecoveryTraceByteBudget
+    $env:DS4_EXPERT_RECOVERY_TRACE_ROOT = $expertRecoveryTraceRoot
+    $env:DS4_EXPERT_RECOVERY_TRACE_OUTPUT_PREFIX =
+        $expertRecoveryTracePrefix
+    $env:DS4_EXPERT_RECOVERY_BUILD_MANIFEST_SHA256 =
+        $buildManifestHashAtStart
+    $env:DS4_EXPERT_RECOVERY_BUILD_INPUT_FINGERPRINT_SHA256 =
+        [string]$buildManifest.input_fingerprint_sha256
+    $env:DS4_EXPERT_RECOVERY_EXECUTABLE_SHA256 = $exeHashAtStart
+} else {
+    foreach ($traceEnvironmentName in $expertRecoveryTraceEnvironmentNames) {
+        [Environment]::SetEnvironmentVariable(
+            $traceEnvironmentName, $null,
+            [EnvironmentVariableTarget]::Process)
+    }
+}
 if ($nestedResidualGpuJoinSafetyReceiptAtStart) {
     $safetyReceipt = $nestedResidualGpuJoinSafetyReceiptAtStart
     $safetyResult = $nestedResidualGpuJoinSafetyResultAtStart
@@ -3180,6 +4890,88 @@ if ($telemetryProc -and -not $telemetryProc.HasExited) {
     $telemetryProc.WaitForExit(10000) | Out-Null
 }
 
+$expertRecoveryTraceArtifact = [pscustomobject]@{
+    requested = [bool]$ExpertRecoveryTrace
+    observed = $false
+    valid = (-not [bool]$ExpertRecoveryTrace)
+}
+if ($ExpertRecoveryTrace) {
+    $expertRecoveryLogText = if (Test-Path -LiteralPath $stderrLog) {
+        Get-Content -LiteralPath $stderrLog -Raw
+    } else { "" }
+    $traceFailureMarkers = [regex]::Matches(
+        $expertRecoveryLogText,
+        '(?m)^ds4: \[expert-recovery-trace\] result=failed reason=[^\r\n]+\r?$')
+    if ($traceFailureMarkers.Count -ne 0) {
+        throw "Expert recovery runtime reported a fail-closed artifact failure"
+    }
+    $expertRecoveryTraceArtifact = Read-G7ExpertRecoveryTraceArtifact `
+        -Required $true -RootPath $expertRecoveryTraceRoot `
+        -OutputPrefix $expertRecoveryTracePrefix `
+        -ExpectedLayer $ExpertRecoveryTraceLayer `
+        -ExpectedExpert $ExpertRecoveryTraceExpert `
+        -ExpectedMaxSamples $ExpertRecoveryTraceMaxSamples `
+        -ExpectedByteBudget $ExpertRecoveryTraceByteBudget `
+        -ExpectedModelSHA256 $modelHashAtStart `
+        -ExpectedModelBytes ([UInt64]$modelInfoAtStart.Length) `
+        -ExpectedSidecarSHA256 $q1_0SidecarHashAtStart `
+        -ExpectedSidecarBytes ([UInt64]$q1_0SidecarInfoAtStart.Length) `
+        -ExpectedBuildManifestSHA256 $buildManifestHashAtStart `
+        -ExpectedBuildFingerprintSHA256 `
+            ([string]$buildManifest.input_fingerprint_sha256) `
+        -ExpectedExecutableSHA256 $exeHashAtStart
+    $traceCompletePattern =
+        '(?m)^ds4: \[expert-recovery-trace\] result=complete ' +
+        'samples=(?<samples>[0-9]+) max_samples=(?<max>[0-9]+) ' +
+        'capped=(?<capped>[0-9]+) vector_dim=(?<dim>[0-9]+) ' +
+        'vector_bytes=(?<vector_bytes>[0-9]+) ' +
+        'binary_bytes=(?<binary_bytes>[0-9]+) ' +
+        'jsonl_bytes=(?<jsonl_bytes>[0-9]+) ' +
+        'manifest_bytes=(?<manifest_bytes>[0-9]+) ' +
+        'byte_budget=(?<budget>[0-9]+) layer=(?<layer>[0-9]+) ' +
+        'expert=(?<expert>[0-9]+) ' +
+        'binary_sha256=(?<binary_sha>[0-9a-f]{64}) ' +
+        'jsonl_sha256=(?<jsonl_sha>[0-9a-f]{64}) ' +
+        'manifest_sha256=(?<manifest_sha>[0-9a-f]{64}) ' +
+        'input_only=1 teacher_output=offline_exact_iq2\r?$'
+    $traceCompleteMatches = [regex]::Matches(
+        $expertRecoveryLogText, $traceCompletePattern)
+    if ($traceCompleteMatches.Count -ne 1) {
+        throw "Expert recovery runtime completion summary is missing or duplicated"
+    }
+    $traceComplete = $traceCompleteMatches[0]
+    if ([UInt64]$traceComplete.Groups['samples'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.sample_count -or
+        [UInt64]$traceComplete.Groups['max'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.max_samples -or
+        [UInt64]$traceComplete.Groups['capped'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.capped_samples -or
+        [UInt64]$traceComplete.Groups['dim'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.vector_dim -or
+        [UInt64]$traceComplete.Groups['vector_bytes'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.vector_bytes_per_sample -or
+        [UInt64]$traceComplete.Groups['binary_bytes'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.binary_bytes -or
+        [UInt64]$traceComplete.Groups['jsonl_bytes'].Value -ne
+            [UInt64](Get-Item $expertRecoveryTraceArtifact.jsonl_path).Length -or
+        [UInt64]$traceComplete.Groups['manifest_bytes'].Value -ne
+            [UInt64](Get-Item $expertRecoveryTraceArtifact.manifest_path).Length -or
+        [UInt64]$traceComplete.Groups['budget'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.byte_budget -or
+        [UInt64]$traceComplete.Groups['layer'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.layer -or
+        [UInt64]$traceComplete.Groups['expert'].Value -ne
+            [UInt64]$expertRecoveryTraceArtifact.expert -or
+        $traceComplete.Groups['binary_sha'].Value -cne
+            [string]$expertRecoveryTraceArtifact.binary_sha256 -or
+        $traceComplete.Groups['jsonl_sha'].Value -cne
+            [string]$expertRecoveryTraceArtifact.jsonl_sha256 -or
+        $traceComplete.Groups['manifest_sha'].Value -cne
+            [string]$expertRecoveryTraceArtifact.manifest_sha256) {
+        throw "Expert recovery runtime summary does not match the committed artifact"
+    }
+}
+
 $runtimeSamples = @()
 if (Test-Path -LiteralPath $runtimeTelemetryLog) {
     foreach ($line in Get-Content -LiteralPath $runtimeTelemetryLog) {
@@ -3523,6 +5315,8 @@ $arenaCapRequestedBytes = 0; $arenaCapRequestedSlots = 0
 $arenaCapChosenBytes = 0; $arenaCapChosenSlots = 0
 $arenaCapPageableBytes = 0; $arenaCapPageableSlots = 0
 $arenaCapTotalSlots = 0
+$arenaCapRingSlots = 0; $arenaCapHostBudgetBytes = 0
+$arenaCapSsdWrap = $false; $arenaReadyRingSlots = 0
 $arenaCapCapped = $false; $arenaCapResult = "not_observed"
 $arenaCapReason = "not_observed"
 $requestPhaseObserved = $false; $requestPhaseLineCount = 0
@@ -3560,6 +5354,17 @@ if (Test-Path $stderrLog) {
         $runtimeFailureSuffix = if ($runtimeFailureEvidence.Count -gt 0) {
             "; runtime=" + ($runtimeFailureEvidence -join " | ")
         } else { "" }
+        $runtimeFailureReason = if ($runtimeAbortSample) {
+            "runtime-contamination-abort"
+        } elseif (-not $httpOk) {
+            "http-request-failed"
+        } else {
+            "runtime-invariant-preparse"
+        }
+        Write-G7MeasurementFailure `
+            -Reason $runtimeFailureReason `
+            -AbortSample $runtimeAbortSample `
+            -Evidence $runtimeFailureEvidence
         throw ("Measurement failed before runtime invariant parsing: " +
             "http_ok=$httpOk completed=$($results.Count) expected=$Repeats" +
             $runtimeFailureSuffix)
@@ -4169,27 +5974,57 @@ if (Test-Path $stderrLog) {
     }
     $arenaCapLine = $lines | Where-Object { $_ -match "^\s*ds4: \[arena-cap\] " } | Select-Object -Last 1
     if ($arenaCapLine) {
+        $arenaCapSsdPattern = "^ds4: \[arena-cap\] requested_gib=([0-9.]+) min_available_gib=([0-9.]+) available_before_gib=(-?[0-9.]+) requested_bytes=(\d+) requested_slots=(\d+) chosen_bytes=(\d+) chosen_slots=(\d+) pageable_bytes=(\d+) pageable_slots=(\d+) total_slots=(\d+) ring_slots=(\d+) host_budget_bytes=(\d+) ssd_wrap=1 capped=(0|1) result=(ready|disabled) reason=([a-z-]+)$"
         $arenaCapPattern = "^ds4: \[arena-cap\] requested_gib=([0-9.]+) min_available_gib=([0-9.]+) available_before_gib=(-?[0-9.]+) requested_bytes=(\d+) requested_slots=(\d+) chosen_bytes=(\d+) chosen_slots=(\d+) pageable_bytes=(\d+) pageable_slots=(\d+) total_slots=(\d+) capped=(0|1) result=(ready|disabled) reason=([a-z-]+)$"
-        if ($arenaCapLine -notmatch $arenaCapPattern) {
+        if ($arenaCapLine -match $arenaCapSsdPattern) {
+            $arenaCapSsdWrap = $true
+            $arenaCapObserved = $true
+            $arenaCapRequestedGiB = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaCapMinAvailableGiB = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaCapAvailableBeforeGiB = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaCapRequestedBytes = [long]$Matches[4]
+            $arenaCapRequestedSlots = [long]$Matches[5]
+            $arenaCapChosenBytes = [long]$Matches[6]
+            $arenaCapChosenSlots = [long]$Matches[7]
+            $arenaCapPageableBytes = [long]$Matches[8]
+            $arenaCapPageableSlots = [long]$Matches[9]
+            $arenaCapTotalSlots = [long]$Matches[10]
+            $arenaCapRingSlots = [long]$Matches[11]
+            $arenaCapHostBudgetBytes = [long]$Matches[12]
+            $arenaCapCapped = ($Matches[13] -eq "1")
+            $arenaCapResult = $Matches[14]
+            $arenaCapReason = $Matches[15]
+        } elseif ($arenaCapLine -notmatch $arenaCapPattern) {
             throw "Dynamic arena cap line format mismatch: $arenaCapLine"
+        } else {
+            $arenaCapObserved = $true
+            $arenaCapRequestedGiB = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaCapMinAvailableGiB = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaCapAvailableBeforeGiB = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture)
+            $arenaCapRequestedBytes = [long]$Matches[4]
+            $arenaCapRequestedSlots = [long]$Matches[5]
+            $arenaCapChosenBytes = [long]$Matches[6]
+            $arenaCapChosenSlots = [long]$Matches[7]
+            $arenaCapPageableBytes = [long]$Matches[8]
+            $arenaCapPageableSlots = [long]$Matches[9]
+            $arenaCapTotalSlots = [long]$Matches[10]
+            $arenaCapCapped = ($Matches[11] -eq "1")
+            $arenaCapResult = $Matches[12]
+            $arenaCapReason = $Matches[13]
         }
-        $arenaCapObserved = $true
-        $arenaCapRequestedGiB = [double]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaCapMinAvailableGiB = [double]::Parse($Matches[2], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaCapAvailableBeforeGiB = [double]::Parse($Matches[3], [Globalization.CultureInfo]::InvariantCulture)
-        $arenaCapRequestedBytes = [long]$Matches[4]
-        $arenaCapRequestedSlots = [long]$Matches[5]
-        $arenaCapChosenBytes = [long]$Matches[6]
-        $arenaCapChosenSlots = [long]$Matches[7]
-        $arenaCapPageableBytes = [long]$Matches[8]
-        $arenaCapPageableSlots = [long]$Matches[9]
-        $arenaCapTotalSlots = [long]$Matches[10]
-        $arenaCapCapped = ($Matches[11] -eq "1")
-        $arenaCapResult = $Matches[12]
-        $arenaCapReason = $Matches[13]
     }
     $arenaReadyLine = $lines | Where-Object { $_ -match "CUDA dynamic arena ready" } | Select-Object -Last 1
-    if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready pinned=([0-9.]+) GiB pageable=([0-9.]+) GiB total_slots=(\d+) pinned_slots=(\d+) pageable_slots=(\d+).*bytes=(\d+) slot_bytes=(\d+)") {
+    if ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready pinned=([0-9.]+) GiB pageable=([0-9.]+) GiB total_slots=(\d+) pinned_slots=(\d+) pageable_slots=(\d+) ring_slots=(\d+).*bytes=(\d+) host_budget_bytes=(\d+) slot_bytes=(\d+)") {
+        $arenaAllocatedSlots = [long]$Matches[3]
+        $arenaAllocatedPinnedSlots = [long]$Matches[4]
+        $arenaAllocatedPageableSlots = [long]$Matches[5]
+        $arenaReadyRingSlots = [long]$Matches[6]
+        $arenaAllocatedBytes = [long]$Matches[7]
+        $arenaAllocatedTotalBytes = [long]$Matches[8]
+        $arenaSlotBytes = [long]$Matches[9]
+        $arenaAllocatedPageableBytes =
+            $arenaAllocatedPageableSlots * $arenaSlotBytes
+    } elseif ($arenaReadyLine -and $arenaReadyLine -match "CUDA dynamic arena ready pinned=([0-9.]+) GiB pageable=([0-9.]+) GiB total_slots=(\d+) pinned_slots=(\d+) pageable_slots=(\d+).*bytes=(\d+) slot_bytes=(\d+)") {
         $arenaAllocatedSlots = [long]$Matches[3]
         $arenaAllocatedPinnedSlots = [long]$Matches[4]
         $arenaAllocatedPageableSlots = [long]$Matches[5]
@@ -5326,11 +7161,40 @@ $q1_0Telemetry = Read-G7Q1_0SidecarTelemetry `
     -ResidentArenaRequested ([bool]($Q1_0ResidentArena -or $Q1_0SnapshotBacking)) `
     -SnapshotBackingRequested ([bool]$Q1_0SnapshotBacking) `
     -DualSparseRequested ([bool]$Q1_0DualSparseCompanion) `
-    -ExpectedSnapshotEntries ([UInt64]$ExpectedQ1_0SnapshotEntries) `
+    -ExpectedResidentEntries ([UInt64]$(if ($Q1_0SnapshotBacking) {
+        $ExpectedQ1_0SnapshotEntries
+    } else {
+        $ExpectedQ1_0ResidentEntries
+    })) `
     -SidecarPath $Q1_0ExpertSidecar
+$q1_0MixedResolverRequired = [bool](
+    $Q1_0SnapshotBacking -or $Q1_0MixedColdOne -or
+    $Q1_0DynamicPromotion -or
+    ($Q1_0ExpertSidecar -and $Q1_0ResidentArena -and
+     $Q1_0DualArena -and -not $Q1_0DualSparseCompanion))
+$q1_0MixedExpectedRouter = ""
+if ($q1_0MixedResolverRequired -and $Q1_0ResidentArena -and
+    $Q1_0DualArena -and -not $Q1_0DualSparseCompanion) {
+    $q1_0MixedExpectedRouter = if ($ComposePrefillMassOpenRouter) {
+        "open"
+    } else {
+        "unchanged"
+    }
+}
 $q1_0MixedTelemetry = Read-G7Q1_0MixedTelemetry `
     -LogText $q1_0SidecarLogText `
-    -Required ([bool]($Q1_0SnapshotBacking -or $Q1_0MixedColdOne))
+    -Required $q1_0MixedResolverRequired `
+    -ExpectedRouter $q1_0MixedExpectedRouter
+$q1_0MixedRouteTraceRequired = [bool](
+    $q1_0MixedResolverRequired -and $Q1_0MixedTrace)
+$q1_0MixedRouteTraceTelemetry = Read-G7Q1_0MixedRouteTraceTelemetry `
+    -LogText $q1_0SidecarLogText `
+    -Required $q1_0MixedRouteTraceRequired
+$q1_0MixedIq2Routes = [UInt64]$q1_0MixedTelemetry.iq2_vram
+$q1_0MixedIq2Routes += [UInt64]$q1_0MixedTelemetry.iq2_snapshot_ram
+$q1_0MixedIq2Routes += [UInt64]$q1_0MixedTelemetry.iq2_tier_ram
+$q1_0MixedAccountedRoutes = [UInt64]$q1_0MixedIq2Routes
+$q1_0MixedAccountedRoutes += [UInt64]$q1_0MixedTelemetry.q1_resident
 $q1_0SidecarRuntimeObserved = [bool]$q1_0Telemetry.runtime_observed
 $q1_0SidecarCalls = [UInt64]$q1_0Telemetry.route_calls
 $q1_0SidecarSlots = [UInt64]$q1_0Telemetry.route_slots
@@ -5343,8 +7207,197 @@ $q1_0ResidentH2DBytes = [UInt64]$q1_0Telemetry.resident_h2d_bytes
 $q1_0DirectPreadFallbacks = [UInt64]$q1_0Telemetry.direct_pread_fallbacks
 $q1_0DirectPreadBytes = [UInt64]$q1_0Telemetry.direct_pread_bytes
 $q1_0BootstrapEntries = [UInt64]$q1_0Telemetry.bootstrap_entries
-$q1_0RuntimeContractValid = [bool]$q1_0Telemetry.runtime_contract_valid
+$q1_0ProfileExpectedMappingBytes = [UInt64]$(
+    if ($ExpectedQ1_0ExpertSidecarBytes -ne 0) {
+        $ExpectedQ1_0ExpertSidecarBytes
+    } elseif ($q1_0SidecarInfoAtStart) {
+        [UInt64]$q1_0SidecarInfoAtStart.Length
+    } else {
+        [UInt64]0
+    })
+$q1_0ProfileTelemetry = Read-G7Q1_0ProfileTelemetry `
+    -LogText $q1_0SidecarLogText -Required ([bool]$Q1_0Profile) `
+    -Windows ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) `
+    -ExpectedMappingBytes $q1_0ProfileExpectedMappingBytes `
+    -ExpectedResidentHits $q1_0ResidentHits `
+    -ExpectedResidentH2DBytes $q1_0ResidentH2DBytes `
+    -ExpectedMixedJoinCalls ([UInt64]$q1_0MixedTelemetry.joins)
+$q1_0SsdWrapTelemetry = Read-G7Q1_0SsdWrapTelemetry `
+    -LogText $q1_0SidecarLogText `
+    -Required ([bool]$Q1_0PromotionSsdWrap) `
+    -ExpectedHostBudgetBytes ([UInt64]$arenaCapHostBudgetBytes) `
+    -ExpectedPinnedGiB $Q1_0Iq2PinnedGiB
+$q1_0RuntimeContractValid = [bool](
+    $q1_0Telemetry.runtime_contract_valid -and $q1_0ProfileTelemetry.valid -and
+    $q1_0SsdWrapTelemetry.valid)
 $q1_0FailClosedObserved = [bool]$q1_0Telemetry.fail_closed_observed
+$q1_0BootstrapPinnedBytes = [UInt64]0
+$q1_0BootstrapPageableBytes = [UInt64]0
+$q1_0BootstrapPinnedSlots = [UInt64]0
+$q1_0BootstrapPageableSlots = [UInt64]0
+$q1_0BootstrapTotalSlots = [UInt64]0
+$q1_0BootstrapTotalBytes = [UInt64]0
+$q1_0BootstrapLayerFirst = [UInt64]0
+$q1_0BootstrapLayerLast = [UInt64]0
+$q1_0SourceUnlockObserved = $false
+$q1_0SourceUnlockResult = ""
+$q1_0SourceUnlockWindows = 0
+$q1_0SourceUnlockPageSize = [UInt64]0
+$q1_0SourceUnlockPageAligned = 0
+$q1_0SourceUnlockDestinationUnchanged = 0
+$q1_0SourceUnlockLayers = [UInt64]0
+$q1_0SourceUnlockRangesAttempted = [UInt64]0
+$q1_0SourceUnlockBytesAttempted = [UInt64]0
+$q1_0SourceUnlockCalls = [UInt64]0
+$q1_0SourceUnlockSuccess = [UInt64]0
+$q1_0SourceUnlockTrue = [UInt64]0
+$q1_0SourceUnlockNotLocked = [UInt64]0
+$q1_0SourceUnlockErrorNotLocked = [UInt64]0
+$q1_0SourceUnlockFailed = [UInt64]0
+$q1_0SourceUnlockSeconds = [double]0.0
+$q1_0SourceUnlockAvailableBefore = [UInt64]0
+$q1_0SourceUnlockAvailableAfter = [UInt64]0
+$q1_0SourceUnlockWorkingSetBefore = [UInt64]0
+$q1_0SourceUnlockWorkingSetAfter = [UInt64]0
+$q1_0SourceUnlockPageFaultBefore = [UInt64]0
+$q1_0SourceUnlockPageFaultAfter = [UInt64]0
+$q1_0SourceUnlockReadTransferBefore = [UInt64]0
+$q1_0SourceUnlockReadTransferAfter = [UInt64]0
+$q1_0SourceUnlockLastError = [UInt64]0
+$q1_0SourceUnlockExpectedEntries = [UInt64]0
+$q1_0SourceUnlockTotalBytes = [UInt64]0
+$q1_0BootstrapMatches = [regex]::Matches(
+    $q1_0SidecarLogText,
+    '(?m)^(?:ds4: )?\[q1-0-resident-arena\] result=bootstrapped entries=(\d+) layers=(\d+)\.\.(\d+) generation=(\d+) source=sidecar-mmap route_pread=disabled iq2_host_arena=([^ \r\n]+) mixed_host_backing=([^ \r\n]+) pinned=(\d+) pageable=(\d+) pinned_slots=(\d+) pageable_slots=(\d+) total_slots=(\d+) total_bytes=(\d+)\r?$')
+if ($q1_0BootstrapMatches.Count -gt 0) {
+    if ($q1_0BootstrapMatches.Count -ne 1) {
+        throw "Q1_0 resident arena requires exactly one bootstrap marker; observed $($q1_0BootstrapMatches.Count)"
+    }
+    $q1_0BootstrapMatch = $q1_0BootstrapMatches[0]
+    $q1_0BootstrapLayerFirst = [UInt64]$q1_0BootstrapMatch.Groups[2].Value
+    $q1_0BootstrapLayerLast = [UInt64]$q1_0BootstrapMatch.Groups[3].Value
+    $q1_0BootstrapPinnedBytes =
+        [UInt64]$q1_0BootstrapMatch.Groups[7].Value
+    $q1_0BootstrapPageableBytes =
+        [UInt64]$q1_0BootstrapMatch.Groups[8].Value
+    $q1_0BootstrapPinnedSlots =
+        [UInt64]$q1_0BootstrapMatch.Groups[9].Value
+    $q1_0BootstrapPageableSlots =
+        [UInt64]$q1_0BootstrapMatch.Groups[10].Value
+    $q1_0BootstrapTotalSlots =
+        [UInt64]$q1_0BootstrapMatch.Groups[11].Value
+    $q1_0BootstrapTotalBytes =
+        [UInt64]$q1_0BootstrapMatch.Groups[12].Value
+}
+$q1_0SourceUnlockPattern =
+    '(?m)^(?:ds4: )?\[q1-0-source-unlock\] result=([^ \r\n]+) ' +
+    'phase=bootstrap source=sidecar-mmap windows=(\d+) page_size=(\d+) ' +
+    'page_aligned=(\d+) destination_unchanged=(\d+) layers=(\d+) ' +
+    'ranges_attempted=(\d+) bytes_attempted=(\d+) calls=(\d+) ' +
+    'success=(\d+) true=(\d+) not_locked=(\d+) error_not_locked=(\d+) ' +
+    'failed=(\d+) seconds=([0-9]+(?:\.[0-9]+)?) ' +
+    'available_before=(\d+) available_after=(\d+) ' +
+    'working_set_before=(\d+) working_set_after=(\d+) ' +
+    'page_fault_before=(\d+) page_fault_after=(\d+) ' +
+    'read_transfer_before=(\d+) read_transfer_after=(\d+) ' +
+    'last_error=(\d+) expected_entries=(\d+) total_bytes=(\d+)\r?$'
+$q1_0SourceUnlockMatches = [regex]::Matches(
+    $q1_0SidecarLogText, $q1_0SourceUnlockPattern)
+$q1_0SourceUnlockRequired =
+    [bool]($Q1_0ResidentArena -and -not $Q1_0SnapshotBacking -and
+           $q1_0BootstrapMatches.Count -gt 0 -and
+           [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT)
+if ($q1_0SourceUnlockMatches.Count -gt 1) {
+    throw "Q1_0 source unlock telemetry must be emitted at most once; observed $($q1_0SourceUnlockMatches.Count)"
+}
+if ($q1_0SourceUnlockRequired -and
+    $q1_0SourceUnlockMatches.Count -ne 1) {
+    throw "Q1_0 source unlock telemetry missing for Windows resident sidecar bootstrap"
+}
+if ($q1_0SourceUnlockMatches.Count -eq 1) {
+    $q1_0SourceUnlockObserved = $true
+    $q1_0SourceUnlockMatch = $q1_0SourceUnlockMatches[0]
+    $q1_0SourceUnlockResult = [string]$q1_0SourceUnlockMatch.Groups[1].Value
+    $q1_0SourceUnlockWindows =
+        [int]$q1_0SourceUnlockMatch.Groups[2].Value
+    $q1_0SourceUnlockPageSize =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[3].Value
+    $q1_0SourceUnlockPageAligned =
+        [int]$q1_0SourceUnlockMatch.Groups[4].Value
+    $q1_0SourceUnlockDestinationUnchanged =
+        [int]$q1_0SourceUnlockMatch.Groups[5].Value
+    $q1_0SourceUnlockLayers =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[6].Value
+    $q1_0SourceUnlockRangesAttempted =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[7].Value
+    $q1_0SourceUnlockBytesAttempted =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[8].Value
+    $q1_0SourceUnlockCalls =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[9].Value
+    $q1_0SourceUnlockSuccess =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[10].Value
+    $q1_0SourceUnlockTrue =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[11].Value
+    $q1_0SourceUnlockNotLocked =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[12].Value
+    $q1_0SourceUnlockErrorNotLocked =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[13].Value
+    $q1_0SourceUnlockFailed =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[14].Value
+    $q1_0SourceUnlockSeconds =
+        [double]$q1_0SourceUnlockMatch.Groups[15].Value
+    $q1_0SourceUnlockAvailableBefore =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[16].Value
+    $q1_0SourceUnlockAvailableAfter =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[17].Value
+    $q1_0SourceUnlockWorkingSetBefore =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[18].Value
+    $q1_0SourceUnlockWorkingSetAfter =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[19].Value
+    $q1_0SourceUnlockPageFaultBefore =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[20].Value
+    $q1_0SourceUnlockPageFaultAfter =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[21].Value
+    $q1_0SourceUnlockReadTransferBefore =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[22].Value
+    $q1_0SourceUnlockReadTransferAfter =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[23].Value
+    $q1_0SourceUnlockLastError =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[24].Value
+    $q1_0SourceUnlockExpectedEntries =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[25].Value
+    $q1_0SourceUnlockTotalBytes =
+        [UInt64]$q1_0SourceUnlockMatch.Groups[26].Value
+    if ($q1_0SourceUnlockResult -ne "complete" -or
+        $q1_0SourceUnlockWindows -ne 1 -or
+        $q1_0SourceUnlockPageAligned -ne 1 -or
+        $q1_0SourceUnlockDestinationUnchanged -ne 1 -or
+        $q1_0SourceUnlockPageSize -eq 0 -or
+        (($q1_0SourceUnlockPageSize -band
+          ($q1_0SourceUnlockPageSize - 1)) -ne 0) -or
+        $q1_0SourceUnlockSuccess -ne $q1_0SourceUnlockTrue -or
+        $q1_0SourceUnlockNotLocked -ne
+            $q1_0SourceUnlockErrorNotLocked -or
+        $q1_0SourceUnlockCalls -ne
+            ($q1_0SourceUnlockSuccess + $q1_0SourceUnlockNotLocked +
+             $q1_0SourceUnlockFailed) -or
+        $q1_0SourceUnlockExpectedEntries -ne $q1_0BootstrapEntries -or
+        $q1_0SourceUnlockTotalBytes -ne $q1_0BootstrapTotalBytes) {
+        throw "Q1_0 source unlock telemetry counters are inconsistent"
+    }
+    if ($q1_0BootstrapMatches.Count -gt 0) {
+        $expectedQ1_0UnlockLayers =
+            $q1_0BootstrapLayerLast - $q1_0BootstrapLayerFirst + 1
+        if ($q1_0SourceUnlockLayers -ne $expectedQ1_0UnlockLayers -or
+            $q1_0SourceUnlockRangesAttempted -ne
+                ($expectedQ1_0UnlockLayers * 3) -or
+            $q1_0SourceUnlockCalls -ne
+                $q1_0SourceUnlockRangesAttempted -or
+            $q1_0SourceUnlockBytesAttempted -eq 0) {
+            throw "Q1_0 source unlock range accounting is inconsistent"
+        }
+    }
+}
 if ($Q1_0PureResident -and
     ([UInt64]$q1_0MixedTelemetry.all_iq2 -ne 0 -or
      [UInt64]$q1_0MixedTelemetry.iq2_vram -ne 0 -or
@@ -5359,6 +7412,35 @@ if ($Q1_0PureResident -and
      [UInt64]$q1_0MixedTelemetry.iq2_ssd_violations -ne 0 -or
      [UInt64]$q1_0MixedTelemetry.failures -ne 0)) {
     throw "Q1_0 pure-resident counters show IQ2 routing, incomplete Q1 coverage, SSD access, or a runtime failure"
+}
+if ($q1_0MixedResolverRequired -and $Q1_0DualArena -and
+    -not $Q1_0DualSparseCompanion -and $Q1_0MixedTrace -and
+    ([UInt64]$q1_0MixedTelemetry.trace_rows -eq 0 -or
+     [UInt64]$q1_0MixedTelemetry.tier_route_entries -ne
+        [UInt64]$q1_0MixedTelemetry.trace_rows)) {
+    throw "Q1_0 mixed resolver route-entry counters do not cover every traced route"
+}
+if ($q1_0MixedResolverRequired -and $Q1_0DualArena -and
+    -not $Q1_0DualSparseCompanion -and $Q1_0MixedTrace) {
+    if ([UInt64]$q1_0MixedAccountedRoutes -ne
+        [UInt64]$q1_0MixedTelemetry.trace_rows) {
+        throw "Q1_0 mixed summary route categories do not cover every traced route"
+    }
+    if (-not [bool]$q1_0MixedRouteTraceTelemetry.observed -or
+        [UInt64]$q1_0MixedRouteTraceTelemetry.rows -ne
+            [UInt64]$q1_0MixedTelemetry.trace_rows -or
+        [UInt64]$q1_0MixedRouteTraceTelemetry.iq2_vram -ne
+            [UInt64]$q1_0MixedTelemetry.iq2_vram -or
+        [UInt64]$q1_0MixedRouteTraceTelemetry.iq2_snapshot_ram -ne
+            [UInt64]$q1_0MixedTelemetry.iq2_snapshot_ram -or
+        [UInt64]$q1_0MixedRouteTraceTelemetry.iq2_tier_ram -ne
+            [UInt64]$q1_0MixedTelemetry.iq2_tier_ram -or
+        [UInt64]$q1_0MixedRouteTraceTelemetry.q1_resident -ne
+            [UInt64]$q1_0MixedTelemetry.q1_resident -or
+        [UInt64]$q1_0MixedRouteTraceTelemetry.iq2_total -ne
+            [UInt64]$q1_0MixedIq2Routes) {
+        throw "Q1_0 mixed route trace accounting does not match the summary"
+    }
 }
 $q1_0DualSparseRuntimeObserved = $false
 $q1_0DualSparseEntries = [UInt64]0
@@ -5687,7 +7769,26 @@ $iq1Promotion2BitSsdSeconds = 0.0
 $iq1Promotion2BitSsdBytesPerSecond = 0.0
 $iq1PromotionDirectSsdToVramRejected = [UInt64]0
 $iq1PromotionProbationBackingReclaims = [UInt64]0
+$iq1PromotionQ1_0Observed = [UInt64]0
+$iq1PromotionQ1_0StageAttempts = [UInt64]0
+$iq1PromotionQ1_0StageSuccesses = [UInt64]0
+$iq1PromotionQ1_0NextCallGuards = [UInt64]0
+$iq1PromotionQ1_0RecordRejects = [UInt64]0
+$iq1PromotionQ1_0RecordAttempts = [UInt64]0
+$iq1PromotionQ1_0RecordSuccesses = [UInt64]0
+$iq1PromotionQ1_0RecordFailures = [UInt64]0
 $iq1PromotionFailures = [UInt64]0
+$q1_0PromotionRecords = @()
+$q1_0PromotionRecordArtifactPath = ""
+$q1_0PromotionRecordArtifactSHA256 = ""
+$q1_0PromotionRecordCount = [UInt64]0
+$q1_0PromotionRecordPhysicalLineCount = [UInt64]0
+$q1_0PromotionRecordAttemptCount = [UInt64]0
+$q1_0PromotionRecordSuccessCount = [UInt64]0
+$q1_0PromotionRecordRejectCount = [UInt64]0
+$q1_0PromotionRecordFailureCount = [UInt64]0
+$q1_0PromotionRecordBoundedExceptionLimit = [UInt64]16
+$q1_0PromotionTelemetryRecordLimit = [UInt64]0
 $iq1MixedSummaryMatches = [regex]::Matches(
     $iq1SSidecarLogText,
     '\[iq1-mixed\] result=summary calls=(\d+) hot_main=(\d+) cold_iq1=(\d+) primary_cold_avoided=(\d+) joins=(\d+) failures=(\d+) last_layer=(\d+) last_slot=(\d+) last_expert=(-?\d+)')
@@ -5748,7 +7849,7 @@ $iq1PromotionMatches = [regex]::Matches(
     $iq1SSidecarLogText,
     '(?m)^(?:ds4: )?\[iq1-promotion\] final (?<kv>.+?)\r?$')
 $iq1PromotionLineCount = $iq1PromotionMatches.Count
-if ($Iq1Promotion) {
+if ($quantPromotionRequested) {
     if ($iq1PromotionLineCount -ne $requestCountExpected) {
         throw "IQ1 promotion requires one final line per request; expected $requestCountExpected observed $iq1PromotionLineCount"
     }
@@ -5763,6 +7864,10 @@ if ($Iq1Promotion) {
         "probation_ram_hits", "next_token_waits",
         "promotion_2bit_ssd_bytes", "promotion_2bit_ssd_seconds",
         "direct_ssd_to_vram_rejected", "probation_backing_reclaims",
+        "q1_0_observed", "q1_0_stage_attempts",
+        "q1_0_stage_successes", "q1_0_next_call_guards",
+        "q1_0_record_rejects", "q1_0_record_attempts",
+        "q1_0_record_successes", "q1_0_record_failures",
         "failures")
     for ($iq1PromotionIndex = 0; $iq1PromotionIndex -lt $iq1PromotionMatches.Count; $iq1PromotionIndex++) {
         $iq1PromotionMatch = $iq1PromotionMatches[$iq1PromotionIndex]
@@ -5826,6 +7931,14 @@ if ($Iq1Promotion) {
                 [Globalization.CultureInfo]::InvariantCulture)
             direct_ssd_to_vram_rejected = [UInt64]$iq1PromotionFields["direct_ssd_to_vram_rejected"]
             probation_backing_reclaims = [UInt64]$iq1PromotionFields["probation_backing_reclaims"]
+            q1_0_observed = [UInt64]$iq1PromotionFields["q1_0_observed"]
+            q1_0_stage_attempts = [UInt64]$iq1PromotionFields["q1_0_stage_attempts"]
+            q1_0_stage_successes = [UInt64]$iq1PromotionFields["q1_0_stage_successes"]
+            q1_0_next_call_guards = [UInt64]$iq1PromotionFields["q1_0_next_call_guards"]
+            q1_0_record_rejects = [UInt64]$iq1PromotionFields["q1_0_record_rejects"]
+            q1_0_record_attempts = [UInt64]$iq1PromotionFields["q1_0_record_attempts"]
+            q1_0_record_successes = [UInt64]$iq1PromotionFields["q1_0_record_successes"]
+            q1_0_record_failures = [UInt64]$iq1PromotionFields["q1_0_record_failures"]
             failures = [UInt64]$iq1PromotionFields["failures"]
         }
         if ([double]::IsNaN($iq1PromotionRow.min_weight) -or
@@ -5839,21 +7952,21 @@ if ($Iq1Promotion) {
             $iq1PromotionRow.promotion_2bit_ssd_seconds -lt 0.0) {
             throw "IQ1 promotion numeric telemetry is invalid at request $($iq1PromotionIndex + 1)"
         }
-        $expectedPromotionSnapshotEvictions = if ($ComposePrefillMassOpenRouter) { [UInt64]0 } else { [UInt64]$Iq1PromotionProbationSlots }
+        $expectedPromotionSnapshotEvictions = if ($ComposePrefillMassOpenRouter) { [UInt64]0 } else { [UInt64]$promotionProbationSlotsExpected }
         [UInt64]$iq1PromotionSuppressed =
             $iq1PromotionRow.skips_touches +
             $iq1PromotionRow.skips_weight +
             $iq1PromotionRow.skips_mass +
             $iq1PromotionRow.skips_request_budget +
             $iq1PromotionRow.skips_window_budget
-        if ($iq1PromotionRow.requested_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
-            $iq1PromotionRow.reserved_slots -ne [UInt64]$Iq1PromotionProbationSlots -or
-            $iq1PromotionRow.min_touches -ne $Iq1PromotionMinTouches -or
-            [math]::Abs($iq1PromotionRow.min_weight - $Iq1PromotionMinWeight) -gt 0.000000000001 -or
-            [math]::Abs($iq1PromotionRow.min_mass - $Iq1PromotionMinMass) -gt 0.000000000001 -or
-            $iq1PromotionRow.request_budget -ne $Iq1PromotionRequestBudget -or
-            $iq1PromotionRow.window_calls -ne $Iq1PromotionWindowCalls -or
-            $iq1PromotionRow.window_budget -ne $Iq1PromotionWindowBudget -or
+        if ($iq1PromotionRow.requested_slots -ne [UInt64]$promotionProbationSlotsExpected -or
+            $iq1PromotionRow.reserved_slots -ne [UInt64]$promotionProbationSlotsExpected -or
+            $iq1PromotionRow.min_touches -ne $promotionMinTouchesExpected -or
+            [math]::Abs($iq1PromotionRow.min_weight - $promotionMinWeightExpected) -gt 0.000000000001 -or
+            [math]::Abs($iq1PromotionRow.min_mass - $promotionMinMassExpected) -gt 0.000000000001 -or
+            $iq1PromotionRow.request_budget -ne $promotionRequestBudgetExpected -or
+            $iq1PromotionRow.window_calls -ne $promotionWindowCallsExpected -or
+            $iq1PromotionRow.window_budget -ne $promotionWindowBudgetExpected -or
             ($ComposePrefillMassOpenRouter -and $iq1PromotionRow.reserve_strategy -ne "pre-reserved-open-router") -or
             $iq1PromotionRow.snapshot_evictions -ne $expectedPromotionSnapshotEvictions -or
             $iq1PromotionRow.cold_observed -le 0 -or
@@ -5863,6 +7976,29 @@ if ($Iq1Promotion) {
                 ($iq1PromotionRow.cold_to_2bit_ram +
                  $iq1PromotionSuppressed) -or
             $iq1PromotionRow.direct_ssd_to_vram_rejected -ne 0 -or
+            ($Q1_0DynamicPromotion -and
+             ($iq1PromotionRow.q1_0_observed -eq 0 -or
+              $iq1PromotionRow.q1_0_stage_attempts -eq 0 -or
+              $iq1PromotionRow.q1_0_stage_successes -eq 0 -or
+              $iq1PromotionRow.q1_0_stage_successes -gt
+                $iq1PromotionRow.q1_0_stage_attempts -or
+              $iq1PromotionRow.q1_0_next_call_guards -ne
+                $iq1PromotionRow.q1_0_stage_successes -or
+              $iq1PromotionRow.q1_0_record_attempts -ne
+                $iq1PromotionRow.q1_0_stage_attempts -or
+              $iq1PromotionRow.q1_0_record_successes -ne
+                $iq1PromotionRow.q1_0_stage_successes -or
+              $iq1PromotionRow.q1_0_record_failures -ne
+                $iq1PromotionRow.failures)) -or
+            (-not $Q1_0DynamicPromotion -and
+             ($iq1PromotionRow.q1_0_observed -ne 0 -or
+              $iq1PromotionRow.q1_0_stage_attempts -ne 0 -or
+              $iq1PromotionRow.q1_0_stage_successes -ne 0 -or
+              $iq1PromotionRow.q1_0_next_call_guards -ne 0 -or
+              $iq1PromotionRow.q1_0_record_rejects -ne 0 -or
+              $iq1PromotionRow.q1_0_record_attempts -ne 0 -or
+              $iq1PromotionRow.q1_0_record_successes -ne 0 -or
+              $iq1PromotionRow.q1_0_record_failures -ne 0)) -or
             $iq1PromotionRow.failures -ne 0) {
             throw "IQ1 promotion final counters are inconsistent at request $($iq1PromotionIndex + 1)"
         }
@@ -5896,6 +8032,14 @@ if ($Iq1Promotion) {
         $iq1Promotion2BitSsdSeconds += $iq1PromotionRow.promotion_2bit_ssd_seconds
         $iq1PromotionDirectSsdToVramRejected += $iq1PromotionRow.direct_ssd_to_vram_rejected
         $iq1PromotionProbationBackingReclaims += $iq1PromotionRow.probation_backing_reclaims
+        $iq1PromotionQ1_0Observed += $iq1PromotionRow.q1_0_observed
+        $iq1PromotionQ1_0StageAttempts += $iq1PromotionRow.q1_0_stage_attempts
+        $iq1PromotionQ1_0StageSuccesses += $iq1PromotionRow.q1_0_stage_successes
+        $iq1PromotionQ1_0NextCallGuards += $iq1PromotionRow.q1_0_next_call_guards
+        $iq1PromotionQ1_0RecordRejects += $iq1PromotionRow.q1_0_record_rejects
+        $iq1PromotionQ1_0RecordAttempts += $iq1PromotionRow.q1_0_record_attempts
+        $iq1PromotionQ1_0RecordSuccesses += $iq1PromotionRow.q1_0_record_successes
+        $iq1PromotionQ1_0RecordFailures += $iq1PromotionRow.q1_0_record_failures
         $iq1PromotionFailures += $iq1PromotionRow.failures
     }
     if ($iq1Promotion2BitSsdSeconds -gt 0.0) {
@@ -5911,6 +8055,393 @@ if ($Iq1Promotion) {
     $iq1PromotionRuntimeObserved = $true
 } elseif ($iq1PromotionLineCount -ne 0) {
     throw "IQ1 promotion telemetry appeared while promotion was disabled"
+}
+
+$q1_0PromotionRecordMatches = @()
+if (-not [string]::IsNullOrEmpty($iq1SSidecarLogText)) {
+    $q1_0PromotionRecordPhysicalLines = @($iq1SSidecarLogText -split '\r?\n')
+    for ($q1_0PromotionRecordPhysicalIndex = 0;
+         $q1_0PromotionRecordPhysicalIndex -lt $q1_0PromotionRecordPhysicalLines.Count;
+         $q1_0PromotionRecordPhysicalIndex++) {
+        $q1_0PromotionRecordPhysicalLine =
+            [string]$q1_0PromotionRecordPhysicalLines[$q1_0PromotionRecordPhysicalIndex]
+        if ($q1_0PromotionRecordPhysicalLine.Contains(
+                '[q1-0-promotion-record]')) {
+            $q1_0PromotionRecordMatches += [pscustomobject]@{
+                physical_line = $q1_0PromotionRecordPhysicalIndex + 1
+                text = $q1_0PromotionRecordPhysicalLine
+            }
+        }
+    }
+}
+if ($Q1_0DynamicPromotion) {
+    if ($q1_0PromotionRecordMatches.Count -eq 0) {
+        throw "Q1_0 dynamic promotion requires per-expert promotion records"
+    }
+    $q1_0PromotionRecordRequiredFields = @(
+        "kind", "result", "reason", "record_id", "request_epoch",
+        "promotion_window_epoch", "current_call", "observation_call",
+        "first_eligible_call",
+        "layer", "expert", "touch_count", "weight", "mass",
+        "gate_min_touches", "gate_min_weight", "gate_min_mass",
+        "gate_request_budget", "gate_request_used", "gate_window_calls",
+        "gate_window_budget", "gate_window_used", "source_kind",
+        "source_sidecar_sha256", "source_sidecar_size",
+        "source_q1_snapshot", "source_gate_base_offset",
+        "source_up_base_offset", "source_down_base_offset",
+        "source_gate_stride", "source_up_stride", "source_down_stride",
+        "source_gate_offset", "source_up_offset",
+        "source_down_offset", "source_gate_bytes", "source_up_bytes",
+        "source_down_bytes", "source_bytes", "destination_kind",
+        "destination_model_sha256", "destination_model_size",
+        "destination_gate_base_offset", "destination_up_base_offset",
+        "destination_down_base_offset", "destination_gate_stride",
+        "destination_up_stride", "destination_down_stride",
+        "destination_gate_offset", "destination_up_offset",
+        "destination_down_offset", "destination_gate_bytes",
+        "destination_up_bytes", "destination_down_bytes",
+        "destination_bytes", "destination_ram_slot",
+        "destination_ram_generation", "direct_ssd_to_vram_current_token",
+        "same_call_eligible")
+    $q1_0PromotionRecordAllowed = @{}
+    foreach ($field in $q1_0PromotionRecordRequiredFields) {
+        $q1_0PromotionRecordAllowed[$field] = $true
+    }
+    $q1_0PromotionRecordAttemptByKey = @{}
+    $q1_0PromotionRecordAttemptIdentities = @{}
+    $q1_0PromotionRecordTerminalByKey = @{}
+    $q1_0PromotionRecordRejectKeys = @{}
+    $q1_0PromotionRecordTerminalFailures = @{}
+    $q1_0PromotionRequestBudgetNextByEpoch = @{}
+    $q1_0PromotionWindowBudgetNextByEpoch = @{}
+    for ($q1_0PromotionRecordIndex = 0;
+         $q1_0PromotionRecordIndex -lt $q1_0PromotionRecordMatches.Count;
+         $q1_0PromotionRecordIndex++) {
+        $match = $q1_0PromotionRecordMatches[$q1_0PromotionRecordIndex]
+        $lineMatch = [regex]::Match(
+            [string]$match.text,
+            '^(?:ds4: )?\[q1-0-promotion-record\] (?<kv>(?:[A-Za-z0-9_]+=[^ \r\n]+)(?: [A-Za-z0-9_]+=[^ \r\n]+)*)$')
+        if (-not $lineMatch.Success) {
+            throw "Q1_0 promotion malformed marker at physical line $($match.physical_line)"
+        }
+        $fields = @{}
+        foreach ($part in @($lineMatch.Groups["kv"].Value -split " ")) {
+            if ($part -notmatch '^([A-Za-z0-9_]+)=([^ \r\n]+)$') {
+                throw "Q1_0 promotion record malformed key/value token at physical line $($match.physical_line): $part"
+            }
+            $key = $Matches[1]
+            $value = $Matches[2]
+            if (-not $q1_0PromotionRecordAllowed.ContainsKey($key)) {
+                throw "Q1_0 promotion record unexpected telemetry key at physical line $($match.physical_line): $key"
+            }
+            if ($fields.ContainsKey($key)) {
+                throw "Q1_0 promotion record duplicate telemetry key at physical line $($match.physical_line): $key"
+            }
+            $fields[$key] = $value
+        }
+        foreach ($requiredField in $q1_0PromotionRecordRequiredFields) {
+            if (-not $fields.ContainsKey($requiredField)) {
+                throw "Q1_0 promotion record omitted $requiredField at physical line $($match.physical_line)"
+            }
+        }
+        $row = [pscustomobject][ordered]@{
+            line_index = ($q1_0PromotionRecordIndex + 1)
+            physical_line = [int]$match.physical_line
+            kind = [string]$fields["kind"]
+            result = [string]$fields["result"]
+            reason = [string]$fields["reason"]
+            record_id = Convert-G7StrictUInt64 $fields["record_id"] "record_id"
+            request_epoch = Convert-G7StrictUInt64 $fields["request_epoch"] "request_epoch"
+            promotion_window_epoch = Convert-G7StrictUInt64 $fields["promotion_window_epoch"] "promotion_window_epoch"
+            current_call = Convert-G7StrictUInt64 $fields["current_call"] "current_call"
+            observation_call = Convert-G7StrictUInt64 $fields["observation_call"] "observation_call"
+            first_eligible_call = Convert-G7StrictUInt64 $fields["first_eligible_call"] "first_eligible_call"
+            layer = Convert-G7StrictUInt32 $fields["layer"] "layer"
+            expert = Convert-G7StrictUInt32 $fields["expert"] "expert"
+            touch_count = Convert-G7StrictUInt64 $fields["touch_count"] "touch_count"
+            weight = Convert-G7StrictDouble $fields["weight"] "weight"
+            mass = Convert-G7StrictDouble $fields["mass"] "mass"
+            gate_min_touches = Convert-G7StrictUInt64 $fields["gate_min_touches"] "gate_min_touches"
+            gate_min_weight = Convert-G7StrictDouble $fields["gate_min_weight"] "gate_min_weight"
+            gate_min_mass = Convert-G7StrictDouble $fields["gate_min_mass"] "gate_min_mass"
+            gate_request_budget = Convert-G7StrictUInt64 $fields["gate_request_budget"] "gate_request_budget"
+            gate_request_used = Convert-G7StrictUInt64 $fields["gate_request_used"] "gate_request_used"
+            gate_window_calls = Convert-G7StrictUInt64 $fields["gate_window_calls"] "gate_window_calls"
+            gate_window_budget = Convert-G7StrictUInt64 $fields["gate_window_budget"] "gate_window_budget"
+            gate_window_used = Convert-G7StrictUInt64 $fields["gate_window_used"] "gate_window_used"
+            source_kind = [string]$fields["source_kind"]
+            source_sidecar_sha256 = ([string]$fields["source_sidecar_sha256"]).ToLowerInvariant()
+            source_sidecar_size = Convert-G7StrictUInt64 $fields["source_sidecar_size"] "source_sidecar_size"
+            source_q1_snapshot = Convert-G7StrictFlag01 $fields["source_q1_snapshot"] "source_q1_snapshot"
+            source_gate_base_offset = Convert-G7StrictUInt64 $fields["source_gate_base_offset"] "source_gate_base_offset"
+            source_up_base_offset = Convert-G7StrictUInt64 $fields["source_up_base_offset"] "source_up_base_offset"
+            source_down_base_offset = Convert-G7StrictUInt64 $fields["source_down_base_offset"] "source_down_base_offset"
+            source_gate_stride = Convert-G7StrictUInt64 $fields["source_gate_stride"] "source_gate_stride"
+            source_up_stride = Convert-G7StrictUInt64 $fields["source_up_stride"] "source_up_stride"
+            source_down_stride = Convert-G7StrictUInt64 $fields["source_down_stride"] "source_down_stride"
+            source_gate_offset = Convert-G7StrictUInt64 $fields["source_gate_offset"] "source_gate_offset"
+            source_up_offset = Convert-G7StrictUInt64 $fields["source_up_offset"] "source_up_offset"
+            source_down_offset = Convert-G7StrictUInt64 $fields["source_down_offset"] "source_down_offset"
+            source_gate_bytes = Convert-G7StrictUInt64 $fields["source_gate_bytes"] "source_gate_bytes"
+            source_up_bytes = Convert-G7StrictUInt64 $fields["source_up_bytes"] "source_up_bytes"
+            source_down_bytes = Convert-G7StrictUInt64 $fields["source_down_bytes"] "source_down_bytes"
+            source_bytes = Convert-G7StrictUInt64 $fields["source_bytes"] "source_bytes"
+            destination_kind = [string]$fields["destination_kind"]
+            destination_model_sha256 = ([string]$fields["destination_model_sha256"]).ToLowerInvariant()
+            destination_model_size = Convert-G7StrictUInt64 $fields["destination_model_size"] "destination_model_size"
+            destination_gate_base_offset = Convert-G7StrictUInt64 $fields["destination_gate_base_offset"] "destination_gate_base_offset"
+            destination_up_base_offset = Convert-G7StrictUInt64 $fields["destination_up_base_offset"] "destination_up_base_offset"
+            destination_down_base_offset = Convert-G7StrictUInt64 $fields["destination_down_base_offset"] "destination_down_base_offset"
+            destination_gate_stride = Convert-G7StrictUInt64 $fields["destination_gate_stride"] "destination_gate_stride"
+            destination_up_stride = Convert-G7StrictUInt64 $fields["destination_up_stride"] "destination_up_stride"
+            destination_down_stride = Convert-G7StrictUInt64 $fields["destination_down_stride"] "destination_down_stride"
+            destination_gate_offset = Convert-G7StrictUInt64 $fields["destination_gate_offset"] "destination_gate_offset"
+            destination_up_offset = Convert-G7StrictUInt64 $fields["destination_up_offset"] "destination_up_offset"
+            destination_down_offset = Convert-G7StrictUInt64 $fields["destination_down_offset"] "destination_down_offset"
+            destination_gate_bytes = Convert-G7StrictUInt64 $fields["destination_gate_bytes"] "destination_gate_bytes"
+            destination_up_bytes = Convert-G7StrictUInt64 $fields["destination_up_bytes"] "destination_up_bytes"
+            destination_down_bytes = Convert-G7StrictUInt64 $fields["destination_down_bytes"] "destination_down_bytes"
+            destination_bytes = Convert-G7StrictUInt64 $fields["destination_bytes"] "destination_bytes"
+            destination_ram_slot = Convert-G7StrictUInt64 $fields["destination_ram_slot"] "destination_ram_slot"
+            destination_ram_generation = Convert-G7StrictUInt64 $fields["destination_ram_generation"] "destination_ram_generation"
+            direct_ssd_to_vram_current_token = Convert-G7StrictFlag01 $fields["direct_ssd_to_vram_current_token"] "direct_ssd_to_vram_current_token"
+            same_call_eligible = Convert-G7StrictFlag01 $fields["same_call_eligible"] "same_call_eligible"
+        }
+        Assert-G7U64Sum3 `
+            $row.source_gate_bytes $row.source_up_bytes `
+            $row.source_down_bytes $row.source_bytes "source"
+        Assert-G7U64Sum3 `
+            $row.destination_gate_bytes $row.destination_up_bytes `
+            $row.destination_down_bytes $row.destination_bytes "destination"
+        Assert-G7PromotionOffsetFormula `
+            $row.source_gate_base_offset $row.source_gate_stride `
+            $row.expert $row.source_gate_bytes $row.source_gate_offset `
+            $row.source_sidecar_size "source_gate"
+        Assert-G7PromotionOffsetFormula `
+            $row.source_up_base_offset $row.source_up_stride `
+            $row.expert $row.source_up_bytes $row.source_up_offset `
+            $row.source_sidecar_size "source_up"
+        Assert-G7PromotionOffsetFormula `
+            $row.source_down_base_offset $row.source_down_stride `
+            $row.expert $row.source_down_bytes $row.source_down_offset `
+            $row.source_sidecar_size "source_down"
+        Assert-G7PromotionOffsetFormula `
+            $row.destination_gate_base_offset $row.destination_gate_stride `
+            $row.expert $row.destination_gate_bytes `
+            $row.destination_gate_offset $row.destination_model_size `
+            "destination_gate"
+        Assert-G7PromotionOffsetFormula `
+            $row.destination_up_base_offset $row.destination_up_stride `
+            $row.expert $row.destination_up_bytes `
+            $row.destination_up_offset $row.destination_model_size `
+            "destination_up"
+        Assert-G7PromotionOffsetFormula `
+            $row.destination_down_base_offset $row.destination_down_stride `
+            $row.expert $row.destination_down_bytes `
+            $row.destination_down_offset $row.destination_model_size `
+            "destination_down"
+        $expectedWindowEpoch = [UInt64]0
+        if ($row.gate_window_calls -ne [UInt64]0) {
+            $tickForWindow = $(if ($row.current_call -eq [UInt64]0) {
+                [UInt64]1
+            } else {
+                $row.current_call
+            })
+            $expectedWindowEpoch = [UInt64]([decimal]::Floor(
+                ([decimal]$tickForWindow - [decimal]1) /
+                [decimal]$row.gate_window_calls))
+        }
+        if ($row.kind -notin @("reject", "attempt", "success", "failure") -or
+            $row.layer -gt 42 -or
+            $row.expert -ge 256 -or
+            $row.request_epoch -eq 0 -or
+            $row.current_call -ne $row.observation_call -or
+            ($row.current_call -eq [UInt64]::MaxValue -and
+             $row.reason -ne "call_tick_overflow") -or
+            $row.promotion_window_epoch -ne $expectedWindowEpoch -or
+            $row.same_call_eligible -ne 0 -or
+            $row.direct_ssd_to_vram_current_token -ne 0 -or
+            $row.source_kind -ne "q1_resident" -or
+            $row.source_q1_snapshot -ne 0 -or
+            $row.source_sidecar_sha256 -ine $ExpectedQ1_0ExpertSidecarSHA256 -or
+            $row.source_sidecar_size -ne $ExpectedQ1_0ExpertSidecarBytes -or
+            $row.destination_model_sha256 -ine $ExpectedModelSHA256 -or
+            $row.destination_model_size -ne [UInt64]$modelInfoAtStart.Length -or
+            $row.gate_min_touches -ne [UInt64]$promotionMinTouchesExpected -or
+            [math]::Abs($row.gate_min_weight - $promotionMinWeightExpected) -gt 0.000000000001 -or
+            [math]::Abs($row.gate_min_mass - $promotionMinMassExpected) -gt 0.000000000001 -or
+            $row.gate_request_budget -ne [UInt64]$promotionRequestBudgetExpected -or
+            $row.gate_window_calls -ne [UInt64]$promotionWindowCallsExpected -or
+            $row.gate_window_budget -ne [UInt64]$promotionWindowBudgetExpected) {
+            throw "Q1_0 promotion record invariant failed at line $($row.line_index)"
+        }
+        $key = Get-G7PromotionRecordKey $row
+        $identity = Get-G7PromotionRecordImmutableIdentity $row
+        if ($row.kind -eq "attempt") {
+            if ($row.result -ne "attempt" -or
+                $row.reason -ne "admitted" -or
+                $row.first_eligible_call -le $row.observation_call -or
+                $row.touch_count -lt $row.gate_min_touches -or
+                [math]::Abs($row.weight) -lt $row.gate_min_weight -or
+                $row.mass -lt $row.gate_min_mass -or
+                ($row.gate_request_budget -ne [UInt64]0 -and
+                 $row.gate_request_used -ge $row.gate_request_budget) -or
+                ($row.gate_window_budget -ne [UInt64]0 -and
+                 $row.gate_window_used -ge $row.gate_window_budget) -or
+                $row.destination_kind -ne "exact_iq2_ram_pending" -or
+                $q1_0PromotionRecordAttemptByKey.ContainsKey($key) -or
+                $q1_0PromotionRecordAttemptIdentities.ContainsKey($identity)) {
+                throw "Q1_0 promotion attempt record failed admission proof at line $($row.line_index)"
+            }
+            if ($row.gate_request_budget -ne [UInt64]0) {
+                $requestScope = [string]$row.request_epoch
+                $expectedRequestUsed =
+                    if ($q1_0PromotionRequestBudgetNextByEpoch.ContainsKey(
+                            $requestScope)) {
+                        [UInt64]$q1_0PromotionRequestBudgetNextByEpoch[
+                            $requestScope]
+                    } else {
+                        [UInt64]0
+                    }
+                if ($row.gate_request_used -ne $expectedRequestUsed -or
+                    $expectedRequestUsed -ge $row.gate_request_budget) {
+                    throw "Q1_0 promotion request budget sequence failed at line $($row.line_index)"
+                }
+                $q1_0PromotionRequestBudgetNextByEpoch[$requestScope] =
+                    [UInt64]($expectedRequestUsed + [UInt64]1)
+            }
+            if ($row.gate_window_budget -ne [UInt64]0) {
+                $windowScope = ('{0}:{1}' -f
+                    $row.request_epoch, $row.promotion_window_epoch)
+                $expectedWindowUsed =
+                    if ($q1_0PromotionWindowBudgetNextByEpoch.ContainsKey(
+                            $windowScope)) {
+                        [UInt64]$q1_0PromotionWindowBudgetNextByEpoch[
+                            $windowScope]
+                    } else {
+                        [UInt64]0
+                    }
+                if ($row.gate_window_used -ne $expectedWindowUsed -or
+                    $expectedWindowUsed -ge $row.gate_window_budget) {
+                    throw "Q1_0 promotion window budget sequence failed at line $($row.line_index)"
+                }
+                $q1_0PromotionWindowBudgetNextByEpoch[$windowScope] =
+                    [UInt64]($expectedWindowUsed + [UInt64]1)
+            }
+            $q1_0PromotionRecordAttemptByKey[$key] = $identity
+            $q1_0PromotionRecordAttemptIdentities[$identity] = $true
+        } elseif ($row.kind -eq "success") {
+            if ($row.result -ne "success" -or
+                $row.reason -ne "staged" -or
+                $row.first_eligible_call -le $row.observation_call -or
+                $row.destination_kind -ne "exact_iq2_ram" -or
+                $row.destination_ram_slot -eq [UInt64]4294967295 -or
+                $row.destination_ram_generation -eq 0 -or
+                -not $q1_0PromotionRecordAttemptByKey.ContainsKey($key) -or
+                [string]$q1_0PromotionRecordAttemptByKey[$key] -ne $identity -or
+                $q1_0PromotionRecordTerminalByKey.ContainsKey($key)) {
+                throw "Q1_0 promotion success record failed provenance proof at line $($row.line_index)"
+            }
+            $q1_0PromotionRecordTerminalByKey[$key] = "success"
+        } elseif ($row.kind -eq "reject") {
+            if ($row.result -ne "rejected" -or
+                $row.reason -notin @(
+                    "request_epoch_missing", "call_tick_overflow",
+                    "offset_overflow", "ram_admit_alloc", "entry_contract",
+                    "destination_offset_overflow",
+                    "destination_offset_mismatch") -or
+                $row.destination_kind -notin @(
+                    "none")) {
+                throw "Q1_0 promotion reject record failed reason proof at line $($row.line_index)"
+            }
+            if (($row.reason -eq "call_tick_overflow" -and
+                 ($row.current_call -ne [UInt64]::MaxValue -or
+                  $row.first_eligible_call -ne [UInt64]0))) {
+                throw "Q1_0 promotion reject predicate failed at line $($row.line_index)"
+            }
+            $rejectKey = "${identity}:$($row.reason):$($row.destination_kind)"
+            if ($q1_0PromotionRecordRejectKeys.ContainsKey($rejectKey)) {
+                throw "Q1_0 promotion duplicate reject record at line $($row.line_index)"
+            }
+            $q1_0PromotionRecordRejectKeys[$rejectKey] = $true
+        } else {
+            if ($row.result -ne "failed" -or
+                $row.reason -notin @("pread_failed", "victim_contract") -or
+                $row.first_eligible_call -le $row.observation_call -or
+                $row.destination_kind -ne "exact_iq2_ram_failed" -or
+                -not $q1_0PromotionRecordAttemptByKey.ContainsKey($key) -or
+                [string]$q1_0PromotionRecordAttemptByKey[$key] -ne $identity -or
+                $q1_0PromotionRecordTerminalByKey.ContainsKey($key)) {
+                throw "Q1_0 promotion failure record failed reason proof at line $($row.line_index)"
+            }
+            $q1_0PromotionRecordTerminalByKey[$key] = "failure"
+            $q1_0PromotionRecordTerminalFailures[$key] = $true
+        }
+        $q1_0PromotionRecords += $row
+    }
+    foreach ($attemptKey in @($q1_0PromotionRecordAttemptByKey.Keys)) {
+        if (-not $q1_0PromotionRecordTerminalByKey.ContainsKey($attemptKey)) {
+            throw "Q1_0 promotion attempt missing terminal record: $attemptKey"
+        }
+    }
+    $q1_0PromotionRecordCount = [UInt64]$q1_0PromotionRecords.Count
+    $q1_0PromotionRecordAttemptCount = [UInt64](
+        @($q1_0PromotionRecords | Where-Object { $_.kind -eq "attempt" }).Count)
+    $q1_0PromotionRecordSuccessCount = [UInt64](
+        @($q1_0PromotionRecords | Where-Object { $_.kind -eq "success" }).Count)
+    $q1_0PromotionRecordRejectCount = [UInt64](
+        @($q1_0PromotionRecords | Where-Object { $_.kind -eq "reject" }).Count)
+    $q1_0PromotionRecordFailureCount = [UInt64](
+        @($q1_0PromotionRecords | Where-Object { $_.kind -eq "failure" }).Count)
+    $q1_0PromotionTelemetryRecordLimitDecimal =
+        ([decimal]$q1_0PromotionRecordAttemptCount * [decimal]2) +
+        [decimal]$q1_0PromotionRecordBoundedExceptionLimit
+    if ($q1_0PromotionTelemetryRecordLimitDecimal -gt
+            [decimal][UInt64]::MaxValue) {
+        throw "Q1_0 promotion telemetry record limit overflow"
+    }
+    $q1_0PromotionTelemetryRecordLimit =
+        [UInt64]$q1_0PromotionTelemetryRecordLimitDecimal
+    if ($q1_0PromotionRecordCount -gt
+            $q1_0PromotionTelemetryRecordLimit) {
+        throw "Q1_0 promotion telemetry record flood: count=$q1_0PromotionRecordCount limit=$q1_0PromotionTelemetryRecordLimit"
+    }
+    if ($q1_0PromotionRecordAttemptCount -ne $iq1PromotionQ1_0StageAttempts -or
+        $q1_0PromotionRecordSuccessCount -ne $iq1PromotionQ1_0StageSuccesses -or
+        $q1_0PromotionRecordSuccessCount -ne $iq1PromotionQ1_0NextCallGuards -or
+        $q1_0PromotionRecordRejectCount -ne $iq1PromotionQ1_0RecordRejects -or
+        $q1_0PromotionRecordFailureCount -ne $iq1PromotionQ1_0RecordFailures -or
+        $q1_0PromotionRecordAttemptCount -eq 0 -or
+        $q1_0PromotionRecordSuccessCount -eq 0 -or
+        ([decimal]$q1_0PromotionRecordFailureCount +
+         [decimal]$q1_0PromotionRecordRejectCount) -ne
+            [decimal]$iq1PromotionFailures) {
+        throw "Q1_0 promotion record counts do not match final promotion counters"
+    }
+    if ($Q1_0PromotionSsdWrap -and
+        ($q1_0SsdWrapTelemetry.attempts -ne
+             $q1_0PromotionRecordAttemptCount -or
+         $q1_0SsdWrapTelemetry.successes -ne
+             $q1_0PromotionRecordSuccessCount -or
+         $q1_0SsdWrapTelemetry.failures -ne
+             $q1_0PromotionRecordFailureCount)) {
+        throw "Q1_0 SSD-WRAP counters do not match promotion records"
+    }
+    $q1_0PromotionRecordArtifactPath = Join-Path $outdir (
+        "g7_" + $Tag + "_q1_0_promotion_records.jsonl")
+    if (Test-Path -LiteralPath $q1_0PromotionRecordArtifactPath) {
+        throw "Q1_0 promotion record artifact already exists: $q1_0PromotionRecordArtifactPath"
+    }
+    $q1_0PromotionRecordPhysicalLineCount =
+        [UInt64]$q1_0PromotionRecords.Count
+    @($q1_0PromotionRecords | ForEach-Object {
+        $_ | ConvertTo-Json -Compress -Depth 8
+    }) | Set-Content -LiteralPath $q1_0PromotionRecordArtifactPath -Encoding UTF8
+    $q1_0PromotionRecordArtifactSHA256 =
+        (Get-FileHash -LiteralPath $q1_0PromotionRecordArtifactPath -Algorithm SHA256).
+            Hash.ToLowerInvariant()
+} elseif ($q1_0PromotionRecordMatches.Count -ne 0) {
+    throw "Q1_0 promotion per-expert records appeared while dynamic promotion was disabled"
 }
 
 $iq1ProfileSsdReadCalls = [UInt64]0
@@ -5986,12 +8517,29 @@ if ($mixedPrimaryColdAvoided -gt $gpuRoutesExpectedPrimarySelected) {
     throw "Mixed decode excluded more primary routes than the GPU resolver observed"
 }
 $gpuRoutesExpectedPrimarySelected -= $mixedPrimaryColdAvoided
+$splitFusedPrimaryRouteBasis = "gpu-resident-route-population"
+$splitFusedExpectedPrimaryRoutes = [UInt64]$gpuRoutesExpectedPrimarySelected
+$splitFusedQ1ResidentRoutesExcluded = [UInt64]0
+$splitFusedObservedPrimaryRoutes = [UInt64](
+    [UInt64]$splitFusedHits + [UInt64]$splitFusedMisses)
+$q1_0MixedSplitFusedPrimaryTransport = [bool](
+    $q1_0MixedRouteTraceRequired -and
+    [bool]$q1_0MixedRouteTraceTelemetry.observed -and
+    $Q1_0ResidentArena -and
+    $Q1_0DualArena -and -not $Q1_0DualSparseCompanion -and
+    [bool]$q1_0MixedTelemetry.observed)
+if ($q1_0MixedSplitFusedPrimaryTransport) {
+    $splitFusedPrimaryRouteBasis = "q1-0-mixed-iq2-routes"
+    $splitFusedExpectedPrimaryRoutes = [UInt64]$q1_0MixedIq2Routes
+    $splitFusedQ1ResidentRoutesExcluded =
+        [UInt64]$q1_0MixedTelemetry.q1_resident
+}
 if ($SplitFused) {
     if (-not $gpuRoutesObserved -or $gpuRoutesCalls -le 0 -or
         -not $splitFusedObserved -or $splitFusedCalls -ne $gpuRoutesCalls) {
         throw "SplitFused was requested but fused calls were not observed on every GPU route call"
     }
-    if (($splitFusedHits + $splitFusedMisses) -ne $gpuRoutesExpectedPrimarySelected) {
+    if ($splitFusedObservedPrimaryRoutes -ne $splitFusedExpectedPrimaryRoutes) {
         throw "SplitFused route accounting does not match the primary-model route population"
     }
     if ($splitFusedMissScratchBytesAvoided -le 0 -or
@@ -6058,9 +8606,9 @@ if ($ExpertTiering -eq "off") {
                 }
             }
             $matchingWrap = $prefillMassWrapParsedEvents[$tierLineIndex]
-            $matchingPromotion = if ($Iq1Promotion) { $iq1PromotionRows[$tierLineIndex] } else { $null }
+            $matchingPromotion = if ($quantPromotionRequested) { $iq1PromotionRows[$tierLineIndex] } else { $null }
             $expectedSnapshotBackingEntries = [uint32]$matchingWrap.candidate
-            if ($Iq1Promotion -and -not $ComposePrefillMassOpenRouter) {
+            if ($quantPromotionRequested -and -not $ComposePrefillMassOpenRouter) {
                 if ([UInt64]$matchingPromotion.reserved_slots -gt [UInt64]$matchingWrap.candidate) {
                     throw "Expert tiering compose failed: IQ1 promotion reserved more slots than the candidate snapshot at request $($tierLineIndex + 1)"
                 }
@@ -6146,7 +8694,7 @@ if ($ExpertTiering -eq "off") {
                 $expertTieringSnapshotBackingEntries -ne $prefillMassWrapCandidate) {
                 throw "Expert tiering compose failed: open snapshot backing differs from prefill publication"
             }
-        } elseif ($Iq1Promotion) {
+        } elseif ($quantPromotionRequested) {
             if ([UInt64]$iq1PromotionReservedSlots -gt
                 [UInt64]$prefillMassWrapCandidate) {
                 throw "Expert tiering compose failed: aggregate IQ1 promotion slots exceed published candidates"
@@ -6204,7 +8752,7 @@ if ($ExpertTiering -eq "off") {
     # Without promotion, the IQ1 cold lane bypasses primary-model tiering.
     # Promotion observes that lane while staging its exact IQ2 backing, so it
     # is already present in expertTieringSelected and must not be subtracted.
-    if (-not $Iq1Promotion) {
+    if (-not $quantPromotionRequested) {
         $expertTieringExpectedSelected -= $iq1MixedPrimaryColdAvoided
     }
     if ($expertTieringSelected -ne $expertTieringExpectedSelected) {
@@ -6544,17 +9092,35 @@ if ($DynamicArenaObservedWindow -gt 0) {
 }
 if ($DynamicArenaGiB -gt 0.0) {
     if (-not $arenaCapObserved) { throw "Dynamic arena cap telemetry was not observed" }
+    if ($arenaCapSsdWrap -ne [bool]$Q1_0PromotionSsdWrap) {
+        throw "Dynamic arena SSD-WRAP mode differs from the request"
+    }
     if ([math]::Abs($arenaCapMinAvailableGiB - $DynamicArenaMinAvailableGiB) -gt 0.0015) {
         throw "Dynamic arena cap measurement failed: observed min-available differs from requested value"
     }
-    if ($arenaCapChosenBytes -gt $arenaCapRequestedBytes -or
-        $arenaCapChosenSlots -gt $arenaCapRequestedSlots) {
-        throw "Dynamic arena cap measurement failed: chosen arena exceeds requested arena"
-    }
-    if (-not $arenaCapCapped -and
-        ($arenaCapChosenBytes -ne $arenaCapRequestedBytes -or
-         $arenaCapChosenSlots -ne $arenaCapRequestedSlots)) {
-        throw "Dynamic arena cap measurement failed: uncapped telemetry changed the requested arena"
+    if ($Q1_0PromotionSsdWrap) {
+        if ($arenaCapRingSlots -ne 4 -or $arenaReadyRingSlots -ne 4 -or
+            $arenaCapHostBudgetBytes -gt $arenaCapRequestedBytes -or
+            [decimal]$arenaCapChosenBytes +
+                [decimal]$arenaCapPageableBytes -ne
+                [decimal]$arenaCapHostBudgetBytes -or
+            $arenaAllocatedTotalBytes -ne $arenaCapHostBudgetBytes) {
+            throw "Dynamic arena SSD-WRAP fixed-budget accounting failed"
+        }
+        if (-not $arenaCapCapped -and
+            $arenaCapHostBudgetBytes -ne $arenaCapRequestedBytes) {
+            throw "Dynamic arena SSD-WRAP changed the uncapped host budget"
+        }
+    } else {
+        if ($arenaCapChosenBytes -gt $arenaCapRequestedBytes -or
+            $arenaCapChosenSlots -gt $arenaCapRequestedSlots) {
+            throw "Dynamic arena cap measurement failed: chosen arena exceeds requested arena"
+        }
+        if (-not $arenaCapCapped -and
+            ($arenaCapChosenBytes -ne $arenaCapRequestedBytes -or
+             $arenaCapChosenSlots -ne $arenaCapRequestedSlots)) {
+            throw "Dynamic arena cap measurement failed: uncapped telemetry changed the requested arena"
+        }
     }
     if ($arenaCapChosenSlots -lt 1) {
         if ($arenaCapResult -ne "disabled" -or $arenaAllocatedBytes -ne 0 -or
@@ -6571,10 +9137,15 @@ if ($DynamicArenaGiB -gt 0.0) {
             throw "Dynamic arena cap measurement failed: ready allocation differs from chosen cap"
         }
     }
+    $arenaCapacityBytesForGate = if ($Q1_0PromotionSsdWrap) {
+        $arenaCapHostBudgetBytes
+    } else {
+        $arenaCapChosenBytes
+    }
     if ($DynamicArenaMinAvailableGiB -gt 0.0 -and
         $arenaCapAvailableBeforeGiB -ge 0.0 -and
-        $arenaCapChosenBytes -gt 0) {
-        $arenaCapChosenGiB = [double]$arenaCapChosenBytes / 1GB
+        $arenaCapacityBytesForGate -gt 0) {
+        $arenaCapChosenGiB = [double]$arenaCapacityBytesForGate / 1GB
         if (($arenaCapAvailableBeforeGiB - $arenaCapChosenGiB + 0.000001) -lt
             $DynamicArenaMinAvailableGiB) {
             throw "Dynamic arena cap measurement failed: chosen arena violates min-available request"
@@ -6866,14 +9437,15 @@ $expertTieringResult = [pscustomobject]@{
     prefill_vram_seed_failures = $prefillVramSeedFailures
     prefill_vram_seed_prior_mass = $prefillVramSeedPriorMass
     prefill_vram_seed_semantics = $prefillVramSeedSemantics
-    iq1_promotion_requested = [bool]$Iq1Promotion
-    iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
-    iq1_promotion_min_touches_requested = $Iq1PromotionMinTouches
-    iq1_promotion_min_weight_requested = $Iq1PromotionMinWeight
-    iq1_promotion_min_mass_requested = $Iq1PromotionMinMass
-    iq1_promotion_request_budget_requested = $Iq1PromotionRequestBudget
-    iq1_promotion_window_calls_requested = $Iq1PromotionWindowCalls
-    iq1_promotion_window_budget_requested = $Iq1PromotionWindowBudget
+    iq1_promotion_requested = [bool]$quantPromotionRequested
+    iq1_promotion_kind = $(if ($Q1_0DynamicPromotion) { "q1_0" } elseif ($Iq1Promotion) { "iq1_s" } else { "off" })
+    iq1_promotion_probation_slots_requested = $promotionProbationSlotsExpected
+    iq1_promotion_min_touches_requested = $promotionMinTouchesExpected
+    iq1_promotion_min_weight_requested = $promotionMinWeightExpected
+    iq1_promotion_min_mass_requested = $promotionMinMassExpected
+    iq1_promotion_request_budget_requested = $promotionRequestBudgetExpected
+    iq1_promotion_window_calls_requested = $promotionWindowCallsExpected
+    iq1_promotion_window_budget_requested = $promotionWindowBudgetExpected
     iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_reserved_slots = $iq1PromotionReservedSlots
@@ -6972,10 +9544,13 @@ $outerQualitySuiteMember = [bool](
 $qualityEligible = [bool](
     $GateKind -ne "structural-safety" -and
     $Repeats -ge 3 -and
-    -not $outerQualitySuiteMember)
+    -not $outerQualitySuiteMember -and
+    -not $ExpertRecoveryTrace)
 $sotaEligible = [bool]($qualityEligible -and -not $SkipSystemQuiescencePreflight)
 $contaminationReason = ""
-if (-not $qualityEligible) {
+if ($ExpertRecoveryTrace) {
+    $contaminationReason = "expert-recovery-trace-diagnostic-only"
+} elseif (-not $qualityEligible) {
     if ($GateKind -eq "structural-safety") {
         $contaminationReason = "structural-safety-gate-not-quality-eligible"
     } elseif ($outerQualitySuiteMember) {
@@ -6992,6 +9567,7 @@ $rawOutputs = [pscustomobject]@{
     schema = "g7_raw_outputs_v1"
     tag = $Tag
     gate_kind = $GateKind
+    force_open_router_requested = [bool]$ForceOpenRouter
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
     contamination_reason = $contaminationReason
@@ -7230,6 +9806,24 @@ $rawOutputs = [pscustomobject]@{
     ds4_q1_0_dual_sparse_companion = $(if ($Q1_0ExpertSidecar -and $Q1_0DualSparseCompanion) { "1" } else { "" })
     ds4_q1_0_mixed_cold_one = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedColdOne) { "1" } else { "" })
     ds4_q1_0_pageable_overflow = $(if ($Q1_0ExpertSidecar -and $Q1_0PageableOverflow) { "1" } else { "" })
+    ds4_q1_0_dynamic_arena_gb = $(if ($Q1_0ExpertSidecar -and $Q1_0ArenaGB -gt 0.0) { $Q1_0ArenaGB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_dynamic_promotion = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { "1" } else { "" })
+    ds4_q1_0_promotion_ssd_wrap = $(if ($Q1_0PromotionSsdWrap) { "1" } else { "" })
+    ds4_q1_0_iq2_pinned_gib = $(if ($Q1_0PromotionSsdWrap) { $Q1_0Iq2PinnedGiB.ToString("R", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_profile = $(if ($Q1_0ExpertSidecar -and $Q1_0Profile) { "1" } else { "" })
+    ds4_expert_recovery_trace = $(if ($ExpertRecoveryTrace) { "1" } else { "" })
+    ds4_expert_recovery_trace_layer = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceLayer } else { "" })
+    ds4_expert_recovery_trace_expert = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceExpert } else { "" })
+    ds4_expert_recovery_trace_max_samples = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceMaxSamples } else { "" })
+    ds4_expert_recovery_trace_max_bytes = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceByteBudget } else { "" })
+    ds4_expert_recovery_trace_output_prefix = $(if ($ExpertRecoveryTrace) { $expertRecoveryTracePrefix } else { "" })
+    ds4_q1_0_promotion_probation_slots = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionProbationSlots } else { "" })
+    ds4_q1_0_promotion_min_touches = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionMinTouches } else { "" })
+    ds4_q1_0_promotion_min_weight = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { $Q1_0PromotionMinWeight.ToString("R", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_promotion_min_mass = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { $Q1_0PromotionMinMass.ToString("R", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_promotion_request_budget = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionRequestBudget } else { "" })
+    ds4_q1_0_promotion_window_calls = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionWindowCalls } else { "" })
+    ds4_q1_0_promotion_window_budget = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionWindowBudget } else { "" })
     ds4_q1_0_mixed_trace = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedTrace) { "1" } else { "" })
     ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
     ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
@@ -7241,9 +9835,30 @@ $rawOutputs = [pscustomobject]@{
     q1_0_mixed_cold_one_requested = [bool]$Q1_0MixedColdOne
     q1_0_snapshot_backing_requested = [bool]$Q1_0SnapshotBacking
     q1_0_pageable_overflow_requested = [bool]$Q1_0PageableOverflow
+    q1_0_dynamic_arena_gb_requested = $Q1_0ArenaGB
+    q1_0_dynamic_promotion_requested = [bool]$Q1_0DynamicPromotion
+    q1_0_promotion_requested_config = [pscustomobject]@{
+        probation_slots = $Q1_0PromotionProbationSlots
+        min_touches = $Q1_0PromotionMinTouches
+        min_weight = $Q1_0PromotionMinWeight
+        min_mass = $Q1_0PromotionMinMass
+        request_budget = $Q1_0PromotionRequestBudget
+        window_calls = $Q1_0PromotionWindowCalls
+        window_budget = $Q1_0PromotionWindowBudget
+    }
+    q1_0_promotion_probation_slots_requested = $Q1_0PromotionProbationSlots
+    q1_0_promotion_min_touches_requested = $Q1_0PromotionMinTouches
+    q1_0_promotion_min_weight_requested = $Q1_0PromotionMinWeight
+    q1_0_promotion_min_mass_requested = $Q1_0PromotionMinMass
+    q1_0_promotion_request_budget_requested = $Q1_0PromotionRequestBudget
+    q1_0_promotion_window_calls_requested = $Q1_0PromotionWindowCalls
+    q1_0_promotion_window_budget_requested = $Q1_0PromotionWindowBudget
     q1_0_pure_resident_requested = [bool]$Q1_0PureResident
     q1_0_snapshot_entries_expected = $ExpectedQ1_0SnapshotEntries
+    q1_0_resident_entries_expected = $ExpectedQ1_0ResidentEntries
     q1_0_mixed_trace_requested = [bool]$Q1_0MixedTrace
+    q1_0_mixed_resolver_required = $q1_0MixedResolverRequired
+    q1_0_mixed_expected_router = $q1_0MixedExpectedRouter
     q1_0_dual_arena_runtime_observed = $q1_0DualArenaRuntimeObserved
     q1_0_dual_sparse_runtime_observed = $q1_0DualSparseRuntimeObserved
     q1_0_dual_sparse_entries = $q1_0DualSparseEntries
@@ -7275,7 +9890,59 @@ $rawOutputs = [pscustomobject]@{
     q1_0_direct_pread_fallbacks = $q1_0DirectPreadFallbacks
     q1_0_direct_pread_bytes = $q1_0DirectPreadBytes
     q1_0_bootstrap_entries = $q1_0BootstrapEntries
+    q1_0_bootstrap_pinned_bytes = $q1_0BootstrapPinnedBytes
+    q1_0_bootstrap_pageable_bytes = $q1_0BootstrapPageableBytes
+    q1_0_bootstrap_pinned_slots = $q1_0BootstrapPinnedSlots
+    q1_0_bootstrap_pageable_slots = $q1_0BootstrapPageableSlots
+    q1_0_bootstrap_total_slots = $q1_0BootstrapTotalSlots
+    q1_0_bootstrap_total_bytes = $q1_0BootstrapTotalBytes
+    q1_0_bootstrap_layer_first = $q1_0BootstrapLayerFirst
+    q1_0_bootstrap_layer_last = $q1_0BootstrapLayerLast
+    q1_0_source_unlock_observed = $q1_0SourceUnlockObserved
+    q1_0_source_unlock_result = $q1_0SourceUnlockResult
+    q1_0_source_unlock_windows = $q1_0SourceUnlockWindows
+    q1_0_source_unlock_page_size = $q1_0SourceUnlockPageSize
+    q1_0_source_unlock_page_aligned = $q1_0SourceUnlockPageAligned
+    q1_0_source_unlock_destination_unchanged =
+        $q1_0SourceUnlockDestinationUnchanged
+    q1_0_source_unlock_layers = $q1_0SourceUnlockLayers
+    q1_0_source_unlock_ranges_attempted =
+        $q1_0SourceUnlockRangesAttempted
+    q1_0_source_unlock_bytes_attempted = $q1_0SourceUnlockBytesAttempted
+    q1_0_source_unlock_calls = $q1_0SourceUnlockCalls
+    q1_0_source_unlock_success = $q1_0SourceUnlockSuccess
+    q1_0_source_unlock_not_locked = $q1_0SourceUnlockNotLocked
+    q1_0_source_unlock_failed = $q1_0SourceUnlockFailed
+    q1_0_source_unlock_seconds = $q1_0SourceUnlockSeconds
+    q1_0_source_unlock_available_before =
+        $q1_0SourceUnlockAvailableBefore
+    q1_0_source_unlock_available_after = $q1_0SourceUnlockAvailableAfter
+    q1_0_source_unlock_working_set_before =
+        $q1_0SourceUnlockWorkingSetBefore
+    q1_0_source_unlock_working_set_after =
+        $q1_0SourceUnlockWorkingSetAfter
+    q1_0_source_unlock_page_fault_before =
+        $q1_0SourceUnlockPageFaultBefore
+    q1_0_source_unlock_page_fault_after =
+        $q1_0SourceUnlockPageFaultAfter
+    q1_0_source_unlock_read_transfer_before =
+        $q1_0SourceUnlockReadTransferBefore
+    q1_0_source_unlock_read_transfer_after =
+        $q1_0SourceUnlockReadTransferAfter
+    q1_0_source_unlock_last_error = $q1_0SourceUnlockLastError
     q1_0_mixed = $q1_0MixedTelemetry
+    q1_0_mixed_route_trace = $q1_0MixedRouteTraceTelemetry
+    q1_0_mixed_iq2_routes = $q1_0MixedIq2Routes
+    q1_0_mixed_accounted_routes = $q1_0MixedAccountedRoutes
+    q1_0_profile_requested = [bool]$Q1_0Profile
+    q1_0_profile = $q1_0ProfileTelemetry
+    q1_0_promotion_ssd_wrap_requested = [bool]$Q1_0PromotionSsdWrap
+    q1_0_iq2_pinned_gib_requested = $Q1_0Iq2PinnedGiB
+    q1_0_ssd_wrap = $q1_0SsdWrapTelemetry
+    expert_recovery_trace_requested = [bool]$ExpertRecoveryTrace
+    expert_recovery_trace = $expertRecoveryTraceArtifact
+    expert_recovery_trace_performance_eligible = $false
+    expert_recovery_trace_quality_eligible = $false
     q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
     q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
     q1_0_fail_closed_observed = $q1_0FailClosedObserved
@@ -7343,14 +10010,15 @@ $rawOutputs = [pscustomobject]@{
     iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls
     iq1_s_mixed_gpu_plan_wait_ms = $iq1MixedGpuPlanWaitMs
     iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
-    iq1_promotion_requested = [bool]$Iq1Promotion
-    iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
-    iq1_promotion_min_touches_requested = $Iq1PromotionMinTouches
-    iq1_promotion_min_weight_requested = $Iq1PromotionMinWeight
-    iq1_promotion_min_mass_requested = $Iq1PromotionMinMass
-    iq1_promotion_request_budget_requested = $Iq1PromotionRequestBudget
-    iq1_promotion_window_calls_requested = $Iq1PromotionWindowCalls
-    iq1_promotion_window_budget_requested = $Iq1PromotionWindowBudget
+    iq1_promotion_requested = [bool]$quantPromotionRequested
+    iq1_promotion_kind = $(if ($Q1_0DynamicPromotion) { "q1_0" } elseif ($Iq1Promotion) { "iq1_s" } else { "off" })
+    iq1_promotion_probation_slots_requested = $promotionProbationSlotsExpected
+    iq1_promotion_min_touches_requested = $promotionMinTouchesExpected
+    iq1_promotion_min_weight_requested = $promotionMinWeightExpected
+    iq1_promotion_min_mass_requested = $promotionMinMassExpected
+    iq1_promotion_request_budget_requested = $promotionRequestBudgetExpected
+    iq1_promotion_window_calls_requested = $promotionWindowCallsExpected
+    iq1_promotion_window_budget_requested = $promotionWindowBudgetExpected
     iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
@@ -7383,6 +10051,28 @@ $rawOutputs = [pscustomobject]@{
     iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
     iq1_promotion_direct_ssd_to_vram_rejected = $iq1PromotionDirectSsdToVramRejected
     iq1_promotion_probation_backing_reclaims = $iq1PromotionProbationBackingReclaims
+    iq1_promotion_q1_0_observed = $iq1PromotionQ1_0Observed
+    iq1_promotion_q1_0_stage_attempts = $iq1PromotionQ1_0StageAttempts
+    iq1_promotion_q1_0_stage_successes = $iq1PromotionQ1_0StageSuccesses
+    iq1_promotion_q1_0_next_call_guards = $iq1PromotionQ1_0NextCallGuards
+    iq1_promotion_q1_0_record_rejects = $iq1PromotionQ1_0RecordRejects
+    iq1_promotion_q1_0_record_attempts = $iq1PromotionQ1_0RecordAttempts
+    iq1_promotion_q1_0_record_successes = $iq1PromotionQ1_0RecordSuccesses
+    iq1_promotion_q1_0_record_failures = $iq1PromotionQ1_0RecordFailures
+    q1_0_promotion_records_observed = [bool]($q1_0PromotionRecordCount -gt 0)
+    q1_0_promotion_records_path = $q1_0PromotionRecordArtifactPath
+    q1_0_promotion_records_sha256 = $q1_0PromotionRecordArtifactSHA256
+    q1_0_promotion_records_count = $q1_0PromotionRecordCount
+    q1_0_promotion_records_physical_line_count =
+        $q1_0PromotionRecordPhysicalLineCount
+    q1_0_promotion_record_attempt_count = $q1_0PromotionRecordAttemptCount
+    q1_0_promotion_record_success_count = $q1_0PromotionRecordSuccessCount
+    q1_0_promotion_record_reject_count = $q1_0PromotionRecordRejectCount
+    q1_0_promotion_record_failure_count = $q1_0PromotionRecordFailureCount
+    q1_0_promotion_record_bounded_exception_limit =
+        $q1_0PromotionRecordBoundedExceptionLimit
+    q1_0_promotion_telemetry_record_limit =
+        $q1_0PromotionTelemetryRecordLimit
     iq1_promotion_failures = $iq1PromotionFailures
     iq1_promotion_requests = $iq1PromotionRows
     iq1_s_profile_requested = [bool]$Iq1SProfile
@@ -7427,6 +10117,7 @@ $arenaReportedResident = if ($PrefillMassWrap -and $prefillMassWrapResult -eq "p
 $summary = [pscustomobject]@{
     tag = $Tag
     gate_kind = $GateKind
+    force_open_router_requested = [bool]$ForceOpenRouter
     quality_eligible = $qualityEligible
     sota_eligible = $sotaEligible
     contamination_reason = $contaminationReason
@@ -7678,6 +10369,24 @@ $summary = [pscustomobject]@{
     ds4_q1_0_dual_sparse_companion = $(if ($Q1_0ExpertSidecar -and $Q1_0DualSparseCompanion) { "1" } else { "" })
     ds4_q1_0_mixed_cold_one = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedColdOne) { "1" } else { "" })
     ds4_q1_0_pageable_overflow = $(if ($Q1_0ExpertSidecar -and $Q1_0PageableOverflow) { "1" } else { "" })
+    ds4_q1_0_dynamic_arena_gb = $(if ($Q1_0ExpertSidecar -and $Q1_0ArenaGB -gt 0.0) { $Q1_0ArenaGB.ToString("0.###", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_dynamic_promotion = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { "1" } else { "" })
+    ds4_q1_0_promotion_ssd_wrap = $(if ($Q1_0PromotionSsdWrap) { "1" } else { "" })
+    ds4_q1_0_iq2_pinned_gib = $(if ($Q1_0PromotionSsdWrap) { $Q1_0Iq2PinnedGiB.ToString("R", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_profile = $(if ($Q1_0ExpertSidecar -and $Q1_0Profile) { "1" } else { "" })
+    ds4_expert_recovery_trace = $(if ($ExpertRecoveryTrace) { "1" } else { "" })
+    ds4_expert_recovery_trace_layer = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceLayer } else { "" })
+    ds4_expert_recovery_trace_expert = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceExpert } else { "" })
+    ds4_expert_recovery_trace_max_samples = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceMaxSamples } else { "" })
+    ds4_expert_recovery_trace_max_bytes = $(if ($ExpertRecoveryTrace) { [string]$ExpertRecoveryTraceByteBudget } else { "" })
+    ds4_expert_recovery_trace_output_prefix = $(if ($ExpertRecoveryTrace) { $expertRecoveryTracePrefix } else { "" })
+    ds4_q1_0_promotion_probation_slots = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionProbationSlots } else { "" })
+    ds4_q1_0_promotion_min_touches = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionMinTouches } else { "" })
+    ds4_q1_0_promotion_min_weight = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { $Q1_0PromotionMinWeight.ToString("R", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_promotion_min_mass = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { $Q1_0PromotionMinMass.ToString("R", [Globalization.CultureInfo]::InvariantCulture) } else { "" })
+    ds4_q1_0_promotion_request_budget = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionRequestBudget } else { "" })
+    ds4_q1_0_promotion_window_calls = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionWindowCalls } else { "" })
+    ds4_q1_0_promotion_window_budget = $(if ($Q1_0ExpertSidecar -and $Q1_0DynamicPromotion) { [string]$Q1_0PromotionWindowBudget } else { "" })
     ds4_q1_0_mixed_trace = $(if ($Q1_0ExpertSidecar -and $Q1_0MixedTrace) { "1" } else { "" })
     ds4_q1_0_layer_first = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerFirst } else { "" })
     ds4_q1_0_layer_last = $(if ($Q1_0ExpertSidecar) { [string]$Q1_0LayerLast } else { "" })
@@ -7689,9 +10398,30 @@ $summary = [pscustomobject]@{
     q1_0_mixed_cold_one_requested = [bool]$Q1_0MixedColdOne
     q1_0_snapshot_backing_requested = [bool]$Q1_0SnapshotBacking
     q1_0_pageable_overflow_requested = [bool]$Q1_0PageableOverflow
+    q1_0_dynamic_arena_gb_requested = $Q1_0ArenaGB
+    q1_0_dynamic_promotion_requested = [bool]$Q1_0DynamicPromotion
+    q1_0_promotion_requested_config = [pscustomobject]@{
+        probation_slots = $Q1_0PromotionProbationSlots
+        min_touches = $Q1_0PromotionMinTouches
+        min_weight = $Q1_0PromotionMinWeight
+        min_mass = $Q1_0PromotionMinMass
+        request_budget = $Q1_0PromotionRequestBudget
+        window_calls = $Q1_0PromotionWindowCalls
+        window_budget = $Q1_0PromotionWindowBudget
+    }
+    q1_0_promotion_probation_slots_requested = $Q1_0PromotionProbationSlots
+    q1_0_promotion_min_touches_requested = $Q1_0PromotionMinTouches
+    q1_0_promotion_min_weight_requested = $Q1_0PromotionMinWeight
+    q1_0_promotion_min_mass_requested = $Q1_0PromotionMinMass
+    q1_0_promotion_request_budget_requested = $Q1_0PromotionRequestBudget
+    q1_0_promotion_window_calls_requested = $Q1_0PromotionWindowCalls
+    q1_0_promotion_window_budget_requested = $Q1_0PromotionWindowBudget
     q1_0_pure_resident_requested = [bool]$Q1_0PureResident
     q1_0_snapshot_entries_expected = $ExpectedQ1_0SnapshotEntries
+    q1_0_resident_entries_expected = $ExpectedQ1_0ResidentEntries
     q1_0_mixed_trace_requested = [bool]$Q1_0MixedTrace
+    q1_0_mixed_resolver_required = $q1_0MixedResolverRequired
+    q1_0_mixed_expected_router = $q1_0MixedExpectedRouter
     q1_0_dual_arena_runtime_observed = $q1_0DualArenaRuntimeObserved
     q1_0_dual_sparse_runtime_observed = $q1_0DualSparseRuntimeObserved
     q1_0_dual_sparse_entries = $q1_0DualSparseEntries
@@ -7724,7 +10454,59 @@ $summary = [pscustomobject]@{
     q1_0_direct_pread_fallbacks = $q1_0DirectPreadFallbacks
     q1_0_direct_pread_bytes = $q1_0DirectPreadBytes
     q1_0_bootstrap_entries = $q1_0BootstrapEntries
+    q1_0_bootstrap_pinned_bytes = $q1_0BootstrapPinnedBytes
+    q1_0_bootstrap_pageable_bytes = $q1_0BootstrapPageableBytes
+    q1_0_bootstrap_pinned_slots = $q1_0BootstrapPinnedSlots
+    q1_0_bootstrap_pageable_slots = $q1_0BootstrapPageableSlots
+    q1_0_bootstrap_total_slots = $q1_0BootstrapTotalSlots
+    q1_0_bootstrap_total_bytes = $q1_0BootstrapTotalBytes
+    q1_0_bootstrap_layer_first = $q1_0BootstrapLayerFirst
+    q1_0_bootstrap_layer_last = $q1_0BootstrapLayerLast
+    q1_0_source_unlock_observed = $q1_0SourceUnlockObserved
+    q1_0_source_unlock_result = $q1_0SourceUnlockResult
+    q1_0_source_unlock_windows = $q1_0SourceUnlockWindows
+    q1_0_source_unlock_page_size = $q1_0SourceUnlockPageSize
+    q1_0_source_unlock_page_aligned = $q1_0SourceUnlockPageAligned
+    q1_0_source_unlock_destination_unchanged =
+        $q1_0SourceUnlockDestinationUnchanged
+    q1_0_source_unlock_layers = $q1_0SourceUnlockLayers
+    q1_0_source_unlock_ranges_attempted =
+        $q1_0SourceUnlockRangesAttempted
+    q1_0_source_unlock_bytes_attempted = $q1_0SourceUnlockBytesAttempted
+    q1_0_source_unlock_calls = $q1_0SourceUnlockCalls
+    q1_0_source_unlock_success = $q1_0SourceUnlockSuccess
+    q1_0_source_unlock_not_locked = $q1_0SourceUnlockNotLocked
+    q1_0_source_unlock_failed = $q1_0SourceUnlockFailed
+    q1_0_source_unlock_seconds = $q1_0SourceUnlockSeconds
+    q1_0_source_unlock_available_before =
+        $q1_0SourceUnlockAvailableBefore
+    q1_0_source_unlock_available_after = $q1_0SourceUnlockAvailableAfter
+    q1_0_source_unlock_working_set_before =
+        $q1_0SourceUnlockWorkingSetBefore
+    q1_0_source_unlock_working_set_after =
+        $q1_0SourceUnlockWorkingSetAfter
+    q1_0_source_unlock_page_fault_before =
+        $q1_0SourceUnlockPageFaultBefore
+    q1_0_source_unlock_page_fault_after =
+        $q1_0SourceUnlockPageFaultAfter
+    q1_0_source_unlock_read_transfer_before =
+        $q1_0SourceUnlockReadTransferBefore
+    q1_0_source_unlock_read_transfer_after =
+        $q1_0SourceUnlockReadTransferAfter
+    q1_0_source_unlock_last_error = $q1_0SourceUnlockLastError
     q1_0_mixed = $q1_0MixedTelemetry
+    q1_0_mixed_route_trace = $q1_0MixedRouteTraceTelemetry
+    q1_0_mixed_iq2_routes = $q1_0MixedIq2Routes
+    q1_0_mixed_accounted_routes = $q1_0MixedAccountedRoutes
+    q1_0_profile_requested = [bool]$Q1_0Profile
+    q1_0_profile = $q1_0ProfileTelemetry
+    q1_0_promotion_ssd_wrap_requested = [bool]$Q1_0PromotionSsdWrap
+    q1_0_iq2_pinned_gib_requested = $Q1_0Iq2PinnedGiB
+    q1_0_ssd_wrap = $q1_0SsdWrapTelemetry
+    expert_recovery_trace_requested = [bool]$ExpertRecoveryTrace
+    expert_recovery_trace = $expertRecoveryTraceArtifact
+    expert_recovery_trace_performance_eligible = $false
+    expert_recovery_trace_quality_eligible = $false
     q1_0_runtime_contract_valid = $q1_0RuntimeContractValid
     q1_0_fail_closed_checks_passed = $q1_0RuntimeContractValid
     q1_0_fail_closed_observed = $q1_0FailClosedObserved
@@ -7796,23 +10578,24 @@ $summary = [pscustomobject]@{
     iq1_s_mixed_gpu_plan_calls = $iq1MixedGpuPlanCalls
     iq1_s_mixed_gpu_plan_wait_ms = $iq1MixedGpuPlanWaitMs
     iq1_s_mixed_gpu_plan_failures = $iq1MixedGpuPlanFailures
-    iq1_promotion_requested = [bool]$Iq1Promotion
-    iq1_promotion_probation_slots_requested = $Iq1PromotionProbationSlots
+    iq1_promotion_requested = [bool]$quantPromotionRequested
+    iq1_promotion_kind = $(if ($Q1_0DynamicPromotion) { "q1_0" } elseif ($Iq1Promotion) { "iq1_s" } else { "off" })
+    iq1_promotion_probation_slots_requested = $promotionProbationSlotsExpected
     iq1_promotion_requested_config = [pscustomobject]@{
-        probation_slots = $Iq1PromotionProbationSlots
-        min_touches = $Iq1PromotionMinTouches
-        min_weight = $Iq1PromotionMinWeight
-        min_mass = $Iq1PromotionMinMass
-        request_budget = $Iq1PromotionRequestBudget
-        window_calls = $Iq1PromotionWindowCalls
-        window_budget = $Iq1PromotionWindowBudget
+        probation_slots = $promotionProbationSlotsExpected
+        min_touches = $promotionMinTouchesExpected
+        min_weight = $promotionMinWeightExpected
+        min_mass = $promotionMinMassExpected
+        request_budget = $promotionRequestBudgetExpected
+        window_calls = $promotionWindowCallsExpected
+        window_budget = $promotionWindowBudgetExpected
     }
-    iq1_promotion_min_touches_requested = $Iq1PromotionMinTouches
-    iq1_promotion_min_weight_requested = $Iq1PromotionMinWeight
-    iq1_promotion_min_mass_requested = $Iq1PromotionMinMass
-    iq1_promotion_request_budget_requested = $Iq1PromotionRequestBudget
-    iq1_promotion_window_calls_requested = $Iq1PromotionWindowCalls
-    iq1_promotion_window_budget_requested = $Iq1PromotionWindowBudget
+    iq1_promotion_min_touches_requested = $promotionMinTouchesExpected
+    iq1_promotion_min_weight_requested = $promotionMinWeightExpected
+    iq1_promotion_min_mass_requested = $promotionMinMassExpected
+    iq1_promotion_request_budget_requested = $promotionRequestBudgetExpected
+    iq1_promotion_window_calls_requested = $promotionWindowCallsExpected
+    iq1_promotion_window_budget_requested = $promotionWindowBudgetExpected
     iq1_promotion_runtime_observed = $iq1PromotionRuntimeObserved
     iq1_promotion_line_count = $iq1PromotionLineCount
     iq1_promotion_requested_slots = $iq1PromotionRequestedSlots
@@ -7844,6 +10627,28 @@ $summary = [pscustomobject]@{
     iq1_promotion_2bit_ssd_bytes_per_second = $iq1Promotion2BitSsdBytesPerSecond
     iq1_promotion_direct_ssd_to_vram_rejected = $iq1PromotionDirectSsdToVramRejected
     iq1_promotion_probation_backing_reclaims = $iq1PromotionProbationBackingReclaims
+    iq1_promotion_q1_0_observed = $iq1PromotionQ1_0Observed
+    iq1_promotion_q1_0_stage_attempts = $iq1PromotionQ1_0StageAttempts
+    iq1_promotion_q1_0_stage_successes = $iq1PromotionQ1_0StageSuccesses
+    iq1_promotion_q1_0_next_call_guards = $iq1PromotionQ1_0NextCallGuards
+    iq1_promotion_q1_0_record_rejects = $iq1PromotionQ1_0RecordRejects
+    iq1_promotion_q1_0_record_attempts = $iq1PromotionQ1_0RecordAttempts
+    iq1_promotion_q1_0_record_successes = $iq1PromotionQ1_0RecordSuccesses
+    iq1_promotion_q1_0_record_failures = $iq1PromotionQ1_0RecordFailures
+    q1_0_promotion_records_observed = [bool]($q1_0PromotionRecordCount -gt 0)
+    q1_0_promotion_records_path = $q1_0PromotionRecordArtifactPath
+    q1_0_promotion_records_sha256 = $q1_0PromotionRecordArtifactSHA256
+    q1_0_promotion_records_count = $q1_0PromotionRecordCount
+    q1_0_promotion_records_physical_line_count =
+        $q1_0PromotionRecordPhysicalLineCount
+    q1_0_promotion_record_attempt_count = $q1_0PromotionRecordAttemptCount
+    q1_0_promotion_record_success_count = $q1_0PromotionRecordSuccessCount
+    q1_0_promotion_record_reject_count = $q1_0PromotionRecordRejectCount
+    q1_0_promotion_record_failure_count = $q1_0PromotionRecordFailureCount
+    q1_0_promotion_record_bounded_exception_limit =
+        $q1_0PromotionRecordBoundedExceptionLimit
+    q1_0_promotion_telemetry_record_limit =
+        $q1_0PromotionTelemetryRecordLimit
     iq1_promotion_failures = $iq1PromotionFailures
     iq1_promotion_requests = $iq1PromotionRows
     iq1_s_profile_requested = [bool]$Iq1SProfile
@@ -8321,6 +11126,11 @@ $summary = [pscustomobject]@{
     split_fused_calls = $splitFusedCalls
     split_fused_hits = $splitFusedHits
     split_fused_misses = $splitFusedMisses
+    split_fused_primary_route_basis = $splitFusedPrimaryRouteBasis
+    split_fused_primary_routes_expected = $splitFusedExpectedPrimaryRoutes
+    split_fused_primary_routes_observed = $splitFusedObservedPrimaryRoutes
+    split_fused_q1_resident_routes_excluded =
+        $splitFusedQ1ResidentRoutesExcluded
     split_fused_miss_scratch_bytes_avoided = $splitFusedMissScratchBytesAvoided
     split_fused_sum_read_bytes_avoided = $splitFusedSumReadBytesAvoided
     gpu_resident_routes_observed = $gpuRoutesObserved
@@ -8543,6 +11353,9 @@ Write-Host ("nested residual gpu-join residual-cache requested/observed/enabled/
 Write-Host ("nested residual profile requested/observed lookup/pread/reconstruct/verify/host-copy/H2D-enqueue/H2D-sync/submit-launch/ready-wait sec: " + [bool]$NestedResidualProfile + " / " + $nestedResidualProfileObserved + " / " + $nestedResidualProfileLookupSeconds + " / " + $nestedResidualProfilePreadSeconds + " / " + $nestedResidualProfileReconstructSeconds + " / " + $nestedResidualProfileVerifySeconds + " / " + $nestedResidualProfileHostCopySeconds + " / " + $nestedResidualProfileH2DEnqueueSeconds + " / " + $nestedResidualProfileH2DSyncSeconds + " / " + $nestedResidualProfileRouteBeginSeconds + " / " + $nestedResidualProfileRouteReadyWaitSeconds)
 Write-Host ("Q1_0 sidecar enabled/selected-load/resident/dual-requested/dual-observed/observed/calls/slots/loads/failures: " + [bool]$Q1_0ExpertSidecar + " / " + [bool]$Q1_0SelectedLoad + " / " + [bool]$Q1_0ResidentArena + " / " + [bool]$Q1_0DualArena + " / " + $q1_0DualArenaRuntimeObserved + " / " + $q1_0SidecarRuntimeObserved + " / " + $q1_0SidecarCalls + " / " + $q1_0SidecarSlots + " / " + $q1_0SidecarSelectedLoads + " / " + $q1_0SidecarFailures)
 Write-Host ("Q1_0 resident mode/hits/misses/H2D bytes/direct-fallbacks/direct-bytes/bootstrap: " + $q1_0ResidentMode + " / " + $q1_0ResidentHits + " / " + $q1_0ResidentMisses + " / " + $q1_0ResidentH2DBytes + " / " + $q1_0DirectPreadFallbacks + " / " + $q1_0DirectPreadBytes + " / " + $q1_0BootstrapEntries)
+Write-Host ("Q1_0 profile requested/observed/pinned-hits/pageable-hits/pinned-H2D/pageable-H2D/enqueue-sec/sync-sec/kernel-sec/join-sec: " + [bool]$Q1_0Profile + " / " + $q1_0ProfileTelemetry.observed + " / " + $q1_0ProfileTelemetry.pinned_route_hits + " / " + $q1_0ProfileTelemetry.pageable_route_hits + " / " + $q1_0ProfileTelemetry.pinned_h2d_bytes + " / " + $q1_0ProfileTelemetry.pageable_h2d_bytes + " / " + $q1_0ProfileTelemetry.h2d_enqueue_seconds_total + " / " + $q1_0ProfileTelemetry.upload_sync_seconds_total + " / " + $q1_0ProfileTelemetry.q1_kernel_seconds + " / " + $q1_0ProfileTelemetry.mixed_join_seconds)
+Write-Host ("Q1_0 SSD-WRAP requested/observed/attempts/successes/failures/host-budget-GiB: " + [bool]$Q1_0PromotionSsdWrap + " / " + $q1_0SsdWrapTelemetry.observed + " / " + $q1_0SsdWrapTelemetry.attempts + " / " + $q1_0SsdWrapTelemetry.successes + " / " + $q1_0SsdWrapTelemetry.failures + " / " + [math]::Round($q1_0SsdWrapTelemetry.host_budget_bytes / 1GB, 3))
+Write-Host ("Expert recovery trace requested/observed/valid/layer/expert/samples/capped/binary/jsonl/manifest SHA: " + [bool]$ExpertRecoveryTrace + " / " + $expertRecoveryTraceArtifact.observed + " / " + $expertRecoveryTraceArtifact.valid + " / " + $expertRecoveryTraceArtifact.layer + " / " + $expertRecoveryTraceArtifact.expert + " / " + $expertRecoveryTraceArtifact.sample_count + " / " + $expertRecoveryTraceArtifact.capped_samples + " / " + $expertRecoveryTraceArtifact.binary_sha256 + " / " + $expertRecoveryTraceArtifact.jsonl_sha256 + " / " + $expertRecoveryTraceArtifact.manifest_sha256)
 Write-Host ("Q1_0 runtime-contract/fail-closed/structural-eligible/performance-eligible: " + $q1_0RuntimeContractValid + " / " + $q1_0FailClosedObserved + " / " + $q1_0StructuralSmokeEligible + " / False")
 Write-Host ("IQ1_S RAM cache req/observed/capacity/count/hits/misses/evictions/failures: " + $Iq1SRamCacheGiB + " / " + $iq1SRamCacheRuntimeObserved + " / " + $iq1SRamCacheCapacity + " / " + $iq1SRamCacheCount + " / " + $iq1SRamCacheHits + " / " + $iq1SRamCacheMisses + " / " + $iq1SRamCacheEvictions + " / " + $iq1SRamCacheFailures)
 Write-Host ("IQ1_S RAM cache hit-rate/SSD GiB/H2D GiB/SSD avoided GiB: " + [math]::Round($iq1SRamCacheHitRate, 4) + " / " + [math]::Round($iq1SRamCacheSsdBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheH2dBytes / 1GB, 3) + " / " + [math]::Round($iq1SRamCacheSsdAvoidedBytes / 1GB, 3))
@@ -8553,12 +11366,24 @@ Write-Host ("IQ1_S mixed calls/hot-main/cold-IQ1/primary-avoided/joins/failures:
 Write-Host ("IQ1_S mixed GPU plan requested/observed/calls/wait-ms/failures: " + [bool]$Iq1SMixedGpuPlan + " / " + $iq1MixedGpuPlanRuntimeObserved + " / " + $iq1MixedGpuPlanCalls + " / " + $iq1MixedGpuPlanWaitMs + " / " + $iq1MixedGpuPlanFailures)
 Write-Host ("IQ1 promotion gate config min-touches/min-weight/min-mass/request-budget/window-calls/window-budget: " + $iq1PromotionObservedMinTouches + " / " + $iq1PromotionObservedMinWeight + " / " + $iq1PromotionObservedMinMass + " / " + $iq1PromotionObservedRequestBudget + " / " + $iq1PromotionObservedWindowCalls + " / " + $iq1PromotionObservedWindowBudget)
 Write-Host ("IQ1 promotion gate candidates weight>=.001/.002/.005/.010 skips touches/weight/mass/request/window: " + $iq1PromotionColdGateCandidates + " / " + $iq1PromotionWeightGe001 + " / " + $iq1PromotionWeightGe002 + " / " + $iq1PromotionWeightGe005 + " / " + $iq1PromotionWeightGe010 + " / " + $iq1PromotionSkipsTouches + " / " + $iq1PromotionSkipsWeight + " / " + $iq1PromotionSkipsMass + " / " + $iq1PromotionSkipsRequestBudget + " / " + $iq1PromotionSkipsWindowBudget)
-Write-Host ("IQ1 promotion requested/observed/lines/slots/cold/existing2bit/to2bitram/ssd-GiB/ssd-sec/ssd-Bps/direct-rejected/backing-reclaims/failures: " + [bool]$Iq1Promotion + " / " + $iq1PromotionRuntimeObserved + " / " + $iq1PromotionLineCount + " / " + $Iq1PromotionProbationSlots + " / " + $iq1PromotionColdObserved + " / " + $iq1PromotionColdExisting2Bit + " / " + $iq1PromotionColdTo2BitRam + " / " + [math]::Round($iq1Promotion2BitSsdBytes / 1GB, 3) + " / " + $iq1Promotion2BitSsdSeconds + " / " + [math]::Round($iq1Promotion2BitSsdBytesPerSecond, 3) + " / " + $iq1PromotionDirectSsdToVramRejected + " / " + $iq1PromotionProbationBackingReclaims + " / " + $iq1PromotionFailures)
+Write-Host ("Quant promotion kind/requested/observed/lines/slots/cold/existing2bit/to2bitram/ssd-GiB/ssd-sec/ssd-Bps/direct-rejected/backing-reclaims/failures: " + $(if ($Q1_0DynamicPromotion) { "q1_0" } elseif ($Iq1Promotion) { "iq1_s" } else { "off" }) + " / " + [bool]$quantPromotionRequested + " / " + $iq1PromotionRuntimeObserved + " / " + $iq1PromotionLineCount + " / " + $promotionProbationSlotsExpected + " / " + $iq1PromotionColdObserved + " / " + $iq1PromotionColdExisting2Bit + " / " + $iq1PromotionColdTo2BitRam + " / " + [math]::Round($iq1Promotion2BitSsdBytes / 1GB, 3) + " / " + $iq1Promotion2BitSsdSeconds + " / " + [math]::Round($iq1Promotion2BitSsdBytesPerSecond, 3) + " / " + $iq1PromotionDirectSsdToVramRejected + " / " + $iq1PromotionProbationBackingReclaims + " / " + $iq1PromotionFailures)
+Write-Host ("Q1_0 promotion records observed/count/lines/attempt/success/reject/failure/path/sha: " + [bool]($q1_0PromotionRecordCount -gt 0) + " / " + $q1_0PromotionRecordCount + " / " + $q1_0PromotionRecordPhysicalLineCount + " / " + $q1_0PromotionRecordAttemptCount + " / " + $q1_0PromotionRecordSuccessCount + " / " + $q1_0PromotionRecordRejectCount + " / " + $q1_0PromotionRecordFailureCount + " / " + $q1_0PromotionRecordArtifactPath + " / " + $q1_0PromotionRecordArtifactSHA256)
 Write-Host ("IQ1_S profile/no-main-sync/packed-H2D: " + [bool]$Iq1SProfile + " / " + [bool]$Iq1SNoMainSync + " / " + [bool]$Iq1SPackedH2D)
 Write-Host ("IQ1_S profile SSD reads/ms H2D batches/copies/enqueue-ms/syncs/sync-ms: " + $iq1ProfileSsdReadCalls + " / " + $iq1ProfileSsdReadMs + " / " + $iq1ProfileH2dBatches + " / " + $iq1ProfileH2dCopies + " / " + $iq1ProfileH2dEnqueueMs + " / " + $iq1ProfileH2dSyncs + " / " + $iq1ProfileH2dSyncMs)
 Write-Host ("IQ1_S mixed profile calls/router-D2H/meta-H2D/main-submit/main-sync/cold-submit/join ms: " + $iq1MixedProfileCalls + " / " + $iq1MixedProfileRouterD2hMs + " / " + $iq1MixedProfileMetadataH2dMs + " / " + $iq1MixedProfileMainSubmitMs + " / " + $iq1MixedProfileMainSyncMs + " / " + $iq1MixedProfileColdSubmitMs + " / " + $iq1MixedProfileJoinSubmitMs)
 Write-Host ("last_sel_line : " + $lastSel)
 Write-Host "=================================================="
+} catch {
+    $failureReason = "runtime-failure"
+    if (Get-Variable -Name runtimeAbortSample -Scope Local -ErrorAction SilentlyContinue) {
+        if ($runtimeAbortSample) { $failureReason = "runtime-contamination-abort" }
+    }
+    Write-G7MeasurementFailure `
+        -Reason $failureReason `
+        -Exception $_.Exception.Message `
+        -AbortSample $(if (Get-Variable -Name runtimeAbortSample -Scope Local -ErrorAction SilentlyContinue) { $runtimeAbortSample } else { $null }) `
+        -Evidence $(if (Get-Variable -Name runtimeFailureEvidence -Scope Local -ErrorAction SilentlyContinue) { @($runtimeFailureEvidence) } else { @() })
+    throw
 } finally {
     if ($null -ne $modelLockStream) {
         try { $modelLockStream.Dispose() } catch {}
