@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 import subprocess
 import time
 import uuid
@@ -12,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "g73_live_html_b_end_to_end.ps1"
 MOCK = ROOT / "tests" / "g73_live_html_b_mock_server.py"
 PROTOCOL = ROOT / "G73_LIVE_HTML_B_MOCK_INTEGRATION_PROTOCOL.md"
-OUT_ROOT = ROOT / "g7_runs" / "g73_live_html_b_mock_integration"
+OUT_ROOT = Path(tempfile.gettempdir()) / "g73_live_html_b_mock_integration"
 POWERSHELL = Path(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe")
 
 SYSTEM_PROMPT = "You are a coding assistant. Follow the user instructions exactly."
@@ -102,6 +103,15 @@ def test_static_contract() -> None:
         "Get-MockCaptureValidation",
         "mock_validation_receipt.json",
         "Mock mode must not access the DS4 model or executable",
+        "Read-FileTailLines",
+        "startup-progress-stalled",
+        "startup-absolute-cap",
+        "Get-StartupProgressMetric",
+        "Get-GpuSamplerRowCount",
+        "Test-LivePreflightLaunchGate",
+        "request_epoch",
+        "abort_floor_tps",
+        "/health",
     ):
         assert token in text
     assert MOCK.is_file()
@@ -126,6 +136,10 @@ def test_success_two_turn_byte_exact() -> None:
     assert summary["mock"]["validation"]["pass"] is True
     assert summary["mock"]["synthetic_quality_claim"] == "L2-contract-only"
     assert len(summary["requests"]) == 2
+    assert [request["request_epoch"] for request in summary["requests"]] == [1, 2]
+    assert summary["config"]["decode_abort_manifest"]["abort_floor_tps"] == 0.1025
+    assert summary["config"]["decode_abort_manifest"]["warm_tokens"] == 16
+    assert summary["config"]["decode_abort_manifest"]["consecutive_tokens"] == 30
 
     capture = out_dir / "mock_capture"
     request1_raw = (capture / "request1.raw.json").read_bytes()

@@ -6,6 +6,8 @@ param(
     [string]$Tag = '',
     [ValidateRange(60, 14400)]
     [int]$TimeoutSec = 7200,
+    [ValidateRange(60, 14400)]
+    [int]$StartupAbsoluteCapSec = 2700,
     [switch]$StaticCheckOnly,
     [switch]$LifecycleSelfTest,
     [switch]$MockIntegration,
@@ -186,7 +188,7 @@ $exe = Join-Path $root 'build\Release\ds4_server.exe'
 $model = 'C:\ds4-models\ds4-2bit.gguf'
 $modelReceipt = "$model.receipt.json"
 $liveOutRoot = Join-Path $root 'g7_runs\g73_live_html_b_end_to_end'
-$mockOutRoot = Join-Path $root 'g7_runs\g73_live_html_b_mock_integration'
+$mockOutRoot = Join-Path ([IO.Path]::GetTempPath()) 'g73_live_html_b_mock_integration'
 $outRoot = if ($MockIntegration) { $mockOutRoot } else { $liveOutRoot }
 $lockPath = Join-Path $outRoot 'g73_live_html_b_end_to_end_v2.lock'
 $canonicalRunner = Join-Path $root 'g73_split_fused_ab.ps1'
@@ -201,7 +203,7 @@ $expectedBuildFingerprint = 'c8698dc4f5ba0dcd4e29f50c84545704140875d653f122f1a81
 $expectedExeSha = 'f703f53246331cd632e81eadba9892b8184645cc0b714ad6005ad87d2899dcfa'
 $expectedModelSha = 'efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668'
 $expectedModelBytes = [UInt64]86720111488
-$expectedCanonicalRunnerSha = '977ac73114bcdb883d06c123e3c33e467f230eea96235406c87d29f951b58470'
+$expectedCanonicalRunnerSha = '3b29ebefb0dddda13111ac9d415198f777836c405090a82bd5aa2369a88937e0'
 $contextTokens = 8192
 $prefillChunk = 256
 $maxTokens = 3000
@@ -209,6 +211,30 @@ $temperature = 0
 $think = $false
 $stopSequence = '</html>'
 $samplerIntervalMs = 500
+$startupProgressStallSec = 300
+$decodeNoProgressStallSec = 300
+$samplerStallSec = 5
+$decodeFloorManifest = [ordered]@{
+    schema = 'g73_live_html_b_decode_abort_manifest_v1'
+    predicted_decode_tps = 0.205
+    abort_floor_derivation = 'predicted_decode_tps * 0.50'
+    abort_floor_fraction = 0.50
+    abort_floor_tps = 0.1025
+    warm_tokens = 16
+    consecutive_tokens = 30
+    no_progress_stall_seconds = 300
+}
+$preflightThresholds = [ordered]@{
+    gpu_vram_idle_max_mib = 700.0
+    gpu_utilization_idle_max_percent = 5.0
+    available_ram_floor_gib = 2.0
+    c_free_floor_gib = 5.0
+}
+$samplerPressureThresholds = [ordered]@{
+    page_reads_per_sec_max = 1000.0
+    pages_per_sec_max = 100000.0
+    disk_read_bytes_per_sec_max = 1073741824.0
+}
 $systemPrompt = 'You are a coding assistant. Follow the user instructions exactly.'
 $prompt1 = 'Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.'
 $prompt1Sha = '38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6'
@@ -319,6 +345,281 @@ function Convert-ToDoubleOrNull {
         return [double]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture)
     } catch {
         return $null
+    }
+}
+
+function Convert-ToDoubleInvariant {
+    param([AllowNull()][object]$Value, [double]$Default = 0.0)
+    $parsed = Convert-ToDoubleOrNull $Value
+    if ($null -eq $parsed) { return $Default }
+    return [double]$parsed
+}
+
+function Get-FileLengthSafe {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [UInt64]0 }
+    return [UInt64](Get-Item -LiteralPath $Path).Length
+}
+
+function New-FileTailState {
+    param([string]$Path, [switch]$FromEnd)
+    return [pscustomobject]@{
+        path = $Path
+        offset = if ($FromEnd) { Get-FileLengthSafe $Path } else { [UInt64]0 }
+        partial = ''
+    }
+}
+
+function Read-FileTailLines {
+    param([object]$State)
+    if (-not (Test-Path -LiteralPath $State.path -PathType Leaf)) { return @() }
+    $stream = [IO.File]::Open($State.path, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+    try {
+        if ([UInt64]$stream.Length -lt [UInt64]$State.offset) {
+            throw "monitored file truncated: $($State.path)"
+        }
+        [void]$stream.Seek([Int64]$State.offset, [IO.SeekOrigin]::Begin)
+        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false, $true),
+            $true, 4096, $true)
+        try {
+            $text = $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+        $State.offset = [UInt64]$stream.Position
+    } finally {
+        $stream.Dispose()
+    }
+    if ([string]::IsNullOrEmpty($text)) { return @() }
+    $combined = [string]$State.partial + $text
+    $parts = $combined -split "`n", -1
+    if ($combined.EndsWith("`n")) {
+        $State.partial = ''
+        $complete = if ($parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } else { @() }
+    } else {
+        $State.partial = [string]$parts[-1]
+        $complete = if ($parts.Count -gt 1) { @($parts[0..($parts.Count - 2)]) } else { @() }
+    }
+    return @($complete | ForEach-Object { ([string]$_).TrimEnd("`r") })
+}
+
+function Get-TextFileTail {
+    param([string]$Path, [int]$Lines = 80)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
+    return @(Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction SilentlyContinue)
+}
+
+function Invoke-NvidiaSmiSnapshot {
+    try {
+        $rows = @(& nvidia-smi --query-gpu=name,utilization.gpu,memory.used,memory.total,pstate `
+            --format=csv,noheader,nounits 2>&1)
+        return [pscustomobject]@{
+            ok = ($LASTEXITCODE -eq 0 -and $rows.Count -gt 0)
+            exit_code = $LASTEXITCODE
+            output = ($rows -join "`n")
+        }
+    } catch {
+        return [pscustomobject]@{
+            ok = $false
+            exit_code = $null
+            output = "nvidia-smi-error:$($_.Exception.Message)"
+        }
+    }
+}
+
+function Write-AbortSnapshot {
+    param(
+        [string]$Path,
+        [string]$Reason,
+        [AllowNull()][object]$OwnedProcess,
+        [string]$StderrPath,
+        [string]$SamplerPath)
+    $snapshots = @()
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        try {
+            $existing = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+            $snapshots = @($existing.snapshots)
+        } catch {}
+    }
+    $snapshots += [pscustomobject]@{
+        captured_utc = [DateTime]::UtcNow.ToString('o')
+        reason = $Reason
+        pid = if ($OwnedProcess) { [int]$OwnedProcess.Id } else { $null }
+        process_alive = if ($OwnedProcess) { Test-OwnedProcessAlive $OwnedProcess } else { $false }
+        nvidia_smi = Invoke-NvidiaSmiSnapshot
+        stderr_tail = @(Get-TextFileTail -Path $StderrPath -Lines 120)
+        sampler_tail = @(Get-TextFileTail -Path $SamplerPath -Lines 20)
+    }
+    Write-JsonUtf8 -Path $Path -Value ([ordered]@{
+        schema = 'g73_live_html_b_abort_snapshot_v1'
+        snapshots = @($snapshots)
+    }) -Depth 16
+}
+
+function Stop-OwnedProcessWithSnapshot {
+    param(
+        [AllowNull()][object]$OwnedProcess,
+        [int]$TimeoutMs = 10000,
+        [string]$SnapshotPath,
+        [string]$Reason,
+        [string]$StderrPath,
+        [string]$SamplerPath)
+    if ($OwnedProcess -and (Test-OwnedProcessAlive $OwnedProcess)) {
+        Write-AbortSnapshot -Path $SnapshotPath -Reason $Reason -OwnedProcess $OwnedProcess `
+            -StderrPath $StderrPath -SamplerPath $SamplerPath
+    }
+    return Stop-OwnedProcess -OwnedProcess $OwnedProcess -TimeoutMs $TimeoutMs
+}
+
+function Get-GpuSamplerRowCount {
+    param([string]$CsvPath)
+    if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) { return 0 }
+    $count = 0
+    try {
+        $stream = [IO.File]::Open($CsvPath, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $reader = [IO.StreamReader]::new($stream)
+            try {
+                [void]$reader.ReadLine()
+                while ($null -ne $reader.ReadLine()) { $count++ }
+            } finally {
+                $reader.Dispose()
+            }
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {}
+    return [int]$count
+}
+
+function Get-GpuSamplerLatestRow {
+    param([string]$CsvPath)
+    if (-not (Test-Path -LiteralPath $CsvPath -PathType Leaf)) { return $null }
+    try {
+        $last = @(Get-Content -LiteralPath $CsvPath -Tail 1 -ErrorAction Stop)
+        if ($last.Count -eq 0 -or [string]::IsNullOrWhiteSpace($last[-1]) -or
+            $last[-1] -match '^timestamp_utc,') { return $null }
+        $headers = 'timestamp_utc,name,utilization_gpu_percent,memory_used_mib,memory_total_mib,pstate,pages_per_sec,page_reads_per_sec,disk_read_bytes_per_sec'
+        return @(@($headers, $last[-1]) | ConvertFrom-Csv)[0]
+    } catch {
+        return $null
+    }
+}
+
+function Test-SamplerPressureAbort {
+    param([string]$SamplerPath)
+    $row = Get-GpuSamplerLatestRow -CsvPath $SamplerPath
+    if (-not $row) { return $null }
+    $pages = Convert-ToDoubleInvariant $row.pages_per_sec 0.0
+    $reads = Convert-ToDoubleInvariant $row.page_reads_per_sec 0.0
+    $disk = Convert-ToDoubleInvariant $row.disk_read_bytes_per_sec 0.0
+    if ($reads -gt [double]$samplerPressureThresholds.page_reads_per_sec_max) {
+        return "paging pressure: page_reads_per_sec=$reads"
+    }
+    if ($pages -gt [double]$samplerPressureThresholds.pages_per_sec_max) {
+        return "paging pressure: pages_per_sec=$pages"
+    }
+    if ($disk -gt [double]$samplerPressureThresholds.disk_read_bytes_per_sec_max) {
+        return "disk pressure: disk_read_bytes_per_sec=$disk"
+    }
+    return $null
+}
+
+function Get-StartupProgressMetric {
+    param([string]$Line)
+    if ([string]::IsNullOrWhiteSpace($Line)) { return $null }
+    if ($Line -match '([0-9]+(?:\.[0-9]+)?)\s+GiB cached') {
+        return [pscustomobject]@{
+            kind = 'cached_gib'
+            value = [double]$matches[1]
+            recognized = $true
+        }
+    }
+    if ($Line -match 'loaded model layer\s+([0-9]+)\s*/\s*([0-9]+)') {
+        return [pscustomobject]@{
+            kind = 'model_layer'
+            value = [double]([int64]$matches[1])
+            recognized = $true
+        }
+    }
+    if ($Line -match '([0-9]+)\s*/\s*([0-9]+)\s+tensors\s+loaded' -or
+        $Line -match 'loaded\s+([0-9]+)\s*/\s*([0-9]+)\s+tensors') {
+        return [pscustomobject]@{
+            kind = 'tensors_loaded'
+            value = [double]([int64]$matches[1])
+            recognized = $true
+        }
+    }
+    if ($Line -match '\b([0-9]+)\s+bytes\b') {
+        return [pscustomobject]@{
+            kind = 'bytes'
+            value = [double]([uint64]$matches[1])
+            recognized = $true
+        }
+    }
+    if ($Line -match 'loading model tensors') {
+        return [pscustomobject]@{
+            kind = 'startup_marker'
+            value = $null
+            recognized = $true
+        }
+    }
+    return $null
+}
+
+function Convert-NvidiaSmiGpuRows {
+    param([string]$Text)
+    $rows = @()
+    foreach ($line in @(([string]$Text) -split "`n")) {
+        if ([string]::IsNullOrWhiteSpace($line) -or $line -match '^nvidia-smi-error:') { continue }
+        $parts = @($line.Split(',') | ForEach-Object { $_.Trim() })
+        if ($parts.Count -lt 5) { continue }
+        $rows += [pscustomobject]@{
+            name = $parts[0]
+            utilization_gpu_percent = Convert-ToDoubleOrNull $parts[1]
+            memory_used_mib = Convert-ToDoubleOrNull $parts[2]
+            memory_total_mib = Convert-ToDoubleOrNull $parts[3]
+            pstate = $parts[4]
+        }
+    }
+    return @($rows)
+}
+
+function Test-LivePreflightLaunchGate {
+    param([object]$Preflight)
+    $failures = [System.Collections.ArrayList]::new()
+    if (-not $Preflight) { throw 'Preflight refused launch: unable to verify preflight object' }
+    $gpuRows = @(Convert-NvidiaSmiGpuRows -Text ([string]$Preflight.gpu))
+    if ($gpuRows.Count -eq 0) {
+        [void]$failures.Add('unable to verify gpu baseline')
+    } else {
+        foreach ($gpu in $gpuRows) {
+            if ($null -eq $gpu.memory_used_mib -or $null -eq $gpu.memory_total_mib -or
+                $null -eq $gpu.utilization_gpu_percent -or [double]$gpu.memory_total_mib -le 0) {
+                [void]$failures.Add('unable to verify gpu baseline')
+                continue
+            }
+            if ([double]$gpu.memory_used_mib -gt [double]$preflightThresholds.gpu_vram_idle_max_mib -or
+                [double]$gpu.utilization_gpu_percent -gt [double]$preflightThresholds.gpu_utilization_idle_max_percent) {
+                [void]$failures.Add("gpu baseline busy: mem_used_mib=$($gpu.memory_used_mib) util=$($gpu.utilization_gpu_percent)")
+            }
+        }
+    }
+    if ($null -eq $Preflight.available_ram_gib -or
+        [double]$Preflight.available_ram_gib -le 0) {
+        [void]$failures.Add('unable to verify available RAM')
+    } elseif ([double]$Preflight.available_ram_gib -lt [double]$preflightThresholds.available_ram_floor_gib) {
+        [void]$failures.Add("available RAM below floor: available_gib=$($Preflight.available_ram_gib)")
+    }
+    if ($null -eq $Preflight.c_free_gib -or [double]$Preflight.c_free_gib -le 0) {
+        [void]$failures.Add('unable to verify free disk')
+    } elseif ([double]$Preflight.c_free_gib -lt [double]$preflightThresholds.c_free_floor_gib) {
+        [void]$failures.Add("free disk below floor: c_free_gib=$($Preflight.c_free_gib)")
+    }
+    if ($failures.Count -ne 0) {
+        throw "Preflight refused launch: $(@($failures) -join '; ')"
     }
 }
 
@@ -504,13 +805,31 @@ function Wait-OwnedProcessReadiness {
         [object]$OwnedProcess,
         [scriptblock]$Probe,
         [int]$TimeoutMs,
-        [int]$PollMs = 100)
+        [int]$PollMs = 100,
+        [string]$LogPath = '',
+        [int]$ProgressStallMs = 300000,
+        [int]$StartupAbsoluteCapMs = 2700000,
+        [string]$SamplerPath = '',
+        [int]$SamplerStallMs = 5000,
+        [switch]$ProgressAware)
     $started = [DateTime]::UtcNow
-    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    $deadline = if ($ProgressAware) { $null } else { (Get-Date).AddMilliseconds($TimeoutMs) }
     $lastProbeError = ''
-    while ((Get-Date) -lt $deadline) {
+    $tail = if ($LogPath) { New-FileTailState -Path $LogPath } else { $null }
+    $lastProgressUtc = [DateTime]::UtcNow
+    $progressCount = 0
+    $lastProgressLine = ''
+    $lastCachedGib = $null
+    $lastProgressMetricKind = ''
+    $lastProgressMetricValue = $null
+    $lastMetrics = @{}
+    $lastSamplerRows = if ($SamplerPath) { Get-GpuSamplerRowCount -CsvPath $SamplerPath } else { 0 }
+    $lastSamplerAdvanceUtc = [DateTime]::UtcNow
+    while ($true) {
+        $now = Get-Date
+        if ($deadline -and $now -ge $deadline) { break }
         if (-not (Test-OwnedProcessAlive $OwnedProcess)) {
-            $exit = Complete-OwnedProcessExit -OwnedProcess $OwnedProcess -TimeoutMs 0
+            $exit = Complete-OwnedProcessExit -OwnedProcess $OwnedProcess -TimeoutMs 5000
             return [pscustomobject]@{
                 ready = $false
                 status = 'process-exited-before-readiness'
@@ -518,6 +837,49 @@ function Wait-OwnedProcessReadiness {
                 elapsed_ms = [int]([DateTime]::UtcNow - $started).TotalMilliseconds
                 last_probe_error = $lastProbeError
                 exit = $exit
+            }
+        }
+        if ($tail) {
+            foreach ($line in @(Read-FileTailLines -State $tail)) {
+                $metric = Get-StartupProgressMetric -Line $line
+                if ($metric -and $null -ne $metric.value) {
+                    $kind = [string]$metric.kind
+                    $value = [double]$metric.value
+                    if (-not $lastMetrics.ContainsKey($kind) -or
+                        $value -gt [double]$lastMetrics[$kind]) {
+                        $lastMetrics[$kind] = $value
+                        $lastProgressUtc = [DateTime]::UtcNow
+                        $progressCount++
+                        $lastProgressLine = $line
+                        $lastProgressMetricKind = $kind
+                        $lastProgressMetricValue = $value
+                        if ($kind -eq 'cached_gib') {
+                            $lastCachedGib = $value
+                        }
+                    }
+                }
+            }
+        }
+        if ($SamplerPath) {
+            $samplerRows = Get-GpuSamplerRowCount -CsvPath $SamplerPath
+            if ($samplerRows -gt $lastSamplerRows) {
+                $lastSamplerRows = $samplerRows
+                $lastSamplerAdvanceUtc = [DateTime]::UtcNow
+            } elseif (([DateTime]::UtcNow - $lastSamplerAdvanceUtc).TotalMilliseconds -gt $SamplerStallMs) {
+                return [pscustomobject]@{
+                    ready = $false
+                    status = 'sampler-stalled-before-readiness'
+                    pid = [int]$OwnedProcess.Id
+                    elapsed_ms = [int]([DateTime]::UtcNow - $started).TotalMilliseconds
+                    last_probe_error = $lastProbeError
+                    exit = $null
+                    startup_progress_count = $progressCount
+                    startup_last_progress_line = $lastProgressLine
+                    startup_last_cached_gib = $lastCachedGib
+                    startup_last_progress_metric_kind = $lastProgressMetricKind
+                    startup_last_progress_metric_value = $lastProgressMetricValue
+                    sampler_rows = $lastSamplerRows
+                }
             }
         }
         try {
@@ -529,10 +891,50 @@ function Wait-OwnedProcessReadiness {
                     elapsed_ms = [int]([DateTime]::UtcNow - $started).TotalMilliseconds
                     last_probe_error = $lastProbeError
                     exit = $null
+                    startup_progress_count = $progressCount
+                    startup_last_progress_line = $lastProgressLine
+                    startup_last_cached_gib = $lastCachedGib
+                    startup_last_progress_metric_kind = $lastProgressMetricKind
+                    startup_last_progress_metric_value = $lastProgressMetricValue
+                    sampler_rows = $lastSamplerRows
                 }
             }
         } catch {
             $lastProbeError = $_.Exception.Message
+        }
+        if ($ProgressAware -and
+            ([DateTime]::UtcNow - $lastProgressUtc).TotalMilliseconds -gt $ProgressStallMs) {
+            return [pscustomobject]@{
+                ready = $false
+                status = 'startup-progress-stalled'
+                pid = [int]$OwnedProcess.Id
+                elapsed_ms = [int]([DateTime]::UtcNow - $started).TotalMilliseconds
+                last_probe_error = $lastProbeError
+                exit = $null
+                startup_progress_count = $progressCount
+                startup_last_progress_line = $lastProgressLine
+                startup_last_cached_gib = $lastCachedGib
+                startup_last_progress_metric_kind = $lastProgressMetricKind
+                startup_last_progress_metric_value = $lastProgressMetricValue
+                sampler_rows = $lastSamplerRows
+            }
+        }
+        if ($ProgressAware -and
+            ([DateTime]::UtcNow - $started).TotalMilliseconds -gt $StartupAbsoluteCapMs) {
+            return [pscustomobject]@{
+                ready = $false
+                status = 'startup-absolute-cap'
+                pid = [int]$OwnedProcess.Id
+                elapsed_ms = [int]([DateTime]::UtcNow - $started).TotalMilliseconds
+                last_probe_error = $lastProbeError
+                exit = $null
+                startup_progress_count = $progressCount
+                startup_last_progress_line = $lastProgressLine
+                startup_last_cached_gib = $lastCachedGib
+                startup_last_progress_metric_kind = $lastProgressMetricKind
+                startup_last_progress_metric_value = $lastProgressMetricValue
+                sampler_rows = $lastSamplerRows
+            }
         }
         Start-Sleep -Milliseconds $PollMs
     }
@@ -543,6 +945,12 @@ function Wait-OwnedProcessReadiness {
         elapsed_ms = [int]([DateTime]::UtcNow - $started).TotalMilliseconds
         last_probe_error = $lastProbeError
         exit = $null
+        startup_progress_count = $progressCount
+        startup_last_progress_line = $lastProgressLine
+        startup_last_cached_gib = $lastCachedGib
+        startup_last_progress_metric_kind = $lastProgressMetricKind
+        startup_last_progress_metric_value = $lastProgressMetricValue
+        sampler_rows = $lastSamplerRows
     }
 }
 
@@ -705,6 +1113,8 @@ function Get-Preflight {
     } catch {
         $gpu = "nvidia-smi-error:$($_.Exception.Message)"
     }
+    $cDrive = Get-PSDrive C -ErrorAction SilentlyContinue
+    $dDrive = Get-PSDrive D -ErrorAction SilentlyContinue
     return [pscustomobject]@{
         captured_utc = [DateTime]::UtcNow.ToString('o')
         probe_warnings = @($warnings)
@@ -716,8 +1126,10 @@ function Get-Preflight {
         page_reads_per_sec = if ($mem) { [UInt64]$mem.PageReadsPersec } else { $null }
         disk = $disk
         gpu = $gpu
-        c_free_gib = [math]::Round((Get-PSDrive C).Free / 1GB, 3)
-        d_free_gib = [math]::Round((Get-PSDrive D).Free / 1GB, 3)
+        gpu_parsed = @(Convert-NvidiaSmiGpuRows -Text $gpu)
+        c_free_gib = if ($cDrive) { [math]::Round($cDrive.Free / 1GB, 3) } else { $null }
+        d_free_gib = if ($dDrive) { [math]::Round($dDrive.Free / 1GB, 3) } else { $null }
+        thresholds = $preflightThresholds
     }
 }
 
@@ -1425,6 +1837,8 @@ function Invoke-LongHtmlRequest {
         [object]$OwnedProcess,
         [string]$LogPath,
         [System.Collections.ArrayList]$RunnerEvents,
+        [string]$SamplerPath = '',
+        [string]$AbortSnapshotPath = '',
         [AllowNull()][string]$Turn1DocumentSha256Used = $null)
     $body = [ordered]@{
         model = 'deepseek-chat'
@@ -1445,6 +1859,14 @@ function Invoke-LongHtmlRequest {
     [IO.File]::WriteAllText($requestPath, $json, [Text.UTF8Encoding]::new($false))
     Add-RunnerEvent -Events $RunnerEvents -Name 'request_start' -Request $Name
     $started = Get-Date
+    $requestEpoch = if ($Name -match 'request([0-9]+)') { [int]$matches[1] } else { $null }
+    $tail = New-FileTailState -Path $LogPath -FromEnd
+    $tokenTimes = [System.Collections.ArrayList]::new()
+    $lastDecodeToken = 0
+    $lastDecodeProgressUtc = [DateTime]::UtcNow
+    $decodeStarted = $false
+    $lastSamplerRows = if ($SamplerPath) { Get-GpuSamplerRowCount -CsvPath $SamplerPath } else { 0 }
+    $lastSamplerAdvanceUtc = [DateTime]::UtcNow
     $client = [System.Net.Http.HttpClient]::new()
     $content = $null
     $message = $null
@@ -1459,18 +1881,93 @@ function Invoke-LongHtmlRequest {
             if (-not (Test-OwnedProcessAlive $OwnedProcess)) {
                 throw "Owned server exited during $Name"
             }
-            $runtimeReloads = @(Get-RuntimeModelTensorReloadEvents -LogPath $LogPath)
-            if ($runtimeReloads.Count -ne 0) {
-                [void](Stop-OwnedProcess -OwnedProcess $OwnedProcess)
-                throw "Model tensor cache reload during $Name; lines=$(@($runtimeReloads | ForEach-Object {$_.line_number}) -join ',')"
+            foreach ($line in @(Read-FileTailLines -State $tail)) {
+                if ($line -match 'CUDA loading model tensors ([0-9.]+) GiB cached') {
+                    [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                        -SnapshotPath $AbortSnapshotPath -Reason "model-tensor-cache-reload-$Name" `
+                        -StderrPath $LogPath -SamplerPath $SamplerPath)
+                    throw "Model tensor cache reload during $Name; line=$line"
+                }
+                if ($line -match '\[g73-two-turn-tier\]') {
+                    $kv = Convert-LineKeyValues $line
+                    if ((Convert-ToUInt64OrZero $kv.snapshot_backing_misses) -ne 0 -or
+                        (Convert-ToUInt64OrZero $kv.ssd_bytes) -ne 0 -or
+                        (Convert-ToUInt64OrZero $kv.failures) -ne 0 -or
+                        (Convert-ToUInt64OrZero $kv.forbidden_cold_ssd_to_vram) -ne 0) {
+                        [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                            -SnapshotPath $AbortSnapshotPath -Reason "unsafe-tier-$Name" `
+                            -StderrPath $LogPath -SamplerPath $SamplerPath)
+                        throw "Unsafe tier/backing event during $Name; line=$line"
+                    }
+                }
+                if ($line -match 'ds4-server: chat .* gen=([0-9]+) decoding chunk=([0-9.]+) t/s avg=([0-9.]+) t/s ([0-9.]+)s') {
+                    $decodeStarted = $true
+                    $gen = [int]$matches[1]
+                    $seconds = [double]$matches[4]
+                    if ($gen -gt $lastDecodeToken) {
+                        $lastDecodeToken = $gen
+                        $lastDecodeProgressUtc = [DateTime]::UtcNow
+                        [void]$tokenTimes.Add([pscustomobject]@{ gen = $gen; seconds = $seconds })
+                    }
+                    $warm = [int]$decodeFloorManifest.warm_tokens
+                    $consecutive = [int]$decodeFloorManifest.consecutive_tokens
+                    if ($gen -ge ($warm + $consecutive)) {
+                        $startGen = $gen - $consecutive
+                        $startSample = @($tokenTimes | Where-Object { [int]$_.gen -le $startGen } | Select-Object -Last 1)
+                        $endSample = @($tokenTimes | Where-Object { [int]$_.gen -eq $gen } | Select-Object -Last 1)
+                        if ($startSample.Count -eq 1 -and $endSample.Count -eq 1) {
+                            $delta = [double]$endSample[0].seconds - [double]$startSample[0].seconds
+                            if ($delta -le 0) {
+                                [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                                    -SnapshotPath $AbortSnapshotPath -Reason "decode-clock-not-advancing-$Name" `
+                                    -StderrPath $LogPath -SamplerPath $SamplerPath)
+                                throw "Decode clock did not advance during $Name"
+                            }
+                            $rolling = [double]$consecutive / $delta
+                            if ($rolling -lt [double]$decodeFloorManifest.abort_floor_tps) {
+                                [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                                    -SnapshotPath $AbortSnapshotPath -Reason "decode-floor-$Name" `
+                                    -StderrPath $LogPath -SamplerPath $SamplerPath)
+                                throw ("Rolling decode throughput below floor during ${Name}: " +
+                                    "rolling_tps=$rolling floor=$($decodeFloorManifest.abort_floor_tps)")
+                            }
+                        }
+                    }
+                } elseif ($line -match 'ds4-server: chat .* gen=([0-9]+) finish=') {
+                    $lastDecodeToken = [int]$matches[1]
+                    $lastDecodeProgressUtc = [DateTime]::UtcNow
+                }
             }
-            $unsafeTier = @(Get-UnsafeTierEvents -LogPath $LogPath)
-            if ($unsafeTier.Count -ne 0) {
-                [void](Stop-OwnedProcess -OwnedProcess $OwnedProcess)
-                throw "Unsafe tier/backing event during $Name; events=$($unsafeTier.Count)"
+            if ($decodeStarted -and
+                ([DateTime]::UtcNow - $lastDecodeProgressUtc).TotalSeconds -gt [double]$decodeNoProgressStallSec) {
+                [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                    -SnapshotPath $AbortSnapshotPath -Reason "decode-no-progress-$Name" `
+                    -StderrPath $LogPath -SamplerPath $SamplerPath)
+                throw "Decode made no token progress for $decodeNoProgressStallSec seconds during $Name"
+            }
+            if ($SamplerPath) {
+                $samplerRows = Get-GpuSamplerRowCount -CsvPath $SamplerPath
+                if ($samplerRows -gt $lastSamplerRows) {
+                    $lastSamplerRows = $samplerRows
+                    $lastSamplerAdvanceUtc = [DateTime]::UtcNow
+                } elseif (([DateTime]::UtcNow - $lastSamplerAdvanceUtc).TotalSeconds -gt [double]$samplerStallSec) {
+                    [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                        -SnapshotPath $AbortSnapshotPath -Reason "sampler-stalled-$Name" `
+                        -StderrPath $LogPath -SamplerPath $SamplerPath)
+                    throw "GPU/paging sampler row count stopped advancing during $Name"
+                }
+                $pressure = Test-SamplerPressureAbort -SamplerPath $SamplerPath
+                if ($pressure) {
+                    [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                        -SnapshotPath $AbortSnapshotPath -Reason "sampler-pressure-$Name" `
+                        -StderrPath $LogPath -SamplerPath $SamplerPath)
+                    throw "Sampler pressure abort during ${Name}: $pressure"
+                }
             }
             if ((Get-Date) -ge $deadline) {
-                [void](Stop-OwnedProcess -OwnedProcess $OwnedProcess)
+                [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $OwnedProcess `
+                    -SnapshotPath $AbortSnapshotPath -Reason "http-timeout-$Name" `
+                    -StderrPath $LogPath -SamplerPath $SamplerPath)
                 throw "HTTP request timeout during $Name"
             }
         }
@@ -1496,6 +1993,7 @@ function Invoke-LongHtmlRequest {
     return [pscustomobject]@{
         name = $Name
         turn = $Turn
+        request_epoch = $requestEpoch
         http_status = 200
         wall_seconds = [math]::Round(((Get-Date) - $started).TotalSeconds, 6)
         request_path = $requestPath
@@ -1597,7 +2095,13 @@ function Join-RequestMetrics {
     $joined = @()
     for ($i = 0; $i -lt $HttpResults.Count; $i++) {
         $http = $HttpResults[$i]
-        $log = if ($i -lt $LogMetrics.Count) { $LogMetrics[$i] } else { $null }
+        $logMatches = @()
+        if ($null -ne $http.request_epoch) {
+            $logMatches = @($LogMetrics | Where-Object {
+                $null -ne $_.request_epoch -and [int]$_.request_epoch -eq [int]$http.request_epoch
+            })
+        }
+        $log = if ($logMatches.Count -eq 1) { $logMatches[0] } else { $null }
         $prefillSeconds = if ($log) { Convert-ToDoubleOrNull $log.prompt_done_seconds } else { $null }
         $decodeSeconds = $null
         if ($log -and $null -ne $log.finish_elapsed_seconds -and $null -ne $log.prompt_done_seconds) {
@@ -1614,6 +2118,7 @@ function Join-RequestMetrics {
         $joined += [pscustomobject]@{
             name = $http.name
             turn = $http.turn
+            request_epoch = $http.request_epoch
             http_status = $http.http_status
             wall_seconds = $http.wall_seconds
             prompt_tokens = $http.prompt_tokens
@@ -1649,6 +2154,12 @@ function Join-RequestMetrics {
             raw_assistant_path = $http.raw_assistant_path
             document_path = $http.document_path
             server_log = $log
+            server_log_join = [pscustomobject]@{
+                key = 'request_epoch'
+                matched = [bool]($null -ne $log)
+                matches = $logMatches.Count
+                request_epoch = $http.request_epoch
+            }
         }
     }
     return @($joined)
@@ -1835,7 +2346,7 @@ function Get-LastEffective {
 
 function Get-StatusFromGates {
     param([object[]]$Gates, [string]$Failure = '')
-    if ($Failure -match 'Model tensor cache reload|Unsafe tier/backing|HTTP request timeout') {
+    if ($Failure -match 'Model tensor cache reload|Unsafe tier/backing|HTTP request timeout|Rolling decode throughput below floor|Decode made no token progress|sampler row count stopped advancing|Sampler pressure abort|Decode clock did not advance') {
         return 'aborted'
     }
     if (@($Gates | Where-Object { -not $_.pass }).Count -ne 0) { return 'failed' }
@@ -1925,6 +2436,12 @@ function Add-CommonGates {
         Add-Gate $Gates $names.stop ($req.Count -gt 0 -and [bool]$req[0].stop_contract_valid) "observed=$(if($req.Count){$req[0].stop_sequence_observed}else{'missing'}) reinjected=$(if($req.Count){$req[0].stop_reinjected}else{'missing'})"
         Add-Gate $Gates $names.raw ($req.Count -gt 0 -and [bool]$req[0].raw_only_html_contract) "fence=$(if($req.Count){$req[0].raw_has_markdown_fence}else{'missing'}) prefix=$(if($req.Count){$req[0].raw_prefix_non_whitespace}else{'missing'}) suffix=$(if($req.Count){$req[0].raw_suffix_non_whitespace}else{'missing'})"
         Add-Gate $Gates $names.document ($req.Count -gt 0 -and [int]$req[0].document_length -gt 0) "bytes=$(if($req.Count){$req[0].document_length}else{'missing'})"
+        Add-Gate $Gates "${requestName}_epoch_log_join" ($req.Count -gt 0 -and
+            $req[0].server_log_join -and [bool]$req[0].server_log_join.matched) `
+            "epoch=$(if($req.Count){$req[0].request_epoch}else{'missing'}) matches=$(if($req.Count -and $req[0].server_log_join){$req[0].server_log_join.matches}else{'missing'})"
+        Add-Gate $Gates "${requestName}_server_tps_non_null" ($req.Count -gt 0 -and
+            $null -ne $req[0].prefill_tps -and $null -ne $req[0].decode_tps_server) `
+            "prefill_tps=$(if($req.Count){$req[0].prefill_tps}else{'missing'}) decode_tps_server=$(if($req.Count){$req[0].decode_tps_server}else{'missing'})"
     }
     foreach ($qual in @($Quality)) {
         Add-Gate $Gates "$($qual.turn)_quality_structural" ([bool]$qual.pass) "parseable=$($qual.parseable_html) css=$($qual.has_css) nav=$($qual.has_nav) hero=$($qual.has_hero) form=$($qual.has_form) script=$($qual.has_script) popup=$($qual.has_popup) dark=$($qual.dark_almost_black) cyan=$($qual.cyan_accent) magenta=$($qual.magenta_accent)"
@@ -2063,6 +2580,66 @@ exit 0
         if (-not $timeoutExit.exited -or $null -eq $timeoutExit.exit_code) {
             throw "Timed-out child exit capture failed: $($timeoutExit | ConvertTo-Json -Compress)"
         }
+
+        $cachedMetric = Get-StartupProgressMetric -Line 'CUDA loading model tensors 12.500 GiB cached'
+        $layerMetric = Get-StartupProgressMetric -Line 'loaded model layer 42/61'
+        $tensorMetric = Get-StartupProgressMetric -Line 'loaded 128/256 tensors'
+        $bytesMetric = Get-StartupProgressMetric -Line 'cache copy advanced 4096 bytes'
+        $markerMetric = Get-StartupProgressMetric -Line 'CUDA loading model tensors into device cache'
+        if (-not $cachedMetric -or $cachedMetric.kind -ne 'cached_gib' -or
+            [double]$cachedMetric.value -ne 12.5 -or
+            -not $layerMetric -or $layerMetric.kind -ne 'model_layer' -or
+            [double]$layerMetric.value -ne 42 -or
+            -not $tensorMetric -or $tensorMetric.kind -ne 'tensors_loaded' -or
+            [double]$tensorMetric.value -ne 128 -or
+            -not $bytesMetric -or $bytesMetric.kind -ne 'bytes' -or
+            [double]$bytesMetric.value -ne 4096 -or
+            -not $markerMetric -or $markerMetric.kind -ne 'startup_marker' -or
+            $null -ne $markerMetric.value) {
+            throw 'Startup progress metric parser self-test failed'
+        }
+
+        $stalledLog = Join-Path $tmp 'startup_stalled.err'
+        $stalledMarker = Join-Path $tmp 'startup_stalled.marker'
+        $stalledScript = @"
+for (`$i = 0; `$i -lt 40; `$i++) {
+    [Console]::Error.WriteLine('CUDA loading model tensors 1.000 GiB cached')
+    Start-Sleep -Milliseconds 25
+}
+exit 0
+"@
+        $stalled = & $startChild 'startup_stalled' $stalledScript
+        $stalledReady = Wait-OwnedProcessReadiness -OwnedProcess $stalled -TimeoutMs 5000 `
+            -PollMs 25 -Probe { return (Test-Path -LiteralPath $stalledMarker -PathType Leaf) } `
+            -LogPath $stalledLog -ProgressStallMs 200 -StartupAbsoluteCapMs 5000 -ProgressAware
+        if ($stalledReady.ready -or $stalledReady.status -ne 'startup-progress-stalled' -or
+            [int]$stalledReady.startup_progress_count -ne 1 -or
+            [string]$stalledReady.startup_last_progress_metric_kind -ne 'cached_gib' -or
+            [double]$stalledReady.startup_last_progress_metric_value -ne 1.0) {
+            throw "Startup monotonic stall self-test failed: $($stalledReady | ConvertTo-Json -Compress -Depth 6)"
+        }
+        [void](Stop-OwnedProcess -OwnedProcess $stalled -TimeoutMs 5000)
+        [void](Complete-OwnedProcessExit -OwnedProcess $stalled -TimeoutMs 0)
+
+        $absoluteLog = Join-Path $tmp 'startup_absolute.err'
+        $absoluteMarker = Join-Path $tmp 'startup_absolute.marker'
+        $absoluteScript = @"
+for (`$i = 1; `$i -lt 100; `$i++) {
+    [Console]::Error.WriteLine("CUDA loading model tensors `$i GiB cached")
+    Start-Sleep -Milliseconds 10
+}
+exit 0
+"@
+        $absolute = & $startChild 'startup_absolute' $absoluteScript
+        $absoluteReady = Wait-OwnedProcessReadiness -OwnedProcess $absolute -TimeoutMs 5000 `
+            -PollMs 25 -Probe { return (Test-Path -LiteralPath $absoluteMarker -PathType Leaf) } `
+            -LogPath $absoluteLog -ProgressStallMs 5000 -StartupAbsoluteCapMs 1200 -ProgressAware
+        if ($absoluteReady.ready -or $absoluteReady.status -ne 'startup-absolute-cap' -or
+            [int]$absoluteReady.startup_progress_count -lt 2) {
+            throw "Startup absolute cap self-test failed: $($absoluteReady | ConvertTo-Json -Compress -Depth 6)"
+        }
+        [void](Stop-OwnedProcess -OwnedProcess $absolute -TimeoutMs 5000)
+        [void](Complete-OwnedProcessExit -OwnedProcess $absolute -TimeoutMs 0)
 
         $marker = Join-Path $tmp 'ready.marker'
         $escapedMarker = $marker.Replace("'", "''")
@@ -2261,6 +2838,7 @@ if (-not $PSCmdlet.ShouldProcess($target, 'Run dedicated live runner')) {
     return
 }
 
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outRoot) | Out-Null
 New-Item -ItemType Directory -Force -Path $outRoot | Out-Null
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
 if (-not $Tag) {
@@ -2279,6 +2857,7 @@ $stderrLog = Join-Path $outDir 'server.stderr.log'
 $samplerPath = Join-Path $outDir 'gpu_sampler.csv'
 $runnerEventsPath = Join-Path $outDir 'runner_events.json'
 $environmentPath = Join-Path $outDir 'environment.json'
+$abortSnapshotPath = Join-Path $outDir 'abort_snapshot.json'
 $mockCaptureDir = Join-Path $outDir 'mock_capture'
 $mockValidationReceiptPath = Join-Path $outDir 'mock_validation_receipt.json'
 
@@ -2331,6 +2910,9 @@ try {
     $preflight | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $preflightPath -Encoding UTF8
     if (@($preflight.conflicting_processes).Count -ne 0) {
         throw 'Preflight refused launch: conflicting process exists'
+    }
+    if (-not $MockIntegration) {
+        Test-LivePreflightLaunchGate -Preflight $preflight
     }
     if (-not $MockIntegration) {
         $receipt = Get-Content -Raw -LiteralPath $modelReceipt | ConvertFrom-Json
@@ -2389,23 +2971,27 @@ try {
         }
     } else {
         $readinessProbe = {
-            $client = $null
+            $healthClient = [System.Net.Http.HttpClient]::new()
             try {
-                $client = [Net.Sockets.TcpClient]::new()
-                $async = $client.BeginConnect('127.0.0.1', $port, $null, $null)
-                if (-not $async.AsyncWaitHandle.WaitOne(200, $false)) { return $false }
-                $client.EndConnect($async)
-                return $true
+                $healthClient.Timeout = [TimeSpan]::FromMilliseconds(500)
+                $health = $healthClient.GetAsync("http://127.0.0.1:$port/health").Result
+                return [bool]$health.IsSuccessStatusCode
             } catch {
                 return $false
             } finally {
-                if ($client) { $client.Close() }
+                $healthClient.Dispose()
             }
         }
     }
-    $readinessTimeoutMs = if ($MockIntegration) { 10000 } else { [math]::Min(300000, $TimeoutSec * 1000) }
+    $readinessTimeoutMs = if ($MockIntegration) { 10000 } else { $TimeoutSec * 1000 }
     $readinessResult = Wait-OwnedProcessReadiness -OwnedProcess $process `
-        -Probe $readinessProbe -TimeoutMs $readinessTimeoutMs -PollMs 100
+        -Probe $readinessProbe -TimeoutMs $readinessTimeoutMs -PollMs 100 `
+        -LogPath $(if ($MockIntegration) { '' } else { $stderrLog }) `
+        -ProgressStallMs ($startupProgressStallSec * 1000) `
+        -StartupAbsoluteCapMs ($StartupAbsoluteCapSec * 1000) `
+        -SamplerPath $(if ($MockIntegration) { '' } else { $samplerPath }) `
+        -SamplerStallMs ($samplerStallSec * 1000) `
+        -ProgressAware:([bool](-not $MockIntegration))
     $lifecycle.readiness = $readinessResult
     if (-not $readinessResult.ready) {
         if ($readinessResult.status -eq 'process-exited-before-readiness') {
@@ -2413,7 +2999,9 @@ try {
             $lifecycle.vanished_pid_detected_utc = [DateTime]::UtcNow.ToString('o')
             $serverExit = $readinessResult.exit
         } else {
-            [void](Stop-OwnedProcess -OwnedProcess $process -TimeoutMs 10000)
+            [void](Stop-OwnedProcessWithSnapshot -OwnedProcess $process -TimeoutMs 10000 `
+                -SnapshotPath $abortSnapshotPath -Reason "readiness-$($readinessResult.status)" `
+                -StderrPath $stderrLog -SamplerPath $samplerPath)
             $serverExit = Complete-OwnedProcessExit -OwnedProcess $process -TimeoutMs 0
         }
         throw "Server readiness failed: status=$($readinessResult.status) exit=$($serverExit.exit_code) reason=$($serverExit.reason)"
@@ -2423,7 +3011,9 @@ try {
     $turn1 = Invoke-LongHtmlRequest -Uri $uri `
         -Messages @(@{role='system'; content=$systemPrompt}, @{role='user'; content=$prompt1}) `
         -Name 'request1' -Turn 'turn1' `
-        -OutDir $outDir -OwnedProcess $process -LogPath $stderrLog -RunnerEvents $runnerEvents
+        -OutDir $outDir -OwnedProcess $process -LogPath $stderrLog -RunnerEvents $runnerEvents `
+        -SamplerPath $(if ($MockIntegration) { '' } else { $samplerPath }) `
+        -AbortSnapshotPath $abortSnapshotPath
     $requestResults += $turn1
     $turn1Doc = Get-Content -Raw -LiteralPath $turn1.document_path
     $turn1Raw = [string]$turn1.raw_assistant_text
@@ -2442,7 +3032,10 @@ try {
         @{role='assistant'; content=$turn1Raw},
         @{role='user'; content=$prompt2}
     ) -Name 'request2' -Turn 'turn2' -OutDir $outDir -OwnedProcess $process `
-        -LogPath $stderrLog -RunnerEvents $runnerEvents -Turn1DocumentSha256Used $turn1.raw_assistant_sha256
+        -LogPath $stderrLog -RunnerEvents $runnerEvents `
+        -SamplerPath $(if ($MockIntegration) { '' } else { $samplerPath }) `
+        -AbortSnapshotPath $abortSnapshotPath `
+        -Turn1DocumentSha256Used $turn1.raw_assistant_sha256
     $requestResults += $turn2
     $turn2Doc = Get-Content -Raw -LiteralPath $turn2.document_path
     $turn2Raw = [string]$turn2.raw_assistant_text
@@ -2464,7 +3057,9 @@ try {
             $lifecycle.vanished_pid_detected_utc = [DateTime]::UtcNow.ToString('o')
         }
         if ($processWasAlive) {
-            $lifecycle.cleanup_stopped_process = [bool](Stop-OwnedProcess -OwnedProcess $process -TimeoutMs 10000)
+            $lifecycle.cleanup_stopped_process = [bool](Stop-OwnedProcessWithSnapshot `
+                -OwnedProcess $process -TimeoutMs 10000 -SnapshotPath $abortSnapshotPath `
+                -Reason "catch-$runStage" -StderrPath $stderrLog -SamplerPath $samplerPath)
         }
     }
     if ($process -and -not $serverExit) {
@@ -2482,9 +3077,11 @@ try {
         if ($process) {
             $lifecycle.cleanup_attempted = $true
             if (Test-OwnedProcessAlive $process) {
-                $lifecycle.cleanup_stopped_process = [bool](Stop-OwnedProcess -OwnedProcess $process -TimeoutMs 10000)
+                $lifecycle.cleanup_stopped_process = [bool](Stop-OwnedProcessWithSnapshot `
+                    -OwnedProcess $process -TimeoutMs 10000 -SnapshotPath $abortSnapshotPath `
+                    -Reason 'finally-cleanup' -StderrPath $stderrLog -SamplerPath $samplerPath)
             }
-            if (-not $serverExit) {
+            if ((-not $serverExit) -or (-not [bool]$serverExit.exited)) {
                 $serverExit = Complete-OwnedProcessExit -OwnedProcess $process -TimeoutMs 10000
             }
             $process.Dispose()
@@ -2631,6 +3228,12 @@ try {
             think = $think
             stop_sequence = $stopSequence
             requests = 2
+            decode_abort_manifest = $decodeFloorManifest
+            startup_progress_stall_seconds = $startupProgressStallSec
+            startup_absolute_cap_seconds = $StartupAbsoluteCapSec
+            sampler_stall_seconds = $samplerStallSec
+            preflight_thresholds = $preflightThresholds
+            sampler_pressure_thresholds = $samplerPressureThresholds
         }
         environment = $environment
         launch_file = $launchFilePath
@@ -2676,6 +3279,7 @@ try {
             gpu_sampler_worker_stdout = "$samplerPath.worker.stdout.log"
             gpu_sampler_worker_stderr = "$samplerPath.worker.stderr.log"
             runner_events = $runnerEventsPath
+            abort_snapshot = $abortSnapshotPath
             preflight = $preflightPath
             postflight = $postflightPath
             environment = $environmentPath
@@ -2740,6 +3344,7 @@ try {
             stderr = $stderrLog
             gpu_sampler = $samplerPath
             runner_events = $runnerEventsPath
+            abort_snapshot = $abortSnapshotPath
             preflight = $preflightPath
             postflight = $postflightPath
             environment = $environmentPath
@@ -2756,7 +3361,7 @@ if ($status -ne 'pass') {
             -SummaryPath $summaryPath -Stage $failureStage -Failure $runFailure `
             -Lifecycle $lifecycle -ArtifactPaths @(
                 $preflightPath, $postflightPath, $environmentPath, $runnerEventsPath,
-                $stdoutLog, $stderrLog, $samplerPath,
+                $stdoutLog, $stderrLog, $samplerPath, $abortSnapshotPath,
                 "$samplerPath.worker.stdout.log", "$samplerPath.worker.stderr.log",
                 $mockValidationReceiptPath,
                 (Join-Path $mockCaptureDir 'request1.raw.json'),
