@@ -233,7 +233,7 @@ def watchdog_replay(samples: list[dict]) -> tuple[subprocess.CompletedProcess[st
     value = {
         "schema": "g130_u1_watchdog_replay_fixture_v2",
         "baseline_page_out": 1000000,
-        "thresholds": {"wall_cap_seconds": 900, "startup_stall_seconds": 180, "ttft_cap_seconds": 180, "application_data_stall_seconds": 60, "throughput_floor_tps": 0.1025, "throughput_warm_tokens": 16, "throughput_consecutive_tokens": 30},
+        "thresholds": {"wall_cap_seconds": 900, "startup_stall_seconds": 180, "ttft_cap_seconds": 180, "application_data_stall_seconds": 60, "page_out_delta_abort_pages": 100000, "throughput_floor_tps": 0.1025, "throughput_warm_tokens": 16, "throughput_consecutive_tokens": 30},
         "samples": samples,
     }
     with tempfile.TemporaryDirectory() as td:
@@ -468,6 +468,7 @@ class WhatIfConfigurationAndQuotingTests(unittest.TestCase):
         self.assertEqual(prereg["predicted_profile_component_seconds_per_token"], {"minimum": 0.2, "maximum": 0.5, "basis": "observed prior full/open diagnostic range"})
         self.assertEqual(prereg["abort_floor_derivation"], "predicted_decode_tps * 0.50")
         self.assertEqual(prereg["abort_floor_tps"], 0.1025)
+        self.assertEqual(prereg["page_out_delta_abort_pages"], 100000)
         self.assertEqual((prereg["warm_tokens"], prereg["consecutive_tokens"]), (16, 30))
         self.assertFalse(prereg["p2_authorization"]["device_timers_included"])
         self.assertEqual(prereg["normative_telemetry_substitution"]["replaced"], ["routeprof", "selprof"])
@@ -760,6 +761,8 @@ class WatchdogAndParentSupervisionTests(unittest.TestCase):
             self.assert_abort([watchdog_sample(1, stderr_delta=marker)], "A-6", "A6_PROMOTION_OR_SSD_WRAP_MARKER")
         for marker in ("forbidden_cold_ssd_to_vram=1", "direct_ssd_to_vram_current_token=1"):
             self.assert_abort([watchdog_sample(1, stderr_delta=marker)], "A-7", "A7_SAME_TOKEN_SSD_TO_VRAM")
+        for marker in ("reason=entry-contract", "reason=dynamic-promotion-contract", "reason=cold-one-contract", "reason=route-entry-contract"):
+            self.assert_abort([watchdog_sample(1, stderr_delta=marker)], "A-7", "A7_RESIDENCY_CONTRACT_VIOLATION")
 
     def test_a8_a9_a10_and_progress_aware_late_load(self) -> None:
         self.assert_abort([watchdog_sample(900)], "A-8", "A8_WALL_CAP")

@@ -6,6 +6,7 @@
     "startup_stall_seconds": 180,
     "ttft_cap_seconds": 180,
     "application_data_stall_seconds": 60,
+    "page_out_delta_abort_pages": 100000,
     "throughput_floor_tps": 0.1025,
     "throughput_warm_tokens": 16,
     "throughput_consecutive_tokens": 30
