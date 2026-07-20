@@ -1,0 +1,22 @@
+﻿{
+    "captured_utc":  "2026-07-20T05:29:00.0413789Z",
+    "probe_warnings":  [
+                           "Win32_Process denied; using Get-Process fallback: Accesso negato ",
+                           "Memory perf counters unavailable: Accesso negato ",
+                           "Disk perf counters unavailable: Accesso negato "
+                       ],
+    "conflicting_processes":  [
+
+                              ],
+    "total_ram_gib":  63.891,
+    "available_ram_gib":  55.445,
+    "ram_source":  "GlobalMemoryStatusEx",
+    "pages_per_sec":  null,
+    "page_reads_per_sec":  null,
+    "disk":  [
+
+             ],
+    "gpu":  "NVIDIA GeForce RTX 3060, 0, 691, 12288, P8",
+    "c_free_gib":  0,
+    "d_free_gib":  0
+}

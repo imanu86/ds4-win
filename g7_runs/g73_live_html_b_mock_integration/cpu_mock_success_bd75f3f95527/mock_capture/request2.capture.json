@@ -1,0 +1,15 @@
+{
+  "index": 2,
+  "raw_path": "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request2.raw.json",
+  "raw_sha256": "2ba7811bb5cf8378bc6794a82f2b208cb88bdabc8ce3a10384f10b01f3956e0b",
+  "raw_bytes": 2923,
+  "canonical_path": "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request2.canonical.json",
+  "canonical_sha256": "6fc5f30fdc50d8d33839a5a0cc148ba1ffb86624e93e14f86da269e6bc315265",
+  "canonical_bytes": 2013,
+  "roles": [
+    "system",
+    "user",
+    "assistant",
+    "user"
+  ]
+}

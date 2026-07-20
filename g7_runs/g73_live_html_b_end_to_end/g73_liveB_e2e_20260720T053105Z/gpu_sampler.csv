@@ -1,0 +1,2 @@
+timestamp_utc,name,utilization_gpu_percent,memory_used_mib,memory_total_mib,pstate,pages_per_sec,page_reads_per_sec,disk_read_bytes_per_sec
+2026-07-20T05:29:00.3410346Z,NVIDIA GeForce RTX 3060, 0, 691, 12288, P8,,,

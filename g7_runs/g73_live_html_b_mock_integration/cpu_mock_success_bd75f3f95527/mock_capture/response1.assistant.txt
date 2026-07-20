@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Forge AI</title>
+<style>
+body { margin: 0; background: #f4f7fb; color: #151823; font-family: Arial, sans-serif; }
+nav { display: flex; justify-content: space-between; padding: 18px 7vw; background: #ffffff; }
+.hero { min-height: 58vh; padding: 72px 7vw; background: #dff8ff; }
+.accent { color: #006f88; }
+form { display: grid; gap: 12px; max-width: 520px; padding: 24px 7vw 64px; }
+input, textarea, button { padding: 12px; font: inherit; }
+</style>
+</head>
+<body>
+<nav><strong>NEON FORGE AI</strong><a href="#request">Request build</a></nav>
+<main class="hero"><h1>Cyberpunk AI programming, forged to ship.</h1><p class="accent">Agents, tools, and custom automation for ambitious teams.</p></main>
+<form id="request"><label>Name <input name="name" required></label><label>Project <textarea name="project" required></textarea></label><button type="submit">Transmit request</button></form>
+<script>document.getElementById('request').addEventListener('submit',function(event){event.preventDefault();alert('Request received by Neon Forge AI.');});</script>
+</body>
+</html>

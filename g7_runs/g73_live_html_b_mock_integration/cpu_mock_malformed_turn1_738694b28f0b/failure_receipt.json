@@ -1,0 +1,81 @@
+{
+    "schema":  "g73_live_html_b_failure_receipt_v1",
+    "status":  "failed",
+    "native":  true,
+    "captured_utc":  "2026-07-20T07:51:45.6801784Z",
+    "stage":  "request1",
+    "failure":  "Turn1 fail-fast before request2: finish=stop stop_contract=True raw_only_html=False quality=False",
+    "summary_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\summary.json",
+    "summary":  {
+                    "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\summary.json",
+                    "sha256":  "83c0e4998df77ebbd51734406961af1ddb3419f97add9480fcf1153a2de9167e",
+                    "bytes":  31778
+                },
+    "lifecycle":  {
+                      "launcher":  "direct-system-diagnostics-process",
+                      "wrapper_used":  false,
+                      "process_pid":  8500,
+                      "process_start_utc":  "2026-07-20T07:51:44.6499088Z",
+                      "readiness":  {
+                                        "ready":  true,
+                                        "status":  "ready",
+                                        "pid":  8500,
+                                        "elapsed_ms":  641,
+                                        "last_probe_error":  "",
+                                        "exit":  null
+                                    },
+                      "vanished_pid_detected":  false,
+                      "vanished_pid_detected_utc":  null,
+                      "cleanup_attempted":  true,
+                      "cleanup_stopped_process":  true,
+                      "stdout_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\server.stdout.log",
+                      "stderr_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\server.stderr.log"
+                  },
+    "artifacts":  [
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\preflight.json",
+                          "sha256":  "29bb93aad59046728798824d6643e2d66c5b32d12144786cf375197607366eed",
+                          "bytes":  382
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\postflight.json",
+                          "sha256":  "062f10387c08f3967d64791e0a053539c424c19359a313d4e82b681822cbc5aa",
+                          "bytes":  377
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\environment.json",
+                          "sha256":  "2b8f31bfc32e087cf27bf2151f7fe3b4cc6db34566b30c69ba84d4c848075054",
+                          "bytes":  11
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\runner_events.json",
+                          "sha256":  "7b37bb31941735a6d81e2398d85c0c6410b7c1b68fb07528e0d6c41a890c0a78",
+                          "bytes":  766
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\server.stdout.log",
+                          "sha256":  "e4efe018e5f8e4d1795a2dd81d153b509b1bb404e8caea925a4ca8905031549d",
+                          "bytes":  153
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\server.stderr.log",
+                          "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                          "bytes":  0
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\mock_validation_receipt.json",
+                          "sha256":  "082873fded35093a857b7f1e98c983294171b3dadaf030019b932435489e71f7",
+                          "bytes":  4025
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\mock_capture\\request1.raw.json",
+                          "sha256":  "11a4a32e34e8e515c8d3272f9f6b60f14e2b0bb845042ae8935245180f0bc64a",
+                          "bytes":  712
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\mock_capture\\request1.canonical.json",
+                          "sha256":  "68e3a5a97f0e2f5a5179afe58561ce6dec78e3a97d9d86dc3f671c4ccca938cc",
+                          "bytes":  425
+                      }
+                  ]
+}

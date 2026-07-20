@@ -1,0 +1,75 @@
+{
+    "schema":  "g73_live_html_b_failure_receipt_v1",
+    "status":  "failed",
+    "native":  true,
+    "captured_utc":  "2026-07-20T07:51:43.2753734Z",
+    "stage":  "server-readiness",
+    "failure":  "Server readiness failed: status=process-exited-before-readiness exit=23 reason=ok",
+    "summary_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\summary.json",
+    "summary":  {
+                    "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\summary.json",
+                    "sha256":  "3478e0a4621981e70ba8169c7e954fe48b444f2fceef5ffea3f1c82171cb7c0e",
+                    "bytes":  22736
+                },
+    "lifecycle":  {
+                      "launcher":  "direct-system-diagnostics-process",
+                      "wrapper_used":  false,
+                      "process_pid":  18288,
+                      "process_start_utc":  "2026-07-20T07:51:42.3905431Z",
+                      "readiness":  {
+                                        "ready":  false,
+                                        "status":  "process-exited-before-readiness",
+                                        "pid":  18288,
+                                        "elapsed_ms":  649,
+                                        "last_probe_error":  "",
+                                        "exit":  {
+                                                     "exited":  true,
+                                                     "exit_code":  23,
+                                                     "reason":  "ok"
+                                                 }
+                                    },
+                      "vanished_pid_detected":  true,
+                      "vanished_pid_detected_utc":  "2026-07-20T07:51:43.0499569Z",
+                      "cleanup_attempted":  true,
+                      "cleanup_stopped_process":  false,
+                      "stdout_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stdout.log",
+                      "stderr_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stderr.log"
+                  },
+    "artifacts":  [
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\preflight.json",
+                          "sha256":  "edca4987c2afc30af3fb89496053ecb87616eac11832bc02d4f611caec03625f",
+                          "bytes":  382
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\postflight.json",
+                          "sha256":  "62fa4d76a805eb1f97c4d7401dfa4e356c5543f51ddd8df23f537708a5d4ae2d",
+                          "bytes":  377
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\environment.json",
+                          "sha256":  "2b8f31bfc32e087cf27bf2151f7fe3b4cc6db34566b30c69ba84d4c848075054",
+                          "bytes":  11
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\runner_events.json",
+                          "sha256":  "9767a7b5bbdf52c89c05811e85c43c94b4e7eb231d338779499c7e30abb32413",
+                          "bytes":  381
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stdout.log",
+                          "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                          "bytes":  0
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stderr.log",
+                          "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                          "bytes":  0
+                      },
+                      {
+                          "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\mock_validation_receipt.json",
+                          "sha256":  "c69e3fc4948228cf09f9b503de265092f2ba3c5951f3e7b8eee18a5c8ba5c788",
+                          "bytes":  1851
+                      }
+                  ]
+}

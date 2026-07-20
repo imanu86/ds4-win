@@ -1,0 +1,3 @@
+[mock-http] ready port=57435 scenario=malformed-turn1
+[mock-http] "GET /health HTTP/1.1" 200 -
+[mock-http] "POST /v1/chat/completions HTTP/1.1" 200 -

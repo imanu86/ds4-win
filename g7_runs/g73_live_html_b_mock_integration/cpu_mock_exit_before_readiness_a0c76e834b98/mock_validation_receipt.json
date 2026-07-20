@@ -1,0 +1,40 @@
+{
+    "schema":  "g73_live_html_b_mock_validation_v1",
+    "captured_utc":  "2026-07-20T07:51:43.1002115Z",
+    "cpu_only":  true,
+    "no_g73_mechanism_quality_performance_claim":  true,
+    "scenario":  "exit-before-readiness",
+    "pass":  true,
+    "validation":  {
+                       "pass":  true,
+                       "scenario":  "exit-before-readiness",
+                       "request_count":  0,
+                       "request1_present":  false,
+                       "request2_present":  false,
+                       "request1_roles":  [
+
+                                          ],
+                       "request2_roles":  [
+
+                                          ],
+                       "request1_roles_exact":  false,
+                       "request2_roles_exact":  false,
+                       "request1_content_exact":  false,
+                       "request2_content_exact":  false,
+                       "assistant1_byte_exact_in_request2":  false,
+                       "assistant1_runner_sha256":  null,
+                       "assistant1_mock_sha256":  null,
+                       "request2_assistant_sha256":  null,
+                       "controls_exact":  true,
+                       "capture_complete":  true,
+                       "request1_raw":  null,
+                       "request1_canonical":  null,
+                       "request2_raw":  null,
+                       "request2_canonical":  null
+                   },
+    "capture":  {
+                    "request1":  null,
+                    "request2":  null
+                },
+    "capture_dir":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\mock_capture"
+}

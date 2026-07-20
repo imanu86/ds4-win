@@ -1,0 +1,17 @@
+{
+    "model":  "deepseek-chat",
+    "messages":  [
+                     {
+                         "content":  "You are a coding assistant. Follow the user instructions exactly.",
+                         "role":  "system"
+                     },
+                     {
+                         "content":  "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
+                         "role":  "user"
+                     }
+                 ],
+    "max_tokens":  3000,
+    "temperature":  0,
+    "think":  false,
+    "stop":  "\u003c/html\u003e"
+}

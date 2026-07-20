@@ -1,0 +1,27 @@
+﻿{
+    "schema":  "g73_long_html_render_manifest_v1",
+    "generated_utc":  "2026-07-20T07:51:40.6336456Z",
+    "browser_rendering_authorized":  false,
+    "tests":  [
+                  {
+                      "name":  "render-turn1",
+                      "html_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\request1.document.html",
+                      "check":  "load as local HTML and inspect layout"
+                  },
+                  {
+                      "name":  "render-turn2",
+                      "html_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\request2.document.html",
+                      "check":  "load as local HTML and inspect dark transformed layout"
+                  },
+                  {
+                      "name":  "popup-form-turn1",
+                      "html_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\request1.document.html",
+                      "check":  "submit first form and observe popup/confirmation"
+                  },
+                  {
+                      "name":  "popup-form-turn2",
+                      "html_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\request2.document.html",
+                      "check":  "submit first form and observe preserved popup/confirmation"
+                  }
+              ]
+}

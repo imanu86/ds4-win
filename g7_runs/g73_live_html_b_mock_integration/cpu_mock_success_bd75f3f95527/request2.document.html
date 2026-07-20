@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Forge AI</title>
+<style>
+:root { --bg: #050505; --panel: #0d0d12; --text: #f7fbff; --cyan: #00ffff; --magenta: #ff00ff; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: Arial, sans-serif; }
+nav { display: flex; justify-content: space-between; padding: 18px 7vw; background: var(--panel); border-bottom: 1px solid var(--cyan); }
+nav a, .accent { color: var(--cyan); }
+.hero { min-height: 58vh; padding: 72px 7vw; background: #08080d; }
+h1 { text-shadow: 2px 2px 0 var(--magenta); }
+form { display: grid; gap: 12px; max-width: 520px; padding: 24px 7vw 64px; }
+input, textarea { padding: 12px; background: #111118; color: #ffffff; border: 1px solid var(--cyan); }
+button { padding: 12px; background: var(--magenta); color: #ffffff; border: 0; }
+</style>
+</head>
+<body>
+<nav><strong>NEON FORGE AI</strong><a href="#request">Request build</a></nav>
+<main class="hero"><h1>Cyberpunk AI programming, forged to ship.</h1><p class="accent">Agents, tools, and custom automation for ambitious teams.</p></main>
+<form id="request"><label>Name <input name="name" required></label><label>Project <textarea name="project" required></textarea></label><button type="submit">Transmit request</button></form>
+<script>document.getElementById('request').addEventListener('submit',function(event){event.preventDefault();alert('Request received by Neon Forge AI.');});</script>
+</body>
+</html>

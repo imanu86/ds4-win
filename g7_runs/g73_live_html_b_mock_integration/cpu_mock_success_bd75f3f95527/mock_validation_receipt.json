@@ -1,0 +1,74 @@
+{
+    "schema":  "g73_live_html_b_mock_validation_v1",
+    "captured_utc":  "2026-07-20T07:51:40.8113587Z",
+    "cpu_only":  true,
+    "no_g73_mechanism_quality_performance_claim":  true,
+    "scenario":  "success",
+    "pass":  true,
+    "validation":  {
+                       "pass":  true,
+                       "scenario":  "success",
+                       "request_count":  2,
+                       "request1_present":  true,
+                       "request2_present":  true,
+                       "request1_roles":  [
+                                              "system",
+                                              "user"
+                                          ],
+                       "request2_roles":  [
+                                              "system",
+                                              "user",
+                                              "assistant",
+                                              "user"
+                                          ],
+                       "request1_roles_exact":  true,
+                       "request2_roles_exact":  true,
+                       "request1_content_exact":  true,
+                       "request2_content_exact":  true,
+                       "assistant1_byte_exact_in_request2":  true,
+                       "assistant1_runner_sha256":  "f5a6c675058c5f6a2ed0ea9d42515388756c827ce59d0dcf30f85ac1739a8e0e",
+                       "assistant1_mock_sha256":  "f5a6c675058c5f6a2ed0ea9d42515388756c827ce59d0dcf30f85ac1739a8e0e",
+                       "request2_assistant_sha256":  "f5a6c675058c5f6a2ed0ea9d42515388756c827ce59d0dcf30f85ac1739a8e0e",
+                       "controls_exact":  true,
+                       "capture_complete":  true,
+                       "request1_raw":  {
+                                            "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request1.raw.json",
+                                            "sha256":  "11a4a32e34e8e515c8d3272f9f6b60f14e2b0bb845042ae8935245180f0bc64a",
+                                            "bytes":  712
+                                        },
+                       "request1_canonical":  {
+                                                  "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request1.canonical.json",
+                                                  "sha256":  "68e3a5a97f0e2f5a5179afe58561ce6dec78e3a97d9d86dc3f671c4ccca938cc",
+                                                  "bytes":  425
+                                              },
+                       "request2_raw":  {
+                                            "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request2.raw.json",
+                                            "sha256":  "2ba7811bb5cf8378bc6794a82f2b208cb88bdabc8ce3a10384f10b01f3956e0b",
+                                            "bytes":  2923
+                                        },
+                       "request2_canonical":  {
+                                                  "path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request2.canonical.json",
+                                                  "sha256":  "6fc5f30fdc50d8d33839a5a0cc148ba1ffb86624e93e14f86da269e6bc315265",
+                                                  "bytes":  2013
+                                              }
+                   },
+    "capture":  {
+                    "request1":  {
+                                     "raw_sha256":  "11a4a32e34e8e515c8d3272f9f6b60f14e2b0bb845042ae8935245180f0bc64a",
+                                     "raw_bytes":  712,
+                                     "raw_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request1.raw.json",
+                                     "canonical_sha256":  "68e3a5a97f0e2f5a5179afe58561ce6dec78e3a97d9d86dc3f671c4ccca938cc",
+                                     "canonical_bytes":  425,
+                                     "canonical_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request1.canonical.json"
+                                 },
+                    "request2":  {
+                                     "raw_sha256":  "2ba7811bb5cf8378bc6794a82f2b208cb88bdabc8ce3a10384f10b01f3956e0b",
+                                     "raw_bytes":  2923,
+                                     "raw_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request2.raw.json",
+                                     "canonical_sha256":  "6fc5f30fdc50d8d33839a5a0cc148ba1ffb86624e93e14f86da269e6bc315265",
+                                     "canonical_bytes":  2013,
+                                     "canonical_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture\\request2.canonical.json"
+                                 }
+                },
+    "capture_dir":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_success_bd75f3f95527\\mock_capture"
+}

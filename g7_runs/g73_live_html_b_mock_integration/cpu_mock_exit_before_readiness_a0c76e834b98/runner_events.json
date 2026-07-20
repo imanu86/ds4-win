@@ -1,0 +1,17 @@
+[
+    {
+        "event":  "server_start",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:42.3791341Z"
+    },
+    {
+        "event":  "server_process_started",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:42.4012800Z"
+    },
+    {
+        "event":  "run_failure",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:43.0599021Z"
+    }
+]

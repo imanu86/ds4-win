@@ -1,0 +1,1 @@
+{"id":"g73-mock-1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"```html\n<html><body><h1>cut off"},"finish_reason":"stop"}],"usage":{"prompt_tokens":101,"completion_tokens":3,"total_tokens":104}}

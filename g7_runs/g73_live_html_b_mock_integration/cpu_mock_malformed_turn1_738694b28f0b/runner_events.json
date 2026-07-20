@@ -1,0 +1,32 @@
+[
+    {
+        "event":  "server_start",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:44.6435979Z"
+    },
+    {
+        "event":  "server_process_started",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:44.6545635Z"
+    },
+    {
+        "event":  "server_ready",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:45.3092602Z"
+    },
+    {
+        "event":  "request_start",
+        "request":  "request1",
+        "utc":  "2026-07-20T07:51:45.3212931Z"
+    },
+    {
+        "event":  "request_end",
+        "request":  "request1",
+        "utc":  "2026-07-20T07:51:45.3568709Z"
+    },
+    {
+        "event":  "run_failure",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:45.4358601Z"
+    }
+]

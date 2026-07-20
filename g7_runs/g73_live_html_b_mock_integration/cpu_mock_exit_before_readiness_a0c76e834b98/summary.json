@@ -1,0 +1,363 @@
+{
+    "schema":  "g73_live_html_b_mock_integration_v1",
+    "status":  "failed",
+    "failure":  "Server readiness failed: status=process-exited-before-readiness exit=23 reason=ok",
+    "failure_stage":  "server-readiness",
+    "parser_error":  "",
+    "summary_origin":  "native-runner",
+    "summary_recovered":  false,
+    "tag":  "cpu_mock_exit_before_readiness_a0c76e834b98",
+    "arm":  "B",
+    "output_dir":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98",
+    "no_n_ge_3_claim":  true,
+    "no_quality_performance_full_open_claim":  true,
+    "lifecycle":  {
+                      "launcher":  "direct-system-diagnostics-process",
+                      "wrapper_used":  false,
+                      "process_pid":  18288,
+                      "process_start_utc":  "2026-07-20T07:51:42.3905431Z",
+                      "readiness":  {
+                                        "ready":  false,
+                                        "status":  "process-exited-before-readiness",
+                                        "pid":  18288,
+                                        "elapsed_ms":  649,
+                                        "last_probe_error":  "",
+                                        "exit":  {
+                                                     "exited":  true,
+                                                     "exit_code":  23,
+                                                     "reason":  "ok"
+                                                 }
+                                    },
+                      "vanished_pid_detected":  true,
+                      "vanished_pid_detected_utc":  "2026-07-20T07:51:43.0499569Z",
+                      "cleanup_attempted":  true,
+                      "cleanup_stopped_process":  false,
+                      "stdout_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stdout.log",
+                      "stderr_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stderr.log"
+                  },
+    "provenance":  {
+                       "runner_sha256":  "2eff6fac57a1cc7e8bafe96ff13dea6e5bf69dac431c354fb33828404aa5b0a8",
+                       "protocol_sha256":  "65564fbd0a10d27b510b1532364f917831102d39e936e9fec9547e71969cb052",
+                       "contract_test_sha256":  "e67bc76e4465001d4060743f42c34a8a4a7f2ca1f8e790e10ee48d60bcc95fe8",
+                       "mock_server_sha256":  "fd465ca601c0dc8555676871b4939e0e3f5ba0c3109e42bfdc69d5b79454cd69",
+                       "model_receipt_file_sha256":  null,
+                       "build_manifest":  null,
+                       "build_fingerprint_expected_sha256":  "c8698dc4f5ba0dcd4e29f50c84545704140875d653f122f1a8136d82c5444daa",
+                       "executable_sha256":  null,
+                       "executable_expected_sha256":  "f703f53246331cd632e81eadba9892b8184645cc0b714ad6005ad87d2899dcfa",
+                       "canonical_runner_sha256":  "977ac73114bcdb883d06c123e3c33e467f230eea96235406c87d29f951b58470",
+                       "canonical_runner_expected_sha256":  "977ac73114bcdb883d06c123e3c33e467f230eea96235406c87d29f951b58470",
+                       "model":  "C:\\ds4-models\\ds4-2bit.gguf",
+                       "model_sha256":  "efc7ed607ff27076e3e501fc3fefefa33c0ed8cf1eff483a2b7fdc0c2e616668",
+                       "model_bytes":  86720111488,
+                       "model_receipt_path":  "C:\\ds4-models\\ds4-2bit.gguf.receipt.json",
+                       "system_prompt_sha256":  "544c14acdae73b33236f42552854e143855373047431ea4ff9f0e103dd2d0fe4",
+                       "prompt1_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+                       "prompt1_expected_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+                       "prompt2_sha256":  "44d75b9687aafaca4d1312bb2516e25a44df250a367f094b7d9bea730292dfe1",
+                       "prompt2_expected_sha256":  "44d75b9687aafaca4d1312bb2516e25a44df250a367f094b7d9bea730292dfe1",
+                       "git":  {
+                                   "branch":  "",
+                                   "head":  "",
+                                   "dirty":  true
+                               }
+                   },
+    "config":  {
+                   "context":  8192,
+                   "prefill_chunk":  256,
+                   "max_tokens":  3000,
+                   "temperature":  0,
+                   "think":  false,
+                   "stop_sequence":  "\u003c/html\u003e",
+                   "requests":  2
+               },
+    "environment":  {
+
+                    },
+    "launch_file":  "C:\\Users\\imanu\\.cache\\codex-runtimes\\codex-primary-runtime\\dependencies\\python\\python.exe",
+    "arguments":  [
+                      "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\tests\\g73_live_html_b_mock_server.py",
+                      "--port",
+                      "54539",
+                      "--scenario",
+                      "exit-before-readiness",
+                      "--capture-dir",
+                      "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\mock_capture"
+                  ],
+    "server_pid":  18288,
+    "server_exit":  {
+                        "exited":  true,
+                        "exit_code":  23,
+                        "reason":  "ok"
+                    },
+    "requests":  [
+
+                 ],
+    "quality_gates":  [
+
+                      ],
+    "turn1_readiness_for_turn2":  null,
+    "chat_transcript":  null,
+    "render_manifest":  null,
+    "gpu_sampler":  {
+                        "path":  null,
+                        "rows":  0,
+                        "disabled":  "cpu-mock"
+                    },
+    "mock":  {
+                 "enabled":  true,
+                 "scenario":  "exit-before-readiness",
+                 "cpu_only":  true,
+                 "synthetic_quality_claim":  "none",
+                 "no_g73_mechanism_quality_performance_claim":  true,
+                 "validation":  {
+                                    "pass":  true,
+                                    "scenario":  "exit-before-readiness",
+                                    "request_count":  0,
+                                    "request1_present":  false,
+                                    "request2_present":  false,
+                                    "request1_roles":  [
+
+                                                       ],
+                                    "request2_roles":  [
+
+                                                       ],
+                                    "request1_roles_exact":  false,
+                                    "request2_roles_exact":  false,
+                                    "request1_content_exact":  false,
+                                    "request2_content_exact":  false,
+                                    "assistant1_byte_exact_in_request2":  false,
+                                    "assistant1_runner_sha256":  null,
+                                    "assistant1_mock_sha256":  null,
+                                    "request2_assistant_sha256":  null,
+                                    "controls_exact":  true,
+                                    "capture_complete":  true,
+                                    "request1_raw":  null,
+                                    "request1_canonical":  null,
+                                    "request2_raw":  null,
+                                    "request2_canonical":  null
+                                },
+                 "validation_receipt_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\mock_validation_receipt.json"
+             },
+    "gates":  [
+                  {
+                      "name":  "mock_cpu_only_mode",
+                      "pass":  true,
+                      "detail":  "scenario=exit-before-readiness"
+                  },
+                  {
+                      "name":  "mock_preflight_conflicts_zero",
+                      "pass":  true,
+                      "detail":  "conflicts=0"
+                  },
+                  {
+                      "name":  "mock_expected_request_count",
+                      "pass":  true,
+                      "detail":  "observed=0 expected=0"
+                  },
+                  {
+                      "name":  "mock_capture_contract",
+                      "pass":  true,
+                      "detail":  "pass=True"
+                  },
+                  {
+                      "name":  "mock_pre_readiness_exit_23",
+                      "pass":  true,
+                      "detail":  "exit=23"
+                  },
+                  {
+                      "name":  "mock_expected_failure_observed",
+                      "pass":  true,
+                      "detail":  "Server readiness failed: status=process-exited-before-readiness exit=23 reason=ok"
+                  }
+              ],
+    "failed_gates":  [
+
+                     ],
+    "log_summary":  {
+                        "server_request_metrics":  [
+
+                                                   ],
+                        "model_tensor_cache_events":  [
+
+                                                      ],
+                        "runtime_model_tensor_progress":  [
+
+                                                          ],
+                        "sync":  [
+
+                                 ],
+                        "prefill":  [
+
+                                    ],
+                        "workspace":  [
+
+                                      ],
+                        "compose":  [
+
+                                    ],
+                        "arena":  [
+
+                                  ],
+                        "arena_wrap_profile":  [
+
+                                               ],
+                        "prefill_mass_wrap":  [
+
+                                              ],
+                        "effective":  [
+
+                                      ],
+                        "seed":  [
+
+                                 ],
+                        "cache":  [
+
+                                  ],
+                        "cache_ensure":  [
+
+                                         ],
+                        "tier":  [
+
+                                 ],
+                        "unsafe_tier":  [
+
+                                        ],
+                        "gpu_resident_routes":  [
+
+                                                ],
+                        "mask_sets":  {
+                                          "request1_candidate":  {
+                                                                     "marker":  "g73-two-turn-mask-layer",
+                                                                     "request_epoch":  1,
+                                                                     "phase":  "candidate",
+                                                                     "layers":  0,
+                                                                     "entries":  0,
+                                                                     "first_line":  null,
+                                                                     "last_line":  null,
+                                                                     "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                     "keys":  [
+
+                                                                              ]
+                                                                 },
+                                          "request2_candidate":  {
+                                                                     "marker":  "g73-two-turn-mask-layer",
+                                                                     "request_epoch":  2,
+                                                                     "phase":  "candidate",
+                                                                     "layers":  0,
+                                                                     "entries":  0,
+                                                                     "first_line":  null,
+                                                                     "last_line":  null,
+                                                                     "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                     "keys":  [
+
+                                                                              ]
+                                                                 },
+                                          "overlap":  {
+                                                          "comparable":  true,
+                                                          "overlap":  0,
+                                                          "union":  0,
+                                                          "jaccard":  null,
+                                                          "entered":  0,
+                                                          "exited":  0
+                                                      }
+                                      },
+                        "seed_sets":  {
+                                          "request1_seed_ready":  {
+                                                                      "marker":  "g73-two-turn-vram-layer",
+                                                                      "request_epoch":  1,
+                                                                      "phase":  "seed-ready",
+                                                                      "layers":  0,
+                                                                      "entries":  0,
+                                                                      "first_line":  null,
+                                                                      "last_line":  null,
+                                                                      "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                      "keys":  [
+
+                                                                               ]
+                                                                  },
+                                          "request2_seed_ready":  {
+                                                                      "marker":  "g73-two-turn-vram-layer",
+                                                                      "request_epoch":  2,
+                                                                      "phase":  "seed-ready",
+                                                                      "layers":  0,
+                                                                      "entries":  0,
+                                                                      "first_line":  null,
+                                                                      "last_line":  null,
+                                                                      "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                      "keys":  [
+
+                                                                               ]
+                                                                  },
+                                          "overlap":  {
+                                                          "comparable":  true,
+                                                          "overlap":  0,
+                                                          "union":  0,
+                                                          "jaccard":  null,
+                                                          "entered":  0,
+                                                          "exited":  0
+                                                      }
+                                      },
+                        "order":  {
+                                      "request_epoch":  2,
+                                      "arm":  "B",
+                                      "pass":  false,
+                                      "prefill_begin_line":  null,
+                                      "prefill_end_line":  null,
+                                      "workspace_release_line":  null,
+                                      "seed_deferred_line":  null,
+                                      "cache_ensure_decode_line":  null,
+                                      "seed_ready_line":  null,
+                                      "first_route_line":  null,
+                                      "decode_ensure_between_begin_end":  false,
+                                      "prepare_during_prefill_only_skip_explicit_prefill":  true
+                                  }
+                    },
+    "cleanup_errors":  [
+
+                       ],
+    "paths":  {
+                  "summary":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\summary.json",
+                  "failure_receipt":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\failure_receipt.json",
+                  "mock_validation_receipt":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\mock_validation_receipt.json",
+                  "mock_capture_dir":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\mock_capture",
+                  "stdout":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stdout.log",
+                  "stderr":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\server.stderr.log",
+                  "gpu_sampler":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\gpu_sampler.csv",
+                  "gpu_sampler_worker_stdout":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\gpu_sampler.csv.worker.stdout.log",
+                  "gpu_sampler_worker_stderr":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\gpu_sampler.csv.worker.stderr.log",
+                  "runner_events":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\runner_events.json",
+                  "preflight":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\preflight.json",
+                  "postflight":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\postflight.json",
+                  "environment":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_exit_before_readiness_a0c76e834b98\\environment.json",
+                  "render_manifest":  null,
+                  "chat_transcript_markdown":  null,
+                  "chat_transcript_messages_json":  null
+              },
+    "preflight":  {
+                      "captured_utc":  "2026-07-20T07:51:42.3617824Z",
+                      "mode":  "cpu-mock",
+                      "conflicting_processes":  [
+
+                                                ],
+                      "total_ram_gib":  63.891,
+                      "available_ram_gib":  54.651,
+                      "ram_source":  "GlobalMemoryStatusEx",
+                      "gpu":  "not-probed-mock-cpu-only",
+                      "model_accessed":  false,
+                      "native_executable_accessed":  false
+                  },
+    "postflight":  {
+                       "captured_utc":  "2026-07-20T07:51:43.0755468Z",
+                       "mode":  "cpu-mock",
+                       "conflicting_processes":  [
+
+                                                 ],
+                       "total_ram_gib":  63.891,
+                       "available_ram_gib":  54.673,
+                       "ram_source":  "GlobalMemoryStatusEx",
+                       "gpu":  "not-probed-mock-cpu-only",
+                       "model_accessed":  false,
+                       "native_executable_accessed":  false
+                   }
+}

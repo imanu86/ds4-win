@@ -1,0 +1,24 @@
+﻿[
+    {
+        "ordinal":  1,
+        "role":  "USER",
+        "turn":  "turn1",
+        "content":  "Create a complete single-file HTML landing page for a cyberpunk AI programming shop. Include CSS, navigation, hero, request form, and a JavaScript confirmation popup. Return only the HTML document.",
+        "sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+        "expected_sha256":  "38f6ec5ee5403f59dd2418eb5d9a5a94a0f0da19df015060383bb1ae46003bb6",
+        "bytes":  197,
+        "artifact_path":  null,
+        "byte_exact":  true
+    },
+    {
+        "ordinal":  2,
+        "role":  "ASSISTANT",
+        "turn":  "turn1",
+        "content":  "```html\n\u003chtml\u003e\u003cbody\u003e\u003ch1\u003ecut off",
+        "sha256":  "d73f559ec248289b5b50d102a137061ed4169380235d00ea48b071e8f58201ef",
+        "expected_sha256":  "d73f559ec248289b5b50d102a137061ed4169380235d00ea48b071e8f58201ef",
+        "bytes":  31,
+        "artifact_path":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_mock_integration\\cpu_mock_malformed_turn1_738694b28f0b\\request1.raw_assistant.txt",
+        "byte_exact":  true
+    }
+]

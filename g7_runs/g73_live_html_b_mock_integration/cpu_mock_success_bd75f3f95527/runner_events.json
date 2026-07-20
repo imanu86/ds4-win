@@ -1,0 +1,42 @@
+[
+    {
+        "event":  "server_start",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:39.7484392Z"
+    },
+    {
+        "event":  "server_process_started",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:39.7616017Z"
+    },
+    {
+        "event":  "server_ready",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:40.4273764Z"
+    },
+    {
+        "event":  "request_start",
+        "request":  "request1",
+        "utc":  "2026-07-20T07:51:40.4432901Z"
+    },
+    {
+        "event":  "request_end",
+        "request":  "request1",
+        "utc":  "2026-07-20T07:51:40.4749421Z"
+    },
+    {
+        "event":  "request_start",
+        "request":  "request2",
+        "utc":  "2026-07-20T07:51:40.5740994Z"
+    },
+    {
+        "event":  "request_end",
+        "request":  "request2",
+        "utc":  "2026-07-20T07:51:40.5740994Z"
+    },
+    {
+        "event":  "server_exit",
+        "request":  "",
+        "utc":  "2026-07-20T07:51:40.6456975Z"
+    }
+]

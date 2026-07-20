@@ -1,0 +1,122 @@
+﻿{
+    "schema":  "g73_live_html_b_end_to_end_v1_manual_recovery",
+    "status":  "failed",
+    "failure":  "failed-start/pre-request: ds4_server PID 3880 was observed by external launch monitor, then disappeared before readiness and before any request artifact; server.stderr.log contains only CUDA backend init and initial CUDA loading model tensors into device cache line. Runner did not write native summary and left live-run lock v2, so this summary is manual fail-closed recovery from on-disk artifacts.",
+    "tag":  "g73_liveB_e2e_20260720T053105Z",
+    "arm":  "B",
+    "stage":  "failed-start/pre-request",
+    "output_dir":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z",
+    "manual_recovery":  true,
+    "summary_recovered":  true,
+    "native_summary_missing":  true,
+    "no_retry_performed":  true,
+    "no_arm_a_performed":  true,
+    "no_n_ge_3_claim":  true,
+    "no_quality_performance_full_open_claim":  true,
+    "server_pid":  3880,
+    "server_pid_present_now":  false,
+    "server_exit":  null,
+    "requests":  [
+
+                 ],
+    "quality_gates":  [
+
+                      ],
+    "chat_transcript":  null,
+    "failed_gates":  [
+                         {
+                             "name":  "server_readiness",
+                             "pass":  false,
+                             "detail":  "ds4_server disappeared before readiness"
+                         },
+                         {
+                             "name":  "expected_request_count",
+                             "pass":  false,
+                             "detail":  "observed=0 expected=2"
+                         },
+                         {
+                             "name":  "summary_always_native",
+                             "pass":  false,
+                             "detail":  "native summary missing; manual recovery materialized"
+                         },
+                         {
+                             "name":  "lifecycle_pid_ownership",
+                             "pass":  false,
+                             "detail":  "wrapper process and discovered ds4_server PID not reconciled on failed-start path"
+                         }
+                     ],
+    "paths":  {
+                  "output_dir":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z",
+                  "summary":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\summary.json",
+                  "failed_start_receipt":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\failed_start_receipt.json",
+                  "preflight":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\preflight.json",
+                  "environment":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\environment.json",
+                  "gpu_sampler":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\gpu_sampler.csv",
+                  "stdout":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\server.stdout.log",
+                  "stderr":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\server.stderr.log",
+                  "launch_out":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z.launch.out",
+                  "launch_err":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z.launch.err"
+              },
+    "artifact_hashes":  {
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\preflight.json":  {
+                                                                                                                                                                                                                           "sha256":  "ea59542caab3e384fe4aeb0f456daf687e8edd0c3fe8a17c56eef2e9ec30a096",
+                                                                                                                                                                                                                           "bytes":  753
+                                                                                                                                                                                                                       },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\environment.json":  {
+                                                                                                                                                                                                                             "sha256":  "8602e892f1da4823108ff6719bf4c9560b128ee79729da393cf4252a0a28e39f",
+                                                                                                                                                                                                                             "bytes":  1617
+                                                                                                                                                                                                                         },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\gpu_sampler.csv":  {
+                                                                                                                                                                                                                            "sha256":  "52e203da5cf748a0fb8f45450a29fa4750100cd38c7f8af3050934d77ef518ba",
+                                                                                                                                                                                                                            "bytes":  217
+                                                                                                                                                                                                                        },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\server.stderr.log":  {
+                                                                                                                                                                                                                              "sha256":  "4b7aaefb5816739058fc3da17d9e0677d8c30fe6dc8b296f26416d47b14f4778",
+                                                                                                                                                                                                                              "bytes":  117
+                                                                                                                                                                                                                          },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\server.stdout.log":  {
+                                                                                                                                                                                                                              "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                                                                                                                                                                              "bytes":  0
+                                                                                                                                                                                                                          },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z.launch.out":  {
+                                                                                                                                                                                                                      "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                                                                                                                                                                      "bytes":  0
+                                                                                                                                                                                                                  },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z.launch.err":  {
+                                                                                                                                                                                                                      "sha256":  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                                                                                                                                                                                                                      "bytes":  0
+                                                                                                                                                                                                                  },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g73_live_html_b_end_to_end.ps1":  {
+                                                                                                                                                                      "sha256":  "8a69314f80441561c2f31157b4bd1cfd216a6ac616edf3c2b1bcbe55c91b531c",
+                                                                                                                                                                      "bytes":  88875
+                                                                                                                                                                  },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g73_split_fused_ab.ps1":  {
+                                                                                                                                                              "sha256":  "977ac73114bcdb883d06c123e3c33e467f230eea96235406c87d29f951b58470",
+                                                                                                                                                              "bytes":  30548
+                                                                                                                                                          },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\build\\Release\\ds4_server.exe":  {
+                                                                                                                                                                      "sha256":  "f703f53246331cd632e81eadba9892b8184645cc0b714ad6005ad87d2899dcfa",
+                                                                                                                                                                      "bytes":  3743744
+                                                                                                                                                                  },
+                            "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\build\\Release\\g7_build_manifest.json":  {
+                                                                                                                                                                              "sha256":  "322a00ee90699df119b8a8d8a8d6c94d7db886c3f36bf3b531365def53103694",
+                                                                                                                                                                              "bytes":  10816
+                                                                                                                                                                          },
+                            "C:\\ds4-models\\ds4-2bit.gguf.receipt.json":  {
+                                                                               "sha256":  "a1a6626088489743628165692d32870f083cfe74386469176d0b333a2c95eb55",
+                                                                               "bytes":  555
+                                                                           }
+                        },
+    "recovered_receipt":  "C:\\Users\\imanu\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\ds4-win-work\\g7_runs\\g73_live_html_b_end_to_end\\g73_liveB_e2e_20260720T053105Z\\failed_start_receipt.json",
+    "root_cause":  {
+                       "failed_component":  "live-runner launcher/readiness/PID ownership",
+                       "facts":  [
+                                     "preflight.json and environment.json were written before launch",
+                                     "server.stderr.log has exactly startup CUDA backend init plus initial model tensor cache load line",
+                                     "no request*.request.json, response.json, raw assistant, transcript, or runner_events.json exist",
+                                     "PID 3880 was visible during external monitor and is absent now; no ds4_server process remains",
+                                     "runner native summary was missing and g73_live_html_b_end_to_end_v2.lock remained, proving summary-always failed in the launcher/readiness path"
+                                 ],
+                       "analysis":  "The live clone replaced Start-Process with a cmd /c wrapper and then tracked the discovered ds4_server PID separately from the wrapper Process object. The server vanished during initial model load before readiness/request; the runner lifecycle path failed to reconcile that server PID with the wrapper and did not enter its normal summary finalization. This is a runner lifecycle bug, not a G73 request2 mechanism result."
+                   }
+}

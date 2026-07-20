@@ -1,0 +1,13 @@
+{
+    "captured_utc":  "2026-07-20T07:51:40.6653251Z",
+    "mode":  "cpu-mock",
+    "conflicting_processes":  [
+
+                              ],
+    "total_ram_gib":  63.891,
+    "available_ram_gib":  54.638,
+    "ram_source":  "GlobalMemoryStatusEx",
+    "gpu":  "not-probed-mock-cpu-only",
+    "model_accessed":  false,
+    "native_executable_accessed":  false
+}

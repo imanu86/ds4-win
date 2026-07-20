@@ -1,0 +1,4 @@
+[mock-http] ready port=58905 scenario=success
+[mock-http] "GET /health HTTP/1.1" 200 -
+[mock-http] "POST /v1/chat/completions HTTP/1.1" 200 -
+[mock-http] "POST /v1/chat/completions HTTP/1.1" 200 -
