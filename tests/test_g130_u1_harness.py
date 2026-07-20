@@ -29,7 +29,14 @@ WATCHDOG = ROOT / "g130_u1_watchdog.ps1"
 COMMON = ROOT / "g130_u1_common.ps1"
 SERVER = ROOT / "ds4_server.c"
 BASE = "63de9b23f71993a3d9965355c9e445830c12f81c"
-BASE_WORKTREE = pathlib.Path(r"C:\Users\imanu\Documents\Codex\2026-07-20\g130-ds4-work")
+BASE_WORKTREE_ENV = os.environ.get("G130_BASE_WORKTREE")
+BASE_WORKTREE = pathlib.Path(BASE_WORKTREE_ENV) if BASE_WORKTREE_ENV else None
+BASE_WORKTREE_AVAILABLE = BASE_WORKTREE is not None and BASE_WORKTREE.exists()
+BASE_WORKTREE_SKIP_REASON = (
+    f"G130_BASE_WORKTREE must point to an existing worktree: {BASE_WORKTREE}"
+    if BASE_WORKTREE is not None
+    else "G130_BASE_WORKTREE must be set to an existing worktree"
+)
 FIXTURES = ROOT / "tests" / "fixtures" / "g130_u1"
 VALID_PROFILE = FIXTURES / "profile_valid.stderr.log"
 LATE_LOAD = FIXTURES / "late_port_bind.json"
@@ -421,6 +428,7 @@ class SyntaxStaticAndRuntimePatchTests(unittest.TestCase):
         cuda_diff = subprocess.run(["git", "diff", BASE, "--", "ds4_cuda.cu"], cwd=ROOT, text=True, capture_output=True, check=True).stdout
         self.assertEqual(cuda_diff, "")
 
+    @unittest.skipUnless(BASE_WORKTREE_AVAILABLE, BASE_WORKTREE_SKIP_REASON)
     def test_forbidden_files_and_base_worktree_invariant(self) -> None:
         changed = set(subprocess.run(["git", "diff", "--name-only", BASE], cwd=ROOT, text=True, capture_output=True, check=True).stdout.splitlines())
         self.assertFalse({"ds4.c", "ds4_cuda.cu", "g7_measure.ps1"} & changed)
