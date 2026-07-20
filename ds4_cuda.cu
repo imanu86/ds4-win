@@ -23732,6 +23732,7 @@ struct cuda_q1_0_promotion_record_context {
     uint64_t destination_down_bytes;
     uint64_t destination_bytes;
     int attempt_started;
+    int charge_applied;
     int terminal_emitted;
     const char *preadmit_reject_reason;
 };
@@ -23789,6 +23790,9 @@ static int cuda_q1_0_promotion_checked_triplet(
     return 1;
 }
 
+static int cuda_q1_0_ssd_wrap_budget_lock(void);
+static void cuda_q1_0_ssd_wrap_budget_unlock(int locked);
+
 static int cuda_q1_0_promotion_record_context_init(
         cuda_q1_0_promotion_record_context *record,
         uint32_t layer, uint32_t expert, float weight,
@@ -23811,8 +23815,10 @@ static int cuda_q1_0_promotion_record_context_init(
     record->weight = weight;
     record->touch_count = touch_count;
     record->mass = mass;
+    const int budget_locked = cuda_q1_0_ssd_wrap_budget_lock();
     record->gate_request_used = g_iq1_promotion.request_used;
     record->gate_window_used = g_iq1_promotion.window_used;
+    cuda_q1_0_ssd_wrap_budget_unlock(budget_locked);
     record->source_sidecar_size = g_q1_0_sidecar_size;
     record->destination_model_size = g_model_file_size != 0 ?
         g_model_file_size : g_dynamic_arena.model_size;
@@ -23930,6 +23936,10 @@ struct cuda_q1_0_ssd_wrap_state {
     uint64_t failures;
     uint64_t structural_rejects;
     uint64_t stale;
+    uint64_t stale_drops;
+    uint64_t victim_stale_drops;
+    uint64_t destination_stale_drops;
+    uint64_t budget_refunds;
     uint64_t dropped;
     uint64_t bytes_requested;
     uint64_t bytes_read;
@@ -23955,6 +23965,24 @@ struct cuda_q1_0_ssd_wrap_state {
     double service_seconds;
 };
 static cuda_q1_0_ssd_wrap_state g_q1_0_ssd_wrap;
+static void cuda_q1_0_ssd_wrap_fail_terminal_locked(
+        cuda_q1_0_ssd_wrap_state *state, uint32_t except_index);
+static void cuda_q1_0_ssd_wrap_fail_structural(const char *reason);
+
+static int cuda_q1_0_ssd_wrap_budget_lock(void) {
+    cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
+    if (!state.mutex_ready) {
+        /* Before worker startup (and after its joined release), the route
+         * thread is the sole owner of the promotion budget counters. */
+        return 0;
+    }
+    os_mutex_lock(&state.mutex);
+    return 1;
+}
+
+static void cuda_q1_0_ssd_wrap_budget_unlock(int locked) {
+    if (locked) os_mutex_unlock(&g_q1_0_ssd_wrap.mutex);
+}
 
 static const char *cuda_q1_0_ssd_wrap_state_name(
         cuda_q1_0_ssd_wrap_job_state state) {
@@ -23966,6 +23994,85 @@ static const char *cuda_q1_0_ssd_wrap_state_name(
     case CUDA_Q1_0_SSD_WRAP_FAILED:         return "FAILED";
     default:                                return "FREE";
     }
+}
+
+static int cuda_q1_0_ssd_wrap_drop_reason(const char *reason) {
+    return reason &&
+        (!strcmp(reason, "stale_age") ||
+         !strcmp(reason, "victim_stale") ||
+         !strcmp(reason, "destination_stale"));
+}
+
+static int cuda_q1_0_ssd_wrap_structural_reason(const char *reason) {
+    return reason &&
+        (!strcmp(reason, "partial_or_pread") ||
+         !strcmp(reason, "destination_provenance_mismatch") ||
+         !strcmp(reason, "victim_contract") ||
+         !strcmp(reason, "victim_vram_contract") ||
+         !strcmp(reason, "checksum") ||
+         !strcmp(reason, "working_set_pageable_base") ||
+         !strcmp(reason, "working_set_allocation") ||
+         !strcmp(reason, "working_set_query") ||
+         !strcmp(reason, "h2d_bounce_contract") ||
+         !strcmp(reason, "h2d_wait_event") ||
+         !strcmp(reason, "h2d_record_event"));
+}
+
+enum cuda_q1_0_ssd_wrap_failure_class {
+    CUDA_Q1_0_SSD_WRAP_FAILURE_INTERNAL = 0,
+    CUDA_Q1_0_SSD_WRAP_FAILURE_DROP,
+    CUDA_Q1_0_SSD_WRAP_FAILURE_STRUCTURAL,
+};
+
+static cuda_q1_0_ssd_wrap_failure_class
+cuda_q1_0_ssd_wrap_failure_classify(const char *reason) {
+    if (cuda_q1_0_ssd_wrap_drop_reason(reason)) {
+        return CUDA_Q1_0_SSD_WRAP_FAILURE_DROP;
+    }
+    if (cuda_q1_0_ssd_wrap_structural_reason(reason)) {
+        return CUDA_Q1_0_SSD_WRAP_FAILURE_STRUCTURAL;
+    }
+    return CUDA_Q1_0_SSD_WRAP_FAILURE_INTERNAL;
+}
+
+static void cuda_q1_0_ssd_wrap_refund_budget(
+        cuda_q1_0_ssd_wrap_state *state,
+        const cuda_q1_0_promotion_record_context *record) {
+    if (!state || !record || !record->active || !record->attempt_started ||
+        !record->charge_applied) {
+        return;
+    }
+    int refunded = 0;
+    /* The SSD-WRAP mutex owns both admission charges and refunds, including
+     * refunds initiated by the worker's terminal-failure sweep. */
+    if (g_iq1_promotion.request_budget != 0u &&
+        g_iq1_promotion.request_used != 0u) {
+        g_iq1_promotion.request_used--;
+        refunded = 1;
+    }
+    if (g_iq1_promotion.window_calls != 0u &&
+        record->promotion_window_epoch == g_iq1_promotion.window_epoch &&
+        g_iq1_promotion.window_used != 0u) {
+        g_iq1_promotion.window_used--;
+        refunded = 1;
+    }
+    if (refunded) state->budget_refunds++;
+}
+
+static void cuda_q1_0_ssd_wrap_account_drop(
+        cuda_q1_0_ssd_wrap_state *state,
+        cuda_q1_0_ssd_wrap_job *job,
+        const char *reason) {
+    if (!state || !job) return;
+    if (!strcmp(reason, "stale_age")) state->stale_drops++;
+    else if (!strcmp(reason, "victim_stale")) state->victim_stale_drops++;
+    else if (!strcmp(reason, "destination_stale")) {
+        state->destination_stale_drops++;
+    }
+    /* The route thread is the single consumer for completed/discarded jobs;
+     * worker threads only publish job state before these counters are updated. */
+    state->stale++;
+    state->dropped++;
 }
 
 static int cuda_q1_0_ssd_wrap_sha_env_valid(const char *name) {
@@ -24003,7 +24110,7 @@ static void cuda_q1_0_ssd_wrap_working_set_sample(const char *phase) {
                 "ds4: [q1-0-ssd-wrap-working-set] result=failed "
                 "reason=pageable-base phase=%s\n",
                 phase ? phase : "unknown");
-        g_q1_0_ssd_wrap.failed = 1;
+        cuda_q1_0_ssd_wrap_fail_structural("working_set_pageable_base");
         return;
     }
     const uint32_t batch_capacity = 16384u;
@@ -24014,7 +24121,7 @@ static void cuda_q1_0_ssd_wrap_working_set_sample(const char *phase) {
         fprintf(stderr,
                 "ds4: [q1-0-ssd-wrap-working-set] result=failed "
                 "reason=allocation phase=%s\n", phase ? phase : "unknown");
-        g_q1_0_ssd_wrap.failed = 1;
+        cuda_q1_0_ssd_wrap_fail_structural("working_set_allocation");
         return;
     }
     uint64_t resident_pages = 0;
@@ -24036,7 +24143,7 @@ static void cuda_q1_0_ssd_wrap_working_set_sample(const char *phase) {
                     "ds4: [q1-0-ssd-wrap-working-set] result=failed "
                     "reason=query phase=%s error=%lu\n",
                     phase ? phase : "unknown", (unsigned long)GetLastError());
-            g_q1_0_ssd_wrap.failed = 1;
+            cuda_q1_0_ssd_wrap_fail_structural("working_set_query");
             return;
         }
         for (uint32_t i = 0; i < count; i++) {
@@ -24194,7 +24301,7 @@ static void *cuda_q1_0_ssd_wrap_worker(void *) {
                     return a.enqueue_sequence < b.enqueue_sequence;
                 });
         } catch (...) {
-            state.failed = 1;
+            cuda_q1_0_ssd_wrap_fail_terminal_locked(&state, UINT32_MAX);
             os_mutex_unlock(&state.mutex);
             break;
         }
@@ -24446,11 +24553,95 @@ static void cuda_q1_0_ssd_wrap_job_release_locked(
     *job = cuda_q1_0_ssd_wrap_job{};
 }
 
+static void cuda_q1_0_ssd_wrap_reset_destination_slot(
+        const cuda_q1_0_ssd_wrap_job *job) {
+    if (!job || job->replacing || job->slot >= g_dynamic_arena.slots.size()) {
+        return;
+    }
+    cuda_dynamic_arena_slot &slot = g_dynamic_arena.slots[job->slot];
+    if (slot.state == DS4_GPU_ARENA_LOADING &&
+        slot.layer == job->layer && slot.expert == job->expert) {
+        slot.state = DS4_GPU_ARENA_FREE;
+        slot.layer = UINT32_MAX;
+        slot.expert = UINT32_MAX;
+        slot.checksum = 0;
+    }
+}
+
+static int cuda_q1_0_ssd_wrap_job_sweepable(
+        cuda_q1_0_ssd_wrap_job_state state) {
+    return state == CUDA_Q1_0_SSD_WRAP_REQUESTED ||
+        state == CUDA_Q1_0_SSD_WRAP_RAM_READY ||
+        state == CUDA_Q1_0_SSD_WRAP_FAILED;
+}
+
+static void cuda_q1_0_ssd_wrap_sweep_failed_locked(
+        cuda_q1_0_ssd_wrap_state *state, uint32_t except_index) {
+    if (!state) return;
+    for (uint32_t i = 0; i < state->jobs.size(); i++) {
+        if (i == except_index ||
+            !cuda_q1_0_ssd_wrap_job_sweepable(state->jobs[i].state)) {
+            continue;
+        }
+        if (state->jobs[i].state == CUDA_Q1_0_SSD_WRAP_FAILED &&
+            cuda_q1_0_ssd_wrap_failure_classify(
+                state->jobs[i].failure_reason) ==
+                CUDA_Q1_0_SSD_WRAP_FAILURE_STRUCTURAL) {
+            /* The SSD-WRAP mutex owns per-event accounting for structural jobs
+             * that terminal teardown consumes before finish_one can see them. */
+            state->structural_rejects++;
+        }
+        cuda_q1_0_ssd_wrap_reset_destination_slot(&state->jobs[i]);
+        cuda_q1_0_ssd_wrap_refund_budget(state, &state->jobs[i].record);
+        cuda_q1_0_ssd_wrap_job_release_locked(&state->jobs[i]);
+    }
+}
+
+static void cuda_q1_0_ssd_wrap_fail_terminal_locked(
+        cuda_q1_0_ssd_wrap_state *state, uint32_t except_index) {
+    if (!state) return;
+    state->failed = 1;
+    cuda_q1_0_ssd_wrap_sweep_failed_locked(state, except_index);
+    os_cond_broadcast(&state->cond);
+}
+
+static void cuda_q1_0_ssd_wrap_fail_structural_locked(
+        cuda_q1_0_ssd_wrap_state *state, const char *reason,
+        uint32_t except_index) {
+    if (!state) return;
+    /* The SSD-WRAP mutex owns this per-event counter. Count every structural
+     * event even when an earlier event already made the state terminal. */
+    state->structural_rejects++;
+    cuda_q1_0_ssd_wrap_fail_terminal_locked(state, except_index);
+    (void)reason;
+}
+
+static void cuda_q1_0_ssd_wrap_fail_structural(
+        const char *reason) {
+    cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
+    if (!state.mutex_ready) {
+        /* Before mutex initialization, the initializing route thread owns both
+         * the per-event counter and terminal state. */
+        state.structural_rejects++;
+        state.failed = 1;
+        return;
+    }
+    os_mutex_lock(&state.mutex);
+    cuda_q1_0_ssd_wrap_fail_structural_locked(
+        &state, reason, UINT32_MAX);
+    os_mutex_unlock(&state.mutex);
+}
+
 static int cuda_q1_0_ssd_wrap_finish_one(
         uint32_t index, int force) {
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
     cuda_q1_0_ssd_wrap_job local;
     os_mutex_lock(&state.mutex);
+    if (state.failed) {
+        cuda_q1_0_ssd_wrap_sweep_failed_locked(&state, UINT32_MAX);
+        os_mutex_unlock(&state.mutex);
+        return 0;
+    }
     if (index >= state.jobs.size() ||
         (state.jobs[index].state != CUDA_Q1_0_SSD_WRAP_RAM_READY &&
          state.jobs[index].state != CUDA_Q1_0_SSD_WRAP_FAILED)) {
@@ -24475,8 +24666,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         local.record.first_eligible_call <=
             local.record.observation_call)) {
         ok = 0;
-        reason = "stale_or_epoch";
-        state.stale++;
+        reason = "destination_provenance_mismatch";
     }
     cuda_dynamic_arena_slot *slot = ok ?
         &g_dynamic_arena.slots[local.slot] : NULL;
@@ -24497,7 +24687,6 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                  slot->state != DS4_GPU_ARENA_STAGED)) {
                 ok = 0;
                 reason = "victim_stale";
-                state.stale++;
             }
         }
     } else if (ok &&
@@ -24505,8 +24694,28 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 slot->layer != local.layer || slot->expert != local.expert)) {
         ok = 0;
         reason = "destination_stale";
-        state.stale++;
     }
+    os_mutex_lock(&state.mutex);
+    if (state.failed) {
+        /* The SSD-WRAP mutex orders this teardown after the terminal state;
+         * RAM_COMMITTING is released here because the generic sweep skips it. */
+        if (cuda_q1_0_ssd_wrap_failure_classify(local.failure_reason) ==
+            CUDA_Q1_0_SSD_WRAP_FAILURE_STRUCTURAL) {
+            /* finish_one owns the only copy that terminal sweep could not
+             * consume, so account its structural event before releasing it. */
+            state.structural_rejects++;
+        }
+        cuda_q1_0_ssd_wrap_reset_destination_slot(&local);
+        cuda_q1_0_ssd_wrap_refund_budget(&state, &local.record);
+        if (index < state.jobs.size()) {
+            cuda_q1_0_ssd_wrap_job_release_locked(&state.jobs[index]);
+        }
+        os_cond_broadcast(&state.cond);
+        os_mutex_unlock(&state.mutex);
+        return 0;
+    }
+    /* Keep the SSD-WRAP mutex through publication so a terminal transition
+     * cannot overtake this commit after the check above. */
     if (ok && local.replacing) {
         const double copy_started = cuda_wall_sec();
         memcpy(slot->host_ptr, local.read_base,
@@ -24538,6 +24747,8 @@ static int cuda_q1_0_ssd_wrap_finish_one(
             g_moe_tiering.ram_evictions++;
         }
     }
+    int structural_failed = 0;
+    int internal_failed = 0;
     if (ok) {
         slot->state = DS4_GPU_ARENA_LOADING;
         slot->layer = local.layer;
@@ -24571,50 +24782,80 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         cuda_q1_0_promotion_record_emit(
             "success", "success", "staged", &local.record,
             "exact_iq2_ram", local.slot, slot->content_generation);
-    } else {
-        if (!local.replacing && local.slot < g_dynamic_arena.slots.size()) {
-            cuda_dynamic_arena_slot &failed_slot =
-                g_dynamic_arena.slots[local.slot];
-            if (failed_slot.state == DS4_GPU_ARENA_LOADING &&
-                failed_slot.layer == local.layer &&
-                failed_slot.expert == local.expert) {
-                failed_slot.state = DS4_GPU_ARENA_FREE;
-                failed_slot.layer = UINT32_MAX;
-                failed_slot.expert = UINT32_MAX;
-                failed_slot.checksum = 0;
-            }
-        }
+    } else if (cuda_q1_0_ssd_wrap_failure_classify(reason) ==
+               CUDA_Q1_0_SSD_WRAP_FAILURE_DROP) {
+        cuda_q1_0_ssd_wrap_reset_destination_slot(&local);
+        cuda_q1_0_ssd_wrap_account_drop(&state, &local, reason);
+        cuda_q1_0_promotion_record_emit(
+            "drop", "dropped", reason,
+            &local.record, "q1_fallback", UINT32_MAX, 0u);
+    } else if (cuda_q1_0_ssd_wrap_failure_classify(reason) ==
+               CUDA_Q1_0_SSD_WRAP_FAILURE_STRUCTURAL) {
+        cuda_q1_0_ssd_wrap_reset_destination_slot(&local);
         g_iq1_promotion.q1_0_record_failures++;
         g_iq1_promotion.failures++;
         g_moe_tiering.failures++;
         state.failures++;
-        state.failed = 1;
+        structural_failed = 1;
         cuda_q1_0_promotion_record_emit(
-            "failure", "failed", reason ? reason : "ssd_wrap_failed",
+            "failure", "failed", reason,
             &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
+    } else {
+        cuda_q1_0_ssd_wrap_reset_destination_slot(&local);
+        g_iq1_promotion.q1_0_record_failures++;
+        g_iq1_promotion.failures++;
+        g_moe_tiering.failures++;
+        state.failures++;
+        cuda_q1_0_promotion_record_emit(
+            "failure", "failed", reason ? reason : "ssd_wrap_internal",
+            &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
+        internal_failed = 1;
     }
-    os_mutex_lock(&state.mutex);
+    if (!ok) {
+        /* The SSD-WRAP mutex serializes this completion refund with admission. */
+        cuda_q1_0_ssd_wrap_refund_budget(&state, &local.record);
+    }
     if (index < state.jobs.size()) {
         cuda_q1_0_ssd_wrap_job_release_locked(&state.jobs[index]);
     }
-    os_cond_broadcast(&state.cond);
+    if (structural_failed) {
+        cuda_q1_0_ssd_wrap_fail_structural_locked(
+            &state, reason, UINT32_MAX);
+    } else if (internal_failed) {
+        cuda_q1_0_ssd_wrap_fail_terminal_locked(&state, UINT32_MAX);
+    } else {
+        os_cond_broadcast(&state.cond);
+    }
     os_mutex_unlock(&state.mutex);
-    return ok;
+    return ok || cuda_q1_0_ssd_wrap_failure_classify(reason) ==
+        CUDA_Q1_0_SSD_WRAP_FAILURE_DROP;
 }
 
 static int cuda_q1_0_ssd_wrap_poll_internal(int force) {
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
     if (!state.enabled) return 1;
     os_mutex_lock(&state.mutex);
+    if (state.failed) {
+        /* Under the SSD-WRAP mutex, terminal polls only tear down completed
+         * jobs; they never hand RAM_READY work to the publication path. */
+        cuda_q1_0_ssd_wrap_sweep_failed_locked(&state, UINT32_MAX);
+        os_mutex_unlock(&state.mutex);
+        return 0;
+    }
     for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
         if (job.state == CUDA_Q1_0_SSD_WRAP_REQUESTED &&
             g_moe_tiering.call_tick > job.enqueue_call &&
             g_moe_tiering.call_tick - job.enqueue_call >
                 state.max_age_calls) {
             job.failure_reason = "stale_age";
-            job.state = CUDA_Q1_0_SSD_WRAP_FAILED;
-            state.stale++;
-            state.dropped++;
+            cuda_q1_0_ssd_wrap_reset_destination_slot(&job);
+            cuda_q1_0_ssd_wrap_account_drop(&state, &job, "stale_age");
+            /* The polling route thread holds the SSD-WRAP mutex here. */
+            cuda_q1_0_ssd_wrap_refund_budget(&state, &job.record);
+            cuda_q1_0_promotion_record_emit(
+                "drop", "dropped", "stale_age",
+                &job.record, "q1_fallback", UINT32_MAX, 0u);
+            cuda_q1_0_ssd_wrap_job_release_locked(&job);
         }
     }
     os_cond_broadcast(&state.cond);
@@ -24670,6 +24911,10 @@ static int cuda_q1_0_ssd_wrap_submit(
     uint32_t ring_slot = UINT32_MAX;
     uint32_t job_index = UINT32_MAX;
     os_mutex_lock(&state.mutex);
+    if (state.failed) {
+        os_mutex_unlock(&state.mutex);
+        return 0;
+    }
     for (uint32_t i = 0; i < state.jobs.size(); i++) {
         if (state.jobs[i].state == CUDA_Q1_0_SSD_WRAP_FREE) {
             job_index = i;
@@ -24693,8 +24938,6 @@ static int cuda_q1_0_ssd_wrap_submit(
     }
     cuda_q1_0_ssd_wrap_job &job = state.jobs[job_index];
     job = cuda_q1_0_ssd_wrap_job{};
-    job.state = CUDA_Q1_0_SSD_WRAP_REQUESTED;
-    job.record = *record;
     job.request = request;
     job.request_epoch = record->request_epoch;
     job.enqueue_call = g_moe_tiering.call_tick;
@@ -24734,7 +24977,17 @@ static int cuda_q1_0_ssd_wrap_submit(
     g_q1_0_ssd_wrap_reserved_slots[(uint32_t)slot_i] = 1u;
     record->record_id = ++g_iq1_promotion.q1_0_record_attempts;
     record->attempt_started = 1;
+    /* The SSD-WRAP mutex makes the charge precede REQUESTED publication and
+     * serializes it with every terminal/drop refund. */
+    if (g_iq1_promotion.request_budget != 0u) {
+        g_iq1_promotion.request_used++;
+    }
+    if (g_iq1_promotion.window_calls != 0u) {
+        g_iq1_promotion.window_used++;
+    }
+    record->charge_applied = 1;
     job.record = *record;
+    job.state = CUDA_Q1_0_SSD_WRAP_REQUESTED;
     state.requested++;
     state.attempts++;
     state.bytes_requested += job.bytes_requested;
@@ -24757,22 +25010,32 @@ static void cuda_q1_0_ssd_wrap_flush(void) {
     if (!state.enabled || !state.mutex_ready) return;
     for (;;) {
         os_mutex_lock(&state.mutex);
+        if (state.failed) {
+            cuda_q1_0_ssd_wrap_sweep_failed_locked(&state, UINT32_MAX);
+        }
         int worker_pending = 0;
         for (const cuda_q1_0_ssd_wrap_job &job : state.jobs) {
-            if (job.state == CUDA_Q1_0_SSD_WRAP_REQUESTED ||
+            if ((!state.failed &&
+                 job.state == CUDA_Q1_0_SSD_WRAP_REQUESTED) ||
                 job.state == CUDA_Q1_0_SSD_WRAP_SSD_INFLIGHT) {
                 worker_pending = 1;
                 break;
             }
         }
-        if (!worker_pending || state.failed) {
+        if (!worker_pending) {
             os_mutex_unlock(&state.mutex);
             break;
         }
         (void)os_cond_wait(&state.cond, &state.mutex);
         os_mutex_unlock(&state.mutex);
     }
-    (void)cuda_q1_0_ssd_wrap_poll_internal(1);
+    if (!state.failed) {
+        (void)cuda_q1_0_ssd_wrap_poll_internal(1);
+    } else {
+        os_mutex_lock(&state.mutex);
+        cuda_q1_0_ssd_wrap_sweep_failed_locked(&state, UINT32_MAX);
+        os_mutex_unlock(&state.mutex);
+    }
     cuda_q1_0_ssd_wrap_working_set_sample("flush");
 }
 
@@ -24803,6 +25066,8 @@ static void cuda_q1_0_ssd_wrap_release(int report) {
                 "ds4: [q1-0-ssd-wrap] result=%s requested=%llu "
                 "deduplicated=%llu backpressure=%llu attempts=%llu "
                 "successes=%llu failures=%llu structural_rejects=%llu "
+                "stale_drops=%llu victim_stale_drops=%llu "
+                "destination_stale_drops=%llu budget_refunds=%llu "
                 "bytes_requested=%llu bytes_read=%llu bytes_useful=%llu "
                 "ranges_requested=%llu ranges_read=%llu "
                 "coalesced_ranges=%llu max_queue_depth=%llu "
@@ -24821,6 +25086,10 @@ static void cuda_q1_0_ssd_wrap_release(int report) {
                 (unsigned long long)state.successes,
                 (unsigned long long)state.failures,
                 (unsigned long long)state.structural_rejects,
+                (unsigned long long)state.stale_drops,
+                (unsigned long long)state.victim_stale_drops,
+                (unsigned long long)state.destination_stale_drops,
+                (unsigned long long)state.budget_refunds,
                 (unsigned long long)state.bytes_requested,
                 (unsigned long long)state.bytes_read,
                 (unsigned long long)state.bytes_useful,
@@ -24887,7 +25156,7 @@ static int cuda_q1_0_ssd_wrap_prepare_h2d_source(
         gate_bytes > UINT64_MAX - gate_bytes ||
         gate_bytes * 2u > UINT64_MAX - down_bytes ||
         gate_bytes * 2u + down_bytes != g_dynamic_arena.slot_bytes) {
-        g_q1_0_ssd_wrap.failed = 1;
+        cuda_q1_0_ssd_wrap_fail_structural("h2d_bounce_contract");
         return 0;
     }
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
@@ -24901,7 +25170,7 @@ static int cuda_q1_0_ssd_wrap_prepare_h2d_source(
         state.h2d_pending[ring] = 0;
         if (waited != cudaSuccess) {
             (void)cudaGetLastError();
-            state.failed = 1;
+            cuda_q1_0_ssd_wrap_fail_structural("h2d_wait_event");
             return 0;
         }
     }
@@ -24930,7 +25199,7 @@ static int cuda_q1_0_ssd_wrap_record_h2d(
         g_q1_0_ssd_wrap.h2d_done[ring], stream);
     if (recorded != cudaSuccess) {
         (void)cudaGetLastError();
-        g_q1_0_ssd_wrap.failed = 1;
+        cuda_q1_0_ssd_wrap_fail_structural("h2d_record_event");
         return 0;
     }
     g_q1_0_ssd_wrap.h2d_pending[ring] = 1;
@@ -25432,9 +25701,11 @@ static int cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
         g_iq1_promotion.skips_mass++;
         return 1;
     }
+    const int budget_locked = cuda_q1_0_ssd_wrap_budget_lock();
     if (g_iq1_promotion.request_budget != 0u &&
         g_iq1_promotion.request_used >= g_iq1_promotion.request_budget) {
         g_iq1_promotion.skips_request_budget++;
+        cuda_q1_0_ssd_wrap_budget_unlock(budget_locked);
         return 1;
     }
     if (g_iq1_promotion.window_calls != 0u) {
@@ -25448,9 +25719,11 @@ static int cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
         }
         if (g_iq1_promotion.window_used >= g_iq1_promotion.window_budget) {
             g_iq1_promotion.skips_window_budget++;
+            cuda_q1_0_ssd_wrap_budget_unlock(budget_locked);
             return 1;
         }
     }
+    cuda_q1_0_ssd_wrap_budget_unlock(budget_locked);
 
     if (q1_0_source &&
         !cuda_q1_0_promotion_record_context_init(
@@ -25500,14 +25773,6 @@ static int cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
                 g_iq1_promotion.failures++;
                 return 0;
             }
-            if (submitted == 1) {
-                if (g_iq1_promotion.request_budget != 0u) {
-                    g_iq1_promotion.request_used++;
-                }
-                if (g_iq1_promotion.window_calls != 0u) {
-                    g_iq1_promotion.window_used++;
-                }
-            }
             /* Dedup and bounded backpressure deliberately retain the resident
              * Q1 representation. A queued attempt becomes visible only from
              * a later mixed-resolver call after poll/commit. */
@@ -25551,12 +25816,15 @@ static int cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
     }
     g_iq1_promotion.promotion_2bit_ssd_bytes +=
         gate_expert_bytes * 2ull + down_expert_bytes;
+    const int completion_budget_locked =
+        cuda_q1_0_ssd_wrap_budget_lock();
     if (g_iq1_promotion.request_budget != 0u) {
         g_iq1_promotion.request_used++;
     }
     if (g_iq1_promotion.window_calls != 0u) {
         g_iq1_promotion.window_used++;
     }
+    cuda_q1_0_ssd_wrap_budget_unlock(completion_budget_locked);
     return 1;
 }
 
