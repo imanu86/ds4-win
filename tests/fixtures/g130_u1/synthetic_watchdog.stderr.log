@@ -1,0 +1,8 @@
+ds4: loading model tensors into device cache
+ds4: 4.0 GiB cached
+ds4: 12.0 GiB cached
+ds4-server: listening on 127.0.0.1
+ds4-server: chat 1 prompt start
+ds4-server: chat ctx=u1 gen=50 decoding chunk=0.20 t/s avg=0.20 t/s 250.000s
+ds4-server: chat ctx=u1 gen=64 decoding chunk=0.20 t/s avg=0.20 t/s 320.000s
+ds4-server: chat 1 gen=64 finish=length 321.000s

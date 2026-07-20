@@ -1,0 +1,78 @@
+ds4: loading model tensors into device cache
+ds4: 1.0 GiB cached
+ds4: [q1-0-resident-arena] result=bootstrapped entries=11008 layers=0..42 generation=1 source=sidecar-mmap route_pread=disabled iq2_host_arena=enabled mixed_host_backing=dual-arena pinned=26304970752 pageable=12651724800 pinned_slots=7433 pageable_slots=3575 total_slots=11008 total_bytes=38956695552
+ds4: [q1-0-source-working-set] result=ok phase=pre-copy windows=1 page_size=4096 mapping_bytes=39048344416 queried_pages=9533288 resident_pages=9533288 resident_bytes=39048347648 shared_pages=9533288 shared_bytes=39048347648 not_shared_pages=0 not_shared_bytes=0 file_backed_pages=9533288 file_backed_bytes=39048347648 query_calls=146 last_error=0 file_backed_basis=sidecar-file-mapping
+ds4: [q1-0-source-working-set] result=ok phase=post-bootstrap windows=1 page_size=4096 mapping_bytes=39048344416 queried_pages=9533288 resident_pages=9533288 resident_bytes=39048347648 shared_pages=9533288 shared_bytes=39048347648 not_shared_pages=0 not_shared_bytes=0 file_backed_pages=9533288 file_backed_bytes=39048347648 query_calls=146 last_error=0 file_backed_basis=sidecar-file-mapping
+ds4: [q1-0-source-working-set] result=ok phase=post-unlock-settle windows=1 page_size=4096 mapping_bytes=39048344416 queried_pages=9533288 resident_pages=9533288 resident_bytes=39048347648 shared_pages=9533288 shared_bytes=39048347648 not_shared_pages=0 not_shared_bytes=0 file_backed_pages=9533288 file_backed_bytes=39048347648 query_calls=146 last_error=0 file_backed_basis=sidecar-file-mapping
+0720 12:34:56 ds4-server: chat ctx=u1 prompt start
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=1 decode_elapsed_seconds=5.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=2 decode_elapsed_seconds=10.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=3 decode_elapsed_seconds=15.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=4 decode_elapsed_seconds=20.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=5 decode_elapsed_seconds=25.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=6 decode_elapsed_seconds=30.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=7 decode_elapsed_seconds=35.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=8 decode_elapsed_seconds=40.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=9 decode_elapsed_seconds=45.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=10 decode_elapsed_seconds=50.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=11 decode_elapsed_seconds=55.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=12 decode_elapsed_seconds=60.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=13 decode_elapsed_seconds=65.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=14 decode_elapsed_seconds=70.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=15 decode_elapsed_seconds=75.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=16 decode_elapsed_seconds=80.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=17 decode_elapsed_seconds=85.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=18 decode_elapsed_seconds=90.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=19 decode_elapsed_seconds=95.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=20 decode_elapsed_seconds=100.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=21 decode_elapsed_seconds=105.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=22 decode_elapsed_seconds=110.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=23 decode_elapsed_seconds=115.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=24 decode_elapsed_seconds=120.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=25 decode_elapsed_seconds=125.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=26 decode_elapsed_seconds=130.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=27 decode_elapsed_seconds=135.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=28 decode_elapsed_seconds=140.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=29 decode_elapsed_seconds=145.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=30 decode_elapsed_seconds=150.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=31 decode_elapsed_seconds=155.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=32 decode_elapsed_seconds=160.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=33 decode_elapsed_seconds=165.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=34 decode_elapsed_seconds=170.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=35 decode_elapsed_seconds=175.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=36 decode_elapsed_seconds=180.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=37 decode_elapsed_seconds=185.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=38 decode_elapsed_seconds=190.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=39 decode_elapsed_seconds=195.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=40 decode_elapsed_seconds=200.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=41 decode_elapsed_seconds=205.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=42 decode_elapsed_seconds=210.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=43 decode_elapsed_seconds=215.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=44 decode_elapsed_seconds=220.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=45 decode_elapsed_seconds=225.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=46 decode_elapsed_seconds=230.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=47 decode_elapsed_seconds=235.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=48 decode_elapsed_seconds=240.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=49 decode_elapsed_seconds=245.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=50 decode_elapsed_seconds=250.000000000
+0720 12:34:56 ds4-server: chat ctx=u1 gen=50 decoding chunk=0.20 t/s avg=0.20 t/s 250.000s
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=51 decode_elapsed_seconds=255.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=52 decode_elapsed_seconds=260.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=53 decode_elapsed_seconds=265.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=54 decode_elapsed_seconds=270.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=55 decode_elapsed_seconds=275.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=56 decode_elapsed_seconds=280.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=57 decode_elapsed_seconds=285.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=58 decode_elapsed_seconds=290.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=59 decode_elapsed_seconds=295.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=60 decode_elapsed_seconds=300.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=61 decode_elapsed_seconds=305.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=62 decode_elapsed_seconds=310.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=63 decode_elapsed_seconds=315.000000000
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=progress final=0 gen=64 decode_elapsed_seconds=320.000000000
+0720 12:34:56 ds4-server: chat ctx=u1 gen=64 decoding chunk=0.20 t/s avg=0.20 t/s 320.000s
+0720 12:34:56 ds4-server: [q1-0-profile-token] schema=g130_u1_profile_token_v1 result=summary final=1 generated_tokens=64 decode_elapsed_seconds=321.000000000 finish=length
+0720 12:34:56 ds4-server: chat ctx=u1 gen=64 finish=length 321.000s
+ds4: [q1-0-profile] result=summary enabled=1 resident_hits_total=16512 pinned_route_hits=10000 pageable_route_hits=6512 resident_h2d_bytes_total=353894400 pinned_h2d_bytes=247726080 pageable_h2d_bytes=106168320 h2d_enqueue_seconds_total=4.000000000 pinned_h2d_enqueue_seconds=2.000000000 pageable_h2d_enqueue_seconds=2.000000000 upload_sync_calls=6512 upload_sync_seconds_total=240.000000000 pinned_upload_sync_seconds=160.000000000 pageable_upload_sync_seconds=80.000000000 sync_attribution=bytes q1_kernel_calls=2752 q1_kernel_seconds=228.800000000 mixed_join_calls=2752 mixed_join_seconds=0.100000000 timer_failures=0
+ds4: [q1-0-profile-route] result=summary final=1 path=mixed_q1 enabled=1 unit=seconds clock=host_monotonic bucket_scope=completed phase_model=disjoint denominator=per_bucket_calls limitation_hot_device=unmeasured_no_new_sync limitation_failed_calls=counts_only cleanup_required=1 missing_cleanup_policy=incomplete_negative host_device_additive=0 summary_valid=1 cleanup_sync_ok=1 cleanup_sync_error=0 timer_failures=0 timing_values_ok=1 bucket_gap_ok=1 bucket_gap_tolerance_seconds=0.000001000 calls=2752 completed_calls=2752 failed_calls=0 call_seconds=230.000000000 bucket_seconds=230.000000000 bucket_gap_seconds=0.000000000 entry_contract_calls=2752 entry_contract_seconds=0.100000000 selection_d2h_calls=2752 selection_d2h_seconds=0.100000000 classify_map_calls=2752 classify_map_seconds=0.100000000 scratch_prepare_calls=2752 scratch_prepare_seconds=0.100000000 metadata_h2d_calls=2752 metadata_h2d_seconds=0.100000000 hot_branch_calls=2752 hot_branch_seconds=0.100000000 tier_observe_calls=2752 tier_observe_seconds=0.100000000 q1_dispatch_prepare_calls=2752 q1_dispatch_prepare_seconds=0.100000000 q1_entry_calls=2752 q1_entry_seconds=0.100000000 q1_selected_load_calls=2752 q1_selected_load_seconds=0.100000000 q1_prepare_calls=2752 q1_prepare_seconds=0.100000000 q1_kernel_calls=2752 q1_kernel_seconds=228.800000000 q1_kernel_device_calls=2752 q1_kernel_device_seconds=9999.000000000 q1_kernel_device_missing_calls=0 q1_kernel_device_in_bucket=0 q1_kernel_fenced_calls=2752 q1_kernel_unfenced_calls=0 join_publish_calls=2752 join_publish_seconds=0.100000000
+ds4: [q1-0-profile-selection] result=summary final=1 path=mixed_q1 enabled=1 unit=count coverage_scope=completed denominator=completed_routes calls=2752 completed_calls=2752 failed_calls=0 requested_routes=16512 completed_routes=16512 hot_routes=10000 q1_routes=6512 all_iq2_calls=0 mixed_hot_q1_calls=2752 q1_only_calls=0 join_kernel_calls=2752 timer_failures=0 cleanup_sync_ok=1 call_balance_ok=1 route_balance_ok=1 host_coverage_ok=1 device_coverage_ok=1 coverage_ok=1 summary_valid=1
