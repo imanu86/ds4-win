@@ -10,6 +10,7 @@ import pathlib
 import re
 import sys
 from dataclasses import dataclass
+from typing import Optional
 
 
 EPSILON = 1e-6
@@ -46,6 +47,8 @@ class AttributionSummary:
     sum_total_s: float
     residual_total_s: float
     residual_pct: float
+    wall_total_s: Optional[float]
+    loop_overhead_s: Optional[float]
     span_totals_s: dict[str, float]
 
 
@@ -158,8 +161,22 @@ def _parse_summary_line(line: str, line_no: int) -> AttributionSummary:
     ]
     if [key for key, _ in fields[:5]] != required_order:
         raise G130AttributionError(f"line {line_no}: summary header fields are out of order")
+    optional_keys = {"wall_total_s", "loop_overhead_s"}
+    tail_keys = [key for key, _ in fields[5:]]
+    has_optional = any(key in optional_keys for key in tail_keys)
+    wall_total_s: Optional[float] = None
+    loop_overhead_s: Optional[float] = None
+    span_start = 5
+    if has_optional:
+        if len(fields) < 7 or fields[5][0] != "wall_total_s" or fields[6][0] != "loop_overhead_s":
+            raise G130AttributionError(
+                f"line {line_no}: wall_total_s and loop_overhead_s must both be present after residual_pct"
+            )
+        wall_total_s = _parse_float(fields[5][1], "wall_total_s", line_no)
+        loop_overhead_s = _parse_float(fields[6][1], "loop_overhead_s", line_no)
+        span_start = 7
     span_totals: dict[str, float] = {}
-    for key, raw in fields[5:]:
+    for key, raw in fields[span_start:]:
         if not key.startswith("span_") or not key.endswith("_total_s"):
             raise G130AttributionError(f"line {line_no}: unexpected summary field {key}")
         name = key[len("span_") : -len("_total_s")]
@@ -175,6 +192,8 @@ def _parse_summary_line(line: str, line_no: int) -> AttributionSummary:
         sum_total_s=_parse_float(fields[2][1], "sum_total_s", line_no),
         residual_total_s=_parse_float(fields[3][1], "residual_total_s", line_no),
         residual_pct=_parse_float(fields[4][1], "residual_pct", line_no),
+        wall_total_s=wall_total_s,
+        loop_overhead_s=loop_overhead_s,
         span_totals_s=span_totals,
     )
 
@@ -237,6 +256,14 @@ def validate_attribution(text: str) -> AttributionReport:
         raise G130AttributionError("residual_total_s mismatch")
     if not _close(summary.residual_pct, computed_residual_pct):
         raise G130AttributionError("residual_pct mismatch")
+    if (summary.wall_total_s is None) != (summary.loop_overhead_s is None):
+        raise G130AttributionError("wall_total_s and loop_overhead_s must both be present or absent")
+    if summary.wall_total_s is not None and summary.loop_overhead_s is not None:
+        computed_loop_overhead = summary.wall_total_s - summary.decode_total_s
+        if not _close(summary.loop_overhead_s, computed_loop_overhead):
+            raise G130AttributionError("loop_overhead_s mismatch")
+        if summary.loop_overhead_s < -EPSILON:
+            raise G130AttributionError("loop_overhead_s is negative")
     summary_span_sum = sum(summary.span_totals_s.values())
     if not _close(summary.sum_total_s, summary_span_sum):
         raise G130AttributionError("summary span totals do not sum to sum_total_s")
@@ -264,7 +291,7 @@ def validate_attribution(text: str) -> AttributionReport:
 
 
 def report_to_jsonable(report: AttributionReport) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "tokens": len(report.tokens),
         "decode_total_s": report.computed_decode_total_s,
         "sum_total_s": report.computed_sum_total_s,
@@ -272,6 +299,10 @@ def report_to_jsonable(report: AttributionReport) -> dict[str, object]:
         "residual_pct": report.computed_residual_pct,
         "span_totals_s": report.computed_span_totals_s,
     }
+    if report.summary.wall_total_s is not None and report.summary.loop_overhead_s is not None:
+        payload["wall_total_s"] = report.summary.wall_total_s
+        payload["loop_overhead_s"] = report.summary.loop_overhead_s
+    return payload
 
 
 def main(argv: list[str] | None = None) -> int:
