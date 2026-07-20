@@ -24468,10 +24468,16 @@ static int cuda_q1_0_ssd_wrap_finish_one(
     os_mutex_unlock(&state.mutex);
 
     int ok = local.failure_reason == NULL;
+    int stale_epoch = 0;
     const char *reason = local.failure_reason;
-    if (ok && (local.slot >= g_dynamic_arena.slots.size() ||
+    if (ok && local.request_epoch != 0u &&
+        local.record.request_epoch != g_cuda_request_epoch) {
+        ok = 0;
+        reason = "stale_or_epoch";
+        state.stale++;
+        stale_epoch = 1;
+    } else if (ok && (local.slot >= g_dynamic_arena.slots.size() ||
         local.request_epoch == 0u ||
-        local.record.request_epoch != local.request_epoch ||
         local.record.first_eligible_call <=
             local.record.observation_call)) {
         ok = 0;
@@ -24571,6 +24577,10 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         cuda_q1_0_promotion_record_emit(
             "success", "success", "staged", &local.record,
             "exact_iq2_ram", local.slot, slot->content_generation);
+    } else if (stale_epoch) {
+        cuda_q1_0_promotion_record_emit(
+            "discard", "stale", reason ? reason : "stale_or_epoch",
+            &local.record, "exact_iq2_ram_stale", UINT32_MAX, 0u);
     } else {
         if (!local.replacing && local.slot < g_dynamic_arena.slots.size()) {
             cuda_dynamic_arena_slot &failed_slot =
@@ -24599,7 +24609,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
     }
     os_cond_broadcast(&state.cond);
     os_mutex_unlock(&state.mutex);
-    return ok;
+    return ok || stale_epoch;
 }
 
 static int cuda_q1_0_ssd_wrap_poll_internal(int force) {
