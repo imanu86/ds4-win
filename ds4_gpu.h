@@ -39,6 +39,18 @@ typedef struct {
 } ds4_gpu_dynamic_arena_load;
 
 int ds4_gpu_init(void);
+
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+/* Decode-thread-only host attribution.  The server owns token/request
+ * boundaries; CUDA contributes disjoint wall-clock spans without introducing
+ * device events, copies, or synchronization. */
+void ds4_gpu_g130_attribution_request_begin(double decode_started);
+void ds4_gpu_g130_attribution_token_begin(uint64_t token_index,
+                                           double decode_started);
+void ds4_gpu_g130_attribution_token_end(uint64_t token_index,
+                                         uint32_t token_count);
+void ds4_gpu_g130_attribution_request_end(double decode_finished);
+#endif
 void ds4_gpu_cleanup(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);

@@ -1,4 +1,7 @@
 #include "ds4.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
+#endif
 #include "rax.h"
 #include "src/platform/os_clock.h"
 #include "src/platform/os_console.h"
@@ -7414,12 +7417,21 @@ static void generate_job(server *s, job *j) {
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     const bool g130_u1_token_profile = g130_u1_profile_token_enabled();
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+    ds4_gpu_g130_attribution_request_begin(decode_t0);
+#endif
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
     while (!server_stop_requested() && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+        const int attribution_completion_before = completion;
+        const uint64_t attribution_first_token = (uint64_t)completion + 1u;
+        ds4_gpu_g130_attribution_token_begin(
+            attribution_first_token, now_sec());
+#endif
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -7447,6 +7459,10 @@ static void generate_job(server *s, job *j) {
             request_phase_trace("first-sample-return", t0, decode_t0);
         }
         if (token == ds4_token_eos(s->engine)) {
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+            ds4_gpu_g130_attribution_token_end(
+                attribution_first_token, 0u);
+#endif
             finish = "stop";
             break;
         }
@@ -7469,11 +7485,19 @@ static void generate_job(server *s, job *j) {
                                                        err,
                                                        sizeof(err));
             if (ntok < 0) {
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+                ds4_gpu_g130_attribution_token_end(
+                    attribution_first_token, 0u);
+#endif
                 finish = "error";
                 break;
             }
         } else {
             if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+                ds4_gpu_g130_attribution_token_end(
+                    attribution_first_token, 0u);
+#endif
                 finish = "error";
                 break;
             }
@@ -7624,6 +7648,11 @@ static void generate_job(server *s, job *j) {
                 break;
             }
         }
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+        ds4_gpu_g130_attribution_token_end(
+            attribution_first_token,
+            (uint32_t)(completion - attribution_completion_before));
+#endif
         if (stop_decode) break;
     }
 
@@ -7694,7 +7723,11 @@ static void generate_job(server *s, job *j) {
     }
     log_tool_calls_summary(ctx_span, &parsed_calls);
 
-    const double decode_elapsed_seconds = now_sec() - decode_t0;
+    const double decode_finished = now_sec();
+    const double decode_elapsed_seconds = decode_finished - decode_t0;
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+    ds4_gpu_g130_attribution_request_end(decode_finished);
+#endif
 
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,

@@ -2849,6 +2849,247 @@ static double cuda_wall_sec(void) {
     return os_monotonic_sec();
 }
 
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+enum cuda_g130_attribution_span {
+    CUDA_G130_ATTRIB_NONE = -1,
+    CUDA_G130_ATTRIB_MIXED_Q1_CALL = 0,
+    CUDA_G130_ATTRIB_SELECTION_D2H,
+    CUDA_G130_ATTRIB_ROUTE_CLASSIFY,
+    CUDA_G130_ATTRIB_HOT_ROUTE,
+    CUDA_G130_ATTRIB_H2D_ENQUEUE,
+    CUDA_G130_ATTRIB_EXISTING_STREAM_SYNC_WAIT,
+    CUDA_G130_ATTRIB_SELECTED_LOAD,
+    CUDA_G130_ATTRIB_KERNEL_LAUNCH_ENQUEUE,
+    CUDA_G130_ATTRIB_MIXED_JOIN,
+    CUDA_G130_ATTRIB_PROMOTION_STAGING,
+    CUDA_G130_ATTRIB_COUNT
+};
+
+static const char *const g_cuda_g130_attribution_span_names[] = {
+    "mixed_q1_call",
+    "selection_d2h",
+    "route_classify",
+    "hot_route",
+    "h2d_enqueue",
+    "existing_stream_sync_wait",
+    "selected_load",
+    "kernel_launch_enqueue",
+    "mixed_join",
+    "promotion_staging",
+};
+
+struct cuda_g130_attribution_state {
+    int request_active;
+    int token_active;
+    cuda_g130_attribution_span current_span;
+    uint64_t token_index;
+    uint64_t request_tokens;
+    double token_started;
+    double span_started;
+    double token_span_seconds[CUDA_G130_ATTRIB_COUNT];
+    double request_span_seconds[CUDA_G130_ATTRIB_COUNT];
+    double request_decode_seconds;
+    double request_started;
+};
+
+static int g_cuda_g130_attribution_enabled;
+static thread_local cuda_g130_attribution_state *g_cuda_g130_attribution;
+
+static void cuda_g130_attribution_init(void) {
+    const char *value = getenv("DS4_G130_U1_ATTRIBUTION");
+    g_cuda_g130_attribution_enabled =
+        value && value[0] && strcmp(value, "0") != 0;
+}
+
+/* This is the only disabled-path gate used by CUDA call sites.  Its global
+ * test precedes the TLS pointer load, so disabled runs never touch TLS. */
+static cuda_g130_attribution_state *cuda_g130_attribution_token_state(void) {
+    if (!g_cuda_g130_attribution_enabled) return NULL;
+    cuda_g130_attribution_state *state = g_cuda_g130_attribution;
+    return state && state->token_active ? state : NULL;
+}
+
+/* Charge the old bucket before changing buckets.  There is deliberately no
+ * span stack: callers save and restore the returned enum, so overlap is not
+ * representable. */
+static cuda_g130_attribution_span cuda_g130_attribution_switch(
+        cuda_g130_attribution_state *state,
+        cuda_g130_attribution_span next_span) {
+    const cuda_g130_attribution_span previous = state->current_span;
+    const double now = cuda_wall_sec();
+    if (previous >= 0 && previous < CUDA_G130_ATTRIB_COUNT) {
+        state->token_span_seconds[previous] += now - state->span_started;
+    }
+    state->current_span = next_span;
+    state->span_started = now;
+    return previous;
+}
+
+struct cuda_g130_attribution_restore_guard {
+    cuda_g130_attribution_state *state;
+    cuda_g130_attribution_span previous;
+
+    ~cuda_g130_attribution_restore_guard() {
+        if (state) {
+            (void)cuda_g130_attribution_switch(state, previous);
+        }
+    }
+};
+
+extern "C" void ds4_gpu_g130_attribution_request_begin(
+        double decode_started) {
+    if (!g_cuda_g130_attribution_enabled) return;
+    cuda_g130_attribution_state *state = g_cuda_g130_attribution;
+    if (!state) {
+        state = (cuda_g130_attribution_state *)calloc(1, sizeof(*state));
+        if (!state) return;
+        g_cuda_g130_attribution = state;
+    }
+    memset(state, 0, sizeof(*state));
+    state->request_active = 1;
+    state->current_span = CUDA_G130_ATTRIB_NONE;
+    state->request_started = decode_started;
+}
+
+extern "C" void ds4_gpu_g130_attribution_token_begin(
+        uint64_t token_index, double decode_started) {
+    if (!g_cuda_g130_attribution_enabled) return;
+    cuda_g130_attribution_state *state = g_cuda_g130_attribution;
+    if (!state || !state->request_active) return;
+    memset(state->token_span_seconds, 0, sizeof(state->token_span_seconds));
+    state->token_index = token_index;
+    state->current_span = CUDA_G130_ATTRIB_NONE;
+    state->token_started = decode_started;
+    state->span_started = state->token_started;
+    state->token_active = 1;
+}
+
+extern "C" void ds4_gpu_g130_attribution_token_end(
+        uint64_t token_index, uint32_t token_count) {
+    if (!g_cuda_g130_attribution_enabled) return;
+    cuda_g130_attribution_state *state = g_cuda_g130_attribution;
+    if (!state || !state->request_active || !state->token_active) return;
+    const double decode_finished = cuda_wall_sec();
+    if (state->current_span >= 0 &&
+        state->current_span < CUDA_G130_ATTRIB_COUNT) {
+        state->token_span_seconds[state->current_span] +=
+            decode_finished - state->span_started;
+    }
+    state->current_span = CUDA_G130_ATTRIB_NONE;
+    state->span_started = decode_finished;
+    state->token_active = 0;
+    if (token_count == 0u) {
+        return;
+    }
+
+    const uint64_t first_token = token_index;
+    double sum_seconds = 0.0;
+    for (int i = 0; i < CUDA_G130_ATTRIB_COUNT; i++) {
+        sum_seconds += state->token_span_seconds[i];
+        state->request_span_seconds[i] += state->token_span_seconds[i];
+    }
+    const double decode_seconds = decode_finished - state->token_started;
+    double residual_seconds = decode_seconds - sum_seconds;
+    if (residual_seconds < 0.0 && residual_seconds > -1.0e-9) {
+        residual_seconds = 0.0;
+    }
+    state->request_tokens += token_count;
+    state->request_decode_seconds += decode_seconds;
+
+    /* Speculative decode can commit several generated tokens in one target
+     * evaluation.  Share that one wall interval evenly so the emission remains
+     * one line per generated token and the request totals remain exact. */
+    const double divisor = (double)token_count;
+    for (uint32_t token_offset = 0; token_offset < token_count; token_offset++) {
+        char line[2048];
+        int used = snprintf(
+            line, sizeof(line),
+            "ds4: [g130-attrib] token=%llu decode_ms=%.6f",
+            (unsigned long long)(first_token + token_offset),
+            decode_seconds * 1000.0 / divisor);
+        for (int i = 0;
+             i < CUDA_G130_ATTRIB_COUNT && used > 0 &&
+                 (size_t)used < sizeof(line);
+             i++) {
+            const int wrote = snprintf(
+                line + used, sizeof(line) - (size_t)used,
+                " span_%s_ms=%.6f",
+                g_cuda_g130_attribution_span_names[i],
+                state->token_span_seconds[i] * 1000.0 / divisor);
+            if (wrote < 0) {
+                used = -1;
+                break;
+            }
+            used += wrote;
+        }
+        if (used > 0 && (size_t)used < sizeof(line)) {
+            (void)snprintf(
+                line + used, sizeof(line) - (size_t)used,
+                " sum_ms=%.6f residual_ms=%.6f\n",
+                sum_seconds * 1000.0 / divisor,
+                residual_seconds * 1000.0 / divisor);
+            fputs(line, stderr);
+        }
+    }
+}
+
+extern "C" void ds4_gpu_g130_attribution_request_end(double decode_finished) {
+    if (!g_cuda_g130_attribution_enabled) return;
+    cuda_g130_attribution_state *state = g_cuda_g130_attribution;
+    if (!state || !state->request_active) return;
+    if (state->token_active) {
+        ds4_gpu_g130_attribution_token_end(
+            state->token_index, 0u);
+    }
+    double sum_seconds = 0.0;
+    for (int i = 0; i < CUDA_G130_ATTRIB_COUNT; i++) {
+        sum_seconds += state->request_span_seconds[i];
+    }
+    double residual_seconds = state->request_decode_seconds - sum_seconds;
+    if (residual_seconds < 0.0 && residual_seconds > -1.0e-9) {
+        residual_seconds = 0.0;
+    }
+    const double wall_seconds = decode_finished - state->request_started;
+    double loop_overhead_seconds =
+        wall_seconds - state->request_decode_seconds;
+    if (loop_overhead_seconds < 0.0 && loop_overhead_seconds > -1.0e-9) {
+        loop_overhead_seconds = 0.0;
+    }
+    const double residual_pct = state->request_decode_seconds > 0.0
+        ? residual_seconds * 100.0 / state->request_decode_seconds : 0.0;
+    char line[2048];
+    int used = snprintf(
+        line, sizeof(line),
+        "ds4: [g130-attrib-summary] tokens=%llu decode_total_s=%.9f "
+        "sum_total_s=%.9f residual_total_s=%.9f residual_pct=%.6f "
+        "wall_total_s=%.9f loop_overhead_s=%.9f",
+        (unsigned long long)state->request_tokens,
+        state->request_decode_seconds, sum_seconds, residual_seconds,
+        residual_pct, wall_seconds, loop_overhead_seconds);
+    for (int i = 0;
+         i < CUDA_G130_ATTRIB_COUNT && used > 0 &&
+             (size_t)used < sizeof(line);
+         i++) {
+        const int wrote = snprintf(
+            line + used, sizeof(line) - (size_t)used,
+            " span_%s_total_s=%.9f",
+            g_cuda_g130_attribution_span_names[i],
+            state->request_span_seconds[i]);
+        if (wrote < 0) {
+            used = -1;
+            break;
+        }
+        used += wrote;
+    }
+    if (used > 0 && (size_t)used + 1u < sizeof(line)) {
+        line[used++] = '\n';
+        line[used] = '\0';
+        fputs(line, stderr);
+    }
+    state->request_active = 0;
+}
+#endif
+
 static int cuda_q1_0_profile_requested(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -5497,6 +5738,9 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 extern "C" int ds4_gpu_init(void) {
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    cuda_g130_attribution_init();
+#endif
     cuda_q1_0_mixed_profile_reset(1);
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
@@ -5786,6 +6030,16 @@ static cuda_dynamic_arena_copy_status cuda_dynamic_arena_copy_expert_async(
         arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0 &&
         cuda_q1_0_profile_requested();
     const double enqueue_started = q1_profile ? cuda_wall_sec() : 0.0;
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    cuda_g130_attribution_state *attribution_state =
+        cuda_g130_attribution_token_state();
+    cuda_g130_attribution_span attribution_previous = CUDA_G130_ATTRIB_NONE;
+    if (attribution_state) {
+        attribution_previous = cuda_g130_attribution_switch(
+            attribution_state,
+            CUDA_G130_ATTRIB_H2D_ENQUEUE);
+    }
+#endif
     cudaError_t err = cudaMemcpyAsync(gate_dst, gate_src,
                                       (size_t)gate_expert_bytes,
                                       cudaMemcpyHostToDevice,
@@ -5802,6 +6056,12 @@ static cuda_dynamic_arena_copy_status cuda_dynamic_arena_copy_expert_async(
                               cudaMemcpyHostToDevice,
                               g_model_upload_stream);
     }
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution_state) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, attribution_previous);
+    }
+#endif
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         arena.fatal_errors++;
@@ -30976,10 +31236,28 @@ static int cuda_moe_selected_load_q1_0(
     if (selected_arg->bytes < (uint64_t)slot_count * sizeof(int32_t)) return 0;
 
     g_moe_gather.h_sel.resize(slot_count);
-    if (!cuda_ok(cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
-                            (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost),
-                 "Q1_0 selected D2H")) {
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    cuda_g130_attribution_state *attribution_state =
+        cuda_g130_attribution_token_state();
+    cuda_g130_attribution_span attribution_previous = CUDA_G130_ATTRIB_NONE;
+    if (attribution_state) {
+        attribution_previous = cuda_g130_attribution_switch(
+            attribution_state,
+            CUDA_G130_ATTRIB_SELECTION_D2H);
+    }
+#endif
+    const int selected_d2h_ok = cuda_ok(
+        cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
+                   (size_t)slot_count * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost),
+        "Q1_0 selected D2H");
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution_state) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, attribution_previous);
+    }
+#endif
+    if (!selected_d2h_ok) {
         return 0;
     }
     if (!cuda_sparse_bake_validate_selected(
@@ -31054,22 +31332,66 @@ static int cuda_moe_selected_load_q1_0(
                     down_expert_bytes);
             if (status != CUDA_DYNAMIC_ARENA_ENQUEUED) {
                 g_q1_0_resident_misses++;
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+                cuda_g130_attribution_span sync_previous =
+                    CUDA_G130_ATTRIB_NONE;
+                if (attribution_state) {
+                    sync_previous = cuda_g130_attribution_switch(
+                        attribution_state,
+                        CUDA_G130_ATTRIB_EXISTING_STREAM_SYNC_WAIT);
+                }
+#endif
                 (void)cudaStreamSynchronize(g_model_upload_stream);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+                if (attribution_state) {
+                    (void)cuda_g130_attribution_switch(
+                        attribution_state, sync_previous);
+                }
+#endif
                 return 0;
             }
             route_h2d_bytes += gate_expert_bytes * 2u + down_expert_bytes;
         }
-        if (!cuda_ok(cudaMemcpyAsync(
-                         g_moe_gather.slot, slots.data(),
-                         (size_t)slot_count * sizeof(int32_t),
-                         cudaMemcpyHostToDevice, g_model_upload_stream),
-                     "Q1_0 resident slots H2D")) {
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        cuda_g130_attribution_span h2d_previous = CUDA_G130_ATTRIB_NONE;
+        if (attribution_state) {
+            h2d_previous = cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_H2D_ENQUEUE);
+        }
+#endif
+        const int slots_h2d_ok = cuda_ok(
+            cudaMemcpyAsync(g_moe_gather.slot, slots.data(),
+                            (size_t)slot_count * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, g_model_upload_stream),
+            "Q1_0 resident slots H2D");
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution_state) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, h2d_previous);
+        }
+#endif
+        if (!slots_h2d_ok) {
             return 0;
         }
         const int q1_profile = cuda_q1_0_profile_requested();
         const double sync_started = q1_profile ? cuda_wall_sec() : 0.0;
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        cuda_g130_attribution_span sync_previous = CUDA_G130_ATTRIB_NONE;
+        if (attribution_state) {
+            sync_previous = cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_EXISTING_STREAM_SYNC_WAIT);
+        }
+#endif
         const cudaError_t sync_error =
             cudaStreamSynchronize(g_model_upload_stream);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution_state) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, sync_previous);
+        }
+#endif
         if (q1_profile) {
             const double sync_seconds = cuda_wall_sec() - sync_started;
             const uint64_t pinned_h2d =
@@ -31138,19 +31460,35 @@ static int cuda_moe_selected_load_q1_0(
             }
         }
 
-        if (!cuda_ok(cudaMemcpy(g_moe_gather.gate, host_gate.data(),
-                                (size_t)cgate, cudaMemcpyHostToDevice),
-                     "Q1_0 gate H2D") ||
-            !cuda_ok(cudaMemcpy(g_moe_gather.up, host_up.data(),
-                                (size_t)cgate, cudaMemcpyHostToDevice),
-                     "Q1_0 up H2D") ||
-            !cuda_ok(cudaMemcpy(g_moe_gather.down, host_down.data(),
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        cuda_g130_attribution_span h2d_previous = CUDA_G130_ATTRIB_NONE;
+        if (attribution_state) {
+            h2d_previous = cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_H2D_ENQUEUE);
+        }
+#endif
+        const int fallback_h2d_ok =
+            cuda_ok(cudaMemcpy(g_moe_gather.gate, host_gate.data(),
+                               (size_t)cgate, cudaMemcpyHostToDevice),
+                    "Q1_0 gate H2D") &&
+            cuda_ok(cudaMemcpy(g_moe_gather.up, host_up.data(),
+                               (size_t)cgate, cudaMemcpyHostToDevice),
+                    "Q1_0 up H2D") &&
+            cuda_ok(cudaMemcpy(g_moe_gather.down, host_down.data(),
                                 (size_t)cdown, cudaMemcpyHostToDevice),
-                     "Q1_0 down H2D") ||
-            !cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
+                    "Q1_0 down H2D") &&
+            cuda_ok(cudaMemcpy(g_moe_gather.slot, slots.data(),
                                 (size_t)slot_count * sizeof(int32_t),
                                 cudaMemcpyHostToDevice),
-                     "Q1_0 slots H2D")) {
+                    "Q1_0 slots H2D");
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution_state) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, h2d_previous);
+        }
+#endif
+        if (!fallback_h2d_ok) {
             return 0;
         }
         g_q1_0_direct_pread_bytes += cgate * 2u + cdown;
@@ -31519,6 +31857,10 @@ static int routed_moe_launch(
     const uint32_t route_q1_0 =
         gate_type == 41u && (down_type == 41u || down_type == 10u);
     if (!route_iq2_q2 && !route_iq1_s && !route_q1_0) return 0;
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    cuda_g130_attribution_state *attribution_state =
+        cuda_g130_attribution_token_state();
+#endif
     if (route_iq1_s) {
         g_iq1_s_route_calls++;
         g_iq1_s_route_slots += (uint64_t)n_tokens * n_expert;
@@ -31716,12 +32058,26 @@ static int routed_moe_launch(
                 selected_started - mixed_profile_sample->q1_call_started;
             mixed_profile_sample->q1_prepare_started = selected_started;
         }
-        const int selected_loaded =
-            cuda_moe_selected_load_q1_0(
-                model_map, model_size, layer_index,
-                gate_offset, up_offset, down_offset,
-                gate_expert_bytes, down_expert_bytes,
-                n_total_expert, n_expert, n_tokens, selected);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        cuda_g130_attribution_span attribution_previous =
+            CUDA_G130_ATTRIB_NONE;
+        if (attribution_state) {
+            attribution_previous = cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_SELECTED_LOAD);
+        }
+#endif
+        const int selected_loaded = cuda_moe_selected_load_q1_0(
+            model_map, model_size, layer_index,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes,
+            n_total_expert, n_expert, n_tokens, selected);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution_state) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, attribution_previous);
+        }
+#endif
         if (mixed_profile_sample) {
             const double selected_finished = cuda_wall_sec();
             mixed_profile_sample->q1_selected_load_calls++;
@@ -31951,6 +32307,15 @@ static int routed_moe_launch(
                 kernel_started - mixed_profile_sample->q1_prepare_started;
             mixed_profile_sample->q1_kernel_started = kernel_started;
         }
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        cuda_g130_attribution_span kernel_attribution_previous =
+            CUDA_G130_ATTRIB_NONE;
+        if (route_q1_0 && attribution_state) {
+            kernel_attribution_previous = cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_KERNEL_LAUNCH_ENQUEUE);
+        }
+#endif
         q8_K_quantize_kernel<<<xq_grid, 256>>>(
             xq, (const float *)x->ptr, expert_in_dim, n_tokens,
             NULL, 0u, 0u);
@@ -32080,6 +32445,13 @@ static int routed_moe_launch(
                 mixed_profile_sample->q1_kernel_seconds +=
                     cuda_wall_sec() - mixed_profile_sample->q1_kernel_started;
             }
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+            if (attribution_state) {
+                (void)cuda_g130_attribution_switch(
+                    attribution_state,
+                    kernel_attribution_previous);
+            }
+#endif
             return ok;
         }
         if (route_iq1_s) {
@@ -33448,6 +33820,20 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         float clamp,
         const ds4_gpu_tensor *x) {
     g_q1_0_mixed_calls++;
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    cuda_g130_attribution_state *attribution_state =
+        cuda_g130_attribution_token_state();
+    const int attribution = attribution_state != NULL;
+    cuda_g130_attribution_span attribution_previous = CUDA_G130_ATTRIB_NONE;
+    if (attribution) {
+        attribution_previous = cuda_g130_attribution_switch(
+            attribution_state,
+            CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+    }
+    cuda_g130_attribution_restore_guard attribution_restore = {
+        attribution_state, attribution_previous
+    };
+#endif
     const int mixed_profile = cuda_q1_0_profile_requested();
     cuda_q1_0_mixed_profile_sample mixed_profile_sample;
     const double mixed_profile_call_started =
@@ -33628,6 +34014,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             d2h_started - mixed_profile_phase_started;
         mixed_profile_phase_started = d2h_started;
     }
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_SELECTION_D2H);
+    }
+#endif
     const int mixed_selection_d2h_ok =
         cuda_ok(cudaMemcpy(selected_host, selected->ptr,
                            (size_t)n_expert * sizeof(int32_t),
@@ -33637,6 +34029,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                            (size_t)n_expert * sizeof(float),
                            cudaMemcpyDeviceToHost),
                 "Q1_0 mixed weights D2H");
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+    }
+#endif
     if (mixed_profile) {
         const double d2h_finished = cuda_wall_sec();
         mixed_profile_sample.selection_d2h_calls++;
@@ -33649,6 +34047,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         return 0;
     }
 
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_ROUTE_CLASSIFY);
+    }
+#endif
     int32_t hot_selected[CUDA_MOE_ROUTE_COUNT] = {0};
     float hot_weights[CUDA_MOE_ROUTE_COUNT] = {0};
     int32_t cold_selected[CUDA_MOE_ROUTE_COUNT] = {0};
@@ -33804,6 +34208,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         g_q1_0_mixed_cold_one_q1_routes += cold_count;
     }
 
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+    }
+#endif
+
     if (mixed_profile) {
         const double classify_finished = cuda_wall_sec();
         mixed_profile_sample.classify_map_calls++;
@@ -33815,6 +34226,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     if (cold_count == 0u) {
         const double hot_branch_started = mixed_profile
             ? mixed_profile_phase_started : 0.0;
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, CUDA_G130_ATTRIB_HOT_ROUTE);
+        }
+#endif
         const int ok = routed_moe_launch(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
@@ -33824,6 +34241,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+        }
+#endif
         if (mixed_profile) {
             const double hot_branch_finished = cuda_wall_sec();
             mixed_profile_sample.hot_branch_calls++;
@@ -33908,7 +34332,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             scratch_finished - mixed_profile_phase_started;
         mixed_profile_phase_started = scratch_finished;
     }
-    if ((hot_count != 0u &&
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_H2D_ENQUEUE);
+    }
+#endif
+    const int metadata_h2d_ok = !((hot_count != 0u &&
          (!cuda_ok(cudaMemcpy(device_hot_selected, hot_selected,
                               (size_t)hot_count * sizeof(int32_t),
                               cudaMemcpyHostToDevice),
@@ -33924,7 +34354,14 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         !cuda_ok(cudaMemcpy(device_cold_weights, cold_weights,
                             (size_t)cold_count * sizeof(float),
                             cudaMemcpyHostToDevice),
-                 "Q1_0 mixed cold weights H2D")) {
+                 "Q1_0 mixed cold weights H2D"));
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+    }
+#endif
+    if (!metadata_h2d_ok) {
         g_q1_0_mixed_failures++;
         return 0;
     }
@@ -33946,6 +34383,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             device_hot_weights,
             (uint64_t)hot_count * sizeof(float), 0
         };
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, CUDA_G130_ATTRIB_HOT_ROUTE);
+        }
+#endif
         ok = routed_moe_launch(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
@@ -33956,6 +34399,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             expert_in_dim, expert_mid_dim, out_dim,
             &hot_selected_tensor, &hot_weights_tensor, NULL,
             hot_count, clamp, x, 1u, NULL, NULL);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+        }
+#endif
     } else {
         ok = cuda_ok(cudaMemsetAsync(out->ptr, 0, (size_t)out_bytes, 0),
                      "Q1_0 mixed empty IQ2 output");
@@ -34082,10 +34532,24 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             (void)cudaGetLastError();
         }
     }
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_MIXED_JOIN);
+    }
+#endif
     add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
         (float *)out->ptr, (const float *)out->ptr,
         device_cold_out, out_dim);
-    if (!cuda_ok(cudaGetLastError(), "Q1_0 mixed output join")) {
+    const int mixed_join_ok =
+        cuda_ok(cudaGetLastError(), "Q1_0 mixed output join");
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+    }
+#endif
+    if (!mixed_join_ok) {
         if (join_begin) (void)cudaEventDestroy(join_begin);
         if (join_end) (void)cudaEventDestroy(join_end);
         g_q1_0_mixed_failures++;
@@ -34123,6 +34587,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         /* The current result is already queued from resident Q1_0. Admission
          * below is future-token work: exact IQ2 first enters the disjoint RAM
          * probation arena and cannot become VRAM-eligible until a later call. */
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_PROMOTION_STAGING);
+        }
+#endif
         for (uint32_t route = 0; route < cold_count; route++) {
             (void)cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
                 layer_index, (uint32_t)cold_selected[route],
@@ -34132,6 +34603,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 q1_gate_offset, q1_up_offset, q1_down_offset,
                 q1_gate_expert_bytes, q1_down_expert_bytes);
         }
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_MIXED_Q1_CALL);
+        }
+#endif
     }
     if (cuda_q1_0_snapshot_backing_requested()) {
         g_moe_tiering.snapshot_backing_hits += cold_count;
