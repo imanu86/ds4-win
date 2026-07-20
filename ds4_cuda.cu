@@ -23882,6 +23882,7 @@ struct cuda_q1_0_ssd_wrap_job {
     uint32_t ring_slot;
     size_t victim_entry_index;
     uint64_t victim_generation;
+    uint64_t expected_checksum;
     uint32_t victim_layer;
     uint32_t victim_expert;
     cuda_moe_tier_state victim_state;
@@ -24446,6 +24447,27 @@ static void cuda_q1_0_ssd_wrap_job_release_locked(
     *job = cuda_q1_0_ssd_wrap_job{};
 }
 
+static int cuda_q1_0_ssd_wrap_stale_reason(const char *reason) {
+    return reason &&
+        (!strcmp(reason, "stale_age") ||
+         !strcmp(reason, "stale_or_epoch") ||
+         !strcmp(reason, "victim_stale") ||
+         !strcmp(reason, "destination_stale"));
+}
+
+static void cuda_q1_0_ssd_wrap_refund_budget(
+        const cuda_q1_0_promotion_record_context *record) {
+    if (!record || !record->active) return;
+    if (g_iq1_promotion.request_budget != 0u &&
+        g_iq1_promotion.request_used > record->gate_request_used) {
+        g_iq1_promotion.request_used = record->gate_request_used;
+    }
+    if (g_iq1_promotion.window_calls != 0u &&
+        g_iq1_promotion.window_used > record->gate_window_used) {
+        g_iq1_promotion.window_used = record->gate_window_used;
+    }
+}
+
 static int cuda_q1_0_ssd_wrap_finish_one(
         uint32_t index, int force) {
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
@@ -24470,7 +24492,27 @@ static int cuda_q1_0_ssd_wrap_finish_one(
     int ok = local.failure_reason == NULL;
     const char *reason = local.failure_reason;
     if (ok && (local.slot >= g_dynamic_arena.slots.size() ||
-        local.request_epoch == 0u ||
+        local.record.layer != local.layer || local.record.expert != local.expert ||
+        local.record.destination_bytes != g_dynamic_arena.slot_bytes ||
+        local.bytes_read != local.bytes_requested)) {
+        ok = 0;
+        reason = "provenance_mismatch";
+    }
+    if (ok && (local.record.destination_gate_bytes == 0u ||
+        local.record.destination_up_bytes == 0u ||
+        local.record.destination_down_bytes == 0u ||
+        local.record.destination_gate_bytes > UINT64_MAX -
+            local.record.destination_up_bytes ||
+        local.record.destination_gate_bytes +
+            local.record.destination_up_bytes >
+            UINT64_MAX - local.record.destination_down_bytes ||
+        local.record.destination_gate_bytes +
+            local.record.destination_up_bytes +
+            local.record.destination_down_bytes != local.record.destination_bytes)) {
+        ok = 0;
+        reason = "pairing_break";
+    }
+    if (ok && (local.request_epoch == 0u ||
         local.record.request_epoch != local.request_epoch ||
         local.record.first_eligible_call <=
             local.record.observation_call)) {
@@ -24547,6 +24589,17 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         }
         slot->checksum = cuda_dynamic_arena_fnv1a64(
             (const uint8_t *)slot->host_ptr, g_dynamic_arena.slot_bytes);
+        /* Production SSD-wrap submit currently has source ranges but no
+         * trusted source checksum to seed expected_checksum. Keep this guard
+         * reserved for a future manifest-backed submit contract; checksum
+         * fault coverage uses the arena finish-load FNV verifier below. */
+        if (local.expected_checksum != 0u &&
+            slot->checksum != local.expected_checksum) {
+            ok = 0;
+            reason = "checksum_mismatch";
+        }
+    }
+    if (ok) {
         slot->last_dma_sequence = 0;
         slot->state = DS4_GPU_ARENA_READY;
         cuda_moe_tier_entry &entry = g_moe_tiering.entries[
@@ -24572,6 +24625,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
             "success", "success", "staged", &local.record,
             "exact_iq2_ram", local.slot, slot->content_generation);
     } else {
+        const int stale_drop = cuda_q1_0_ssd_wrap_stale_reason(reason);
         if (!local.replacing && local.slot < g_dynamic_arena.slots.size()) {
             cuda_dynamic_arena_slot &failed_slot =
                 g_dynamic_arena.slots[local.slot];
@@ -24584,14 +24638,23 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 failed_slot.checksum = 0;
             }
         }
-        g_iq1_promotion.q1_0_record_failures++;
-        g_iq1_promotion.failures++;
-        g_moe_tiering.failures++;
-        state.failures++;
-        state.failed = 1;
-        cuda_q1_0_promotion_record_emit(
-            "failure", "failed", reason ? reason : "ssd_wrap_failed",
-            &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
+        if (stale_drop) {
+            if (!reason || strcmp(reason, "stale_age")) state.dropped++;
+            cuda_q1_0_ssd_wrap_refund_budget(&local.record);
+            cuda_q1_0_promotion_record_emit(
+                "drop", "dropped", reason ? reason : "stale",
+                &local.record, "none", UINT32_MAX, 0u);
+        } else {
+            g_iq1_promotion.q1_0_record_failures++;
+            g_iq1_promotion.failures++;
+            g_moe_tiering.failures++;
+            state.failures++;
+            state.structural_rejects++;
+            state.failed = 1;
+            cuda_q1_0_promotion_record_emit(
+                "failure", "failed", reason ? reason : "ssd_wrap_failed",
+                &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
+        }
     }
     os_mutex_lock(&state.mutex);
     if (index < state.jobs.size()) {
@@ -24599,7 +24662,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
     }
     os_cond_broadcast(&state.cond);
     os_mutex_unlock(&state.mutex);
-    return ok;
+    return ok || cuda_q1_0_ssd_wrap_stale_reason(reason);
 }
 
 static int cuda_q1_0_ssd_wrap_poll_internal(int force) {
@@ -24937,6 +25000,339 @@ static int cuda_q1_0_ssd_wrap_record_h2d(
     g_q1_0_ssd_wrap.first_use++;
     return 1;
 }
+
+#ifdef DS4_TESTING
+enum ds4_gpu_ssdwrap_test_fault {
+    DS4_GPU_SSDWRAP_TEST_HAPPY = 0,
+    DS4_GPU_SSDWRAP_TEST_STALE_AGE,
+    DS4_GPU_SSDWRAP_TEST_EPOCH_MISMATCH,
+    DS4_GPU_SSDWRAP_TEST_VICTIM_STALE,
+    DS4_GPU_SSDWRAP_TEST_DESTINATION_STALE,
+    DS4_GPU_SSDWRAP_TEST_PREAD_FAILURE,
+    DS4_GPU_SSDWRAP_TEST_PROVENANCE_MISMATCH,
+    DS4_GPU_SSDWRAP_TEST_CHECKSUM_MISMATCH,
+    DS4_GPU_SSDWRAP_TEST_PAIRING_BREAK,
+};
+
+static char g_q1_0_ssd_wrap_test_file_path[256];
+
+static void cuda_q1_0_ssd_wrap_test_capture(
+        ds4_gpu_ssdwrap_test_result *out, int ok) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->requested = g_q1_0_ssd_wrap.requested;
+    out->attempts = g_q1_0_ssd_wrap.attempts;
+    out->successes = g_q1_0_ssd_wrap.successes;
+    out->failures = g_q1_0_ssd_wrap.failures;
+    out->stale = g_q1_0_ssd_wrap.stale;
+    out->dropped = g_q1_0_ssd_wrap.dropped;
+    out->structural_rejects = g_q1_0_ssd_wrap.structural_rejects;
+    out->bytes_read = g_q1_0_ssd_wrap.bytes_read;
+    out->promotion_request_used = g_iq1_promotion.request_used;
+    out->promotion_window_used = g_iq1_promotion.window_used;
+    out->promotion_failures = g_iq1_promotion.failures;
+    out->tiering_failures = g_moe_tiering.failures;
+    out->failed = g_q1_0_ssd_wrap.failed;
+    out->ok = ok;
+}
+
+static void cuda_q1_0_ssd_wrap_test_cleanup(void) {
+    if (g_q1_0_ssd_wrap.mutex_ready) {
+        os_mutex_destroy(&g_q1_0_ssd_wrap.mutex);
+    }
+    if (g_q1_0_ssd_wrap.cond_ready) {
+        os_cond_destroy(&g_q1_0_ssd_wrap.cond);
+    }
+    if (os_file_valid(&g_q1_0_ssd_wrap.file)) {
+        os_file_close(&g_q1_0_ssd_wrap.file);
+    }
+    if (g_q1_0_ssd_wrap_test_file_path[0]) {
+        remove(g_q1_0_ssd_wrap_test_file_path);
+        g_q1_0_ssd_wrap_test_file_path[0] = '\0';
+    }
+    for (cuda_dynamic_arena_slot &slot : g_dynamic_arena.slots) {
+        free(slot.host_ptr);
+        slot.host_ptr = NULL;
+    }
+    free(g_dynamic_arena.ssd_wrap_ssd_ring_base);
+    g_dynamic_arena.ssd_wrap_ssd_ring_base = NULL;
+    g_dynamic_arena = cuda_dynamic_arena();
+    g_q1_0_ssd_wrap = cuda_q1_0_ssd_wrap_state();
+    g_q1_0_ssd_wrap_reserved_slots.clear();
+    g_moe_tiering = cuda_moe_tiering();
+    g_iq1_promotion = cuda_iq1_promotion();
+}
+
+static int cuda_q1_0_ssd_wrap_test_setup(void) {
+    cuda_q1_0_ssd_wrap_test_cleanup();
+    g_dynamic_arena.slot_bytes = 12u;
+    g_dynamic_arena.next_generation = 10u;
+    g_dynamic_arena.slots.resize(1u);
+    g_dynamic_arena.slots[0].host_ptr = (char *)malloc((size_t)g_dynamic_arena.slot_bytes);
+    if (!g_dynamic_arena.slots[0].host_ptr) return 0;
+    memcpy(g_dynamic_arena.slots[0].host_ptr, "abcdefghijkl", 12u);
+    g_dynamic_arena.slots[0].layer = 1u;
+    g_dynamic_arena.slots[0].expert = 2u;
+    g_dynamic_arena.slots[0].content_generation = 11u;
+    g_dynamic_arena.slots[0].state = DS4_GPU_ARENA_LOADING;
+    g_dynamic_arena.ssd_wrap_ssd_ring_base = (char *)malloc((size_t)g_dynamic_arena.slot_bytes);
+    if (!g_dynamic_arena.ssd_wrap_ssd_ring_base) return 0;
+    memcpy(g_dynamic_arena.ssd_wrap_ssd_ring_base, "abcdefghijkl", 12u);
+
+    g_moe_tiering.entries.resize((size_t)CUDA_MOE_LAYER_COUNT * 256u);
+    g_moe_tiering.call_tick = 2u;
+    g_iq1_promotion.request_budget = 4u;
+    g_iq1_promotion.request_used = 1u;
+    g_iq1_promotion.window_calls = 8u;
+    g_iq1_promotion.window_budget = 4u;
+    g_iq1_promotion.window_used = 1u;
+
+    os_file_init(&g_q1_0_ssd_wrap.file);
+    if (os_mutex_init(&g_q1_0_ssd_wrap.mutex) != 0) {
+        return 0;
+    }
+    g_q1_0_ssd_wrap.mutex_ready = 1;
+    if (os_cond_init(&g_q1_0_ssd_wrap.cond) != 0) {
+        return 0;
+    }
+    g_q1_0_ssd_wrap.cond_ready = 1;
+    g_q1_0_ssd_wrap.enabled = 1;
+    g_q1_0_ssd_wrap.max_age_calls = 1u;
+    g_q1_0_ssd_wrap.jobs.resize(1u);
+    g_q1_0_ssd_wrap_reserved_slots.assign(1u, 1u);
+
+    cuda_q1_0_ssd_wrap_job &job = g_q1_0_ssd_wrap.jobs[0];
+    job = cuda_q1_0_ssd_wrap_job();
+    job.state = CUDA_Q1_0_SSD_WRAP_RAM_READY;
+    job.request_epoch = 7u;
+    job.enqueue_call = 2u;
+    job.bytes_requested = g_dynamic_arena.slot_bytes;
+    job.bytes_read = g_dynamic_arena.slot_bytes;
+    job.ranges_requested = 3u;
+    job.ranges_read = 3u;
+    job.layer = 1u;
+    job.expert = 2u;
+    job.slot = 0u;
+    job.ring_slot = UINT32_MAX;
+    job.read_base = g_dynamic_arena.slots[0].host_ptr;
+    job.record.active = 1;
+    job.record.request_epoch = 7u;
+    job.record.current_call = 2u;
+    job.record.observation_call = 1u;
+    job.record.first_eligible_call = 2u;
+    job.record.layer = 1u;
+    job.record.expert = 2u;
+    job.record.gate_request_used = 0u;
+    job.record.gate_window_used = 0u;
+    job.record.destination_model_size = 12u;
+    job.record.destination_gate_offset = 0u;
+    job.record.destination_up_offset = 4u;
+    job.record.destination_down_offset = 8u;
+    job.record.destination_gate_bytes = 4u;
+    job.record.destination_up_bytes = 4u;
+    job.record.destination_down_bytes = 4u;
+    job.record.destination_bytes = 12u;
+    g_q1_0_ssd_wrap.requested = 1u;
+    g_q1_0_ssd_wrap.attempts = 1u;
+    return 1;
+}
+
+static int cuda_q1_0_ssd_wrap_test_commit_checksum(
+        ds4_gpu_ssdwrap_test_result *out) {
+    cuda_q1_0_ssd_wrap_test_cleanup();
+    if (out) memset(out, 0, sizeof(*out));
+
+    g_dynamic_arena.slot_bytes = 12u;
+    g_dynamic_arena.n_layer = 1u;
+    g_dynamic_arena.n_expert = 1u;
+    g_dynamic_arena.snapshot_generation = 1u;
+    g_dynamic_arena.next_generation = 1u;
+    g_dynamic_arena.slots.resize(1u);
+    g_dynamic_arena.staging.resize(1u);
+    g_dynamic_arena.active.resize(1u);
+    g_dynamic_arena.preloaded.resize(1u);
+
+    char *host = (char *)malloc((size_t)g_dynamic_arena.slot_bytes);
+    if (!host) return 0;
+    memcpy(host, "abcdefghijkl", 12u);
+
+    cuda_dynamic_arena_slot &slot = g_dynamic_arena.slots[0];
+    slot.host_ptr = host;
+    slot.layer = 0u;
+    slot.expert = 0u;
+    slot.content_generation = 2u;
+    slot.state = DS4_GPU_ARENA_LOADING;
+
+    const cuda_dynamic_arena_binding empty =
+        cuda_dynamic_arena_empty_binding();
+    g_dynamic_arena.active[0] = empty;
+    g_dynamic_arena.preloaded[0] = empty;
+    g_dynamic_arena.staging[0] = {
+        0u, DS4_GPU_ARENA_LOADING, slot.content_generation, 2u
+    };
+
+    ds4_gpu_dynamic_arena_txn txn;
+    txn.base_generation = 1u;
+    txn.target_generation = 2u;
+    txn.retire_event = NULL;
+    txn.failed = 0;
+    txn.target.assign(1u, 1u);
+    txn.loads.push_back({
+        0u, 0u, 0u, slot.content_generation,
+        slot.host_ptr, g_dynamic_arena.slot_bytes
+    });
+    txn.reserved_slots.push_back(0u);
+    g_dynamic_arena.txn = &txn;
+
+    const uint64_t checksum = cuda_dynamic_arena_fnv1a64(
+        (const uint8_t *)slot.host_ptr, g_dynamic_arena.slot_bytes);
+    const int ok = cuda_dynamic_arena_finish_load_impl(
+        &txn, 0u, checksum ^ 1u, 1, 1);
+    if (out) {
+        out->ok = ok;
+        out->failed = txn.failed;
+    }
+    g_dynamic_arena.txn = NULL;
+    cuda_q1_0_ssd_wrap_test_cleanup();
+    return 1;
+}
+
+static int cuda_q1_0_ssd_wrap_test_run(
+        ds4_gpu_ssdwrap_test_result *out,
+        ds4_gpu_ssdwrap_test_fault fault) {
+    if (!cuda_q1_0_ssd_wrap_test_setup()) {
+        cuda_q1_0_ssd_wrap_test_capture(out, 0);
+        cuda_q1_0_ssd_wrap_test_cleanup();
+        return 0;
+    }
+    cuda_q1_0_ssd_wrap_job &job = g_q1_0_ssd_wrap.jobs[0];
+    switch (fault) {
+    case DS4_GPU_SSDWRAP_TEST_STALE_AGE:
+        job.state = CUDA_Q1_0_SSD_WRAP_REQUESTED;
+        job.enqueue_call = 0u;
+        g_moe_tiering.call_tick = 3u;
+        break;
+    case DS4_GPU_SSDWRAP_TEST_EPOCH_MISMATCH:
+        job.record.request_epoch = 8u;
+        break;
+    case DS4_GPU_SSDWRAP_TEST_VICTIM_STALE: {
+        job.replacing = 1u;
+        job.ring_slot = 0u;
+        job.read_base = g_dynamic_arena.ssd_wrap_ssd_ring_base;
+        job.victim_entry_index = (size_t)3u * 256u + 4u;
+        job.victim_layer = 3u;
+        job.victim_expert = 4u;
+        job.victim_generation = 11u;
+        job.victim_state = CUDA_MOE_TIER_RAM_PROBATION;
+        cuda_moe_tier_entry &victim = g_moe_tiering.entries[job.victim_entry_index];
+        victim.ram_slot = 0u;
+        victim.ram_generation = 12u;
+        victim.state = CUDA_MOE_TIER_RAM_PROBATION;
+        g_dynamic_arena.slots[0].state = DS4_GPU_ARENA_READY;
+        g_dynamic_arena.slots[0].layer = 3u;
+        g_dynamic_arena.slots[0].expert = 4u;
+        break;
+    }
+    case DS4_GPU_SSDWRAP_TEST_DESTINATION_STALE:
+        g_dynamic_arena.slots[0].layer = 9u;
+        break;
+    case DS4_GPU_SSDWRAP_TEST_PREAD_FAILURE: {
+        snprintf(g_q1_0_ssd_wrap_test_file_path,
+                 sizeof(g_q1_0_ssd_wrap_test_file_path),
+                 "g130_ssdwrap_short_pread_%p.bin", (void *)out);
+        FILE *fp = os_fopen(g_q1_0_ssd_wrap_test_file_path, "wb");
+        if (!fp) {
+            job.failure_reason = "pread_test_setup";
+            job.state = CUDA_Q1_0_SSD_WRAP_FAILED;
+            job.bytes_read = 0u;
+            break;
+        }
+        fwrite("short", 1u, 5u, fp);
+        fclose(fp);
+        if (os_file_open_read(
+                &g_q1_0_ssd_wrap.file,
+                g_q1_0_ssd_wrap_test_file_path) != 0) {
+            job.failure_reason = "pread_test_setup";
+            job.state = CUDA_Q1_0_SSD_WRAP_FAILED;
+            job.bytes_read = 0u;
+            break;
+        }
+        uint32_t ranges = 0;
+        uint32_t coalesced = 0;
+        const int read_ok = cuda_q1_0_ssd_wrap_read_job(
+            &job, &ranges, &coalesced);
+        if (read_ok) job.failure_reason = "pread_test_unexpected";
+        else job.failure_reason = "partial_or_pread";
+        job.state = CUDA_Q1_0_SSD_WRAP_FAILED;
+        job.bytes_read = 0u;
+        break;
+    }
+    case DS4_GPU_SSDWRAP_TEST_PROVENANCE_MISMATCH:
+        job.record.layer = 9u;
+        break;
+    case DS4_GPU_SSDWRAP_TEST_CHECKSUM_MISMATCH:
+        cuda_q1_0_ssd_wrap_test_cleanup();
+        return cuda_q1_0_ssd_wrap_test_commit_checksum(out);
+    case DS4_GPU_SSDWRAP_TEST_PAIRING_BREAK:
+        job.record.destination_down_bytes = 5u;
+        break;
+    case DS4_GPU_SSDWRAP_TEST_HAPPY:
+    default:
+        break;
+    }
+    const int ok = fault == DS4_GPU_SSDWRAP_TEST_STALE_AGE ?
+        cuda_q1_0_ssd_wrap_poll_internal(1) :
+        cuda_q1_0_ssd_wrap_finish_one(0u, 1);
+    cuda_q1_0_ssd_wrap_test_capture(out, ok);
+    cuda_q1_0_ssd_wrap_test_cleanup();
+    return 1;
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_happy(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_HAPPY);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_stale_age(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_STALE_AGE);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_epoch_mismatch(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_EPOCH_MISMATCH);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_victim_stale(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_VICTIM_STALE);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_destination_stale(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_DESTINATION_STALE);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_pread_failure(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_PREAD_FAILURE);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_provenance_mismatch(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_PROVENANCE_MISMATCH);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_checksum_mismatch(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_CHECKSUM_MISMATCH);
+}
+
+extern "C" int ds4_gpu_ssdwrap_test_pairing_break(
+        ds4_gpu_ssdwrap_test_result *out) {
+    return cuda_q1_0_ssd_wrap_test_run(out, DS4_GPU_SSDWRAP_TEST_PAIRING_BREAK);
+}
+#endif
 
 static int cuda_moe_tiering_load_to_ram(
         const cuda_moe_route_request &request,

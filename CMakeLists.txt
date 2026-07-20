@@ -34,6 +34,7 @@ endif()
 add_library(ds4_cuda STATIC ds4_cuda.cu)
 target_compile_features(ds4_cuda PRIVATE cxx_std_17)
 target_link_libraries(ds4_cuda PUBLIC ds4_platform)
+target_compile_definitions(ds4_cuda PRIVATE DS4_TESTING)
 set_target_properties(ds4_cuda PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF
     CUDA_ARCHITECTURES "${DS4_CUDA_ARCHITECTURES}"
