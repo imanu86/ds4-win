@@ -2514,6 +2514,16 @@ static int q1_0_pageable_overflow_requested(void) {
     return -1;
 }
 
+static int q1_0_dynamic_promotion_requested(void) {
+    const char *value = getenv("DS4_Q1_0_DYNAMIC_PROMOTION");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_Q1_0_DYNAMIC_PROMOTION=%s; expected 0 or 1\n",
+            value);
+    return -1;
+}
+
 static bool iq1_s_mixed_cold_one_requested(void) {
     const char *value = getenv("DS4_IQ1_S_MIXED_COLD_K");
     return value && strcmp(value, "1") == 0;
@@ -19486,25 +19496,36 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     const int q1_0_snapshot_backing = q1_0_snapshot_backing_requested();
     const int q1_0_pageable_overflow =
         q1_0_pageable_overflow_requested();
+    const int q1_0_dynamic_promotion =
+        q1_0_dynamic_promotion_requested();
     const char *q1_0_selected_load = getenv("DS4_Q1_0_SELECTED_LOAD");
     if (q1_0_resident_arena < 0 || q1_0_dual_arena < 0 ||
         q1_0_dual_sparse_companion < 0 || q1_0_mixed_cold_one < 0 ||
         q1_0_snapshot_backing < 0 || q1_0_pageable_overflow < 0 ||
+        q1_0_dynamic_promotion < 0 ||
         (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0) ||
         (q1_0_dual_sparse_companion > 0 &&
          (q1_0_dual_arena <= 0 || q1_0_resident_arena <= 0 ||
           q1_0_mixed_cold_one <= 0)) ||
         (q1_0_mixed_cold_one > 0 && q1_0_dual_sparse_companion <= 0) ||
-        (q1_0_pageable_overflow > 0 && q1_0_snapshot_backing <= 0) ||
+        (q1_0_pageable_overflow > 0 &&
+         q1_0_snapshot_backing <= 0 &&
+         !(q1_0_resident_arena > 0 && q1_0_dual_arena > 0)) ||
         (q1_0_snapshot_backing > 0 &&
          (q1_0_resident_arena > 0 || q1_0_dual_arena > 0)) ||
+        (q1_0_dynamic_promotion > 0 &&
+         (q1_0_resident_arena <= 0 || q1_0_dual_arena <= 0 ||
+          q1_0_dual_sparse_companion > 0 || q1_0_mixed_cold_one > 0 ||
+          q1_0_snapshot_backing > 0)) ||
         ((q1_0_resident_arena > 0 || q1_0_snapshot_backing > 0) &&
          (!e->q1_0_sidecar_ready || !q1_0_selected_load ||
           strcmp(q1_0_selected_load, "1") != 0))) {
         fprintf(stderr,
                 "ds4: invalid Q1_0 arena configuration; dual sparse 5+1 "
                 "requires resident+dual+cold-one, pageable overflow requires "
-                "exclusive snapshot backing, and every Q1_0 arena requires "
+                "exclusive snapshot backing or resident dual-arena mode, and "
+                "dynamic promotion requires full resident dual-arena mode, "
+                "and every Q1_0 arena requires "
                 "a valid sidecar plus DS4_Q1_0_SELECTED_LOAD=1\n");
         ds4_engine_close(e);
         *out = NULL;
@@ -20114,13 +20135,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             q1_0_snapshot_backing_requested();
         const int q1_0_pageable_overflow =
             q1_0_pageable_overflow_requested();
+        const int q1_0_dynamic_promotion =
+            q1_0_dynamic_promotion_requested();
         const char *arena_gb_env = getenv("DS4_CUDA_DYNAMIC_ARENA_GB");
         const double arena_gb = arena_gb_env && arena_gb_env[0]
             ? strtod(arena_gb_env, NULL) : 0.0;
+        const char *q1_0_arena_gb_env =
+            getenv("DS4_Q1_0_DYNAMIC_ARENA_GB");
+        const double q1_0_arena_gb =
+            q1_0_arena_gb_env && q1_0_arena_gb_env[0]
+                ? strtod(q1_0_arena_gb_env, NULL) : arena_gb;
         if (q1_0_resident_arena < 0 || q1_0_dual_arena < 0 ||
             q1_0_dual_sparse_companion < 0 ||
             q1_0_mixed_cold_one < 0 ||
             q1_0_snapshot_backing < 0 || q1_0_pageable_overflow < 0 ||
+            q1_0_dynamic_promotion < 0 ||
             (q1_0_dual_arena > 0 && q1_0_resident_arena <= 0) ||
             (q1_0_dual_sparse_companion > 0 &&
              (q1_0_dual_arena <= 0 || q1_0_resident_arena <= 0 ||
@@ -20128,16 +20157,24 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             (q1_0_mixed_cold_one > 0 &&
              q1_0_dual_sparse_companion <= 0) ||
             (q1_0_pageable_overflow > 0 &&
-             q1_0_snapshot_backing <= 0) ||
+             q1_0_snapshot_backing <= 0 &&
+             !(q1_0_resident_arena > 0 && q1_0_dual_arena > 0)) ||
             (q1_0_snapshot_backing > 0 &&
-             (q1_0_resident_arena > 0 || q1_0_dual_arena > 0))) {
+             (q1_0_resident_arena > 0 || q1_0_dual_arena > 0)) ||
+            (q1_0_dynamic_promotion > 0 &&
+             (q1_0_resident_arena <= 0 || q1_0_dual_arena <= 0 ||
+              q1_0_dual_sparse_companion > 0 ||
+              q1_0_mixed_cold_one > 0 ||
+              q1_0_snapshot_backing > 0))) {
             metal_graph_free(&s->graph);
             free(s);
             return 1;
         }
-        if (q1_0_resident_arena > 0 && arena_gb <= 0.0) {
+        if (q1_0_resident_arena > 0 && q1_0_arena_gb <= 0.0) {
             fprintf(stderr,
-                    "ds4: Q1_0 resident arena requires DS4_CUDA_DYNAMIC_ARENA_GB>0\n");
+                    "ds4: Q1_0 resident arena requires "
+                    "DS4_Q1_0_DYNAMIC_ARENA_GB>0 or "
+                    "DS4_CUDA_DYNAMIC_ARENA_GB>0\n");
             metal_graph_free(&s->graph);
             free(s);
             return 1;
@@ -20149,10 +20186,23 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
-        if (arena_gb > 0.0) {
+        if (q1_0_dual_arena > 0 && arena_gb <= 0.0) {
+            fprintf(stderr,
+                    "ds4: Q1_0 dual arena requires "
+                    "DS4_CUDA_DYNAMIC_ARENA_GB>0 for exact IQ2 storage\n");
+            metal_graph_free(&s->graph);
+            free(s);
+            return 1;
+        }
+        if (arena_gb > 0.0 || q1_0_arena_gb > 0.0) {
             ds4_gpu_dynamic_arena_layer layers[DS4_N_LAYER];
             const uint64_t requested = arena_gb >= (double)UINT64_MAX / 1073741824.0
                 ? UINT64_MAX : (uint64_t)(arena_gb * 1073741824.0);
+            const uint64_t q1_0_requested =
+                q1_0_arena_gb >=
+                        (double)UINT64_MAX / 1073741824.0
+                    ? UINT64_MAX
+                    : (uint64_t)(q1_0_arena_gb * 1073741824.0);
             if (q1_0_snapshot_backing > 0) {
                 uint64_t allocated = 0;
                 uint32_t slots = 0;
@@ -20238,7 +20288,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 const int q1_prepared = q1_bound &&
                     (q1_0_dual_sparse_companion > 0 ||
                      ds4_gpu_dynamic_arena_prepare_q1_0(
-                        requested, &q1_allocated, &q1_slots,
+                        q1_0_requested, &q1_allocated, &q1_slots,
                         &q1_generation));
                 if (!q1_prepared) {
                     fprintf(stderr,
