@@ -79,17 +79,85 @@ static socket_t g_listen_fd = OS_INVALID_SOCKET;
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
-static void server_request_stop(void) {
+static socket_t server_exchange_listener(socket_t replacement) {
 #ifdef _WIN32
-    InterlockedExchange(&g_stop_requested, 1);
+    return (socket_t)(uintptr_t)InterlockedExchangePointer(
+        (PVOID volatile *)&g_listen_fd,
+        (PVOID)(uintptr_t)replacement);
 #else
-    g_stop_requested = 1;
+    return __atomic_exchange_n(&g_listen_fd, replacement, __ATOMIC_ACQ_REL);
 #endif
-    if (g_listen_fd != OS_INVALID_SOCKET) {
-        socket_t fd = g_listen_fd;
-        g_listen_fd = OS_INVALID_SOCKET;
-        close_socket(fd);
+}
+
+static bool server_stop_requested(void) {
+#ifdef _WIN32
+    return InterlockedCompareExchange(&g_stop_requested, 0, 0) != 0;
+#else
+    return __atomic_load_n(&g_stop_requested, __ATOMIC_ACQUIRE) != 0;
+#endif
+}
+
+static void server_request_stop(void) {
+    socket_t fd;
+#ifdef _WIN32
+    (void)InterlockedExchange(&g_stop_requested, 1);
+#else
+    (void)__atomic_exchange_n(&g_stop_requested, 1, __ATOMIC_RELEASE);
+#endif
+    fd = server_exchange_listener(OS_INVALID_SOCKET);
+    if (fd != OS_INVALID_SOCKET) close_socket(fd);
+}
+
+/* G130 U1 control is intentionally unavailable in normal server operation.
+ * The harness binds loopback only and supplies a per-run hexadecimal token.
+ * Keeping the endpoint profile-local avoids inventing a public shutdown API. */
+static const char *g130_u1_shutdown_token(void) {
+    const char *token = getenv("DS4_G130_U1_SHUTDOWN_TOKEN");
+    if (!token || strlen(token) != 64) return NULL;
+    for (const char *p = token; *p; p++) {
+        if (!(('0' <= *p && *p <= '9') || ('a' <= *p && *p <= 'f'))) return NULL;
     }
+    return token;
+}
+
+static bool g130_u1_shutdown_body_matches(const char *body, const char *token) {
+    if (!body || !token) return false;
+    static const char prefix[] = "{\"token\":\"";
+    static const char suffix[] = "\"}";
+    const size_t prefix_len = sizeof(prefix) - 1;
+    const size_t token_len = 64;
+    const size_t suffix_len = sizeof(suffix) - 1;
+    if (strlen(body) != prefix_len + token_len + suffix_len ||
+        memcmp(body, prefix, prefix_len) != 0 ||
+        memcmp(body + prefix_len + token_len, suffix, suffix_len) != 0) {
+        return false;
+    }
+    unsigned diff = 0;
+    for (size_t i = 0; i < token_len; i++) {
+        diff |= (unsigned char)body[prefix_len + i] ^ (unsigned char)token[i];
+    }
+    return diff == 0;
+}
+
+static bool g130_u1_peer_is_ipv4_loopback(socket_t fd) {
+    struct sockaddr_storage peer;
+#ifdef _WIN32
+    int peer_len = (int)sizeof(peer);
+#else
+    socklen_t peer_len = (socklen_t)sizeof(peer);
+#endif
+    memset(&peer, 0, sizeof(peer));
+    if (getpeername(fd, (struct sockaddr *)&peer, &peer_len) != 0 ||
+        peer.ss_family != AF_INET) {
+        return false;
+    }
+    const struct sockaddr_in *ipv4 = (const struct sockaddr_in *)&peer;
+    return (ntohl(ipv4->sin_addr.s_addr) & 0xff000000u) == 0x7f000000u;
+}
+
+static bool g130_u1_profile_token_enabled(void) {
+    const char *value = getenv("DS4_Q1_0_PROFILE");
+    return value && !strcmp(value, "1");
 }
 
 #ifdef _WIN32
@@ -98,12 +166,7 @@ static BOOL WINAPI stop_console_handler(DWORD ctrl) {
     case CTRL_C_EVENT:
     case CTRL_BREAK_EVENT:
     case CTRL_CLOSE_EVENT:
-        InterlockedExchange(&g_stop_requested, 1);
-        if (g_listen_fd != OS_INVALID_SOCKET) {
-            socket_t fd = g_listen_fd;
-            g_listen_fd = OS_INVALID_SOCKET;
-            close_socket(fd);
-        }
+        server_request_stop();
         return TRUE;
     default:
         return FALSE;
@@ -112,13 +175,8 @@ static BOOL WINAPI stop_console_handler(DWORD ctrl) {
 #else
 static void stop_signal_handler(int sig) {
     (void)sig;
-    if (g_stop_requested) _exit(130);
-    g_stop_requested = 1;
-    if (g_listen_fd != OS_INVALID_SOCKET) {
-        socket_t fd = g_listen_fd;
-        g_listen_fd = OS_INVALID_SOCKET;
-        close_socket(fd);
-    }
+    if (server_stop_requested()) _exit(130);
+    server_request_stop();
 }
 #endif
 
@@ -2738,7 +2796,7 @@ static bool send_all(socket_t fd, const void *p, size_t n) {
     const char *s = p;
     long long deadline = wall_ms() + DS4_SERVER_SEND_STALL_TIMEOUT_MS;
     while (n) {
-        if (g_stop_requested) return false;
+        if (server_stop_requested()) return false;
         int chunk = n > (size_t)INT_MAX ? INT_MAX : (int)n;
         int w = send(fd, s, chunk, 0);
         int err = w < 0 ? sock_errno() : 0;
@@ -7355,11 +7413,12 @@ static void generate_job(server *s, job *j) {
     request_phase_trace("decode-enter", t0, decode_t0);
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
+    const bool g130_u1_token_profile = g130_u1_profile_token_enabled();
     thinking_state thinking = thinking_state_from_prompt(&j->req);
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!server_stop_requested() && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -7437,6 +7496,14 @@ static void generate_job(server *s, job *j) {
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+
+            if (g130_u1_token_profile) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: [q1-0-profile-token] "
+                           "schema=g130_u1_profile_token_v1 result=progress "
+                           "final=0 gen=%d decode_elapsed_seconds=%.9f",
+                           completion, now_sec() - decode_t0);
+            }
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
@@ -7560,7 +7627,7 @@ static void generate_job(server *s, job *j) {
         if (stop_decode) break;
     }
 
-    if (g_stop_requested && strcmp(finish, "error") != 0) {
+    if (server_stop_requested() && strcmp(finish, "error") != 0) {
         finish = "error";
         snprintf(err, sizeof(err), "shutdown requested");
     }
@@ -7627,6 +7694,8 @@ static void generate_job(server *s, job *j) {
     }
     log_tool_calls_summary(ctx_span, &parsed_calls);
 
+    const double decode_elapsed_seconds = now_sec() - decode_t0;
+
     trace_finish(s, trace_id, &j->req, final_finish, completion,
                  saw_tool_start, saw_tool_end,
                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
@@ -7642,8 +7711,9 @@ static void generate_job(server *s, job *j) {
                                          parsed_content ? parsed_content : "");
     }
 
+    bool response_ok = false;
     if (j->req.stream) {
-        bool response_ok = true;
+        response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, &j->req, id, &anthropic_live,
                                                     text.ptr ? text.ptr : "", text.len,
@@ -7670,17 +7740,29 @@ static void generate_job(server *s, job *j) {
                        ctx_span);
         }
     } else if (j->req.api == API_ANTHROPIC) {
-        anthropic_final_response(j->fd, &j->req, id,
-                                 parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                                 parsed_reasoning,
-                                 &parsed_calls, final_finish,
-                                 prompt_tokens, completion);
+        response_ok = anthropic_final_response(
+            j->fd, &j->req, id,
+            parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+            parsed_reasoning, &parsed_calls, final_finish,
+            prompt_tokens, completion);
     } else {
-        final_response(j->fd, &j->req, id,
-                       parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
-                       parsed_reasoning,
-                       &parsed_calls, final_finish,
-                       prompt_tokens, completion);
+        response_ok = final_response(
+            j->fd, &j->req, id,
+            parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
+            parsed_reasoning, &parsed_calls, final_finish,
+            prompt_tokens, completion);
+    }
+    /* The U1 success summary is terminal evidence.  For the streamed U1
+     * contract it is emitted only after finish, usage and [DONE] have all
+     * reached the client.  A partial response therefore cannot acquire a
+     * success-looking summary line. */
+    if (g130_u1_token_profile && j->req.stream && response_ok &&
+        completion == 64 && !strcmp(final_finish, "length")) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: [q1-0-profile-token] "
+                   "schema=g130_u1_profile_token_v1 result=summary final=1 "
+                   "generated_tokens=%d decode_elapsed_seconds=%.9f finish=%s",
+                   completion, decode_elapsed_seconds, final_finish);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -7966,6 +8048,25 @@ static void *client_main(void *arg) {
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models/deepseek-v4-flash")) {
         send_model(s, fd);
         http_request_free(&hr);
+        goto done;
+    }
+
+    if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/__g130_u1_shutdown")) {
+        const char *token = g130_u1_shutdown_token();
+        if (!g130_u1_profile_token_enabled() || !token ||
+            !g130_u1_peer_is_ipv4_loopback(fd)) {
+            http_error(fd, 404, "unknown endpoint");
+            http_request_free(&hr);
+            goto done;
+        }
+        if (!g130_u1_shutdown_body_matches(hr.body, token)) {
+            http_error(fd, 403, "G130 U1 shutdown authentication failed");
+            http_request_free(&hr);
+            goto done;
+        }
+        (void)http_response(fd, 200, "application/json", "{\"status\":\"draining\"}\n");
+        http_request_free(&hr);
+        server_request_stop();
         goto done;
     }
 
@@ -8481,21 +8582,21 @@ int main(int argc, char **argv) {
 #endif
         return 1;
     }
-    g_listen_fd = lfd;
+    (void)server_exchange_listener(lfd);
     server_log(DS4_LOG_DEFAULT, "ds4-server: listening on http://%s:%d", cfg.host, cfg.port);
 
-    while (!g_stop_requested) {
+    while (!server_stop_requested()) {
         socket_t fd = accept(lfd, NULL, NULL);
         if (fd == OS_INVALID_SOCKET) {
             int err = sock_errno();
-            if (g_stop_requested) break;
+            if (server_stop_requested()) break;
             if (sock_interrupted(err)) continue;
             char ebuf[96];
             server_log(DS4_LOG_DEFAULT, "ds4-server: accept failed: %s",
                        socket_error_text(err, ebuf, sizeof(ebuf)));
             continue;
         }
-        if (g_stop_requested) {
+        if (server_stop_requested()) {
             close_socket(fd);
             break;
         }
@@ -8519,10 +8620,7 @@ int main(int argc, char **argv) {
         }
         os_thread_detach(th);
     }
-    if (g_listen_fd != OS_INVALID_SOCKET) {
-        close_socket(lfd);
-        g_listen_fd = OS_INVALID_SOCKET;
-    }
+    server_request_stop();
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     os_mutex_lock(&s.mu);
