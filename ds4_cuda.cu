@@ -419,6 +419,74 @@ struct cuda_q1_0_profile_stats {
 };
 static cuda_q1_0_profile_stats g_q1_0_profile;
 
+/* DS4_Q1_0_PROFILE final summaries for the mixed-Q1 entry point.  Phase
+ * seconds use the host monotonic clock and are accumulated only for completed
+ * calls.  The *_calls fields are the denominator for each disjoint bucket;
+ * call_seconds is the completed-call envelope, so bucket_gap_seconds in the
+ * final line exposes instrumentation gaps instead of naming them "decode".
+ * q1_kernel_device_seconds is the existing CUDA-event measurement; it is an
+ * auxiliary metric and is not added to the disjoint host bucket total.  A
+ * harness accepts a complete pair only with failed/timer/unfenced/missing=0,
+ * successful cleanup sync, finite nonnegative timings, and bucket gap within
+ * tolerance.  Missing cleanup (for example, forced kill) is INCOMPLETE and a
+ * NEGATIVE result, never an implicit zero-call profile. */
+struct cuda_q1_0_mixed_profile_sample {
+    double entry_contract_seconds;
+    double selection_d2h_seconds;
+    double classify_map_seconds;
+    double scratch_prepare_seconds;
+    double metadata_h2d_seconds;
+    double hot_branch_seconds;
+    double tier_observe_seconds;
+    double q1_dispatch_prepare_seconds;
+    double q1_entry_seconds;
+    double q1_selected_load_seconds;
+    double q1_prepare_seconds;
+    double q1_kernel_seconds;
+    double q1_kernel_device_seconds;
+    double join_publish_seconds;
+    double q1_call_started;
+    double q1_prepare_started;
+    double q1_kernel_started;
+    uint64_t entry_contract_calls;
+    uint64_t selection_d2h_calls;
+    uint64_t classify_map_calls;
+    uint64_t scratch_prepare_calls;
+    uint64_t metadata_h2d_calls;
+    uint64_t hot_branch_calls;
+    uint64_t tier_observe_calls;
+    uint64_t q1_dispatch_prepare_calls;
+    uint64_t q1_entry_calls;
+    uint64_t q1_selected_load_calls;
+    uint64_t q1_prepare_calls;
+    uint64_t q1_kernel_calls;
+    uint64_t q1_kernel_device_calls;
+    uint64_t q1_kernel_fenced_calls;
+    uint64_t join_publish_calls;
+};
+
+struct cuda_q1_0_mixed_profile_stats {
+    cuda_q1_0_mixed_profile_sample phases;
+    double call_seconds;
+    uint64_t calls;
+    uint64_t requested_routes;
+    uint64_t completed_calls;
+    uint64_t completed_routes;
+    uint64_t hot_routes;
+    uint64_t q1_routes;
+    uint64_t all_iq2_calls;
+    uint64_t mixed_hot_q1_calls;
+    uint64_t q1_only_calls;
+    uint64_t join_kernel_calls;
+    uint64_t timer_failures;
+};
+
+static cuda_q1_0_mixed_profile_stats g_q1_0_mixed_profile;
+static std::mutex g_q1_0_mixed_profile_mutex;
+static int g_q1_0_mixed_profile_final_emitted;
+static thread_local cuda_q1_0_mixed_profile_sample
+    *g_q1_0_mixed_profile_current_sample;
+
 enum {
     CUDA_EXPERT_RECOVERY_HEADER_BYTES = 64u,
     CUDA_EXPERT_RECOVERY_MAX_SAMPLES = 256u,
@@ -2790,6 +2858,277 @@ static int cuda_q1_0_profile_requested(void) {
     return enabled;
 }
 
+static void cuda_q1_0_mixed_profile_reset(int new_lifecycle) {
+    /* The enable decision is cached for the process lifetime.  When it is
+     * false no mixed-profile writer can run later, so retaining zero-initialized
+     * state is safe and lifecycle calls avoid the profile mutex entirely. */
+    if (!cuda_q1_0_profile_requested()) return;
+    std::lock_guard<std::mutex> guard(g_q1_0_mixed_profile_mutex);
+    g_q1_0_mixed_profile = cuda_q1_0_mixed_profile_stats{};
+    if (new_lifecycle) g_q1_0_mixed_profile_final_emitted = 0;
+}
+
+static void cuda_q1_0_mixed_profile_record_entered(uint32_t routes) {
+    std::lock_guard<std::mutex> guard(g_q1_0_mixed_profile_mutex);
+    g_q1_0_mixed_profile.calls++;
+    g_q1_0_mixed_profile.requested_routes += routes;
+}
+
+static void cuda_q1_0_mixed_profile_record_timer_failure(void) {
+    std::lock_guard<std::mutex> guard(g_q1_0_mixed_profile_mutex);
+    g_q1_0_mixed_profile.timer_failures++;
+}
+
+static void cuda_q1_0_mixed_profile_record_completed(
+        const cuda_q1_0_mixed_profile_sample &sample,
+        double call_seconds,
+        uint32_t hot_routes,
+        uint32_t q1_routes,
+        int joined) {
+    std::lock_guard<std::mutex> guard(g_q1_0_mixed_profile_mutex);
+    cuda_q1_0_mixed_profile_stats &stats = g_q1_0_mixed_profile;
+    cuda_q1_0_mixed_profile_sample &phases = stats.phases;
+    phases.entry_contract_seconds += sample.entry_contract_seconds;
+    phases.selection_d2h_seconds += sample.selection_d2h_seconds;
+    phases.classify_map_seconds += sample.classify_map_seconds;
+    phases.scratch_prepare_seconds += sample.scratch_prepare_seconds;
+    phases.metadata_h2d_seconds += sample.metadata_h2d_seconds;
+    phases.hot_branch_seconds += sample.hot_branch_seconds;
+    phases.tier_observe_seconds += sample.tier_observe_seconds;
+    phases.q1_dispatch_prepare_seconds +=
+        sample.q1_dispatch_prepare_seconds;
+    phases.q1_entry_seconds += sample.q1_entry_seconds;
+    phases.q1_selected_load_seconds += sample.q1_selected_load_seconds;
+    phases.q1_prepare_seconds += sample.q1_prepare_seconds;
+    phases.q1_kernel_seconds += sample.q1_kernel_seconds;
+    phases.q1_kernel_device_seconds += sample.q1_kernel_device_seconds;
+    phases.join_publish_seconds += sample.join_publish_seconds;
+    phases.entry_contract_calls += sample.entry_contract_calls;
+    phases.selection_d2h_calls += sample.selection_d2h_calls;
+    phases.classify_map_calls += sample.classify_map_calls;
+    phases.scratch_prepare_calls += sample.scratch_prepare_calls;
+    phases.metadata_h2d_calls += sample.metadata_h2d_calls;
+    phases.hot_branch_calls += sample.hot_branch_calls;
+    phases.tier_observe_calls += sample.tier_observe_calls;
+    phases.q1_dispatch_prepare_calls += sample.q1_dispatch_prepare_calls;
+    phases.q1_entry_calls += sample.q1_entry_calls;
+    phases.q1_selected_load_calls += sample.q1_selected_load_calls;
+    phases.q1_prepare_calls += sample.q1_prepare_calls;
+    phases.q1_kernel_calls += sample.q1_kernel_calls;
+    phases.q1_kernel_device_calls += sample.q1_kernel_device_calls;
+    phases.q1_kernel_fenced_calls += sample.q1_kernel_fenced_calls;
+    phases.join_publish_calls += sample.join_publish_calls;
+    stats.call_seconds += call_seconds;
+    stats.completed_calls++;
+    stats.completed_routes += (uint64_t)hot_routes + q1_routes;
+    stats.hot_routes += hot_routes;
+    stats.q1_routes += q1_routes;
+    stats.all_iq2_calls += q1_routes == 0u;
+    stats.mixed_hot_q1_calls += hot_routes != 0u && q1_routes != 0u;
+    stats.q1_only_calls += hot_routes == 0u && q1_routes != 0u;
+    stats.join_kernel_calls += joined != 0;
+}
+
+static int cuda_q1_0_mixed_profile_timing_values_ok(
+        const cuda_q1_0_mixed_profile_stats &stats,
+        double bucket_seconds) {
+    const cuda_q1_0_mixed_profile_sample &p = stats.phases;
+    return std::isfinite(stats.call_seconds) && stats.call_seconds >= 0.0 &&
+        std::isfinite(bucket_seconds) && bucket_seconds >= 0.0 &&
+        std::isfinite(p.entry_contract_seconds) &&
+        p.entry_contract_seconds >= 0.0 &&
+        std::isfinite(p.selection_d2h_seconds) &&
+        p.selection_d2h_seconds >= 0.0 &&
+        std::isfinite(p.classify_map_seconds) &&
+        p.classify_map_seconds >= 0.0 &&
+        std::isfinite(p.scratch_prepare_seconds) &&
+        p.scratch_prepare_seconds >= 0.0 &&
+        std::isfinite(p.metadata_h2d_seconds) &&
+        p.metadata_h2d_seconds >= 0.0 &&
+        std::isfinite(p.hot_branch_seconds) &&
+        p.hot_branch_seconds >= 0.0 &&
+        std::isfinite(p.tier_observe_seconds) &&
+        p.tier_observe_seconds >= 0.0 &&
+        std::isfinite(p.q1_dispatch_prepare_seconds) &&
+        p.q1_dispatch_prepare_seconds >= 0.0 &&
+        std::isfinite(p.q1_entry_seconds) && p.q1_entry_seconds >= 0.0 &&
+        std::isfinite(p.q1_selected_load_seconds) &&
+        p.q1_selected_load_seconds >= 0.0 &&
+        std::isfinite(p.q1_prepare_seconds) && p.q1_prepare_seconds >= 0.0 &&
+        std::isfinite(p.q1_kernel_seconds) && p.q1_kernel_seconds >= 0.0 &&
+        std::isfinite(p.q1_kernel_device_seconds) &&
+        p.q1_kernel_device_seconds >= 0.0 &&
+        std::isfinite(p.join_publish_seconds) &&
+        p.join_publish_seconds >= 0.0;
+}
+
+static void cuda_q1_0_mixed_profile_finalize(
+        cudaError_t cleanup_sync_error) {
+    if (!cuda_q1_0_profile_requested()) return;
+    cuda_q1_0_mixed_profile_stats stats = {};
+    {
+        std::lock_guard<std::mutex> guard(g_q1_0_mixed_profile_mutex);
+        if (g_q1_0_mixed_profile_final_emitted) return;
+        g_q1_0_mixed_profile_final_emitted = 1;
+        stats = g_q1_0_mixed_profile;
+    }
+    const cuda_q1_0_mixed_profile_sample &p = stats.phases;
+    const uint64_t failed_calls = stats.calls >= stats.completed_calls
+        ? stats.calls - stats.completed_calls : 0;
+    const uint64_t q1_path_calls =
+        stats.mixed_hot_q1_calls + stats.q1_only_calls;
+    const uint64_t q1_kernel_unfenced_calls =
+        p.q1_kernel_calls >= p.q1_kernel_fenced_calls
+            ? p.q1_kernel_calls - p.q1_kernel_fenced_calls : 0;
+    const uint64_t q1_kernel_device_missing_calls =
+        p.q1_kernel_calls >= p.q1_kernel_device_calls
+            ? p.q1_kernel_calls - p.q1_kernel_device_calls : 0;
+    const double bucket_seconds =
+        p.entry_contract_seconds + p.selection_d2h_seconds +
+        p.classify_map_seconds + p.scratch_prepare_seconds +
+        p.metadata_h2d_seconds + p.hot_branch_seconds +
+        p.tier_observe_seconds + p.q1_dispatch_prepare_seconds +
+        p.q1_entry_seconds + p.q1_selected_load_seconds +
+        p.q1_prepare_seconds + p.q1_kernel_seconds +
+        p.join_publish_seconds;
+    const double bucket_gap_seconds = stats.call_seconds - bucket_seconds;
+    const double bucket_gap_tolerance_seconds = 1.0e-6;
+    const int call_balance_ok =
+        stats.calls == stats.completed_calls + failed_calls;
+    const int route_balance_ok =
+        stats.completed_routes == stats.hot_routes + stats.q1_routes;
+    const int host_coverage_ok =
+        p.entry_contract_calls == stats.completed_calls &&
+        p.selection_d2h_calls == stats.completed_calls &&
+        p.classify_map_calls == stats.completed_calls &&
+        p.hot_branch_calls == stats.completed_calls &&
+        p.join_publish_calls == stats.completed_calls &&
+        p.scratch_prepare_calls == q1_path_calls &&
+        p.metadata_h2d_calls == q1_path_calls &&
+        p.tier_observe_calls == q1_path_calls &&
+        p.q1_dispatch_prepare_calls == q1_path_calls &&
+        p.q1_entry_calls == q1_path_calls &&
+        p.q1_selected_load_calls == q1_path_calls &&
+        p.q1_prepare_calls == q1_path_calls &&
+        p.q1_kernel_calls == q1_path_calls &&
+        stats.join_kernel_calls == q1_path_calls &&
+        stats.all_iq2_calls + q1_path_calls == stats.completed_calls;
+    const int device_coverage_ok =
+        p.q1_kernel_device_calls == p.q1_kernel_calls &&
+        p.q1_kernel_fenced_calls == p.q1_kernel_calls &&
+        q1_kernel_device_missing_calls == 0 &&
+        q1_kernel_unfenced_calls == 0;
+    const int cleanup_sync_ok = cleanup_sync_error == cudaSuccess;
+    const int timing_values_ok =
+        cuda_q1_0_mixed_profile_timing_values_ok(stats, bucket_seconds);
+    const int bucket_gap_ok = std::isfinite(bucket_gap_seconds) &&
+        bucket_gap_seconds >= -bucket_gap_tolerance_seconds;
+    const int coverage_ok = call_balance_ok && route_balance_ok &&
+        host_coverage_ok && device_coverage_ok && failed_calls == 0 &&
+        stats.timer_failures == 0 && cleanup_sync_ok && timing_values_ok &&
+        bucket_gap_ok;
+    const int summary_valid = coverage_ok;
+
+    fprintf(stderr,
+            "ds4: [q1-0-profile-route] result=summary final=1 "
+            "path=mixed_q1 enabled=1 unit=seconds clock=host_monotonic "
+            "bucket_scope=completed phase_model=disjoint "
+            "denominator=per_bucket_calls "
+            "limitation_hot_device=unmeasured_no_new_sync "
+            "limitation_failed_calls=counts_only "
+            "cleanup_required=1 missing_cleanup_policy=incomplete_negative "
+            "host_device_additive=0 "
+            "summary_valid=%d cleanup_sync_ok=%d cleanup_sync_error=%d "
+            "timer_failures=%llu timing_values_ok=%d bucket_gap_ok=%d "
+            "bucket_gap_tolerance_seconds=%.9f "
+            "calls=%llu completed_calls=%llu "
+            "failed_calls=%llu call_seconds=%.9f bucket_seconds=%.9f "
+            "bucket_gap_seconds=%.9f "
+            "entry_contract_calls=%llu entry_contract_seconds=%.9f "
+            "selection_d2h_calls=%llu selection_d2h_seconds=%.9f "
+            "classify_map_calls=%llu classify_map_seconds=%.9f "
+            "scratch_prepare_calls=%llu scratch_prepare_seconds=%.9f "
+            "metadata_h2d_calls=%llu metadata_h2d_seconds=%.9f "
+            "hot_branch_calls=%llu hot_branch_seconds=%.9f "
+            "tier_observe_calls=%llu tier_observe_seconds=%.9f "
+            "q1_dispatch_prepare_calls=%llu "
+            "q1_dispatch_prepare_seconds=%.9f "
+            "q1_entry_calls=%llu q1_entry_seconds=%.9f "
+            "q1_selected_load_calls=%llu q1_selected_load_seconds=%.9f "
+            "q1_prepare_calls=%llu q1_prepare_seconds=%.9f "
+            "q1_kernel_calls=%llu q1_kernel_seconds=%.9f "
+            "q1_kernel_device_calls=%llu q1_kernel_device_seconds=%.9f "
+            "q1_kernel_device_missing_calls=%llu "
+            "q1_kernel_device_in_bucket=0 "
+            "q1_kernel_fenced_calls=%llu q1_kernel_unfenced_calls=%llu "
+            "join_publish_calls=%llu join_publish_seconds=%.9f\n",
+            summary_valid, cleanup_sync_ok, (int)cleanup_sync_error,
+            (unsigned long long)stats.timer_failures,
+            timing_values_ok, bucket_gap_ok, bucket_gap_tolerance_seconds,
+            (unsigned long long)stats.calls,
+            (unsigned long long)stats.completed_calls,
+            (unsigned long long)failed_calls,
+            stats.call_seconds, bucket_seconds, bucket_gap_seconds,
+            (unsigned long long)p.entry_contract_calls,
+            p.entry_contract_seconds,
+            (unsigned long long)p.selection_d2h_calls,
+            p.selection_d2h_seconds,
+            (unsigned long long)p.classify_map_calls,
+            p.classify_map_seconds,
+            (unsigned long long)p.scratch_prepare_calls,
+            p.scratch_prepare_seconds,
+            (unsigned long long)p.metadata_h2d_calls,
+            p.metadata_h2d_seconds,
+            (unsigned long long)p.hot_branch_calls,
+            p.hot_branch_seconds,
+            (unsigned long long)p.tier_observe_calls,
+            p.tier_observe_seconds,
+            (unsigned long long)p.q1_dispatch_prepare_calls,
+            p.q1_dispatch_prepare_seconds,
+            (unsigned long long)p.q1_entry_calls,
+            p.q1_entry_seconds,
+            (unsigned long long)p.q1_selected_load_calls,
+            p.q1_selected_load_seconds,
+            (unsigned long long)p.q1_prepare_calls,
+            p.q1_prepare_seconds,
+            (unsigned long long)p.q1_kernel_calls,
+            p.q1_kernel_seconds,
+            (unsigned long long)p.q1_kernel_device_calls,
+            p.q1_kernel_device_seconds,
+            (unsigned long long)q1_kernel_device_missing_calls,
+            (unsigned long long)p.q1_kernel_fenced_calls,
+            (unsigned long long)q1_kernel_unfenced_calls,
+            (unsigned long long)p.join_publish_calls,
+            p.join_publish_seconds);
+    fprintf(stderr,
+            "ds4: [q1-0-profile-selection] result=summary final=1 "
+            "path=mixed_q1 enabled=1 unit=count coverage_scope=completed "
+            "denominator=completed_routes "
+            "calls=%llu completed_calls=%llu failed_calls=%llu "
+            "requested_routes=%llu completed_routes=%llu hot_routes=%llu "
+            "q1_routes=%llu all_iq2_calls=%llu mixed_hot_q1_calls=%llu "
+            "q1_only_calls=%llu join_kernel_calls=%llu "
+            "timer_failures=%llu cleanup_sync_ok=%d "
+            "call_balance_ok=%d route_balance_ok=%d "
+            "host_coverage_ok=%d device_coverage_ok=%d coverage_ok=%d "
+            "summary_valid=%d\n",
+            (unsigned long long)stats.calls,
+            (unsigned long long)stats.completed_calls,
+            (unsigned long long)failed_calls,
+            (unsigned long long)stats.requested_routes,
+            (unsigned long long)stats.completed_routes,
+            (unsigned long long)stats.hot_routes,
+            (unsigned long long)stats.q1_routes,
+            (unsigned long long)stats.all_iq2_calls,
+            (unsigned long long)stats.mixed_hot_q1_calls,
+            (unsigned long long)stats.q1_only_calls,
+            (unsigned long long)stats.join_kernel_calls,
+            (unsigned long long)stats.timer_failures,
+            cleanup_sync_ok, call_balance_ok, route_balance_ok,
+            host_coverage_ok, device_coverage_ok, coverage_ok,
+            summary_valid);
+}
+
 static int cuda_request_phase_trace_enabled(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -3101,6 +3440,7 @@ static void cuda_iq1_s_sidecar_clear(void) {
 }
 
 static void cuda_q1_0_sidecar_clear(void) {
+    cuda_q1_0_mixed_profile_reset(0);
     cuda_expert_recovery_trace_finalize();
     cuda_expert_recovery_trace_reset();
     if (g_q1_0_dual_sparse_publications != 0 ||
@@ -5157,6 +5497,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 extern "C" int ds4_gpu_init(void) {
+    cuda_q1_0_mixed_profile_reset(1);
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
@@ -5177,7 +5518,15 @@ extern "C" int ds4_gpu_init(void) {
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
-    (void)cudaDeviceSynchronize();
+    const cudaError_t cleanup_sync_error = cudaDeviceSynchronize();
+    if (cleanup_sync_error != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA mixed-Q1 cleanup synchronize failed: "
+                "code=%d error=%s\n",
+                (int)cleanup_sync_error,
+                cudaGetErrorString(cleanup_sync_error));
+    }
+    cuda_q1_0_mixed_profile_finalize(cleanup_sync_error);
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -5586,6 +5935,7 @@ static void cuda_q1_0_dynamic_arena_release(int report) {
     }
     arena = cuda_dynamic_arena{};
     g_q1_0_profile = cuda_q1_0_profile_stats{};
+    cuda_q1_0_mixed_profile_reset(0);
     g_q1_0_dual_sparse_snapshot = cuda_q1_0_dual_sparse_snapshot{};
 }
 
@@ -6070,6 +6420,7 @@ extern "C" int ds4_gpu_dynamic_arena_prepare_q1_0(
     }
 
     g_q1_0_profile = cuda_q1_0_profile_stats{};
+    cuda_q1_0_mixed_profile_reset(1);
     cuda_q1_0_profile_source_working_set_sample(
         "pre-copy", arena.model_map, arena.model_size);
     cuda_q1_0_source_unlock_stats source_unlock = {};
@@ -12860,6 +13211,7 @@ extern "C" int ds4_gpu_set_q1_0_sidecar(
     fprintf(stderr,
             "ds4: CUDA Q1_0 routed-expert sidecar installed: %.2f GiB\n",
             (double)model_size / 1073741824.0);
+    cuda_q1_0_mixed_profile_reset(1);
     return 1;
 }
 
@@ -31354,12 +31706,28 @@ static int routed_moe_launch(
             }
         }
     } else if (route_q1_0) {
+        cuda_q1_0_mixed_profile_sample *mixed_profile_sample =
+            g_q1_0_mixed_profile_current_sample;
+        if (mixed_profile_sample) {
+            const double selected_started = cuda_wall_sec();
+            mixed_profile_sample->q1_entry_calls++;
+            mixed_profile_sample->q1_entry_seconds +=
+                selected_started - mixed_profile_sample->q1_call_started;
+            mixed_profile_sample->q1_prepare_started = selected_started;
+        }
         const int selected_loaded =
             cuda_moe_selected_load_q1_0(
                 model_map, model_size, layer_index,
                 gate_offset, up_offset, down_offset,
                 gate_expert_bytes, down_expert_bytes,
                 n_total_expert, n_expert, n_tokens, selected);
+        if (mixed_profile_sample) {
+            const double selected_finished = cuda_wall_sec();
+            mixed_profile_sample->q1_selected_load_calls++;
+            mixed_profile_sample->q1_selected_load_seconds +=
+                selected_finished - mixed_profile_sample->q1_prepare_started;
+            mixed_profile_sample->q1_prepare_started = selected_finished;
+        }
         if (selected_loaded) {
             g_q1_0_selected_loads++;
             gate_w = g_moe_gather.gate;
@@ -31508,7 +31876,12 @@ static int routed_moe_launch(
                 if (cudaEventCreate(&prof_ev[i]) != cudaSuccess) {
                     for (uint32_t j = 0; j < i; j++) (void)cudaEventDestroy(prof_ev[j]);
                     memset(prof_ev, 0, sizeof(prof_ev));
-                    if (q1_profile_moe) g_q1_0_profile.timer_failures++;
+                    if (q1_profile_moe) {
+                        g_q1_0_profile.timer_failures++;
+                        if (g_q1_0_mixed_profile_current_sample) {
+                            cuda_q1_0_mixed_profile_record_timer_failure();
+                        }
+                    }
                     break;
                 }
             }
@@ -31568,6 +31941,15 @@ static int routed_moe_launch(
         uint32_t tile_capacity = 0;
         uint32_t tile16_capacity = 0;
         dim3 xq_grid(xq_blocks, n_tokens, 1);
+        if (g_q1_0_mixed_profile_current_sample) {
+            cuda_q1_0_mixed_profile_sample *mixed_profile_sample =
+                g_q1_0_mixed_profile_current_sample;
+            const double kernel_started = cuda_wall_sec();
+            mixed_profile_sample->q1_prepare_calls++;
+            mixed_profile_sample->q1_prepare_seconds +=
+                kernel_started - mixed_profile_sample->q1_prepare_started;
+            mixed_profile_sample->q1_kernel_started = kernel_started;
+        }
         q8_K_quantize_kernel<<<xq_grid, 256>>>(
             xq, (const float *)x->ptr, expert_in_dim, n_tokens,
             NULL, 0u, 0u);
@@ -31652,6 +32034,16 @@ static int routed_moe_launch(
                     (void)cudaEventElapsedTime(&ms_sum, prof_ev[5], prof_ev[6]);
                     const cudaError_t elapsed_error = cudaEventElapsedTime(
                         &ms_total, prof_ev[0], prof_ev[6]);
+                    if (g_q1_0_mixed_profile_current_sample) {
+                        cuda_q1_0_mixed_profile_sample *mixed_profile_sample =
+                            g_q1_0_mixed_profile_current_sample;
+                        mixed_profile_sample->q1_kernel_fenced_calls++;
+                        if (elapsed_error == cudaSuccess) {
+                            mixed_profile_sample->q1_kernel_device_calls++;
+                            mixed_profile_sample->q1_kernel_device_seconds +=
+                                (double)ms_total / 1000.0;
+                        }
+                    }
                     if (q1_profile_moe) {
                         if (elapsed_error == cudaSuccess) {
                             g_q1_0_profile.q1_kernel_calls++;
@@ -31659,6 +32051,9 @@ static int routed_moe_launch(
                                 (double)ms_total / 1000.0;
                         } else {
                             g_q1_0_profile.timer_failures++;
+                            if (g_q1_0_mixed_profile_current_sample) {
+                                cuda_q1_0_mixed_profile_record_timer_failure();
+                            }
                         }
                     }
                     if (legacy_profile_moe) {
@@ -31669,10 +32064,20 @@ static int routed_moe_launch(
                     }
                 } else if (q1_profile_moe) {
                     g_q1_0_profile.timer_failures++;
+                    if (g_q1_0_mixed_profile_current_sample) {
+                        cuda_q1_0_mixed_profile_record_timer_failure();
+                    }
                 }
                 for (uint32_t i = 0; i < 7u; i++) {
                     (void)cudaEventDestroy(prof_ev[i]);
                 }
+            }
+            if (g_q1_0_mixed_profile_current_sample) {
+                cuda_q1_0_mixed_profile_sample *mixed_profile_sample =
+                    g_q1_0_mixed_profile_current_sample;
+                mixed_profile_sample->q1_kernel_calls++;
+                mixed_profile_sample->q1_kernel_seconds +=
+                    cuda_wall_sec() - mixed_profile_sample->q1_kernel_started;
             }
             return ok;
         }
@@ -33042,6 +33447,15 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         float clamp,
         const ds4_gpu_tensor *x) {
     g_q1_0_mixed_calls++;
+    const int mixed_profile = cuda_q1_0_profile_requested();
+    cuda_q1_0_mixed_profile_sample mixed_profile_sample;
+    const double mixed_profile_call_started =
+        mixed_profile ? cuda_wall_sec() : 0.0;
+    double mixed_profile_phase_started = mixed_profile_call_started;
+    if (mixed_profile) {
+        memset(&mixed_profile_sample, 0, sizeof(mixed_profile_sample));
+        cuda_q1_0_mixed_profile_record_entered(n_expert);
+    }
     if (!out || !gate || !up || !mid || !down || !main_model_map ||
         !q1_model_map || !selected || !weights || !x ||
         n_expert == 0u || n_expert > CUDA_MOE_ROUTE_COUNT ||
@@ -33206,14 +33620,30 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
 
     int32_t selected_host[CUDA_MOE_ROUTE_COUNT] = {0};
     float weights_host[CUDA_MOE_ROUTE_COUNT] = {0};
-    if (!cuda_ok(cudaMemcpy(selected_host, selected->ptr,
-                            (size_t)n_expert * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost),
-                 "Q1_0 mixed selected D2H") ||
-        !cuda_ok(cudaMemcpy(weights_host, weights->ptr,
-                            (size_t)n_expert * sizeof(float),
-                            cudaMemcpyDeviceToHost),
-                 "Q1_0 mixed weights D2H")) {
+    if (mixed_profile) {
+        const double d2h_started = cuda_wall_sec();
+        mixed_profile_sample.entry_contract_calls++;
+        mixed_profile_sample.entry_contract_seconds +=
+            d2h_started - mixed_profile_phase_started;
+        mixed_profile_phase_started = d2h_started;
+    }
+    const int mixed_selection_d2h_ok =
+        cuda_ok(cudaMemcpy(selected_host, selected->ptr,
+                           (size_t)n_expert * sizeof(int32_t),
+                           cudaMemcpyDeviceToHost),
+                "Q1_0 mixed selected D2H") &&
+        cuda_ok(cudaMemcpy(weights_host, weights->ptr,
+                           (size_t)n_expert * sizeof(float),
+                           cudaMemcpyDeviceToHost),
+                "Q1_0 mixed weights D2H");
+    if (mixed_profile) {
+        const double d2h_finished = cuda_wall_sec();
+        mixed_profile_sample.selection_d2h_calls++;
+        mixed_profile_sample.selection_d2h_seconds +=
+            d2h_finished - mixed_profile_phase_started;
+        mixed_profile_phase_started = d2h_finished;
+    }
+    if (!mixed_selection_d2h_ok) {
         g_q1_0_mixed_failures++;
         return 0;
     }
@@ -33373,7 +33803,17 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         g_q1_0_mixed_cold_one_q1_routes += cold_count;
     }
 
+    if (mixed_profile) {
+        const double classify_finished = cuda_wall_sec();
+        mixed_profile_sample.classify_map_calls++;
+        mixed_profile_sample.classify_map_seconds +=
+            classify_finished - mixed_profile_phase_started;
+        mixed_profile_phase_started = classify_finished;
+    }
+
     if (cold_count == 0u) {
+        const double hot_branch_started = mixed_profile
+            ? mixed_profile_phase_started : 0.0;
         const int ok = routed_moe_launch(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
@@ -33383,6 +33823,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL);
+        if (mixed_profile) {
+            const double hot_branch_finished = cuda_wall_sec();
+            mixed_profile_sample.hot_branch_calls++;
+            mixed_profile_sample.hot_branch_seconds +=
+                hot_branch_finished - hot_branch_started;
+            mixed_profile_phase_started = hot_branch_finished;
+        }
         if (!ok) {
             g_q1_0_mixed_failures++;
             return 0;
@@ -33399,6 +33846,16 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 g_moe_tiering.call_tick, x, expert_in_dim)) {
             g_q1_0_mixed_failures++;
             return 0;
+        }
+        if (mixed_profile) {
+            const double publish_finished = cuda_wall_sec();
+            mixed_profile_sample.join_publish_calls++;
+            mixed_profile_sample.join_publish_seconds +=
+                publish_finished - mixed_profile_phase_started;
+            cuda_q1_0_mixed_profile_record_completed(
+                mixed_profile_sample,
+                publish_finished - mixed_profile_call_started,
+                hot_count, cold_count, 0);
         }
         return 1;
     }
@@ -33443,6 +33900,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     float *device_cold_weights = (float *)(scratch + off_cold_weights);
     float *device_cold_out = (float *)(scratch + off_cold_out);
     float *device_cold_down = (float *)(scratch + off_cold_down);
+    if (mixed_profile) {
+        const double scratch_finished = cuda_wall_sec();
+        mixed_profile_sample.scratch_prepare_calls++;
+        mixed_profile_sample.scratch_prepare_seconds +=
+            scratch_finished - mixed_profile_phase_started;
+        mixed_profile_phase_started = scratch_finished;
+    }
     if ((hot_count != 0u &&
          (!cuda_ok(cudaMemcpy(device_hot_selected, hot_selected,
                               (size_t)hot_count * sizeof(int32_t),
@@ -33462,6 +33926,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                  "Q1_0 mixed cold weights H2D")) {
         g_q1_0_mixed_failures++;
         return 0;
+    }
+    if (mixed_profile) {
+        const double metadata_finished = cuda_wall_sec();
+        mixed_profile_sample.metadata_h2d_calls++;
+        mixed_profile_sample.metadata_h2d_seconds +=
+            metadata_finished - mixed_profile_phase_started;
+        mixed_profile_phase_started = metadata_finished;
     }
 
     int ok = 1;
@@ -33513,6 +33984,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                     iq2_cold_to_ram_after_hot - iq2_cold_to_ram_before));
         return 0;
     }
+    if (mixed_profile) {
+        const double hot_branch_finished = cuda_wall_sec();
+        mixed_profile_sample.hot_branch_calls++;
+        mixed_profile_sample.hot_branch_seconds +=
+            hot_branch_finished - mixed_profile_phase_started;
+        mixed_profile_phase_started = hot_branch_finished;
+    }
 
     /* The IQ2 route worker already observed the hot subset. Q1 routes bypass
      * that worker, so account for their router demand on the same logical
@@ -33532,6 +34010,13 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 cold_weights[route]);
         }
     }
+    if (mixed_profile) {
+        const double tier_observe_finished = cuda_wall_sec();
+        mixed_profile_sample.tier_observe_calls++;
+        mixed_profile_sample.tier_observe_seconds +=
+            tier_observe_finished - mixed_profile_phase_started;
+        mixed_profile_phase_started = tier_observe_finished;
+    }
 
     const ds4_gpu_tensor cold_selected_tensor = {
         device_cold_selected,
@@ -33547,6 +34032,16 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     ds4_gpu_tensor cold_down_tensor = {
         device_cold_down, cold_down_bytes, 0
     };
+    cuda_q1_0_mixed_profile_sample *previous_profile_sample = NULL;
+    if (mixed_profile) {
+        const double q1_call_started = cuda_wall_sec();
+        mixed_profile_sample.q1_dispatch_prepare_calls++;
+        mixed_profile_sample.q1_dispatch_prepare_seconds +=
+            q1_call_started - mixed_profile_phase_started;
+        mixed_profile_sample.q1_call_started = q1_call_started;
+        previous_profile_sample = g_q1_0_mixed_profile_current_sample;
+        g_q1_0_mixed_profile_current_sample = &mixed_profile_sample;
+    }
     ok = routed_moe_launch(
         &cold_out_tensor, gate, up, mid, &cold_down_tensor,
         q1_model_map, q1_model_size, layer_index,
@@ -33557,6 +34052,10 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         expert_in_dim, expert_mid_dim, out_dim,
         &cold_selected_tensor, &cold_weights_tensor, NULL,
         cold_count, clamp, x, 1u, NULL, NULL);
+    if (mixed_profile) {
+        g_q1_0_mixed_profile_current_sample = previous_profile_sample;
+        mixed_profile_phase_started = cuda_wall_sec();
+    }
     if (!ok) {
         fprintf(stderr,
                 "ds4: [q1-0-mixed] result=failed reason=q1-cold-launch "
@@ -33578,6 +34077,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             join_begin = NULL;
             join_end = NULL;
             g_q1_0_profile.timer_failures++;
+            cuda_q1_0_mixed_profile_record_timer_failure();
             (void)cudaGetLastError();
         }
     }
@@ -33603,6 +34103,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 (double)join_ms / 1000.0;
         } else {
             g_q1_0_profile.timer_failures++;
+            cuda_q1_0_mixed_profile_record_timer_failure();
             (void)cudaGetLastError();
         }
         (void)cudaEventDestroy(join_begin);
@@ -33639,6 +34140,16 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     g_q1_0_mixed_iq2_tier_ram += iq2_tier_ram;
     g_q1_0_mixed_q1_resident += cold_count;
     g_q1_0_mixed_joins++;
+    if (mixed_profile) {
+        const double publish_finished = cuda_wall_sec();
+        mixed_profile_sample.join_publish_calls++;
+        mixed_profile_sample.join_publish_seconds +=
+            publish_finished - mixed_profile_phase_started;
+        cuda_q1_0_mixed_profile_record_completed(
+            mixed_profile_sample,
+            publish_finished - mixed_profile_call_started,
+            hot_count, cold_count, 1);
+    }
     return 1;
 }
 
