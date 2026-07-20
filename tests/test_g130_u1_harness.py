@@ -814,10 +814,9 @@ class Utf8SseHttpAndLateBindTests(unittest.TestCase):
             good = pathlib.Path(td) / "good.bin"
             good.write_bytes("data: caffè ☕\r\n\r\n".encode("utf-8"))
             common = str(COMMON).replace("'", "''"); path = str(good).replace("'", "''")
-            command = f". '{common}';Initialize-G130U1Utf8FramerType;$f=[G130U1Utf8LineFramer]::new();$r=@();foreach($b in [IO.File]::ReadAllBytes('{path}')){{$one=[byte[]]@($b);$r+=@($f.Push($one,1))}};$r+=@($f.Complete());$r|ConvertTo-Json -Compress"
+            command = f". '{common}';Initialize-G130U1Utf8FramerType;$bytes=[IO.File]::ReadAllBytes('{path}');for($split=0;$split-le$bytes.Length;$split++){{$f=[G130U1Utf8LineFramer]::new();$a=New-Object byte[] $split;[Array]::Copy($bytes,0,$a,0,$split);$b=New-Object byte[] ($bytes.Length-$split);[Array]::Copy($bytes,$split,$b,0,$b.Length);$r=@();$r+=@($f.Push($a,$a.Length));$r+=@($f.Push($b,$b.Length));$r+=@($f.Complete());if($r.Count-ne2-or$r[0]-cne'data: caffè ☕'-or$r[1]-cne''){{exit 8}}}};exit 0"
             proc = run_ps_command(command)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(json.loads(proc.stdout), ["data: caffè ☕", ""])
             bad = pathlib.Path(td) / "bad.bin"; bad.write_bytes(b"abc\xc3")
             bad_path = str(bad).replace("'", "''")
             command = f". '{common}';Initialize-G130U1Utf8FramerType;$f=[G130U1Utf8LineFramer]::new();$b=[IO.File]::ReadAllBytes('{bad_path}');try{{$null=$f.Push($b,$b.Length);$null=$f.Complete();exit 0}}catch{{exit 7}}"
