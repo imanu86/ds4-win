@@ -2416,8 +2416,6 @@ static void cuda_prefill_mass_observer_reset(void);
 static void cuda_prefill_mass_observer_finalize(void);
 static void cuda_prefill_mass_observer_release(int report);
 static void cuda_moe_tiering_request_boundary_reset(void);
-static void cuda_g133_decode_token_epoch_begin(
-    uint64_t request_epoch, uint64_t token_index);
 static int cuda_prefill_mass_observer_needs_weights(void);
 static int cuda_moe_prefill_tier_compose_requested(void);
 static int cuda_moe_prefill_tier_router_open_requested(void);
@@ -3110,6 +3108,11 @@ static int cuda_g133_tier_requested(void) {
     return enabled;
 }
 
+/* Core target-decode time exists independently of lazy cache/tiering setup so
+ * the first CLI or benchmark position cannot be initialized back to zero. */
+static uint64_t g_cuda_g133_decode_epoch_generation = 1u;
+static uint64_t g_cuda_g133_decode_position_epoch = 0u;
+
 struct cuda_g133_telemetry_counters {
     std::atomic<uint64_t> upload_sync_wait_nanoseconds{0};
     std::atomic<uint64_t> vram_hits{0};
@@ -3250,9 +3253,6 @@ extern "C" void ds4_gpu_g130_attribution_request_begin(
 
 extern "C" void ds4_gpu_g130_attribution_token_begin(
         uint64_t token_index, double decode_started) {
-    if (cuda_g133_tier_requested()) {
-        cuda_g133_decode_token_epoch_begin(g_cuda_request_epoch, token_index);
-    }
     if (!g_cuda_g130_attribution_enabled) return;
     cuda_g130_attribution_state *state = g_cuda_g130_attribution;
     if (!state || !state->request_active) return;
@@ -23750,17 +23750,27 @@ static size_t cuda_moe_tiering_entry_index(uint32_t layer, uint32_t expert) {
     return (size_t)layer * 256u + expert;
 }
 
-static void cuda_g133_decode_token_epoch_begin(
-        uint64_t request_epoch, uint64_t token_index) {
-    if (!g_moe_tiering.g133_enabled) return;
-    if (request_epoch == 0u || request_epoch == UINT64_MAX ||
-        token_index == UINT64_MAX) {
-        g_moe_tiering.failures++;
+extern "C" void ds4_gpu_g133_decode_position_begin(void) {
+    if (!cuda_g133_tier_requested()) return;
+    if (g_cuda_g133_decode_position_epoch != UINT64_MAX) {
+        g_cuda_g133_decode_position_epoch++;
+    } else if (g_cuda_g133_decode_epoch_generation != UINT64_MAX) {
+        g_cuda_g133_decode_epoch_generation++;
+        g_cuda_g133_decode_position_epoch = 1u;
+    } else {
+        if (g_moe_tiering.g133_enabled) {
+            g_moe_tiering.failures++;
+            g_moe_tiering.g133_decode_epoch_valid = 0;
+        }
         return;
     }
-    g_moe_tiering.g133_decode_request_epoch = request_epoch;
-    g_moe_tiering.g133_decode_token_index = token_index;
-    g_moe_tiering.g133_decode_epoch_valid = 1;
+    if (g_moe_tiering.g133_enabled) {
+        g_moe_tiering.g133_decode_request_epoch =
+            g_cuda_g133_decode_epoch_generation;
+        g_moe_tiering.g133_decode_token_index =
+            g_cuda_g133_decode_position_epoch;
+        g_moe_tiering.g133_decode_epoch_valid = 1;
+    }
 }
 
 static void cuda_g133_refresh_entry(cuda_moe_tier_entry &entry) {
@@ -23825,7 +23835,9 @@ static int cuda_g133_ram_demotion_eligible(cuda_moe_tier_entry &entry) {
     const double demote_threshold = std::max(
         0.0, (double)g_moe_tiering.g133_knock_x -
             g_moe_tiering.g133_demotion_margin);
-    return entry.g133_knock < demote_threshold;
+    return demote_threshold == 0.0
+        ? entry.g133_knock <= 0.0
+        : entry.g133_knock < demote_threshold;
 }
 
 static double cuda_moe_tiering_lfru(
@@ -24206,6 +24218,7 @@ static int cuda_moe_tiering_prepare(void) {
     uint32_t g133_knock_y = 5u;
     uint32_t g133_promote_budget = 8u;
     double g133_decay = 0.98;
+    const double g133_demotion_margin = 1.0;
     int g133_seed_dynamic = 1;
     if (policy_requested < 0 ||
         !cuda_moe_tiering_u32_env(
@@ -24237,6 +24250,14 @@ static int cuda_moe_tiering_prepare(void) {
          !cuda_moe_tiering_u32_env(
              "DS4_G133_PROMOTE_BUDGET", 8u, 1u, 512u,
              &g133_promote_budget))) {
+        return 0;
+    }
+    if (g133_enabled &&
+        (double)g133_knock_x <= g133_demotion_margin) {
+        fprintf(stderr,
+                "ds4: invalid G133 knock config: DS4_G133_KNOCK_X=%u "
+                "must exceed demotion margin %.9g\n",
+                g133_knock_x, g133_demotion_margin);
         return 0;
     }
     if (g133_enabled &&
@@ -24399,11 +24420,14 @@ static int cuda_moe_tiering_prepare(void) {
     g_moe_tiering.g133_promote_remaining = g133_promote_budget;
     g_moe_tiering.g133_promote_request_epoch = UINT64_MAX;
     g_moe_tiering.g133_promote_token_index = UINT64_MAX;
-    g_moe_tiering.g133_decode_request_epoch = g_cuda_request_epoch;
-    g_moe_tiering.g133_decode_token_index = 0u;
-    g_moe_tiering.g133_decode_epoch_valid = g_cuda_request_epoch != 0u;
+    g_moe_tiering.g133_decode_request_epoch =
+        g_cuda_g133_decode_epoch_generation;
+    g_moe_tiering.g133_decode_token_index =
+        g_cuda_g133_decode_position_epoch;
+    g_moe_tiering.g133_decode_epoch_valid =
+        g133_enabled && g_cuda_g133_decode_position_epoch != 0u;
     g_moe_tiering.g133_decay = g133_decay;
-    g_moe_tiering.g133_demotion_margin = 1.0;
+    g_moe_tiering.g133_demotion_margin = g133_demotion_margin;
     g_iq1_promotion = cuda_iq1_promotion();
     g_iq1_promotion.requested_slots =
         (uint32_t)promotion_probation_slots;
@@ -24611,57 +24635,72 @@ static int cuda_moe_tiering_pick_ram_slot(
     }
     for (uint32_t pass = 0; pass < (preferred_pageable < 0 ? 1u : 2u);
          pass++) {
-        int best_slot = -1;
-        size_t best_entry = 0;
-        double best_score = 1.0e300;
-        for (size_t index = 0; index < g_moe_tiering.entries.size(); index++) {
-            cuda_moe_tier_entry &entry = g_moe_tiering.entries[index];
-            const uint32_t entry_layer = (uint32_t)(index / 256u);
-            const uint32_t entry_expert = (uint32_t)(index % 256u);
-            const int reclaimable_vram_backing =
-                entry.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
-                cuda_moe_tiering_has_exact_vram(entry_layer, entry_expert);
-            if (entry.ram_slot >= g_dynamic_arena.slots.size() ||
-                !slot_allowed(entry.ram_slot) ||
-                cuda_q1_0_ssd_wrap_slot_reserved(entry.ram_slot) ||
-                cuda_dynamic_arena_slot_refs_load(
-                    &g_dynamic_arena.slots[entry.ram_slot].
-                        cpu_lane_slot_refs) != 0u ||
-                (pass == 0u && preferred_pageable >= 0 &&
-                 (int)g_dynamic_arena.slots[entry.ram_slot].pageable !=
-                     preferred_pageable) ||
-                (entry.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
-                 !reclaimable_vram_backing) ||
-                entry.last_call == g_moe_tiering.call_tick ||
-                index == cuda_moe_tiering_entry_index(
-                    current_layer, current_expert)) {
-                continue;
+        int after_writer_cas_loss = 0;
+        double lost_score = 0.0;
+        size_t lost_entry = 0;
+        for (;;) {
+            int best_slot = -1;
+            size_t best_entry = 0;
+            double best_score = 1.0e300;
+            for (size_t index = 0; index < g_moe_tiering.entries.size(); index++) {
+                cuda_moe_tier_entry &entry = g_moe_tiering.entries[index];
+                const uint32_t entry_layer = (uint32_t)(index / 256u);
+                const uint32_t entry_expert = (uint32_t)(index % 256u);
+                const int reclaimable_vram_backing =
+                    entry.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
+                    cuda_moe_tiering_has_exact_vram(entry_layer, entry_expert);
+                if (entry.ram_slot >= g_dynamic_arena.slots.size() ||
+                    !slot_allowed(entry.ram_slot) ||
+                    cuda_q1_0_ssd_wrap_slot_reserved(entry.ram_slot) ||
+                    cuda_dynamic_arena_slot_refs_load(
+                        &g_dynamic_arena.slots[entry.ram_slot].
+                            cpu_lane_slot_refs) != 0u ||
+                    (pass == 0u && preferred_pageable >= 0 &&
+                     (int)g_dynamic_arena.slots[entry.ram_slot].pageable !=
+                         preferred_pageable) ||
+                    (entry.state == CUDA_MOE_TIER_VRAM_PROTECTED &&
+                     !reclaimable_vram_backing) ||
+                    entry.last_call == g_moe_tiering.call_tick ||
+                    index == cuda_moe_tiering_entry_index(
+                        current_layer, current_expert)) {
+                    continue;
+                }
+                if (g_moe_tiering.g133_enabled &&
+                    !cuda_g133_ram_demotion_eligible(entry)) {
+                    continue;
+                }
+                const double score = g_moe_tiering.g133_enabled
+                    ? cuda_g133_decayed_heat(entry)
+                    : cuda_moe_tiering_lfru(entry, g_moe_tiering.call_tick);
+                if (g_moe_tiering.g133_enabled &&
+                    candidate_score <=
+                        score + g_moe_tiering.g133_demotion_margin) {
+                    continue;
+                }
+                /* A failed writer CAS removes only that ranked victim from
+                 * this attempt; continue with the next eligible score. */
+                if (after_writer_cas_loss &&
+                    (score < lost_score ||
+                     (score == lost_score && index <= lost_entry))) {
+                    continue;
+                }
+                if (score < best_score ||
+                    (score == best_score && index < best_entry)) {
+                    best_score = score;
+                    best_slot = (int)entry.ram_slot;
+                    best_entry = index;
+                }
             }
-            if (g_moe_tiering.g133_enabled &&
-                !cuda_g133_ram_demotion_eligible(entry)) {
-                continue;
-            }
-            const double score = g_moe_tiering.g133_enabled
-                ? cuda_g133_decayed_heat(entry)
-                : cuda_moe_tiering_lfru(entry, g_moe_tiering.call_tick);
-            if (g_moe_tiering.g133_enabled &&
-                candidate_score <=
-                    score + g_moe_tiering.g133_demotion_margin) {
-                continue;
-            }
-            if (score < best_score) {
-                best_score = score;
-                best_slot = (int)entry.ram_slot;
-                best_entry = index;
-            }
-        }
-        if (best_slot >= 0) {
+            if (best_slot < 0) break;
             cuda_dynamic_arena_slot &arena_slot =
                 g_dynamic_arena.slots[(uint32_t)best_slot];
             if (cuda_dynamic_arena_slot_writer_try_acquire(&arena_slot)) {
                 *victim_entry_out = best_entry;
                 return best_slot;
             }
+            after_writer_cas_loss = 1;
+            lost_score = best_score;
+            lost_entry = best_entry;
         }
     }
     return -1;
@@ -25943,7 +25982,9 @@ static int cuda_q1_0_ssd_wrap_record_h2d(
 static int cuda_moe_tiering_load_to_ram(
         const cuda_moe_route_request &request,
         uint32_t layer, uint32_t expert,
-        cuda_q1_0_promotion_record_context *promotion_record = NULL) {
+        cuda_q1_0_promotion_record_context *promotion_record = NULL,
+        int *admission_denied = NULL) {
+    if (admission_denied) *admission_denied = 0;
     if (g_moe_tiering.mode != CUDA_MOE_TIER_ENFORCE ||
         layer >= CUDA_MOE_LAYER_COUNT || expert >= 256u ||
         g_dynamic_arena.slot_bytes !=
@@ -25954,6 +25995,7 @@ static int cuda_moe_tiering_load_to_ram(
     const int slot_i = cuda_moe_tiering_pick_ram_slot(
         layer, expert, &victim_entry_index);
     if (slot_i < 0) {
+        if (admission_denied) *admission_denied = 1;
         if (promotion_record && promotion_record->active) {
             promotion_record->preadmit_reject_reason = "ram_admit_skip";
         }
@@ -25964,6 +26006,7 @@ static int cuda_moe_tiering_load_to_ram(
     cuda_dynamic_arena_slot_writer_guard writer_guard(&slot);
     if (cuda_dynamic_arena_slot_refs_load(&slot.cpu_lane_slot_refs) !=
             CUDA_DYNAMIC_ARENA_SLOT_WRITER) {
+        if (admission_denied) *admission_denied = 1;
         g_moe_tiering.ram_admit_skips++;
         return 0;
     }
@@ -28652,6 +28695,7 @@ static int cuda_moe_tiering_enforce_request(
                 break;
             }
         }
+        int ram_admission_denied = 0;
         if (!have_ram &&
             (!g_moe_tiering.compose_prefill_mass_tiering ||
              g_moe_tiering.compose_router_open) &&
@@ -28661,7 +28705,8 @@ static int cuda_moe_tiering_enforce_request(
              * only the minimum-weight sixth route executes as IQ1_S and is
              * staged for a later token by the mixed path. */
             (void)cuda_moe_tiering_load_to_ram(
-                request, request.layer_index, expert);
+                request, request.layer_index, expert, NULL,
+                &ram_admission_denied);
             have_ram = cuda_moe_tiering_ram_ptrs(
                 request.layer_index, expert,
                 &host_gate, &host_up, &host_down);
@@ -28679,23 +28724,43 @@ static int cuda_moe_tiering_enforce_request(
                 ok = 0;
                 break;
             }
+            const cuda_moe_tier_state prior_state = tier.state;
+            const uint32_t prior_ram_slot = tier.ram_slot;
+            const uint64_t prior_ram_generation = tier.ram_generation;
             tier.state = CUDA_MOE_TIER_SSD_COLD;
             tier.ram_slot = UINT32_MAX;
             tier.ram_generation = 0;
+            int retry_admission_denied = 0;
             (void)cuda_moe_tiering_load_to_ram(
-                request, request.layer_index, expert);
+                request, request.layer_index, expert, NULL,
+                &retry_admission_denied);
+            if (retry_admission_denied) {
+                /* Policy denial is a serving decision, not a residency
+                 * transition. Preserve the exact pre-attempt tier record. */
+                tier.state = prior_state;
+                tier.ram_slot = prior_ram_slot;
+                tier.ram_generation = prior_ram_generation;
+                ram_admission_denied = 1;
+            }
             have_ram = cuda_moe_tiering_ram_ptrs(
                 request.layer_index, expert,
                 &host_gate, &host_up, &host_down);
         }
         if (!have_ram) {
-            if (g_moe_tiering.compose_prefill_mass_tiering) {
+            const int serve_transient_on_admission_denial =
+                g_moe_tiering.compose_prefill_mass_tiering &&
+                ram_admission_denied;
+            if (g_moe_tiering.compose_prefill_mass_tiering &&
+                !serve_transient_on_admission_denial) {
                 g_moe_tiering.forbidden_cold_ssd_to_vram++;
                 g_moe_tiering.failures++;
                 failure_reason = "ram-required";
                 ok = 0;
                 break;
             }
+            /* Exact non-resident serve: SSD -> per-route host staging -> the
+             * existing transient GPU buffers below. Admission denial must not
+             * alter tier state or make decode availability policy-dependent. */
             host_gate = cache->route_host_gate +
                 (uint64_t)miss * cache->gate_expert_bytes;
             host_up = cache->route_host_up +

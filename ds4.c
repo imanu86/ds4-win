@@ -11147,6 +11147,11 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token) {
+    /* Layer zero is the shared target-decode boundary: normal session eval,
+     * CLI/bench, and exact speculative verification all cross it once per
+     * evaluated position. Draft-only MTP uses layer one and is not policy
+     * demand. */
+    if (il == 0u) ds4_gpu_g133_decode_position_begin();
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];

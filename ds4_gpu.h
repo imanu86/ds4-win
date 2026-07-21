@@ -39,6 +39,8 @@ typedef struct {
 } ds4_gpu_dynamic_arena_load;
 
 int ds4_gpu_init(void);
+/* Advance decode-policy time once for each target-model position. */
+void ds4_gpu_g133_decode_position_begin(void);
 
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
 /* Decode-thread-only host attribution.  The server owns token/request
