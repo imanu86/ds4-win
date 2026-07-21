@@ -738,6 +738,7 @@ static uint64_t g_model_file_size;
 static int g_model_cache_full;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
+static cudaEvent_t g_q1_upload_ready;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
 static int g_quality_mode;
@@ -3872,6 +3873,17 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
             (void)cudaGetLastError();
             return 0;
         }
+        err = cudaEventCreateWithFlags(&g_q1_upload_ready,
+                                       cudaEventDisableTiming);
+        if (err != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: CUDA Q1_0 resident upload event creation failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            (void)cudaStreamDestroy(g_model_upload_stream);
+            g_model_upload_stream = NULL;
+            return 0;
+        }
     }
     for (size_t i = 0; i < 4; i++) {
         cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
@@ -5830,6 +5842,10 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
     }
     g_model_stage_bytes = 0;
+    if (g_q1_upload_ready) {
+        (void)cudaEventDestroy(g_q1_upload_ready);
+        g_q1_upload_ready = NULL;
+    }
     if (g_model_upload_stream) {
         (void)cudaStreamDestroy(g_model_upload_stream);
         g_model_upload_stream = NULL;
@@ -31213,13 +31229,44 @@ static int cuda_moe_route_split_down_ensure(
     return 1;
 }
 
+static int cuda_moe_q1_resident_upload_fail(
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        cuda_g130_attribution_state *attribution_state
+#endif
+        ) {
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    cuda_g130_attribution_span sync_previous = CUDA_G130_ATTRIB_NONE;
+    if (attribution_state) {
+        sync_previous = cuda_g130_attribution_switch(
+            attribution_state,
+            CUDA_G130_ATTRIB_EXISTING_STREAM_SYNC_WAIT);
+    }
+#endif
+    (void)cudaStreamSynchronize(g_model_upload_stream);
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+    if (attribution_state) {
+        (void)cuda_g130_attribution_switch(
+            attribution_state, sync_previous);
+    }
+#endif
+    g_moe_gather.slot_tensor.ptr = NULL;
+    g_moe_gather.slot_tensor.bytes = 0;
+    g_moe_gather.slot_tensor.owner = 0;
+    g_moe_gather.direct_cache_active = 0;
+    g_moe_gather.mixed_direct_active = 0;
+    g_moe_gather.mixed_cache_routes = 0;
+    g_moe_gather.mixed_compact_routes = 0;
+    return 0;
+}
+
 static int cuda_moe_selected_load_q1_0(
         const void *model_map, uint64_t model_size,
         uint32_t layer_index,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
-        const ds4_gpu_tensor *selected_arg) {
+        const ds4_gpu_tensor *selected_arg,
+        const int32_t *selected_host_arg) {
     if (!g_q1_0_sidecar_file_valid ||
         model_map != g_q1_0_sidecar_host_base ||
         model_size != g_q1_0_sidecar_size ||
@@ -31239,25 +31286,36 @@ static int cuda_moe_selected_load_q1_0(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_state *attribution_state =
         cuda_g130_attribution_token_state();
-    cuda_g130_attribution_span attribution_previous = CUDA_G130_ATTRIB_NONE;
-    if (attribution_state) {
-        attribution_previous = cuda_g130_attribution_switch(
-            attribution_state,
-            CUDA_G130_ATTRIB_SELECTION_D2H);
-    }
 #endif
-    const int selected_d2h_ok = cuda_ok(
-        cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
-                   (size_t)slot_count * sizeof(int32_t),
-                   cudaMemcpyDeviceToHost),
-        "Q1_0 selected D2H");
+    int selected_ready = 1;
+    if (selected_host_arg) {
+        /* Mixed-Q1 already classified these exact IDs on the host; consuming
+         * them directly avoids a second D2H behind the queued hot kernels. */
+        memcpy(g_moe_gather.h_sel.data(), selected_host_arg,
+               (size_t)slot_count * sizeof(int32_t));
+    } else {
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
-    if (attribution_state) {
-        (void)cuda_g130_attribution_switch(
-            attribution_state, attribution_previous);
-    }
+        cuda_g130_attribution_span attribution_previous =
+            CUDA_G130_ATTRIB_NONE;
+        if (attribution_state) {
+            attribution_previous = cuda_g130_attribution_switch(
+                attribution_state,
+                CUDA_G130_ATTRIB_SELECTION_D2H);
+        }
 #endif
-    if (!selected_d2h_ok) {
+        selected_ready = cuda_ok(
+            cudaMemcpy(g_moe_gather.h_sel.data(), selected_arg->ptr,
+                       (size_t)slot_count * sizeof(int32_t),
+                       cudaMemcpyDeviceToHost),
+            "Q1_0 selected D2H");
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution_state) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, attribution_previous);
+        }
+#endif
+    }
+    if (!selected_ready) {
         return 0;
     }
     if (!cuda_sparse_bake_validate_selected(
@@ -31312,10 +31370,6 @@ static int cuda_moe_selected_load_q1_0(
             return 0;
         }
         uint64_t route_h2d_bytes = 0;
-        const uint64_t pinned_h2d_before =
-            q1_arena->pinned_bytes_uploaded;
-        const uint64_t pageable_h2d_before =
-            q1_arena->pageable_bytes_uploaded;
         for (uint32_t i = 0; i < compact_count; i++) {
             const uint32_t expert = (uint32_t)compact[i];
             const uint64_t gate_dst = (uint64_t)i * gate_expert_bytes;
@@ -31332,23 +31386,11 @@ static int cuda_moe_selected_load_q1_0(
                     down_expert_bytes);
             if (status != CUDA_DYNAMIC_ARENA_ENQUEUED) {
                 g_q1_0_resident_misses++;
+                return cuda_moe_q1_resident_upload_fail(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
-                cuda_g130_attribution_span sync_previous =
-                    CUDA_G130_ATTRIB_NONE;
-                if (attribution_state) {
-                    sync_previous = cuda_g130_attribution_switch(
-                        attribution_state,
-                        CUDA_G130_ATTRIB_EXISTING_STREAM_SYNC_WAIT);
-                }
+                    attribution_state
 #endif
-                (void)cudaStreamSynchronize(g_model_upload_stream);
-#ifndef DS4_G130_ATTRIB_COMPILED_OUT
-                if (attribution_state) {
-                    (void)cuda_g130_attribution_switch(
-                        attribution_state, sync_previous);
-                }
-#endif
-                return 0;
+                );
             }
             route_h2d_bytes += gate_expert_bytes * 2u + down_expert_bytes;
         }
@@ -31372,46 +31414,25 @@ static int cuda_moe_selected_load_q1_0(
         }
 #endif
         if (!slots_h2d_ok) {
-            return 0;
-        }
-        const int q1_profile = cuda_q1_0_profile_requested();
-        const double sync_started = q1_profile ? cuda_wall_sec() : 0.0;
+            return cuda_moe_q1_resident_upload_fail(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
-        cuda_g130_attribution_span sync_previous = CUDA_G130_ATTRIB_NONE;
-        if (attribution_state) {
-            sync_previous = cuda_g130_attribution_switch(
-                attribution_state,
-                CUDA_G130_ATTRIB_EXISTING_STREAM_SYNC_WAIT);
-        }
+                attribution_state
 #endif
-        const cudaError_t sync_error =
-            cudaStreamSynchronize(g_model_upload_stream);
+            );
+        }
+        /* The mixed dispatcher has already queued its hot IQ2 kernels on
+         * stream 0. Fence only the cold Q1 consumer so resident uploads can
+         * overlap that hot work instead of draining it on the host. */
+        if (!cuda_ok(cudaEventRecord(g_q1_upload_ready,
+                                     g_model_upload_stream),
+                     "Q1_0 resident upload ready") ||
+            !cuda_ok(cudaStreamWaitEvent(0, g_q1_upload_ready, 0),
+                     "Q1_0 resident upload wait")) {
+            return cuda_moe_q1_resident_upload_fail(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
-        if (attribution_state) {
-            (void)cuda_g130_attribution_switch(
-                attribution_state, sync_previous);
-        }
+                attribution_state
 #endif
-        if (q1_profile) {
-            const double sync_seconds = cuda_wall_sec() - sync_started;
-            const uint64_t pinned_h2d =
-                q1_arena->pinned_bytes_uploaded - pinned_h2d_before;
-            const uint64_t pageable_h2d =
-                q1_arena->pageable_bytes_uploaded - pageable_h2d_before;
-            const uint64_t attributed_h2d = pinned_h2d + pageable_h2d;
-            g_q1_0_profile.upload_sync_calls++;
-            g_q1_0_profile.upload_sync_seconds += sync_seconds;
-            if (attributed_h2d != 0) {
-                const double pinned_seconds = sync_seconds *
-                    (double)pinned_h2d / (double)attributed_h2d;
-                g_q1_0_profile.pinned_upload_sync_seconds +=
-                    pinned_seconds;
-                g_q1_0_profile.pageable_upload_sync_seconds +=
-                    sync_seconds - pinned_seconds;
-            }
-        }
-        if (!cuda_ok(sync_error, "Q1_0 resident compact upload sync")) {
-            return 0;
+            );
         }
         g_q1_0_resident_hits += compact_count;
         g_q1_0_resident_h2d_bytes += route_h2d_bytes;
@@ -31823,7 +31844,8 @@ static int routed_moe_launch(
         const ds4_gpu_tensor *x,
         uint32_t n_tokens,
         ds4_gpu_spex_queue *spex_queue,
-        const ds4_gpu_spex_key *spex_key) {
+        const ds4_gpu_spex_key *spex_key,
+        const int32_t *selected_host) {
     g_moe_last_selected.valid = 0;
     /* Wave state belongs to this routed-MoE invocation. Decode can take the
      * resident-route path without calling selected-load, so stale prefill
@@ -32071,7 +32093,7 @@ static int routed_moe_launch(
             model_map, model_size, layer_index,
             gate_offset, up_offset, down_offset,
             gate_expert_bytes, down_expert_bytes,
-            n_total_expert, n_expert, n_tokens, selected);
+            n_total_expert, n_expert, n_tokens, selected, selected_host);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution_state) {
             (void)cuda_g130_attribution_switch(
@@ -33540,7 +33562,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, NULL, n_expert, clamp, x, 1,
-                             spex_queue, spex_key);
+                             spex_queue, spex_key, NULL);
 }
 
 static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
@@ -34240,7 +34262,8 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_gate_expert_bytes, main_gate_row_bytes,
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
-            selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL);
+            selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL,
+            NULL);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -34398,7 +34421,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &hot_selected_tensor, &hot_weights_tensor, NULL,
-            hot_count, clamp, x, 1u, NULL, NULL);
+            hot_count, clamp, x, 1u, NULL, NULL, NULL);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -34502,7 +34525,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         q1_down_expert_bytes, q1_down_row_bytes,
         expert_in_dim, expert_mid_dim, out_dim,
         &cold_selected_tensor, &cold_weights_tensor, NULL,
-        cold_count, clamp, x, 1u, NULL, NULL);
+        cold_count, clamp, x, 1u, NULL, NULL, cold_selected);
     if (mixed_profile) {
         g_q1_0_mixed_profile_current_sample = previous_profile_sample;
         mixed_profile_phase_started = cuda_wall_sec();
@@ -34811,7 +34834,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                                main_down_expert_bytes, main_down_row_bytes,
                                expert_in_dim, expert_mid_dim, out_dim,
                                &hot_selected, &hot_weights, NULL, hot_count, clamp,
-                               x, 1u, NULL, NULL);
+                               x, 1u, NULL, NULL, NULL);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -34904,7 +34927,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                            iq1_down_expert_bytes, iq1_down_row_bytes,
                            expert_in_dim, expert_mid_dim, out_dim,
                            &cold_selected, &cold_weight_tensor, NULL, 1u, clamp,
-                           x, 1u, NULL, NULL);
+                           x, 1u, NULL, NULL, NULL);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -34963,7 +34986,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, probs, n_expert, clamp, x, n_tokens,
-                             NULL, NULL);
+                             NULL, NULL, NULL);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
