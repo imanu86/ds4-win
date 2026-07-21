@@ -5,6 +5,8 @@ $sourcePath = Join-Path $root 'ds4_cuda.cu'
 $source = [System.IO.File]::ReadAllText($sourcePath)
 $corePath = Join-Path $root 'ds4.c'
 $core = [System.IO.File]::ReadAllText($corePath)
+$osFilePath = Join-Path $root 'src/platform/os_file.c'
+$osFile = [System.IO.File]::ReadAllText($osFilePath)
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "G133 M1 static contract failed: $Message" }
@@ -22,16 +24,25 @@ function Slice-Between([string]$Start, [string]$End) {
     return Slice-TextBetween $source $Start $End
 }
 
-# R1: all new residency history is per expert, never per cache/arena slot.
+# R1: correctness residency state and bounded advisory state are distinct.
 Assert-True (([regex]::Matches($source, 'struct cuda_moe_tier_entry\s*\{')).Count -eq 1) `
     'cuda_moe_tier_entry must remain unique'
+$advisoryEntry = Slice-Between 'struct cuda_g133_advisory_entry {' `
+    'struct cuda_moe_tier_entry {'
 $tierEntry = Slice-Between 'struct cuda_moe_tier_entry {' 'struct cuda_moe_tiering {'
-foreach ($field in @('g133_heat', 'g133_knock', 'g133_touch_streak',
-                     'g133_ram_candidate', 'g133_vram_candidate',
-                     'g133_observed_request_epoch',
-                     'g133_observed_position_epochs')) {
-    Assert-True ($tierEntry.Contains($field)) "missing per-expert field $field"
-}
+Assert-True ($advisoryEntry.Contains('std::atomic<uint64_t> decayed_touch_count') -and
+             $advisoryEntry.Contains('std::atomic<uint64_t> last_touch_epoch') -and
+             $advisoryEntry.Contains('memory_order_relaxed') -and
+             $advisoryEntry.Contains('no per-position history')) `
+    'advisory state must be bounded relaxed atomics with documented tolerance'
+Assert-True ($tierEntry.Contains('cuda_g133_advisory_entry g133_advisory') -and
+             $tierEntry.Contains('ram_slot') -and
+             $tierEntry.Contains('ram_generation')) `
+    'per-expert advisory state must be split from strict lifecycle fields'
+Assert-True (-not $tierEntry.Contains('std::vector') -and
+             -not $source.Contains('g133_observed_position_epochs') -and
+             -not $source.Contains('g133_observed_base_position_epoch')) `
+    'G133 must not retain unbounded per-position storage or marker machinery'
 $arenaSlot = Slice-Between 'struct cuda_dynamic_arena_slot {' 'enum : uint32_t {'
 $cacheSlot = Slice-Between 'struct cuda_moe_cache_slot {' 'enum cuda_moe_tier_mode'
 Assert-True (-not $arenaSlot.Contains('g133_')) 'arena slot gained G133 residency state'
@@ -78,7 +89,7 @@ Assert-True ($epochHook.Contains('g_cuda_g133_decode_position_epoch++')) `
     'core position hook must advance the authoritative G133 epoch'
 Assert-True ($epochHook.Contains('g_cuda_request_epoch')) `
     'position epoch generation must reuse the authoritative request epoch'
-$requestBegin = Slice-Between 'extern "C" void ds4_gpu_dynamic_arena_request_begin(void)' `
+$requestBegin = Slice-Between 'extern "C" int ds4_gpu_dynamic_arena_request_begin(void)' `
     'extern "C" void ds4_gpu_dynamic_arena_observer_reset(void)'
 Assert-True ($requestBegin.Contains('g_cuda_request_epoch++') -and
              $requestBegin.Contains('g_cuda_g133_decode_position_epoch = 0u;')) `
@@ -97,31 +108,29 @@ Assert-True ($routeBegin.Contains('route_consumed_sequence') -and
              $routeBegin.Contains('prior_sequence')) `
     'route request storage must not be reused before worker snapshot acknowledgement'
 
-# Round-4 F1: each entry records exact position epochs, so duplicate/backward
-# observations do not recount heat or streaks. Promotion refresh follows only
-# the lexicographic maximum epoch and can never refill on alternation.
-$g133Record = Slice-Between 'static int cuda_g133_record_observation(' `
+# Round-5 directive: advisory observations are bounded relaxed updates. A
+# double/lost observation is acceptable; promotion refresh uses atomic max.
+$g133Record = Slice-Between 'static void cuda_g133_record_observation(' `
     'static double cuda_g133_decayed_heat('
-Assert-True ($g133Record.Contains('std::lower_bound(') -and
-             $g133Record.Contains('*observed == epoch.position_epoch') -and
-             $g133Record.Contains('return 0;')) `
-    'G133 observations must be idempotently keyed by entry and exact position epoch'
-Assert-True ($g133Record.Contains('entry.g133_heat_token_index - epoch.position_epoch') -and
-             $g133Record.Contains('pow(g_moe_tiering.g133_decay')) `
-    'backward observations must be weighted at the maximum seen position'
+Assert-True ($g133Record.Contains('decayed_touch_count.store(') -and
+             $g133Record.Contains('last_touch_epoch.compare_exchange_weak(') -and
+             $g133Record.Contains('std::memory_order_relaxed') -and
+             -not $g133Record.Contains('std::lower_bound') -and
+             -not $g133Record.Contains('.insert(')) `
+    'G133 observations must remain bounded O(1) relaxed-atomic updates'
 $observe = Slice-Between 'static cuda_moe_tier_state cuda_moe_tiering_observe_route(' `
     'static uint64_t cuda_iq1_promotion_current_request_epoch(void)'
 Assert-True ($observe.IndexOf('cuda_g133_record_observation(') -ge 0 -and
              $observe.IndexOf('entry.frequency++') -gt
                  $observe.IndexOf('cuda_g133_record_observation(')) `
-    'duplicate position observations must return before generic recounting'
-$promoteRefresh = Slice-Between 'static int cuda_moe_tiering_pick_vram_slot(' `
-    'static void cuda_moe_tiering_commit_vram_reservations('
-Assert-True ($promoteRefresh.Contains('g133_promote_max_request_epoch') -and
-             $promoteRefresh.Contains('g133_promote_max_token_index') -and
-             $promoteRefresh.Contains('request_epoch >') -and
-             $promoteRefresh.Contains('token_index >')) `
-    'promotion budget refresh must advance only for the maximum seen epoch'
+    'advisory observation must precede generic route accounting'
+$promoteRefresh = Slice-Between 'static void cuda_g133_advisory_budget_refresh(' `
+    'static int cuda_g133_advisory_budget_reserve('
+Assert-True ($promoteRefresh.Contains('max_epoch.load(') -and
+             $promoteRefresh.Contains('compare_exchange_weak(') -and
+             $promoteRefresh.Contains('current > maximum') -and
+             $promoteRefresh.Contains('remaining.store(')) `
+    'promotion budget refresh must be keyed on an atomic maximum epoch'
 
 $dispatch = Slice-Between 'static uint64_t g_cuda_g133_decode_position_epoch = 0u;' `
     'struct cuda_g133_telemetry_counters {'
@@ -179,18 +188,29 @@ $cacheFields = Slice-Between 'struct cuda_moe_expert_cache {' `
 Assert-True ($cacheFields.Contains('route_consumed_sequence') -and
              $cacheFields.Contains('route_completed_sequence')) `
     'copy acknowledgement and worker completion must remain distinct sequences'
-$boundaryReset = Slice-Between 'static void cuda_moe_tiering_request_boundary_reset(void) {' `
-    'static int cuda_moe_tiering_reserve_open_router_slots('
-$boundaryDrainAt = $boundaryReset.IndexOf('cuda_moe_route_worker_drain_completed(')
-$boundaryReportAt = $boundaryReset.IndexOf('cuda_moe_tiering_report_and_reset();')
-Assert-True ($boundaryDrainAt -ge 0 -and $boundaryReportAt -gt $boundaryDrainAt) `
-    'request-boundary tiering reset must drain worker completion first'
+$boundaryDrainAt = $requestBegin.IndexOf('cuda_moe_route_worker_drain_completed(')
+$boundaryFlushAt = $requestBegin.IndexOf('cuda_q1_0_ssd_wrap_flush();')
+$boundaryEpochAt = $requestBegin.IndexOf('g_cuda_request_epoch++')
+Assert-True ($requestBegin.Contains('const int shared_policy_active =') -and
+             $requestBegin.Contains('if (shared_policy_active') -and
+             $boundaryDrainAt -ge 0 -and $boundaryFlushAt -gt $boundaryDrainAt -and
+             $boundaryEpochAt -gt $boundaryFlushAt -and
+             $requestBegin.Contains('return 0;')) `
+    'active G133 boundary must drain before SSD flush/epoch and fail closed'
+Assert-True ($core.Contains('if (!ds4_gpu_dynamic_arena_request_begin())')) `
+    'request-boundary failure must propagate to the session API'
 $mixedPolicy = Slice-Between 'extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(' `
     'extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor('
 $mixedDrainAt = $mixedPolicy.IndexOf('cuda_moe_route_worker_drain_completed("q1-0-mixed-policy")')
 $mixedObserveAt = $mixedPolicy.IndexOf('cuda_moe_tiering_observe_route(')
 Assert-True ($mixedDrainAt -ge 0 -and $mixedObserveAt -gt $mixedDrainAt) `
     'decode-thread mixed-Q1 policy mutation must drain worker completion first'
+Assert-True ($mixedPolicy.Contains('if (cuda_g133_shared_policy_active()') -and
+             $requestBegin.Contains('shared_policy_active &&')) `
+    'new request and mixed-policy waits must be gated off the disabled path'
+Assert-True (([regex]::Matches($source,
+                 'if \(cuda_g133_shared_policy_active\(\) &&\s*!cuda_moe_route_worker_drain_completed')).Count -eq 5) `
+    'all mixed and route-failure completion drains must be purity-gated'
 
 # R5/S2-S5: master gate, mass seed, decayed-heat victims, budget, and telemetry.
 Assert-True ($source.Contains('getenv("DS4_G133_TIER")')) 'missing master gate'
@@ -207,7 +227,7 @@ $pick = Slice-Between 'static int cuda_moe_tiering_pick_vram_slot(' `
     'static int cuda_moe_tiering_enforce_request('
 Assert-True ($pick.Contains('cuda_g133_decayed_heat')) `
     'VRAM victim selection must use decayed heat'
-Assert-True ($pick.Contains('g133_promote_remaining')) `
+Assert-True ($pick.Contains('cuda_g133_advisory_budget_reserve')) `
     'promotion path must enforce the per-token budget'
 $ramPick = Slice-Between 'static int cuda_moe_tiering_pick_ram_slot(' `
     'struct cuda_q1_0_promotion_record_context {'
@@ -243,21 +263,44 @@ Assert-True ($settleAt -ge 0 -and $settleAt -lt $preadAt) `
     'other experts provisional VRAM reservations must settle before transient SSD read'
 $routeFinish = Slice-Between 'static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(' `
     'static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit('
-$failureDrainAt = $routeFinish.IndexOf('cuda_moe_route_worker_drain_completed(')
-$failureInvalidateAt = $routeFinish.IndexOf('cuda_moe_expert_cache_invalidate();')
+$routeFailure = Slice-TextBetween $routeFinish `
+    'if (*(volatile uint32_t *)cache->route_failed_host == sequence)' `
+    'const cuda_moe_route_request *request = cache->route_request_host;'
+$failureDrainAt = $routeFailure.IndexOf('cuda_moe_route_worker_drain_completed(')
+$failureInvalidateAt = $routeFailure.IndexOf('cuda_moe_expert_cache_invalidate();')
 Assert-True ($failureDrainAt -ge 0 -and $failureInvalidateAt -gt $failureDrainAt) `
     'decode-thread failure invalidation must drain worker completion first'
+Assert-True ($routeFailure.Contains('cuda_g133_shared_policy_active() &&')) `
+    'route-failure completion drain must preserve disabled-path purity'
+Assert-True ($routeFinish.IndexOf('cuda_moe_route_worker_cancel_and_join') -ge 0 -and
+             $routeFinish.IndexOf('cuda_moe_expert_cache_invalidate();') -gt
+                 $routeFinish.IndexOf('cuda_moe_route_worker_cancel_and_join')) `
+    'cancellation must hard-join before invalidating correctness state'
 Assert-True ($routeFinish.Contains('progress > last_read_progress') -and
              $routeFinish.Contains('transient_absolute_deadline') -and
-             $routeFinish.Contains('route_transient_cancel_sequence = sequence')) `
-    'readiness watchdog must renew only on bytes-read progress and cancel at the absolute deadline'
+             $routeFinish.Contains('std::memory_order_acquire') -and
+             $routeFinish.Contains('Establish a request-local baseline') -and
+             $routeFinish.Contains('cuda_moe_route_worker_cancel_and_join')) `
+    'watchdog must use request-local acquire progress and join on cancellation'
 $chunkedRead = Slice-Between 'static int cuda_moe_transient_pread_chunked(' `
     'static void cuda_moe_route_worker_publish_completed('
 Assert-True ($chunkedRead.Contains('const uint64_t chunk_bytes = 1u << 20;') -and
-             $chunkedRead.Contains('os_pread(') -and
-             $chunkedRead.Contains('route_transient_read_bytes += request_bytes') -and
+             $chunkedRead.Contains('os_pread_cancellable(') -and
+             $chunkedRead.Contains('fetch_add(') -and
+             $chunkedRead.Contains('std::memory_order_release') -and
              $chunkedRead.Contains('cuda_wall_sec() >= absolute_deadline')) `
     'transient SSD service must use observable chunks with an absolute deadline'
+$enforceDeadline = Slice-Between 'static int cuda_moe_tiering_enforce_request(' `
+    'static void *cuda_moe_route_worker(void *arg) {'
+Assert-True (([regex]::Matches($enforceDeadline,
+                 'cuda_g133_transient_io_timeout_seconds\(\)')).Count -eq 1 -and
+             $enforceDeadline.Contains('transient_request_deadline') -and
+             -not $enforceDeadline.Contains('const double absolute_deadline =')) `
+    'transient service must use one request-wide absolute deadline'
+Assert-True ($osFile.Contains('CancelIoEx(state->file, &state->overlapped)') -and
+             $source.Contains('os_pread_cancel(&cache->route_transient_pread)') -and
+             -not $source.Contains('CancelSynchronousIo')) `
+    'Windows transient cancellation must target the live OVERLAPPED with CancelIoEx'
 Assert-True ($source.Contains('getenv("DS4_G133_TRANSIENT_IO_TIMEOUT_S")') -and
              $source.Contains('static double timeout_seconds = 30.0;')) `
     'transient SSD absolute timeout must expose the default-30-second environment contract'
@@ -270,7 +313,7 @@ Assert-True ($source.Contains('!(g133_decay > 0.0 && g133_decay < 1.0)') -and
 $demotion = Slice-Between 'static int cuda_g133_ram_demotion_eligible(' `
     'static double cuda_moe_tiering_lfru('
 Assert-True ($demotion.Contains('demote_threshold == 0.0') -and
-             $demotion.Contains('entry.g133_knock <= 0.0')) `
+             $demotion.Contains('cuda_g133_advisory_touch_count(entry, epoch) <= 0.0')) `
     'zero-heat RAM entries must be eligible at a zero demotion threshold'
 Assert-True (-not $source.Contains('DS4_G132_U1_ATTRIBUTION')) `
     'G132 attribution alias must remain absent from the base path'

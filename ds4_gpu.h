@@ -174,7 +174,7 @@ int ds4_gpu_dynamic_arena_publish(
         ds4_gpu_dynamic_arena_txn *txn,
         uint64_t *snapshot_generation);
 void ds4_gpu_dynamic_arena_abort(ds4_gpu_dynamic_arena_txn *txn);
-void ds4_gpu_dynamic_arena_request_begin(void);
+int ds4_gpu_dynamic_arena_request_begin(void);
 void ds4_gpu_dynamic_arena_observer_reset(void);
 void ds4_gpu_dynamic_arena_release(void);
 

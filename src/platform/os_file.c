@@ -208,13 +208,42 @@ uint64_t os_file_size(const os_file_t *f) {
 #endif
 }
 
-int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {
+void os_pread_cancellable_init(os_pread_cancellable_t *state) {
+    if (!state) return;
+    memset(state, 0, sizeof(*state));
+#ifdef _WIN32
+    state->file = INVALID_HANDLE_VALUE;
+#endif
+}
+
+int os_pread_cancel(os_pread_cancellable_t *state) {
+#ifdef _WIN32
+    if (!state ||
+        InterlockedCompareExchange(&state->active, 1, 1) != 1 ||
+        state->file == NULL || state->file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    if (CancelIoEx(state->file, &state->overlapped)) return 1;
+    return GetLastError() == ERROR_NOT_FOUND;
+#else
+    (void)state;
+    return 0;
+#endif
+}
+
+int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
+                             uint64_t off, os_pread_cancellable_t *state) {
     if (!os_file_valid(f) || (!buf && len != 0)) {
         errno = EINVAL;
         return -1;
     }
     uint64_t done = 0;
 #ifdef _WIN32
+    os_pread_cancellable_t local_state;
+    if (!state) {
+        os_pread_cancellable_init(&local_state);
+        state = &local_state;
+    }
     HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
     if (!ev) {
         errno = os_win_error_to_errno(GetLastError());
@@ -223,40 +252,49 @@ int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {
     while (done < len) {
         const uint64_t remaining = len - done;
         DWORD chunk = (DWORD)(remaining > 0x40000000ull ? 0x40000000ul : remaining);
-        OVERLAPPED ol;
-        memset(&ol, 0, sizeof(ol));
+        memset(&state->overlapped, 0, sizeof(state->overlapped));
         const uint64_t cur = off + done;
-        ol.Offset = (DWORD)(cur & 0xffffffffu);
-        ol.OffsetHigh = (DWORD)(cur >> 32);
-        ol.hEvent = ev;
+        state->overlapped.Offset = (DWORD)(cur & 0xffffffffu);
+        state->overlapped.OffsetHigh = (DWORD)(cur >> 32);
+        state->overlapped.hEvent = ev;
+        state->file = f->h;
         ResetEvent(ev);
+        InterlockedExchange(&state->active, 1);
 
         DWORD got = 0;
-        BOOL ok = ReadFile(f->h, (char *)buf + done, chunk, NULL, &ol);
+        BOOL ok = ReadFile(
+            f->h, (char *)buf + done, chunk, NULL, &state->overlapped);
         if (!ok) {
             DWORD err = GetLastError();
             if (err == ERROR_IO_PENDING) {
-                ok = GetOverlappedResult(f->h, &ol, &got, TRUE);
+                ok = GetOverlappedResult(
+                    f->h, &state->overlapped, &got, TRUE);
                 if (!ok) err = GetLastError();
             }
             if (!ok) {
+                InterlockedExchange(&state->active, 0);
                 CloseHandle(ev);
                 if (err == ERROR_HANDLE_EOF) return (int64_t)done;
                 errno = os_win_error_to_errno(err);
                 return -1;
             }
-        } else if (!GetOverlappedResult(f->h, &ol, &got, FALSE)) {
+        } else if (!GetOverlappedResult(
+                       f->h, &state->overlapped, &got, FALSE)) {
             DWORD err = GetLastError();
+            InterlockedExchange(&state->active, 0);
             CloseHandle(ev);
             if (err == ERROR_HANDLE_EOF) return (int64_t)done;
             errno = os_win_error_to_errno(err);
             return -1;
         }
+        InterlockedExchange(&state->active, 0);
         if (got == 0) break;
         done += got;
     }
+    state->file = INVALID_HANDLE_VALUE;
     CloseHandle(ev);
 #else
+    (void)state;
     while (done < len) {
         const uint64_t remaining = len - done;
         size_t chunk = remaining > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)remaining;
@@ -270,4 +308,8 @@ int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {
     }
 #endif
     return (int64_t)done;
+}
+
+int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {
+    return os_pread_cancellable(f, buf, len, off, NULL);
 }

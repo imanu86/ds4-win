@@ -326,14 +326,14 @@ def test_q1_promotion_emits_per_expert_attempt_and_success_records() -> None:
 def test_request_epoch_uses_request_boundary_not_carry_sequence() -> None:
     request_begin = body(
         CUDA,
-        'extern "C" void ds4_gpu_dynamic_arena_request_begin(void)',
+        'extern "C" int ds4_gpu_dynamic_arena_request_begin(void)',
         'extern "C" void ds4_gpu_dynamic_arena_observer_reset(void)',
     )
     epoch_increment = request_begin.index("g_cuda_request_epoch++")
     tier_reset = request_begin.index("cuda_moe_tiering_request_boundary_reset")
     carry_mode = request_begin.index("cuda_dynamic_arena_carry_mode")
     carry_sequence = request_begin.index("++g_dynamic_arena.request_sequence")
-    assert epoch_increment < tier_reset < carry_mode < carry_sequence
+    assert tier_reset < epoch_increment < carry_mode < carry_sequence
     assert "return g_cuda_request_epoch" in body(
         CUDA,
         "static uint64_t cuda_iq1_promotion_current_request_epoch(void) {",
@@ -1246,13 +1246,13 @@ def test_expert_recovery_trace_is_off_default_targeted_and_post_route() -> None:
 
     request = body(
         CUDA,
-        'extern "C" void ds4_gpu_dynamic_arena_request_begin(void)',
+        'extern "C" int ds4_gpu_dynamic_arena_request_begin(void)',
         'extern "C" void ds4_gpu_dynamic_arena_observer_reset(void)',
     )
     increment = request.index("g_cuda_request_epoch++")
     trace_boundary = request.index("cuda_expert_recovery_trace_request_begin()")
     tier_reset = request.index("cuda_moe_tiering_request_boundary_reset()")
-    assert increment < trace_boundary < tier_reset
+    assert tier_reset < increment < trace_boundary
     request_trace = body(
         CUDA,
         "static void cuda_expert_recovery_trace_request_begin(void)",

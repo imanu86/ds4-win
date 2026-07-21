@@ -20466,7 +20466,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     const char *backend_name = ds4_backend_name(e->backend);
     ds4_reap_mask_poll(&e->model, &e->weights, e->backend == DS4_BACKEND_CUDA);
     if (e->backend == DS4_BACKEND_CUDA) {
-        ds4_gpu_dynamic_arena_request_begin();
+        if (!ds4_gpu_dynamic_arena_request_begin()) {
+            snprintf(err, errlen,
+                     "CUDA request boundary failed to quiesce prior route work");
+            return 1;
+        }
     }
 
     if (s->checkpoint_valid &&
