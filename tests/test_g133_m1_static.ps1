@@ -111,14 +111,16 @@ Assert-True ($routeBegin.Contains('route_consumed_sequence') -and
              $routeBegin.Contains('prior_sequence')) `
     'route request storage must not be reused before worker snapshot acknowledgement'
 
-# Round-6 D1: promotion uses a reachable consecutive-touch integer streak;
-# EMA heat remains ranking/demotion-only and packed epoch order is wrap-safe.
+# Round-7 D1-D3: promotion uses a reachable consecutive-touch integer streak;
+# the packed epoch mixes request generation, streaks saturate, and demotion
+# eligibility is broken-streak plus promotion age. EMA heat ranks victims only.
 $g133Record = Slice-Between 'static void cuda_g133_record_observation(' `
     'static double cuda_g133_decayed_heat('
 Assert-True ($g133Record.Contains('decayed_heat.store(') -and
              $g133Record.Contains('streak_epoch.compare_exchange_weak(') -and
              $g133Record.Contains('elapsed == 1u') -and
-             $g133Record.Contains('? prior_streak + 1u : 1u') -and
+             $g133Record.Contains('prior_streak < CUDA_G133_STREAK_MAX') -and
+             $g133Record.Contains('(uint32_t)CUDA_G133_STREAK_MAX') -and
              $g133Record.Contains('std::memory_order_relaxed') -and
              -not $g133Record.Contains('std::lower_bound') -and
              -not $g133Record.Contains('.insert(')) `
@@ -128,12 +130,15 @@ $ramCandidate = Slice-Between 'static int cuda_g133_ram_candidate(' `
 Assert-True ($ramCandidate.Contains('cuda_g133_consecutive_streak') -and
              -not $ramCandidate.Contains('cuda_g133_advisory_heat')) `
     'KNOCK promotion gates must use only the reachable integer streak'
-$epochPacking = Slice-Between 'static uint32_t cuda_g133_advisory_epoch32(' `
+$epochPacking = Slice-Between 'static uint64_t cuda_g133_advisory_epoch_key(' `
     'static uint32_t cuda_g133_consecutive_streak('
-Assert-True ($epochPacking.Contains('(int32_t)(current - prior) > 0') -and
-             -not $epochPacking.Contains('UINT32_MAX') -and
+Assert-True ($epochPacking.Contains('epoch.request_epoch') -and
+             $epochPacking.Contains('epoch.position_epoch') -and
+             $epochPacking.Contains('CUDA_G133_EPOCH_REQUEST_MASK') -and
+             $epochPacking.Contains('cuda_g133_advisory_epoch_consecutive') -and
+             $epochPacking.Contains('(int32_t)(cuda_g133_advisory_key_position(current) -') -and
              -not $epochPacking.Contains('std::min')) `
-    'packed 32-bit advisory time must use wrap-safe ordering without saturation'
+    'packed advisory time must mix request generation and use wrap-safe ordering'
 $observe = Slice-Between 'static cuda_moe_tier_state cuda_moe_tiering_observe_route(' `
     'static uint64_t cuda_iq1_promotion_current_request_epoch(void)'
 Assert-True ($observe.IndexOf('cuda_g133_record_observation(') -ge 0 -and
@@ -363,17 +368,20 @@ Assert-True ($osThread.Contains('WaitForSingleObject(t, (DWORD)timeout_ms)') -an
 Assert-True ($source.Contains('getenv("DS4_G133_TRANSIENT_IO_TIMEOUT_S")') -and
              $source.Contains('static double timeout_seconds = 30.0;')) `
     'transient SSD absolute timeout must expose the default-30-second environment contract'
-Assert-True ($source.Contains('(double)g133_knock_x <= g133_demotion_margin') -and
-             $source.Contains('must exceed demotion margin')) `
-    'DS4_G133_KNOCK_X=1 must be rejected when margin consumes its threshold'
+Assert-True ($source.Contains('"DS4_G133_KNOCK_Y", 5u, 1u') -and
+             -not $source.Contains('must exceed demotion margin')) `
+    'DS4_G133_KNOCK_Y must be validated as a positive protection window'
 Assert-True ($source.Contains('!(g133_decay > 0.0 && g133_decay < 1.0)') -and
              $source.Contains('must satisfy 0 < decay < 1')) `
     'DS4_G133_DECAY must reject both zero and one with a clear diagnostic'
-$demotion = Slice-Between 'static int cuda_g133_ram_demotion_eligible(' `
-    'static double cuda_moe_tiering_lfru('
-Assert-True ($demotion.Contains('demote_threshold == 0.0') -and
-             $demotion.Contains('cuda_g133_advisory_heat(entry, epoch) <= 0.0')) `
-    'zero-heat RAM entries must be eligible at a zero demotion threshold'
+$demotion = Slice-Between 'static int cuda_g133_demotion_eligible_at(' `
+    'static void cuda_g133_update_entry_candidate_state('
+Assert-True ($demotion.Contains('streak_broken') -and
+             $demotion.Contains('promotion_age_ready') -and
+             $demotion.Contains('promotion_epoch') -and
+             $demotion.Contains('g133_knock_y') -and
+             -not $demotion.Contains('cuda_g133_advisory_heat')) `
+    'G133 demotion eligibility must be broken-streak plus promotion-age only'
 Assert-True (-not $source.Contains('DS4_G132_U1_ATTRIBUTION')) `
     'G132 attribution alias must remain absent from the base path'
 foreach ($field in @('upload_sync_wait_ms', 'vram_hit_pct', 'ram_hit_pct',
