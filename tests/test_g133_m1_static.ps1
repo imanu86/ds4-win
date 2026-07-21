@@ -41,6 +41,14 @@ Assert-True ($arenaBegin.Contains('ds4_gpu_dynamic_arena_abort(txn)')) `
 Assert-True (([regex]::Matches($source,
     'cuda_dynamic_arena_txn_release_writer_claims\(txn\)')).Count -eq 2) `
     'writer claims must release exactly at publish and abort terminals'
+$txnGuard = Slice-Between 'struct cuda_dynamic_arena_transaction_guard {' `
+    'static int cuda_dynamic_arena_wrap_publish_target('
+Assert-True ($txnGuard.Contains('~cuda_dynamic_arena_transaction_guard()')) `
+    'arena wrap must use an RAII transaction guard'
+$guardJoinAt = $txnGuard.IndexOf('join_started_workers();')
+$guardAbortAt = $txnGuard.IndexOf('ds4_gpu_dynamic_arena_abort(txn);')
+Assert-True ($guardJoinAt -ge 0 -and $guardAbortAt -gt $guardJoinAt) `
+    'transaction guard unwind must join workers before aborting writer claims'
 
 # R4: observation and policy remain inside the route worker before enforce/upload.
 $routeWorker = Slice-Between 'static void *cuda_moe_route_worker(void *arg) {' `
@@ -67,7 +75,26 @@ Assert-True ($pick.Contains('cuda_g133_decayed_heat')) `
     'VRAM victim selection must use decayed heat'
 Assert-True ($pick.Contains('g133_promote_remaining')) `
     'promotion path must enforce the per-token budget'
-foreach ($field in @('h2d_ms', 'warm_hit_pct', 'promotions', 'reaps',
+$ramPick = Slice-Between 'static int cuda_moe_tiering_pick_ram_slot(' `
+    'struct cuda_q1_0_promotion_record_context {'
+Assert-True ($ramPick.Contains('cuda_g133_ram_demotion_eligible(entry)')) `
+    'RAM victim path must require G133 demotion eligibility'
+Assert-True ($ramPick.Contains('candidate_score <=') -and
+             $ramPick.Contains('g133_demotion_margin')) `
+    'RAM victim path must enforce an admission margin'
+$enforce = Slice-Between 'static int cuda_moe_tiering_enforce_request(' `
+    'static void *cuda_moe_route_worker(void *arg) {'
+$syncAt = $enforce.IndexOf('cudaStreamSynchronize(cache->route_upload_stream)')
+$commitAt = $enforce.IndexOf('cuda_moe_tiering_commit_vram_reservations(')
+$refundAt = $enforce.IndexOf('cuda_moe_tiering_refund_failed_promotions(')
+Assert-True ($syncAt -ge 0 -and $commitAt -gt $syncAt) `
+    'promotion counters and tier state must commit only after upload sync'
+Assert-True ($refundAt -gt $syncAt) `
+    'failed promotions must have a provisional-budget refund path'
+Assert-True (-not $source.Contains('DS4_G132_U1_ATTRIBUTION')) `
+    'G132 attribution alias must remain absent from the base path'
+foreach ($field in @('upload_sync_wait_ms', 'vram_hit_pct', 'ram_hit_pct',
+                     'promotions', 'reaps',
                      'knock_promotions', 'thrash_guard_trips')) {
     Assert-True ($source.Contains($field)) "missing attribution field $field"
 }

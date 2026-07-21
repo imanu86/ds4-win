@@ -2416,6 +2416,8 @@ static void cuda_prefill_mass_observer_reset(void);
 static void cuda_prefill_mass_observer_finalize(void);
 static void cuda_prefill_mass_observer_release(int report);
 static void cuda_moe_tiering_request_boundary_reset(void);
+static void cuda_g133_decode_token_epoch_begin(
+    uint64_t request_epoch, uint64_t token_index);
 static int cuda_prefill_mass_observer_needs_weights(void);
 static int cuda_moe_prefill_tier_compose_requested(void);
 static int cuda_moe_prefill_tier_router_open_requested(void);
@@ -3109,8 +3111,9 @@ static int cuda_g133_tier_requested(void) {
 }
 
 struct cuda_g133_telemetry_counters {
-    std::atomic<uint64_t> h2d_nanoseconds{0};
-    std::atomic<uint64_t> warm_hits{0};
+    std::atomic<uint64_t> upload_sync_wait_nanoseconds{0};
+    std::atomic<uint64_t> vram_hits{0};
+    std::atomic<uint64_t> ram_hits{0};
     std::atomic<uint64_t> selected{0};
     std::atomic<uint64_t> promotions{0};
     std::atomic<uint64_t> reaps{0};
@@ -3119,12 +3122,12 @@ struct cuda_g133_telemetry_counters {
 };
 static cuda_g133_telemetry_counters g_cuda_g133_telemetry;
 
-static void cuda_g133_telemetry_note_h2d(double seconds) {
+static void cuda_g133_telemetry_note_upload_sync_wait(double seconds) {
     if (!cuda_g133_tier_requested() || !(seconds > 0.0)) return;
     const double nanoseconds = seconds * 1.0e9;
     const uint64_t rounded = nanoseconds >= (double)UINT64_MAX
         ? UINT64_MAX : (uint64_t)(nanoseconds + 0.5);
-    g_cuda_g133_telemetry.h2d_nanoseconds.fetch_add(
+    g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.fetch_add(
         rounded, std::memory_order_relaxed);
 }
 
@@ -3176,8 +3179,9 @@ struct cuda_g130_attribution_state {
     double request_span_seconds[CUDA_G130_ATTRIB_COUNT];
     double request_decode_seconds;
     double request_started;
-    uint64_t g133_h2d_nanoseconds;
-    uint64_t g133_warm_hits;
+    uint64_t g133_upload_sync_wait_nanoseconds;
+    uint64_t g133_vram_hits;
+    uint64_t g133_ram_hits;
     uint64_t g133_selected;
     uint64_t g133_promotions;
     uint64_t g133_reaps;
@@ -3189,8 +3193,7 @@ static int g_cuda_g130_attribution_enabled;
 static thread_local cuda_g130_attribution_state *g_cuda_g130_attribution;
 
 static void cuda_g130_attribution_init(void) {
-    const char *value = getenv("DS4_G132_U1_ATTRIBUTION");
-    if (!value || !value[0]) value = getenv("DS4_G130_U1_ATTRIBUTION");
+    const char *value = getenv("DS4_G130_U1_ATTRIBUTION");
     g_cuda_g130_attribution_enabled =
         value && value[0] && strcmp(value, "0") != 0;
 }
@@ -3247,6 +3250,9 @@ extern "C" void ds4_gpu_g130_attribution_request_begin(
 
 extern "C" void ds4_gpu_g130_attribution_token_begin(
         uint64_t token_index, double decode_started) {
+    if (cuda_g133_tier_requested()) {
+        cuda_g133_decode_token_epoch_begin(g_cuda_request_epoch, token_index);
+    }
     if (!g_cuda_g130_attribution_enabled) return;
     cuda_g130_attribution_state *state = g_cuda_g130_attribution;
     if (!state || !state->request_active) return;
@@ -3256,10 +3262,12 @@ extern "C" void ds4_gpu_g130_attribution_token_begin(
     state->token_started = decode_started;
     state->span_started = state->token_started;
     if (cuda_g133_tier_requested()) {
-        state->g133_h2d_nanoseconds =
-            g_cuda_g133_telemetry.h2d_nanoseconds.load(
+        state->g133_upload_sync_wait_nanoseconds =
+            g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.load(
                 std::memory_order_relaxed);
-        state->g133_warm_hits = g_cuda_g133_telemetry.warm_hits.load(
+        state->g133_vram_hits = g_cuda_g133_telemetry.vram_hits.load(
+            std::memory_order_relaxed);
+        state->g133_ram_hits = g_cuda_g133_telemetry.ram_hits.load(
             std::memory_order_relaxed);
         state->g133_selected = g_cuda_g133_telemetry.selected.load(
             std::memory_order_relaxed);
@@ -3337,13 +3345,16 @@ extern "C" void ds4_gpu_g130_attribution_token_end(
         }
         if (used > 0 && (size_t)used < sizeof(line)) {
             if (cuda_g133_tier_requested()) {
-                const uint64_t h2d_ns =
-                    g_cuda_g133_telemetry.h2d_nanoseconds.load(
+                const uint64_t upload_sync_wait_ns =
+                    g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.load(
                         std::memory_order_relaxed) -
-                    state->g133_h2d_nanoseconds;
-                const uint64_t warm_hits =
-                    g_cuda_g133_telemetry.warm_hits.load(
-                        std::memory_order_relaxed) - state->g133_warm_hits;
+                    state->g133_upload_sync_wait_nanoseconds;
+                const uint64_t vram_hits =
+                    g_cuda_g133_telemetry.vram_hits.load(
+                        std::memory_order_relaxed) - state->g133_vram_hits;
+                const uint64_t ram_hits =
+                    g_cuda_g133_telemetry.ram_hits.load(
+                        std::memory_order_relaxed) - state->g133_ram_hits;
                 const uint64_t selected =
                     g_cuda_g133_telemetry.selected.load(
                         std::memory_order_relaxed) - state->g133_selected;
@@ -3361,14 +3372,18 @@ extern "C" void ds4_gpu_g130_attribution_token_end(
                     g_cuda_g133_telemetry.thrash_guard_trips.load(
                         std::memory_order_relaxed) -
                     state->g133_thrash_guard_trips;
-                const double warm_hit_pct = selected
-                    ? 100.0 * (double)warm_hits / (double)selected : 0.0;
+                const double vram_hit_pct = selected
+                    ? 100.0 * (double)vram_hits / (double)selected : 0.0;
+                const double ram_hit_pct = selected
+                    ? 100.0 * (double)ram_hits / (double)selected : 0.0;
                 const int wrote = snprintf(
                     line + used, sizeof(line) - (size_t)used,
-                    " h2d_ms=%.6f warm_hit_pct=%.6f promotions=%.6f"
+                    " upload_sync_wait_ms=%.6f vram_hit_pct=%.6f"
+                    " ram_hit_pct=%.6f promotions=%.6f"
                     " reaps=%.6f knock_promotions=%.6f"
                     " thrash_guard_trips=%.6f",
-                    (double)h2d_ns / 1.0e6 / divisor, warm_hit_pct,
+                    (double)upload_sync_wait_ns / 1.0e6 / divisor,
+                    vram_hit_pct, ram_hit_pct,
                     (double)promotions / divisor, (double)reaps / divisor,
                     (double)knock_promotions / divisor,
                     (double)thrash_guard_trips / divisor);
@@ -9946,6 +9961,50 @@ static int cuda_primary_dynamic_arena_layer_allowed(uint32_t layer) {
     return !cuda_nested_residual_layer_required(layer);
 }
 
+/* Own every resource acquired after begin(): worker handles are joined before
+ * the transaction is aborted, so stack unwinding cannot strand writer claims. */
+struct cuda_dynamic_arena_transaction_guard {
+    ds4_gpu_dynamic_arena_txn *txn;
+    std::vector<os_thread_t> started_workers;
+
+    explicit cuda_dynamic_arena_transaction_guard(
+            ds4_gpu_dynamic_arena_txn *transaction) : txn(transaction) {}
+
+    ~cuda_dynamic_arena_transaction_guard() {
+        join_started_workers();
+        if (txn) ds4_gpu_dynamic_arena_abort(txn);
+    }
+
+    void reserve_started_workers(size_t count) {
+        started_workers.reserve(count);
+    }
+
+    void note_started_worker(os_thread_t worker) {
+        started_workers.push_back(worker);
+    }
+
+    uint32_t started_worker_count() const {
+        return (uint32_t)started_workers.size();
+    }
+
+    void join_started_workers() {
+        for (os_thread_t worker : started_workers) os_thread_join(worker);
+        started_workers.clear();
+    }
+
+    void publish_succeeded() {
+        txn = NULL;
+    }
+
+    void abort() {
+        join_started_workers();
+        if (txn) {
+            ds4_gpu_dynamic_arena_abort(txn);
+            txn = NULL;
+        }
+    }
+};
+
 static int cuda_dynamic_arena_wrap_publish_target(
         const uint8_t *target,
         uint32_t entry_count,
@@ -10074,6 +10133,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
         if (result) *result = local;
         return 0;
     }
+    cuda_dynamic_arena_transaction_guard transaction_guard(txn);
     const double begin_done_at = cuda_wall_sec();
     double copy_done_at = begin_done_at;
     double finish_done_at = begin_done_at;
@@ -10118,7 +10178,6 @@ static int cuda_dynamic_arena_wrap_publish_target(
     std::vector<uint8_t> part_success;
     std::vector<cuda_dynamic_arena_part_worker_profile> part_worker_profiles;
     std::vector<os_thread_t> threads;
-    std::vector<os_thread_t> started_threads;
     if (load_count != 0) {
         try {
             checksums.assign(load_count, 0);
@@ -10176,7 +10235,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 all_succeeded = 0;
             }
             threads.resize(requested_workers > 1 ? requested_workers - 1 : 0);
-            started_threads.reserve(threads.size());
+            transaction_guard.reserve_started_workers(threads.size());
             if (part_profile &&
                 schedule == CUDA_DYNAMIC_ARENA_WRAP_SOURCE_PARTS) {
                 part_worker_profiles.resize(threads.size() + 1u);
@@ -10306,20 +10365,20 @@ static int cuda_dynamic_arena_wrap_publish_target(
                         context.profile_worker_next.store(0,
                             std::memory_order_relaxed);
                     }
-                    started_threads.clear();
+                    transaction_guard.join_started_workers();
                     if (file_qd_requested == 1u) {
                         for (uint32_t i = 0; i < threads.size(); i++) {
                             if (os_thread_create(
                                     &threads[i],
                                     cuda_dynamic_arena_part_copy_worker,
                                     &context) == 0) {
-                                started_threads.push_back(threads[i]);
+                                transaction_guard.note_started_worker(threads[i]);
                             }
                         }
                     }
                     const uint32_t phase_workers =
                         file_qd_requested > 1u ? 1u :
-                        1u + (uint32_t)started_threads.size();
+                        1u + transaction_guard.started_worker_count();
                     if (phase_workers > local.workers) {
                         local.workers = phase_workers;
                     }
@@ -10344,9 +10403,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
                     source_parts_main_worker_seconds +=
                         cuda_wall_sec() - main_worker_started_at;
                     const double join_started_at = cuda_wall_sec();
-                    for (uint32_t i = 0; i < started_threads.size(); i++) {
-                        os_thread_join(started_threads[i]);
-                    }
+                    transaction_guard.join_started_workers();
                     source_parts_join_seconds +=
                         cuda_wall_sec() - join_started_at;
                     if (part_profile) {
@@ -10613,11 +10670,12 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 }
                 copy_done_at = source_copy_done_at;
             } else if (all_succeeded) {
-                started_threads.clear();
+                transaction_guard.join_started_workers();
                 const uint32_t requested_checksum_workers =
                     cuda_dynamic_arena_observer_workers(load_count);
                 threads.resize(requested_checksum_workers > 1 ?
                                requested_checksum_workers - 1 : 0);
+                transaction_guard.reserve_started_workers(threads.size());
                 cuda_dynamic_arena_checksum_context checksum_context;
                 checksum_context.loads = loads;
                 checksum_context.load_count = load_count;
@@ -10628,15 +10686,13 @@ static int cuda_dynamic_arena_wrap_publish_target(
                     if (os_thread_create(&threads[i],
                                          cuda_dynamic_arena_checksum_worker,
                                          &checksum_context) == 0) {
-                        started_threads.push_back(threads[i]);
+                        transaction_guard.note_started_worker(threads[i]);
                     }
                 }
                 checksum_workers =
-                    1u + (uint32_t)started_threads.size();
+                    1u + transaction_guard.started_worker_count();
                 (void)cuda_dynamic_arena_checksum_worker(&checksum_context);
-                for (uint32_t i = 0; i < started_threads.size(); i++) {
-                    os_thread_join(started_threads[i]);
-                }
+                transaction_guard.join_started_workers();
                 copy_done_at = cuda_wall_sec();
                 source_parts_checksum_seconds =
                     copy_done_at - source_copy_done_at;
@@ -10655,14 +10711,12 @@ static int cuda_dynamic_arena_wrap_publish_target(
                 if (os_thread_create(&threads[i],
                                      cuda_dynamic_arena_wrap_worker,
                                      &context) == 0) {
-                    started_threads.push_back(threads[i]);
+                    transaction_guard.note_started_worker(threads[i]);
                 }
             }
-            local.workers = 1u + (uint32_t)started_threads.size();
+            local.workers = 1u + transaction_guard.started_worker_count();
             (void)cuda_dynamic_arena_wrap_worker(&context);
-            for (uint32_t i = 0; i < started_threads.size(); i++) {
-                os_thread_join(started_threads[i]);
-            }
+            transaction_guard.join_started_workers();
             copy_done_at = cuda_wall_sec();
         }
         for (uint32_t i = 0; i < load_count; i++) {
@@ -10686,6 +10740,7 @@ static int cuda_dynamic_arena_wrap_publish_target(
         ds4_gpu_dynamic_arena_publish(txn, &local.generation);
     const double publish_done_at = cuda_wall_sec();
     if (published) {
+        transaction_guard.publish_succeeded();
         txn = NULL;
         local.reason = "ok";
         local.published = 1;
@@ -10713,7 +10768,8 @@ static int cuda_dynamic_arena_wrap_publish_target(
     }
     if (all_succeeded) local.reason = "publish";
     if (txn) {
-        ds4_gpu_dynamic_arena_abort(txn);
+        transaction_guard.abort();
+        txn = NULL;
         local.aborted = 1;
     }
     local.seconds = cuda_wall_sec() - started_at;
@@ -23057,8 +23113,10 @@ struct cuda_moe_tier_entry {
      * leaves cuda_moe_tier_entry as the single residency authority. */
     double g133_heat;
     double g133_knock;
-    uint64_t g133_heat_window;
-    uint64_t g133_last_touch_window;
+    uint64_t g133_heat_request_epoch;
+    uint64_t g133_heat_token_index;
+    uint64_t g133_last_touch_request_epoch;
+    uint64_t g133_last_touch_token_index;
     uint32_t g133_touch_streak;
     uint8_t g133_ram_candidate;
     uint8_t g133_vram_candidate;
@@ -23127,7 +23185,11 @@ struct cuda_moe_tiering {
     uint32_t g133_knock_y;
     uint32_t g133_promote_budget;
     uint32_t g133_promote_remaining;
-    uint64_t g133_promote_window;
+    uint64_t g133_promote_request_epoch;
+    uint64_t g133_promote_token_index;
+    uint64_t g133_decode_request_epoch;
+    uint64_t g133_decode_token_index;
+    int g133_decode_epoch_valid;
     double g133_decay;
     double g133_demotion_margin;
     std::vector<cuda_moe_tier_entry> entries;
@@ -23688,31 +23750,53 @@ static size_t cuda_moe_tiering_entry_index(uint32_t layer, uint32_t expert) {
     return (size_t)layer * 256u + expert;
 }
 
-static uint64_t cuda_g133_token_window(void) {
-    if (g_moe_tiering.call_tick == 0u) return 0u;
-    return (g_moe_tiering.call_tick - 1u) /
-        (uint64_t)CUDA_MOE_DECODE_WINDOWS_CALLS;
+static void cuda_g133_decode_token_epoch_begin(
+        uint64_t request_epoch, uint64_t token_index) {
+    if (!g_moe_tiering.g133_enabled) return;
+    if (request_epoch == 0u || request_epoch == UINT64_MAX ||
+        token_index == UINT64_MAX) {
+        g_moe_tiering.failures++;
+        return;
+    }
+    g_moe_tiering.g133_decode_request_epoch = request_epoch;
+    g_moe_tiering.g133_decode_token_index = token_index;
+    g_moe_tiering.g133_decode_epoch_valid = 1;
 }
 
 static void cuda_g133_refresh_entry(cuda_moe_tier_entry &entry) {
-    if (!g_moe_tiering.g133_enabled) return;
-    const uint64_t window = cuda_g133_token_window();
-    if (window > entry.g133_heat_window) {
-        const uint64_t elapsed = window - entry.g133_heat_window;
+    if (!g_moe_tiering.g133_enabled ||
+        !g_moe_tiering.g133_decode_epoch_valid) return;
+    const uint64_t request_epoch =
+        g_moe_tiering.g133_decode_request_epoch;
+    const uint64_t token_index = g_moe_tiering.g133_decode_token_index;
+    uint64_t elapsed = 0u;
+    if (entry.g133_heat_request_epoch == 0u) {
+        entry.g133_heat_request_epoch = request_epoch;
+        entry.g133_heat_token_index = token_index;
+    } else if (entry.g133_heat_request_epoch != request_epoch) {
+        /* Requests are distinct policy epochs; never carry a touch streak
+         * across them even when their decode token indices both start at 1. */
+        elapsed = 1u;
+        entry.g133_touch_streak = 0u;
+    } else if (token_index > entry.g133_heat_token_index) {
+        elapsed = token_index - entry.g133_heat_token_index;
+    }
+    if (elapsed != 0u) {
         const double factor = pow(
             g_moe_tiering.g133_decay, (double)elapsed);
         entry.g133_heat *= factor;
         entry.g133_knock *= factor;
-        if (entry.g133_last_touch_window != UINT64_MAX &&
-            window > entry.g133_last_touch_window + 1u) {
+        if (entry.g133_last_touch_request_epoch == request_epoch &&
+            token_index > entry.g133_last_touch_token_index + 1u) {
             const uint64_t missed =
-                window - entry.g133_last_touch_window - 1u;
+                token_index - entry.g133_last_touch_token_index - 1u;
             const double retained = (double)entry.g133_touch_streak *
                 pow(g_moe_tiering.g133_decay, (double)missed);
             entry.g133_touch_streak = retained >= (double)UINT32_MAX
                 ? UINT32_MAX : (uint32_t)retained;
         }
-        entry.g133_heat_window = window;
+        entry.g133_heat_request_epoch = request_epoch;
+        entry.g133_heat_token_index = token_index;
     }
     const uint64_t vram_gate =
         (uint64_t)g_moe_tiering.g133_knock_x +
@@ -23734,6 +23818,14 @@ static void cuda_g133_refresh_entry(cuda_moe_tier_entry &entry) {
 static double cuda_g133_decayed_heat(cuda_moe_tier_entry &entry) {
     cuda_g133_refresh_entry(entry);
     return entry.g133_heat;
+}
+
+static int cuda_g133_ram_demotion_eligible(cuda_moe_tier_entry &entry) {
+    cuda_g133_refresh_entry(entry);
+    const double demote_threshold = std::max(
+        0.0, (double)g_moe_tiering.g133_knock_x -
+            g_moe_tiering.g133_demotion_margin);
+    return entry.g133_knock < demote_threshold;
 }
 
 static double cuda_moe_tiering_lfru(
@@ -24275,7 +24367,7 @@ static int cuda_moe_tiering_prepare(void) {
         cuda_moe_tier_entry empty;
         memset(&empty, 0, sizeof(empty));
         empty.ram_slot = UINT32_MAX;
-        empty.g133_last_touch_window = UINT64_MAX;
+        empty.g133_last_touch_token_index = UINT64_MAX;
         empty.state = CUDA_MOE_TIER_SSD_COLD;
         g_moe_tiering.entries.assign(
             (size_t)CUDA_MOE_LAYER_COUNT * 256u, empty);
@@ -24305,7 +24397,11 @@ static int cuda_moe_tiering_prepare(void) {
     g_moe_tiering.g133_knock_y = g133_knock_y;
     g_moe_tiering.g133_promote_budget = g133_promote_budget;
     g_moe_tiering.g133_promote_remaining = g133_promote_budget;
-    g_moe_tiering.g133_promote_window = UINT64_MAX;
+    g_moe_tiering.g133_promote_request_epoch = UINT64_MAX;
+    g_moe_tiering.g133_promote_token_index = UINT64_MAX;
+    g_moe_tiering.g133_decode_request_epoch = g_cuda_request_epoch;
+    g_moe_tiering.g133_decode_token_index = 0u;
+    g_moe_tiering.g133_decode_epoch_valid = g_cuda_request_epoch != 0u;
     g_moe_tiering.g133_decay = g133_decay;
     g_moe_tiering.g133_demotion_margin = 1.0;
     g_iq1_promotion = cuda_iq1_promotion();
@@ -24488,6 +24584,10 @@ static int cuda_moe_tiering_pick_ram_slot(
         return slot < g_moe_tiering.open_router_pool_slot.size() &&
             g_moe_tiering.open_router_pool_slot[slot] != 0u;
     };
+    cuda_moe_tier_entry &candidate = g_moe_tiering.entries[
+        cuda_moe_tiering_entry_index(current_layer, current_expert)];
+    const double candidate_score = g_moe_tiering.g133_enabled
+        ? cuda_g133_decayed_heat(candidate) : 0.0;
     for (uint32_t pass = 0; pass < (preferred_pageable < 0 ? 1u : 2u);
          pass++) {
         for (uint32_t slot = 0; slot < g_dynamic_arena.slots.size(); slot++) {
@@ -24537,9 +24637,18 @@ static int cuda_moe_tiering_pick_ram_slot(
                     current_layer, current_expert)) {
                 continue;
             }
+            if (g_moe_tiering.g133_enabled &&
+                !cuda_g133_ram_demotion_eligible(entry)) {
+                continue;
+            }
             const double score = g_moe_tiering.g133_enabled
                 ? cuda_g133_decayed_heat(entry)
                 : cuda_moe_tiering_lfru(entry, g_moe_tiering.call_tick);
+            if (g_moe_tiering.g133_enabled &&
+                candidate_score <=
+                    score + g_moe_tiering.g133_demotion_margin) {
+                continue;
+            }
             if (score < best_score) {
                 best_score = score;
                 best_slot = (int)entry.ram_slot;
@@ -26077,13 +26186,23 @@ static cuda_moe_tier_state cuda_moe_tiering_observe_route(
     entry.last_call = g_moe_tiering.call_tick;
     if (g_moe_tiering.g133_enabled) {
         cuda_g133_refresh_entry(entry);
-        const uint64_t window = cuda_g133_token_window();
-        if (entry.g133_last_touch_window != window) {
-            if (entry.g133_touch_streak != UINT32_MAX) {
+        const uint64_t request_epoch =
+            g_moe_tiering.g133_decode_request_epoch;
+        const uint64_t token_index = g_moe_tiering.g133_decode_token_index;
+        if (entry.g133_last_touch_request_epoch != request_epoch ||
+            entry.g133_last_touch_token_index != token_index) {
+            const int consecutive =
+                entry.g133_last_touch_request_epoch == request_epoch &&
+                entry.g133_last_touch_token_index != UINT64_MAX &&
+                entry.g133_last_touch_token_index + 1u == token_index;
+            if (consecutive && entry.g133_touch_streak != UINT32_MAX) {
                 entry.g133_touch_streak++;
+            } else {
+                entry.g133_touch_streak = 1u;
             }
             entry.g133_knock += 1.0;
-            entry.g133_last_touch_window = window;
+            entry.g133_last_touch_request_epoch = request_epoch;
+            entry.g133_last_touch_token_index = token_index;
         }
         entry.g133_heat += fabs((double)weight);
         cuda_g133_refresh_entry(entry);
@@ -26093,8 +26212,11 @@ static cuda_moe_tier_state cuda_moe_tiering_observe_route(
             g_moe_tiering.ram_to_warm++;
         }
         cuda_g133_telemetry_increment(g_cuda_g133_telemetry.selected);
-        if (prior != CUDA_MOE_TIER_SSD_COLD) {
-            cuda_g133_telemetry_increment(g_cuda_g133_telemetry.warm_hits);
+        if (prior == CUDA_MOE_TIER_VRAM_PROTECTED) {
+            cuda_g133_telemetry_increment(g_cuda_g133_telemetry.vram_hits);
+        } else if (prior == CUDA_MOE_TIER_RAM_PROBATION ||
+                   prior == CUDA_MOE_TIER_RAM_WARM) {
+            cuda_g133_telemetry_increment(g_cuda_g133_telemetry.ram_hits);
         }
     }
     return prior;
@@ -27221,8 +27343,12 @@ static int cuda_moe_prefill_vram_seed(
             tier.g133_knock = (double)touches;
             tier.g133_touch_streak = touches >= (uint64_t)UINT32_MAX
                 ? UINT32_MAX : (uint32_t)touches;
-            tier.g133_heat_window = 0u;
-            tier.g133_last_touch_window = touches ? 0u : UINT64_MAX;
+            tier.g133_heat_request_epoch =
+                g_moe_tiering.g133_decode_request_epoch;
+            tier.g133_heat_token_index = 0u;
+            tier.g133_last_touch_request_epoch = touches
+                ? g_moe_tiering.g133_decode_request_epoch : 0u;
+            tier.g133_last_touch_token_index = touches ? 0u : UINT64_MAX;
             tier.g133_ram_candidate =
                 touches >= g_moe_tiering.g133_knock_x;
             tier.g133_vram_candidate = touches >=
@@ -28092,9 +28218,28 @@ static double cuda_moe_tiering_mass_lfru_score(
     return entry.mass * frequency * recency;
 }
 
+struct cuda_moe_vram_promotion_reservation {
+    uint32_t cache_slot;
+    uint32_t candidate_layer;
+    uint32_t candidate_expert;
+    uint32_t victim_layer;
+    uint32_t victim_expert;
+    cuda_moe_tier_state candidate_prior_state;
+    uint8_t active;
+    uint8_t victim_valid;
+    uint8_t from_snapshot;
+    uint8_t free_promotion;
+    uint8_t replacement;
+    uint8_t policy_budget_reserved;
+    uint8_t g133_budget_reserved;
+};
+
 static int cuda_moe_tiering_pick_vram_slot(
         cuda_moe_expert_cache *cache, const uint8_t *claimed,
-        cuda_moe_tier_entry &candidate) {
+        cuda_moe_tier_entry &candidate,
+        cuda_moe_vram_promotion_reservation *reservation) {
+    if (!reservation) return -1;
+    *reservation = cuda_moe_vram_promotion_reservation{};
     if (candidate.promoted_from_iq1_cold) {
         if (!candidate.has_2bit_ram) return -1;
         if (g_moe_tiering.call_tick < candidate.vram_eligible_after_call) {
@@ -28119,9 +28264,13 @@ static int cuda_moe_tiering_pick_vram_slot(
             }
             return -1;
         }
-        const uint64_t window = cuda_g133_token_window();
-        if (window != g_moe_tiering.g133_promote_window) {
-            g_moe_tiering.g133_promote_window = window;
+        const uint64_t request_epoch =
+            g_moe_tiering.g133_decode_request_epoch;
+        const uint64_t token_index = g_moe_tiering.g133_decode_token_index;
+        if (request_epoch != g_moe_tiering.g133_promote_request_epoch ||
+            token_index != g_moe_tiering.g133_promote_token_index) {
+            g_moe_tiering.g133_promote_request_epoch = request_epoch;
+            g_moe_tiering.g133_promote_token_index = token_index;
             g_moe_tiering.g133_promote_remaining =
                 g_moe_tiering.g133_promote_budget;
         }
@@ -28134,16 +28283,23 @@ static int cuda_moe_tiering_pick_vram_slot(
     for (uint32_t slot = 0; slot < cache->capacity; slot++) {
         if (!claimed[slot] &&
             cache->slots[slot].state == CUDA_MOE_CACHE_EMPTY) {
-            g_moe_tiering.policy_free_promotions++;
+            reservation->free_promotion = 1u;
             if (g_moe_tiering.g133_enabled) {
                 g_moe_tiering.g133_promote_remaining--;
+                reservation->g133_budget_reserved = 1u;
             }
             return (int)slot;
         }
     }
     if (g_moe_tiering.policy == CUDA_MOE_TIER_POLICY_SECOND_TOUCH) {
         const int slot = cuda_moe_route_worker_pick_slot(cache, claimed);
-        if (slot >= 0) g_moe_tiering.policy_replacements++;
+        if (slot >= 0) {
+            reservation->replacement = 1u;
+            if (g_moe_tiering.g133_enabled) {
+                g_moe_tiering.g133_promote_remaining--;
+                reservation->g133_budget_reserved = 1u;
+            }
+        }
         return slot;
     }
 
@@ -28282,11 +28438,103 @@ static int cuda_moe_tiering_pick_vram_slot(
         return -1;
     }
     g_moe_tiering.policy_budget_remaining--;
+    reservation->policy_budget_reserved = 1u;
     if (g_moe_tiering.g133_enabled) {
         g_moe_tiering.g133_promote_remaining--;
+        reservation->g133_budget_reserved = 1u;
     }
-    g_moe_tiering.policy_replacements++;
+    reservation->replacement = 1u;
     return victim_slot;
+}
+
+static void cuda_moe_tiering_commit_vram_reservations(
+        cuda_moe_expert_cache *cache,
+        const cuda_moe_vram_promotion_reservation *reservations,
+        uint32_t count) {
+    if (!cache || !reservations) return;
+    const uint64_t expert_bytes =
+        cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
+    for (uint32_t i = 0; i < count; i++) {
+        const cuda_moe_vram_promotion_reservation &reservation =
+            reservations[i];
+        if (!reservation.active || reservation.cache_slot >= cache->capacity) {
+            continue;
+        }
+        if (reservation.victim_valid) {
+            cuda_moe_tiering_demote_cache_entry(
+                reservation.victim_layer, reservation.victim_expert);
+            const size_t old_map_index = cuda_moe_tiering_entry_index(
+                reservation.victim_layer, reservation.victim_expert);
+            if (old_map_index < cache->host_slot_by_layer_expert.size() &&
+                cache->host_slot_by_layer_expert[old_map_index] ==
+                    (int32_t)reservation.cache_slot) {
+                cache->host_slot_by_layer_expert[old_map_index] = -1;
+            }
+        }
+        const size_t new_map_index = cuda_moe_tiering_entry_index(
+            reservation.candidate_layer, reservation.candidate_expert);
+        if (new_map_index < cache->host_slot_by_layer_expert.size()) {
+            cache->host_slot_by_layer_expert[new_map_index] =
+                (int32_t)reservation.cache_slot;
+        }
+        if (reservation.free_promotion && cache->count < cache->capacity) {
+            cache->count++;
+            g_moe_tiering.policy_free_promotions++;
+        } else if (reservation.replacement) {
+            cache->evictions++;
+            g_moe_tiering.policy_replacements++;
+        }
+        cache->admissions++;
+        if (reservation.candidate_prior_state ==
+                CUDA_MOE_TIER_RAM_PROBATION) {
+            g_moe_tiering.ram_to_warm++;
+        }
+        if (reservation.from_snapshot) {
+            g_moe_tiering.snapshot_to_vram_bytes += expert_bytes;
+        }
+        cuda_moe_tier_entry &candidate = g_moe_tiering.entries[new_map_index];
+        candidate.state = CUDA_MOE_TIER_VRAM_PROTECTED;
+        g_moe_tiering.vram_promotions++;
+        if (g_moe_tiering.g133_enabled) {
+            cuda_g133_telemetry_increment(
+                g_cuda_g133_telemetry.promotions);
+            cuda_g133_telemetry_increment(
+                g_cuda_g133_telemetry.knock_promotions);
+        }
+        g_moe_tiering.ram_h2d_bytes += expert_bytes;
+    }
+}
+
+static void cuda_moe_tiering_refund_failed_promotions(
+        const cuda_moe_vram_promotion_reservation *reservations,
+        uint32_t count) {
+    if (!reservations) return;
+    for (uint32_t i = 0; i < count; i++) {
+        const cuda_moe_vram_promotion_reservation &reservation =
+            reservations[i];
+        if (!reservation.active) continue;
+        if (reservation.policy_budget_reserved &&
+            g_moe_tiering.policy_budget_remaining <
+                g_moe_tiering.policy_replacement_budget) {
+            g_moe_tiering.policy_budget_remaining++;
+        }
+        if (reservation.g133_budget_reserved &&
+            g_moe_tiering.g133_promote_remaining <
+                g_moe_tiering.g133_promote_budget) {
+            g_moe_tiering.g133_promote_remaining++;
+        }
+        cuda_moe_tier_entry &candidate = g_moe_tiering.entries[
+            cuda_moe_tiering_entry_index(
+                reservation.candidate_layer, reservation.candidate_expert)];
+        candidate.state = reservation.candidate_prior_state;
+        if (reservation.victim_valid) {
+            /* Its device slot may be partially overwritten; failure rollback
+             * therefore restores the candidate and coherently demotes the
+             * no-longer-valid victim before whole-cache invalidation. */
+            cuda_moe_tiering_demote_cache_entry(
+                reservation.victim_layer, reservation.victim_expert);
+        }
+    }
 }
 
 static int cuda_moe_tiering_enforce_request(
@@ -28308,6 +28556,8 @@ static int cuda_moe_tiering_enforce_request(
         return 0;
     }
     uint32_t admitted[CUDA_MOE_ROUTE_COUNT] = {0};
+    cuda_moe_vram_promotion_reservation
+        promotion_reservations[CUDA_MOE_ROUTE_COUNT] = {};
     uint32_t admitted_count = 0;
     int ok = 1;
     const char *failure_reason = "none";
@@ -28490,28 +28740,34 @@ static int cuda_moe_tiering_enforce_request(
 
         /* Transport accounting is representation-neutral: for supported nested
          * types, base plus residual bytes equal the native expert byte count. */
+        cuda_moe_vram_promotion_reservation pending_reservation = {};
         const int cache_slot_i = have_ram ?
-            cuda_moe_tiering_pick_vram_slot(cache, claimed, tier) : -1;
+            cuda_moe_tiering_pick_vram_slot(
+                cache, claimed, tier, &pending_reservation) : -1;
         const int promote = cache_slot_i >= 0;
         if (promote) {
             const uint32_t cache_slot = (uint32_t)cache_slot_i;
             claimed[cache_slot] = 1u;
             cuda_moe_cache_slot &entry = cache->slots[cache_slot];
+            pending_reservation.active = 1u;
+            pending_reservation.cache_slot = cache_slot;
+            pending_reservation.candidate_layer = request.layer_index;
+            pending_reservation.candidate_expert = expert;
+            pending_reservation.candidate_prior_state = tier.state;
+            pending_reservation.from_snapshot = from_snapshot ? 1u : 0u;
             admitted[admitted_count++] = cache_slot;
+            promotion_reservations[admitted_count - 1u] = pending_reservation;
             int32_t old_map_index = -1;
             const int was_valid = entry.state == CUDA_MOE_CACHE_VALID;
             if (was_valid && entry.layer_index < CUDA_MOE_LAYER_COUNT &&
                 entry.expert_id < 256u) {
-                cuda_moe_tiering_demote_cache_entry(
-                    entry.layer_index, entry.expert_id);
+                promotion_reservations[admitted_count - 1u].victim_valid = 1u;
+                promotion_reservations[admitted_count - 1u].victim_layer =
+                    entry.layer_index;
+                promotion_reservations[admitted_count - 1u].victim_expert =
+                    entry.expert_id;
                 old_map_index = (int32_t)(
                     entry.layer_index * 256u + entry.expert_id);
-                if ((size_t)old_map_index <
-                        cache->host_slot_by_layer_expert.size() &&
-                    cache->host_slot_by_layer_expert[(size_t)old_map_index] ==
-                        (int32_t)cache_slot) {
-                    cache->host_slot_by_layer_expert[(size_t)old_map_index] = -1;
-                }
             }
             entry.state = CUDA_MOE_CACHE_LOADING;
             const uint64_t gate_dst =
@@ -28610,31 +28866,6 @@ static int cuda_moe_tiering_enforce_request(
             entry.age = ++cache->tick;
             entry.layer_owned = 0;
             entry.layer_key = request.gate_offset;
-            cache->host_slot_by_layer_expert[new_map_index] =
-                (int32_t)cache_slot;
-            if (!was_valid && cache->count < cache->capacity) cache->count++;
-            else if (was_valid) cache->evictions++;
-            cache->admissions++;
-            if (tier.state == CUDA_MOE_TIER_RAM_PROBATION) {
-                g_moe_tiering.ram_to_warm++;
-            }
-            if (from_snapshot) {
-                g_moe_tiering.snapshot_to_vram_bytes +=
-                    cache->gate_expert_bytes * 2ull +
-                    cache->down_expert_bytes;
-            } else if (!have_ram) {
-                g_moe_tiering.forbidden_cold_ssd_to_vram++;
-            }
-            tier.state = CUDA_MOE_TIER_VRAM_PROTECTED;
-            g_moe_tiering.vram_promotions++;
-            if (g_moe_tiering.g133_enabled) {
-                cuda_g133_telemetry_increment(
-                    g_cuda_g133_telemetry.promotions);
-                cuda_g133_telemetry_increment(
-                    g_cuda_g133_telemetry.knock_promotions);
-            }
-            g_moe_tiering.ram_h2d_bytes +=
-                cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
         } else {
             if (from_snapshot) {
                 g_moe_tiering.snapshot_to_vram_bytes +=
@@ -28734,14 +28965,14 @@ static int cuda_moe_tiering_enforce_request(
         cuda_nested_residual_gpu_cache_requested() &&
         cuda_nested_residual_layer_required(request.layer_index) ?
          cuda_wall_sec() : 0.0;
-    const double g133_h2d_started = g_moe_tiering.g133_enabled
+    const double g133_upload_sync_wait_started = g_moe_tiering.g133_enabled
         ? cuda_wall_sec() : 0.0;
     const cudaError_t pending_error = cudaGetLastError();
     const cudaError_t sync_error =
         cudaStreamSynchronize(cache->route_upload_stream);
-    if (g133_h2d_started != 0.0) {
-        cuda_g133_telemetry_note_h2d(
-            cuda_wall_sec() - g133_h2d_started);
+    if (g133_upload_sync_wait_started != 0.0) {
+        cuda_g133_telemetry_note_upload_sync_wait(
+            cuda_wall_sec() - g133_upload_sync_wait_started);
     }
     if (h2d_sync_started != 0.0) {
         g_nested_residual.profile_h2d_sync_calls++;
@@ -28757,20 +28988,15 @@ static int cuda_moe_tiering_enforce_request(
         for (uint32_t i = 0; i < admitted_count; i++) {
             cache->slots[admitted[i]].state = CUDA_MOE_CACHE_VALID;
         }
+        cuda_moe_tiering_commit_vram_reservations(
+            cache, promotion_reservations, admitted_count);
     } else if (admitted_count > 0u) {
         /* A failed asynchronous upload can have already changed both host and
-         * device maps. Invalidate the complete resident cache so no later
-         * request can observe a protected tier entry backed by an empty or
-         * partially overwritten slot. This is failure-only and deliberately
-         * favors a coherent cold restart over preserving cache contents. */
-        for (uint32_t i = 0; i < admitted_count; i++) {
-            const cuda_moe_cache_slot &entry = cache->slots[admitted[i]];
-            if (entry.layer_index < CUDA_MOE_LAYER_COUNT &&
-                entry.expert_id < 256u) {
-                cuda_moe_tiering_demote_cache_entry(
-                    entry.layer_index, entry.expert_id);
-            }
-        }
+         * device maps. Refund provisional budgets and restore candidate tier
+         * state before invalidating the resident cache; success counters were
+         * deliberately not committed before this synchronization terminal. */
+        cuda_moe_tiering_refund_failed_promotions(
+            promotion_reservations, admitted_count);
         cuda_moe_expert_cache_invalidate();
     }
     if (!ok) {
