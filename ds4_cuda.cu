@@ -23248,9 +23248,12 @@ struct cuda_g133_advisory_entry {
     std::atomic<uint64_t> decayed_heat;
     /* Single coherent advisory word: streak, promotion-age window counter,
      * position epoch, and request generation. One relaxed load snapshots all
-     * advisory fields. Request aliasing requires 2^24 requests plus the exact
-     * same packed position and streak, which is negligible for this bounded
-     * promotion hint and does not own correctness state. */
+     * advisory fields. Known residual: request generation keeps only 24 bits,
+     * so after exactly 2^24 requests an entry whose stored position equals (or
+     * is one less than) the current position can be misread as same-epoch or
+     * consecutive -- no streak match is required. The worst outcome is one
+     * wrong promotion hint on that request; this word never owns correctness
+     * state (slot lifecycle, generations, reservations, output ordering). */
     std::atomic<uint64_t> streak_epoch;
 
     cuda_g133_advisory_entry()
