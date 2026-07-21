@@ -27,8 +27,6 @@ typedef struct {
     uint64_t position_epoch;
 } ds4_gpu_g133_epoch;
 
-typedef ds4_gpu_g133_epoch (*ds4_gpu_g133_position_begin_fn)(void);
-
 typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
@@ -48,8 +46,10 @@ typedef struct {
 } ds4_gpu_dynamic_arena_load;
 
 int ds4_gpu_init(void);
-/* Initialization selects either the CUDA epoch producer or a no-op producer. */
-extern ds4_gpu_g133_position_begin_fn ds4_gpu_g133_decode_position_begin;
+/* Cached at initialization. The decode path branches once before calling the
+ * epoch producer, so G133-off executes no indirect/no-op token hook. */
+extern int ds4_gpu_g133_enabled;
+ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void);
 
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
 /* Decode-thread-only host attribution.  The server owns token/request

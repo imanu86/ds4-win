@@ -12703,8 +12703,10 @@ static int metal_graph_decode_test(
                                                  (uint32_t)token,
                                                       DS4_N_EMBD,
                                                       DS4_N_HC) != 0;
-    const ds4_gpu_g133_epoch g133_epoch =
-        ds4_gpu_g133_decode_position_begin();
+    ds4_gpu_g133_epoch g133_epoch = {0};
+    if (ds4_gpu_g133_enabled) {
+        g133_epoch = ds4_gpu_g133_decode_position_begin();
+    }
     if (ok) ok = metal_graph_encode_decode_layer(&g,
                                                model,
                                                layer,
@@ -12844,8 +12846,10 @@ static int metal_graph_first_token_full_test(
 
     ds4_gpu_graph g;
     bool ok = metal_graph_alloc(&g, model, weights, &weights->layer[0]);
-    const ds4_gpu_g133_epoch g133_epoch =
-        ds4_gpu_g133_decode_position_begin();
+    ds4_gpu_g133_epoch g133_epoch = {0};
+    if (ds4_gpu_g133_enabled) {
+        g133_epoch = ds4_gpu_g133_decode_position_begin();
+    }
     const bool trace_layers = getenv("DS4_METAL_GRAPH_TRACE_LAYERS") != NULL;
     if (trace_layers && ok) {
         g.materialize_ffn_out = true;
@@ -13022,8 +13026,13 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_spex_queue_reset(g->spex_prefetch, g->spex_epoch);
     }
     g->spex_decode_active = true;
-    const ds4_gpu_g133_epoch g133_epoch =
-        ds4_gpu_g133_decode_position_begin();
+    /* The added epoch parameter prevents literal instruction identity with the
+     * pre-G133 call graph. The OFF contract is behavioral: this one cached
+     * branch plus measured token-hash/performance equality at the M1 gate. */
+    ds4_gpu_g133_epoch g133_epoch = {0};
+    if (ds4_gpu_g133_enabled) {
+        g133_epoch = ds4_gpu_g133_decode_position_begin();
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         metal_graph_spex_before_layer(g, &weights->layer[il], il);
         ok = metal_graph_encode_decode_layer(g,
@@ -16012,10 +16021,12 @@ static bool metal_graph_verify_decode2_exact(
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = true;
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    const ds4_gpu_g133_epoch g133_epoch0 =
-        ds4_gpu_g133_decode_position_begin();
-    const ds4_gpu_g133_epoch g133_epoch1 =
-        ds4_gpu_g133_decode_position_begin();
+    ds4_gpu_g133_epoch g133_epoch0 = {0};
+    ds4_gpu_g133_epoch g133_epoch1 = {0};
+    if (ds4_gpu_g133_enabled) {
+        g133_epoch0 = ds4_gpu_g133_decode_position_begin();
+        g133_epoch1 = ds4_gpu_g133_decode_position_begin();
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t pos0 = start;
         const uint32_t pos1 = start + 1u;

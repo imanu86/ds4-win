@@ -26,6 +26,7 @@ typedef struct {
     HANDLE file;
     OVERLAPPED overlapped;
     volatile LONG active;
+    volatile LONG cancel_sequence;
 #else
     int unused;
 #endif
@@ -45,9 +46,11 @@ int os_file_valid(const os_file_t *f);
 uint64_t os_file_size(const os_file_t *f);
 int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off);
 void os_pread_cancellable_init(os_pread_cancellable_t *state);
+void os_pread_cancellable_reset(os_pread_cancellable_t *state);
 int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
-                             uint64_t off, os_pread_cancellable_t *state);
-int os_pread_cancel(os_pread_cancellable_t *state);
+                             uint64_t off, os_pread_cancellable_t *state,
+                             uint32_t sequence);
+int os_pread_cancel(os_pread_cancellable_t *state, uint32_t sequence);
 FILE *os_fopen(const char *path_utf8, const char *mode);
 
 #ifdef __cplusplus

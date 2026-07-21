@@ -7,6 +7,8 @@ $corePath = Join-Path $root 'ds4.c'
 $core = [System.IO.File]::ReadAllText($corePath)
 $osFilePath = Join-Path $root 'src/platform/os_file.c'
 $osFile = [System.IO.File]::ReadAllText($osFilePath)
+$osThreadPath = Join-Path $root 'src/platform/os_thread.c'
+$osThread = [System.IO.File]::ReadAllText($osThreadPath)
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw "G133 M1 static contract failed: $Message" }
@@ -30,8 +32,9 @@ Assert-True (([regex]::Matches($source, 'struct cuda_moe_tier_entry\s*\{')).Coun
 $advisoryEntry = Slice-Between 'struct cuda_g133_advisory_entry {' `
     'struct cuda_moe_tier_entry {'
 $tierEntry = Slice-Between 'struct cuda_moe_tier_entry {' 'struct cuda_moe_tiering {'
-Assert-True ($advisoryEntry.Contains('std::atomic<uint64_t> decayed_touch_count') -and
-             $advisoryEntry.Contains('std::atomic<uint64_t> last_touch_epoch') -and
+Assert-True ($advisoryEntry.Contains('std::atomic<uint64_t> decayed_heat') -and
+             $advisoryEntry.Contains('std::atomic<uint64_t> streak_epoch') -and
+             $advisoryEntry.Contains('consecutive streak') -and
              $advisoryEntry.Contains('memory_order_relaxed') -and
              $advisoryEntry.Contains('no per-position history')) `
     'advisory state must be bounded relaxed atomics with documented tolerance'
@@ -83,7 +86,7 @@ $decodeBench = Slice-TextBetween $core 'static int metal_graph_decode_test(' `
 Assert-True ($decodeBench.Contains('ds4_gpu_g133_decode_position_begin()')) `
     'nonzero-layer decode benchmark must create a position epoch'
 
-$epochHook = Slice-Between 'static ds4_gpu_g133_epoch cuda_g133_decode_position_enabled(void)' `
+$epochHook = Slice-Between 'extern "C" ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void)' `
     'static void cuda_g133_refresh_entry('
 Assert-True ($epochHook.Contains('g_cuda_g133_decode_position_epoch++')) `
     'core position hook must advance the authoritative G133 epoch'
@@ -92,8 +95,8 @@ Assert-True ($epochHook.Contains('g_cuda_request_epoch')) `
 $requestBegin = Slice-Between 'extern "C" int ds4_gpu_dynamic_arena_request_begin(void)' `
     'extern "C" void ds4_gpu_dynamic_arena_observer_reset(void)'
 Assert-True ($requestBegin.Contains('g_cuda_request_epoch++') -and
-             $requestBegin.Contains('g_cuda_g133_decode_position_epoch = 0u;')) `
-    'G133 generation and position reset must bind to the arena request boundary'
+             -not $requestBegin.Contains('g_cuda_g133_decode_position_epoch = 0u;')) `
+    'request generation must advance without resetting process-wide position time'
 
 $routeWorker = Slice-Between 'static void *cuda_moe_route_worker(void *arg) {' `
     'static int cuda_moe_expert_cache_copy_to_compact_async('
@@ -108,16 +111,29 @@ Assert-True ($routeBegin.Contains('route_consumed_sequence') -and
              $routeBegin.Contains('prior_sequence')) `
     'route request storage must not be reused before worker snapshot acknowledgement'
 
-# Round-5 directive: advisory observations are bounded relaxed updates. A
-# double/lost observation is acceptable; promotion refresh uses atomic max.
+# Round-6 D1: promotion uses a reachable consecutive-touch integer streak;
+# EMA heat remains ranking/demotion-only and packed epoch order is wrap-safe.
 $g133Record = Slice-Between 'static void cuda_g133_record_observation(' `
     'static double cuda_g133_decayed_heat('
-Assert-True ($g133Record.Contains('decayed_touch_count.store(') -and
-             $g133Record.Contains('last_touch_epoch.compare_exchange_weak(') -and
+Assert-True ($g133Record.Contains('decayed_heat.store(') -and
+             $g133Record.Contains('streak_epoch.compare_exchange_weak(') -and
+             $g133Record.Contains('elapsed == 1u') -and
+             $g133Record.Contains('? prior_streak + 1u : 1u') -and
              $g133Record.Contains('std::memory_order_relaxed') -and
              -not $g133Record.Contains('std::lower_bound') -and
              -not $g133Record.Contains('.insert(')) `
     'G133 observations must remain bounded O(1) relaxed-atomic updates'
+$ramCandidate = Slice-Between 'static int cuda_g133_ram_candidate(' `
+    'static void cuda_g133_update_entry_candidate_state('
+Assert-True ($ramCandidate.Contains('cuda_g133_consecutive_streak') -and
+             -not $ramCandidate.Contains('cuda_g133_advisory_heat')) `
+    'KNOCK promotion gates must use only the reachable integer streak'
+$epochPacking = Slice-Between 'static uint32_t cuda_g133_advisory_epoch32(' `
+    'static uint32_t cuda_g133_consecutive_streak('
+Assert-True ($epochPacking.Contains('(int32_t)(current - prior) > 0') -and
+             -not $epochPacking.Contains('UINT32_MAX') -and
+             -not $epochPacking.Contains('std::min')) `
+    'packed 32-bit advisory time must use wrap-safe ordering without saturation'
 $observe = Slice-Between 'static cuda_moe_tier_state cuda_moe_tiering_observe_route(' `
     'static uint64_t cuda_iq1_promotion_current_request_epoch(void)'
 Assert-True ($observe.IndexOf('cuda_g133_record_observation(') -ge 0 -and
@@ -128,20 +144,28 @@ $promoteRefresh = Slice-Between 'static void cuda_g133_advisory_budget_refresh('
     'static int cuda_g133_advisory_budget_reserve('
 Assert-True ($promoteRefresh.Contains('max_epoch.load(') -and
              $promoteRefresh.Contains('compare_exchange_weak(') -and
-             $promoteRefresh.Contains('current > maximum') -and
+             $promoteRefresh.Contains('cuda_g133_advisory_epoch_after(current, maximum)') -and
              $promoteRefresh.Contains('remaining.store(')) `
-    'promotion budget refresh must be keyed on an atomic maximum epoch'
+    'promotion budget refresh must be keyed on wrap-safe atomic epoch order'
 
 $dispatch = Slice-Between 'static uint64_t g_cuda_g133_decode_position_epoch = 0u;' `
     'struct cuda_g133_telemetry_counters {'
-Assert-True ($dispatch.Contains('ds4_gpu_g133_decode_position_begin') -and
-             $dispatch.Contains('cuda_g133_decode_position_noop;') -and
-             $dispatch.Contains('cuda_g133_decode_position_enabled')) `
-    'G133 position hook must use initialization-time no-op/enabled dispatch'
+Assert-True ($dispatch.Contains('ds4_gpu_g133_enabled = 0') -and
+             $dispatch.Contains('ds4_gpu_g133_enabled = 1') -and
+             -not $dispatch.Contains('cuda_g133_decode_position_noop') -and
+             -not $dispatch.Contains('ds4_gpu_g133_position_begin_fn')) `
+    'G133 position hook must use an initialization-cached direct-call gate'
 $gpuInit = Slice-Between 'extern "C" int ds4_gpu_init(void)' `
     'extern "C" void ds4_gpu_cleanup(void)'
 Assert-True ($gpuInit.Contains('cuda_g133_initialize_dispatch()')) `
     'CUDA startup must resolve the G133 hook dispatch once'
+$decodeGate = Slice-TextBetween $core 'static bool metal_graph_encode_token_raw_swa(' `
+    'static bool metal_graph_eval_token_raw_swa('
+Assert-True (([regex]::Matches($decodeGate,
+                 'if \(ds4_gpu_g133_enabled\)')).Count -eq 1 -and
+             $decodeGate.Contains('behavioral: this one cached') -and
+             $decodeGate.Contains('token-hash/performance equality')) `
+    'ordinary decode must use one cached branch and document the behavioral OFF gate'
 $tokenHook = Slice-Between 'extern "C" void ds4_gpu_g130_attribution_token_begin(' `
     'extern "C" void ds4_gpu_g130_attribution_token_end('
 Assert-True (-not $tokenHook.Contains('g133_decode_position') -and
@@ -272,10 +296,10 @@ Assert-True ($failureDrainAt -ge 0 -and $failureInvalidateAt -gt $failureDrainAt
     'decode-thread failure invalidation must drain worker completion first'
 Assert-True ($routeFailure.Contains('cuda_g133_shared_policy_active() &&')) `
     'route-failure completion drain must preserve disabled-path purity'
-Assert-True ($routeFinish.IndexOf('cuda_moe_route_worker_cancel_and_join') -ge 0 -and
+Assert-True ($routeFinish.Contains('if (cuda_moe_route_worker_cancel_and_join(') -and
              $routeFinish.IndexOf('cuda_moe_expert_cache_invalidate();') -gt
                  $routeFinish.IndexOf('cuda_moe_route_worker_cancel_and_join')) `
-    'cancellation must hard-join before invalidating correctness state'
+    'only a completed bounded join may precede correctness-state invalidation'
 Assert-True ($routeFinish.Contains('progress > last_read_progress') -and
              $routeFinish.Contains('transient_absolute_deadline') -and
              $routeFinish.Contains('std::memory_order_acquire') -and
@@ -297,10 +321,45 @@ Assert-True (([regex]::Matches($enforceDeadline,
              $enforceDeadline.Contains('transient_request_deadline') -and
              -not $enforceDeadline.Contains('const double absolute_deadline =')) `
     'transient service must use one request-wide absolute deadline'
+Assert-True ($enforceDeadline.IndexOf('os_pread_cancellable_reset(') -ge 0 -and
+             $enforceDeadline.IndexOf('route_transient_read_sequence.store(') -gt
+                 $enforceDeadline.IndexOf('os_pread_cancellable_reset(')) `
+    'only the G133 transient path may reset cancellation before publishing its read'
 Assert-True ($osFile.Contains('CancelIoEx(state->file, &state->overlapped)') -and
-             $source.Contains('os_pread_cancel(&cache->route_transient_pread)') -and
+             $source.Contains('os_pread_cancel(&cache->route_transient_pread, sequence)') -and
              -not $source.Contains('CancelSynchronousIo')) `
     'Windows transient cancellation must target the live OVERLAPPED with CancelIoEx'
+$cancellablePread = Slice-TextBetween $osFile 'int64_t os_pread_cancellable(' `
+    'int64_t os_pread('
+$armAt = $cancellablePread.IndexOf('InterlockedExchange(&state->active, 1);')
+$cancelCheckAt = $cancellablePread.IndexOf('&state->cancel_sequence, 0, 0')
+Assert-True ($armAt -ge 0 -and $cancelCheckAt -gt $armAt -and
+             ([regex]::Matches($cancellablePread,
+                 '&state->cancel_sequence, 0, 0')).Count -ge 2) `
+    'cancellable pread must arm before checking cancel and recheck after submission'
+$genericPreadAt = $osFile.IndexOf('int64_t os_pread(')
+Assert-True ($genericPreadAt -ge 0) 'missing generic os_pread'
+$genericPread = $osFile.Substring($genericPreadAt)
+Assert-True ($genericPread.Contains('OVERLAPPED ol;') -and
+             -not $genericPread.Contains('os_pread_cancellable(') -and
+             -not $genericPread.Contains('Interlocked')) `
+    'generic os_pread must retain its original non-cancellable path'
+$cancelJoin = Slice-Between 'static int cuda_moe_route_worker_cancel_and_join(' `
+    'static int cuda_moe_route_worker_drain_completed('
+Assert-True ($cancelJoin.Contains('os_thread_join_timeout') -and
+             $cancelJoin.Contains('route_transient_dead_sequence.store(') -and
+             $cancelJoin.Contains('route_worker_safe_leaked = 1') -and
+             $cancelJoin.Contains('os_thread_detach') -and
+             $cancelJoin.Contains('writer slot/cache safe-leaked permanently')) `
+    'route cancellation must bound its join and safe-leak a still-written slot'
+$cachePrepare = Slice-Between 'static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(' `
+    'static int cuda_moe_expert_cache_find('
+Assert-True ($cachePrepare.Contains(
+                 'if (g_moe_expert_cache.route_worker_safe_leaked) return NULL;')) `
+    'a safe-leaked route cache must remain permanently dead and never be reused'
+Assert-True ($osThread.Contains('WaitForSingleObject(t, (DWORD)timeout_ms)') -and
+             $osThread.Contains('pthread_timedjoin_np')) `
+    'Windows and Linux route joins must both expose a bounded wait'
 Assert-True ($source.Contains('getenv("DS4_G133_TRANSIENT_IO_TIMEOUT_S")') -and
              $source.Contains('static double timeout_seconds = 30.0;')) `
     'transient SSD absolute timeout must expose the default-30-second environment contract'
@@ -313,7 +372,7 @@ Assert-True ($source.Contains('!(g133_decay > 0.0 && g133_decay < 1.0)') -and
 $demotion = Slice-Between 'static int cuda_g133_ram_demotion_eligible(' `
     'static double cuda_moe_tiering_lfru('
 Assert-True ($demotion.Contains('demote_threshold == 0.0') -and
-             $demotion.Contains('cuda_g133_advisory_touch_count(entry, epoch) <= 0.0')) `
+             $demotion.Contains('cuda_g133_advisory_heat(entry, epoch) <= 0.0')) `
     'zero-heat RAM entries must be eligible at a zero demotion threshold'
 Assert-True (-not $source.Contains('DS4_G132_U1_ATTRIBUTION')) `
     'G132 attribution alias must remain absent from the base path'

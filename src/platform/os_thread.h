@@ -44,6 +44,7 @@ extern "C" {
 void os_once(os_once_t *once, void (*init_fn)(void));
 int os_thread_create(os_thread_t *t, os_thread_fn fn, void *arg);
 void os_thread_join(os_thread_t t);
+int os_thread_join_timeout(os_thread_t t, uint32_t timeout_ms);
 void os_thread_detach(os_thread_t t);
 long os_cpu_count(void);
 
@@ -77,6 +78,13 @@ static inline int os_thread_create(os_thread_t *t, os_thread_fn fn, void *arg) {
     return pthread_create(t, NULL, fn, arg);
 }
 static inline void os_thread_join(os_thread_t t) { pthread_join(t, NULL); }
+#ifdef __cplusplus
+extern "C" {
+#endif
+int os_thread_join_timeout(os_thread_t t, uint32_t timeout_ms);
+#ifdef __cplusplus
+}
+#endif
 static inline void os_thread_detach(os_thread_t t) { pthread_detach(t); }
 static inline long os_cpu_count(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);

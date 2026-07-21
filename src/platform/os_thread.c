@@ -1,3 +1,8 @@
+#ifndef _WIN32
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
 #include "os_thread.h"
 
 #ifdef _WIN32
@@ -48,6 +53,13 @@ void os_thread_join(os_thread_t t) {
     CloseHandle(t);
 }
 
+int os_thread_join_timeout(os_thread_t t, uint32_t timeout_ms) {
+    const DWORD result = WaitForSingleObject(t, (DWORD)timeout_ms);
+    if (result != WAIT_OBJECT_0) return 0;
+    CloseHandle(t);
+    return 1;
+}
+
 void os_thread_detach(os_thread_t t) {
     CloseHandle(t);
 }
@@ -56,5 +68,28 @@ long os_cpu_count(void) {
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     return si.dwNumberOfProcessors ? (long)si.dwNumberOfProcessors : 1;
+}
+#else
+#include <errno.h>
+#include <time.h>
+
+int os_thread_join_timeout(os_thread_t t, uint32_t timeout_ms) {
+#ifdef __linux__
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 0;
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000l;
+    if (deadline.tv_nsec >= 1000000000l) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000l;
+    }
+    return pthread_timedjoin_np(t, NULL, &deadline) == 0;
+#else
+    /* No portable POSIX timed join exists. Refuse to wait so the caller can
+     * detach and take its documented safe-leak fallback. */
+    (void)t;
+    (void)timeout_ms;
+    return 0;
+#endif
 }
 #endif
