@@ -41,6 +41,10 @@ static ds4_gpu_g133_epoch ds4_gpu_g133_noop_position_begin(void) {
 
 ds4_gpu_g133_position_begin_fn ds4_gpu_g133_decode_position_begin =
     ds4_gpu_g133_noop_position_begin;
+int ds4_gpu_g133_validate_context(uint32_t ctx_size) {
+    (void)ctx_size;
+    return 1;
+}
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;

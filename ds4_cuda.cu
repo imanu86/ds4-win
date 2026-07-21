@@ -12857,8 +12857,10 @@ extern "C" int ds4_gpu_dynamic_arena_request_begin(void) {
     cuda_moe_tiering_request_boundary_reset();
     g_cuda_request_epoch++;
     if (g_cuda_request_epoch == 0u) g_cuda_request_epoch++;
-    /* Position time is process-wide. Its packed low 32 bits use signed-delta
-     * wrap ordering, so neither heat decay nor token-budget refresh freezes. */
+    /* The advisory word keeps 20 request-local position bits. Context
+     * validation prevents same-request wrap; request generation disambiguates
+     * cross-request snapshots. */
+    g_cuda_g133_decode_position_epoch = 0u;
     cuda_expert_recovery_trace_request_begin();
     cuda_prefill_mass_observer_reset();
     if (cuda_q1_0_exclusive_arena_active()) {
@@ -23171,26 +23173,94 @@ enum cuda_moe_tier_state : uint8_t {
     CUDA_MOE_TIER_VRAM_PROTECTED = 3,
 };
 
+static const uint64_t CUDA_G133_TOUCH_SCALE = 65536u;
+static const uint32_t CUDA_G133_STREAK_BITS = 8u;
+static const uint32_t CUDA_G133_PROMOTION_AGE_BITS = 12u;
+static const uint32_t CUDA_G133_EPOCH_POSITION_BITS = 20u;
+static const uint32_t CUDA_G133_EPOCH_REQUEST_BITS =
+    64u - CUDA_G133_STREAK_BITS - CUDA_G133_PROMOTION_AGE_BITS -
+    CUDA_G133_EPOCH_POSITION_BITS;
+static const uint64_t CUDA_G133_STREAK_MAX =
+    (1ull << CUDA_G133_STREAK_BITS) - 1ull;
+static const uint64_t CUDA_G133_PROMOTION_AGE_MAX =
+    (1ull << CUDA_G133_PROMOTION_AGE_BITS) - 1ull;
+static const uint64_t CUDA_G133_EPOCH_POSITION_MASK =
+    (1ull << CUDA_G133_EPOCH_POSITION_BITS) - 1ull;
+static const uint64_t CUDA_G133_EPOCH_REQUEST_MASK =
+    (1ull << CUDA_G133_EPOCH_REQUEST_BITS) - 1ull;
+static const uint64_t CUDA_G133_EPOCH_REQUEST_HALF =
+    1ull << (CUDA_G133_EPOCH_REQUEST_BITS - 1u);
+static const uint32_t CUDA_G133_PROMOTION_AGE_SHIFT =
+    CUDA_G133_STREAK_BITS;
+static const uint32_t CUDA_G133_EPOCH_POSITION_SHIFT =
+    CUDA_G133_STREAK_BITS + CUDA_G133_PROMOTION_AGE_BITS;
+static const uint32_t CUDA_G133_EPOCH_REQUEST_SHIFT =
+    CUDA_G133_EPOCH_POSITION_SHIFT + CUDA_G133_EPOCH_POSITION_BITS;
+static_assert(CUDA_G133_EPOCH_REQUEST_BITS >= 24u,
+              "G133 advisory request generation must keep at least 24 bits");
+
+struct cuda_g133_advisory_fields {
+    uint32_t streak;
+    uint32_t promotion_age;
+    uint32_t position_epoch;
+    uint32_t request_epoch;
+};
+
+static inline uint64_t cuda_g133_advisory_pack(
+        const cuda_g133_advisory_fields &fields) {
+    const uint64_t streak =
+        fields.streak > CUDA_G133_STREAK_MAX
+            ? CUDA_G133_STREAK_MAX : (uint64_t)fields.streak;
+    const uint64_t promotion_age =
+        fields.promotion_age > CUDA_G133_PROMOTION_AGE_MAX
+            ? CUDA_G133_PROMOTION_AGE_MAX : (uint64_t)fields.promotion_age;
+    const uint64_t position_epoch =
+        (uint64_t)fields.position_epoch & CUDA_G133_EPOCH_POSITION_MASK;
+    const uint64_t request_epoch =
+        (uint64_t)fields.request_epoch & CUDA_G133_EPOCH_REQUEST_MASK;
+    return streak |
+        (promotion_age << CUDA_G133_PROMOTION_AGE_SHIFT) |
+        (position_epoch << CUDA_G133_EPOCH_POSITION_SHIFT) |
+        (request_epoch << CUDA_G133_EPOCH_REQUEST_SHIFT);
+}
+
+static inline cuda_g133_advisory_fields cuda_g133_advisory_unpack(
+        uint64_t packed) {
+    cuda_g133_advisory_fields fields;
+    fields.streak = (uint32_t)(packed & CUDA_G133_STREAK_MAX);
+    fields.promotion_age = (uint32_t)(
+        (packed >> CUDA_G133_PROMOTION_AGE_SHIFT) &
+        CUDA_G133_PROMOTION_AGE_MAX);
+    fields.position_epoch = (uint32_t)(
+        (packed >> CUDA_G133_EPOCH_POSITION_SHIFT) &
+        CUDA_G133_EPOCH_POSITION_MASK);
+    fields.request_epoch = (uint32_t)(
+        (packed >> CUDA_G133_EPOCH_REQUEST_SHIFT) &
+        CUDA_G133_EPOCH_REQUEST_MASK);
+    return fields;
+}
+
 struct cuda_g133_advisory_entry {
     /* Advisory only: relaxed races may double-count or lose one observation.
      * That bounded noise can change one promotion choice, but never owns slot
      * lifecycle, generations, reservations, transactions, or output ordering.
      * Storage is O(1) per expert; no per-position history is retained. */
     std::atomic<uint64_t> decayed_heat;
-    /* High bits: request-mixed wrapping position epoch; low bits: saturating
-     * consecutive streak. Keeping both in one CAS prevents an epoch/streak
-     * mismatch and makes request boundaries non-consecutive. */
+    /* Single coherent advisory word: streak, promotion-age window counter,
+     * position epoch, and request generation. One relaxed load snapshots all
+     * advisory fields. Request aliasing requires 2^24 requests plus the exact
+     * same packed position and streak, which is negligible for this bounded
+     * promotion hint and does not own correctness state. */
     std::atomic<uint64_t> streak_epoch;
-    std::atomic<uint64_t> promotion_epoch;
 
     cuda_g133_advisory_entry()
-        : decayed_heat(0u), streak_epoch(0u), promotion_epoch(0u) {}
+        : decayed_heat(0u),
+          streak_epoch(cuda_g133_advisory_pack(
+              cuda_g133_advisory_fields{0u, 0u, 0u, 0u})) {}
     cuda_g133_advisory_entry(const cuda_g133_advisory_entry &other)
         : decayed_heat(other.decayed_heat.load(
               std::memory_order_relaxed)),
           streak_epoch(other.streak_epoch.load(
-              std::memory_order_relaxed)),
-          promotion_epoch(other.promotion_epoch.load(
               std::memory_order_relaxed)) {}
     cuda_g133_advisory_entry &operator=(
             const cuda_g133_advisory_entry &other) {
@@ -23199,9 +23269,6 @@ struct cuda_g133_advisory_entry {
             std::memory_order_relaxed);
         streak_epoch.store(
             other.streak_epoch.load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
-        promotion_epoch.store(
-            other.promotion_epoch.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
         return *this;
     }
@@ -24025,91 +24092,120 @@ static int cuda_g133_epoch_valid(const ds4_gpu_g133_epoch &epoch) {
     return epoch.request_epoch != 0u && epoch.position_epoch != 0u;
 }
 
-static const uint64_t CUDA_G133_TOUCH_SCALE = 65536u;
-static const uint64_t CUDA_G133_STREAK_BITS = 8u;
-static const uint64_t CUDA_G133_STREAK_MAX =
-    (1ull << CUDA_G133_STREAK_BITS) - 1ull;
-static const uint64_t CUDA_G133_EPOCH_POSITION_BITS = 32u;
-static const uint64_t CUDA_G133_EPOCH_REQUEST_BITS =
-    64u - CUDA_G133_STREAK_BITS - CUDA_G133_EPOCH_POSITION_BITS;
-static const uint64_t CUDA_G133_EPOCH_REQUEST_MASK =
-    (1ull << CUDA_G133_EPOCH_REQUEST_BITS) - 1ull;
-static const uint64_t CUDA_G133_EPOCH_REQUEST_HALF =
-    1ull << (CUDA_G133_EPOCH_REQUEST_BITS - 1u);
+extern "C" int ds4_gpu_g133_validate_context(uint32_t ctx_size) {
+    if (!ds4_gpu_g133_enabled) return 1;
+    if (ctx_size == 0u || ctx_size > CUDA_G133_EPOCH_POSITION_MASK) {
+        fprintf(stderr,
+                "ds4: DS4_G133_TIER=1 requires context <= %llu tokens; "
+                "G133 advisory position epoch is %u bits\n",
+                (unsigned long long)CUDA_G133_EPOCH_POSITION_MASK,
+                (unsigned)CUDA_G133_EPOCH_POSITION_BITS);
+        return 0;
+    }
+    return 1;
+}
 
-static uint64_t cuda_g133_advisory_epoch_key(
+static cuda_g133_advisory_fields cuda_g133_advisory_fields_from_epoch(
         const ds4_gpu_g133_epoch &epoch) {
-    return ((epoch.request_epoch & CUDA_G133_EPOCH_REQUEST_MASK) <<
-            CUDA_G133_EPOCH_POSITION_BITS) |
-        (uint32_t)epoch.position_epoch;
+    cuda_g133_advisory_fields fields = {};
+    fields.promotion_age = (uint32_t)CUDA_G133_PROMOTION_AGE_MAX;
+    fields.position_epoch =
+        (uint32_t)(epoch.position_epoch & CUDA_G133_EPOCH_POSITION_MASK);
+    fields.request_epoch =
+        (uint32_t)(epoch.request_epoch & CUDA_G133_EPOCH_REQUEST_MASK);
+    return fields;
 }
 
-static uint64_t cuda_g133_advisory_packed_epoch(uint64_t packed) {
-    return packed >> CUDA_G133_STREAK_BITS;
-}
-
-static uint32_t cuda_g133_advisory_packed_streak(uint64_t packed) {
-    return (uint32_t)(packed & CUDA_G133_STREAK_MAX);
-}
-
-static uint32_t cuda_g133_advisory_key_request(uint64_t key) {
-    return (uint32_t)((key >> CUDA_G133_EPOCH_POSITION_BITS) &
-        CUDA_G133_EPOCH_REQUEST_MASK);
-}
-
-static uint32_t cuda_g133_advisory_key_position(uint64_t key) {
-    return (uint32_t)key;
+static int cuda_g133_advisory_same_epoch(
+        const cuda_g133_advisory_fields &a,
+        const cuda_g133_advisory_fields &b) {
+    return a.request_epoch == b.request_epoch &&
+        a.position_epoch == b.position_epoch;
 }
 
 static int cuda_g133_advisory_epoch_after(
-        uint64_t current, uint64_t prior) {
-    const uint32_t current_request =
-        cuda_g133_advisory_key_request(current);
-    const uint32_t prior_request = cuda_g133_advisory_key_request(prior);
-    if (current_request == prior_request) {
-        return (int32_t)(cuda_g133_advisory_key_position(current) -
-            cuda_g133_advisory_key_position(prior)) > 0;
+        const cuda_g133_advisory_fields &current,
+        const cuda_g133_advisory_fields &prior) {
+    if (current.request_epoch == prior.request_epoch) {
+        return (int32_t)(current.position_epoch - prior.position_epoch) > 0;
     }
     const uint64_t request_delta =
-        ((uint64_t)current_request - (uint64_t)prior_request) &
+        ((uint64_t)current.request_epoch - (uint64_t)prior.request_epoch) &
         CUDA_G133_EPOCH_REQUEST_MASK;
     return request_delta != 0u && request_delta < CUDA_G133_EPOCH_REQUEST_HALF;
 }
 
 static uint32_t cuda_g133_advisory_elapsed(
-        uint64_t prior, uint64_t current) {
+        const cuda_g133_advisory_fields &prior,
+        const cuda_g133_advisory_fields &current) {
     if (!cuda_g133_advisory_epoch_after(current, prior)) return 0u;
-    if (cuda_g133_advisory_key_request(current) !=
-        cuda_g133_advisory_key_request(prior)) {
-        return UINT32_MAX;
+    if (current.request_epoch != prior.request_epoch) {
+        return current.position_epoch == 0u ? 1u : current.position_epoch;
     }
-    return cuda_g133_advisory_key_position(current) -
-        cuda_g133_advisory_key_position(prior);
+    if (current.position_epoch >= prior.position_epoch) {
+        return current.position_epoch - prior.position_epoch;
+    }
+    return (uint32_t)CUDA_G133_PROMOTION_AGE_MAX;
 }
 
 static int cuda_g133_advisory_epoch_consecutive(
-        uint64_t prior, uint64_t current) {
-    return cuda_g133_advisory_key_request(current) ==
-            cuda_g133_advisory_key_request(prior) &&
-        (uint32_t)(cuda_g133_advisory_key_position(current) -
-            cuda_g133_advisory_key_position(prior)) == 1u;
+        const cuda_g133_advisory_fields &prior,
+        const cuda_g133_advisory_fields &current) {
+    return current.request_epoch == prior.request_epoch &&
+        (uint32_t)(current.position_epoch - prior.position_epoch) == 1u;
+}
+
+static uint32_t cuda_g133_advisory_age_add(
+        uint32_t age, uint32_t elapsed) {
+    return elapsed >= CUDA_G133_PROMOTION_AGE_MAX ||
+            age >= CUDA_G133_PROMOTION_AGE_MAX - elapsed
+        ? (uint32_t)CUDA_G133_PROMOTION_AGE_MAX : age + elapsed;
+}
+
+static cuda_g133_advisory_fields cuda_g133_advisory_current_snapshot(
+        uint64_t packed, const ds4_gpu_g133_epoch &epoch) {
+    cuda_g133_advisory_fields current =
+        cuda_g133_advisory_fields_from_epoch(epoch);
+    if (packed == 0u) return current;
+    cuda_g133_advisory_fields prior = cuda_g133_advisory_unpack(packed);
+    if (cuda_g133_advisory_same_epoch(prior, current)) {
+        return prior;
+    }
+    const uint32_t elapsed =
+        cuda_g133_advisory_elapsed(prior, current);
+    current.promotion_age =
+        cuda_g133_advisory_age_add(prior.promotion_age, elapsed);
+    current.streak = 0u;
+    return current;
 }
 
 static uint32_t cuda_g133_consecutive_streak(
         const cuda_moe_tier_entry &entry) {
-    return cuda_g133_advisory_packed_streak(
-        entry.g133_advisory.streak_epoch.load(std::memory_order_relaxed));
+    return cuda_g133_advisory_unpack(
+        entry.g133_advisory.streak_epoch.load(
+            std::memory_order_relaxed)).streak;
+}
+
+static uint32_t cuda_g133_consecutive_streak_at(
+        const cuda_moe_tier_entry &entry,
+        const ds4_gpu_g133_epoch &epoch) {
+    if (!cuda_g133_epoch_valid(epoch)) return cuda_g133_consecutive_streak(entry);
+    const uint64_t packed = entry.g133_advisory.streak_epoch.load(
+        std::memory_order_relaxed);
+    const cuda_g133_advisory_fields fields =
+        cuda_g133_advisory_current_snapshot(packed, epoch);
+    return fields.streak;
 }
 
 static double cuda_g133_advisory_heat(
         const cuda_moe_tier_entry &entry,
         const ds4_gpu_g133_epoch &epoch) {
-    const uint64_t current_epoch = cuda_g133_advisory_epoch_key(epoch);
     const uint64_t packed = entry.g133_advisory.streak_epoch.load(
         std::memory_order_relaxed);
     const uint32_t elapsed = packed == 0u ? 0u :
         cuda_g133_advisory_elapsed(
-            cuda_g133_advisory_packed_epoch(packed), current_epoch);
+            cuda_g133_advisory_unpack(packed),
+            cuda_g133_advisory_fields_from_epoch(epoch));
     const double raw = (double)entry.g133_advisory.decayed_heat.load(
         std::memory_order_relaxed) / (double)CUDA_G133_TOUCH_SCALE;
     return elapsed == 0u ? raw : raw * pow(
@@ -24119,15 +24215,30 @@ static double cuda_g133_advisory_heat(
 static void cuda_g133_mark_promotion(
         cuda_moe_tier_entry &entry, const ds4_gpu_g133_epoch &epoch) {
     if (!cuda_g133_epoch_valid(epoch)) return;
-    entry.g133_advisory.promotion_epoch.store(
-        cuda_g133_advisory_epoch_key(epoch), std::memory_order_relaxed);
+    const cuda_g133_advisory_fields current =
+        cuda_g133_advisory_fields_from_epoch(epoch);
+    uint64_t prior = entry.g133_advisory.streak_epoch.load(
+        std::memory_order_relaxed);
+    for (;;) {
+        cuda_g133_advisory_fields next =
+            cuda_g133_advisory_current_snapshot(prior, epoch);
+        if (!cuda_g133_advisory_same_epoch(next, current)) {
+            next = current;
+        }
+        next.promotion_age = 0u;
+        const uint64_t packed = cuda_g133_advisory_pack(next);
+        if (entry.g133_advisory.streak_epoch.compare_exchange_weak(
+                prior, packed, std::memory_order_relaxed,
+                std::memory_order_relaxed)) {
+            break;
+        }
+    }
 }
 
 static int cuda_g133_ram_candidate(
         const cuda_moe_tier_entry &entry,
         const ds4_gpu_g133_epoch &epoch) {
-    (void)epoch;
-    return cuda_g133_consecutive_streak(entry) >=
+    return cuda_g133_consecutive_streak_at(entry, epoch) >=
         g_moe_tiering.g133_knock_x;
 }
 
@@ -24140,8 +24251,7 @@ static int cuda_g133_ram_candidate_relaxed(
 static int cuda_g133_vram_candidate(
         const cuda_moe_tier_entry &entry,
         const ds4_gpu_g133_epoch &epoch) {
-    (void)epoch;
-    return (uint64_t)cuda_g133_consecutive_streak(entry) >=
+    return (uint64_t)cuda_g133_consecutive_streak_at(entry, epoch) >=
         (uint64_t)g_moe_tiering.g133_knock_x +
             g_moe_tiering.g133_knock_y;
 }
@@ -24150,19 +24260,20 @@ static int cuda_g133_demotion_eligible_at(
         const cuda_moe_tier_entry &entry,
         const ds4_gpu_g133_epoch &epoch) {
     if (!cuda_g133_epoch_valid(epoch)) return 0;
-    const uint64_t current_epoch = cuda_g133_advisory_epoch_key(epoch);
     const uint64_t packed = entry.g133_advisory.streak_epoch.load(
         std::memory_order_relaxed);
-    const uint64_t prior_epoch = cuda_g133_advisory_packed_epoch(packed);
-    const uint64_t promotion_epoch =
-        entry.g133_advisory.promotion_epoch.load(std::memory_order_relaxed);
-    const int streak_broken = packed == 0u ? 1 :
-        prior_epoch != current_epoch &&
-        cuda_g133_advisory_epoch_after(current_epoch, prior_epoch) &&
-        !cuda_g133_advisory_epoch_consecutive(prior_epoch, current_epoch);
-    const int promotion_age_ready = promotion_epoch == 0u ? 1 :
-        cuda_g133_advisory_elapsed(promotion_epoch, current_epoch) >=
-            g_moe_tiering.g133_knock_y;
+    if (packed == 0u) return 1;
+    const cuda_g133_advisory_fields prior =
+        cuda_g133_advisory_unpack(packed);
+    const cuda_g133_advisory_fields current =
+        cuda_g133_advisory_fields_from_epoch(epoch);
+    const cuda_g133_advisory_fields snapshot =
+        cuda_g133_advisory_current_snapshot(packed, epoch);
+    const int streak_broken =
+        !cuda_g133_advisory_same_epoch(prior, current) &&
+        cuda_g133_advisory_epoch_after(current, prior);
+    const int promotion_age_ready =
+        snapshot.promotion_age >= g_moe_tiering.g133_knock_y;
     return streak_broken && promotion_age_ready;
 }
 
@@ -24187,26 +24298,46 @@ static void cuda_g133_record_observation(
         cuda_moe_tier_entry &entry,
         const ds4_gpu_g133_epoch &epoch, double weight) {
     (void)weight;
-    const uint64_t current_epoch = cuda_g133_advisory_epoch_key(epoch);
+    const cuda_g133_advisory_fields current =
+        cuda_g133_advisory_fields_from_epoch(epoch);
     uint64_t prior = entry.g133_advisory.streak_epoch.load(
         std::memory_order_relaxed);
     uint32_t elapsed = 0u;
     for (;;) {
-        const uint64_t prior_epoch = cuda_g133_advisory_packed_epoch(prior);
-        const uint32_t prior_streak =
-            cuda_g133_advisory_packed_streak(prior);
+        cuda_g133_advisory_fields prior_fields =
+            cuda_g133_advisory_unpack(prior);
+        cuda_g133_advisory_fields next = current;
         if (prior != 0u) {
-            elapsed = cuda_g133_advisory_elapsed(prior_epoch, current_epoch);
-            if (elapsed == 0u) return;
+            if (cuda_g133_advisory_same_epoch(prior_fields, current)) {
+                if (prior_fields.streak != 0u) return;
+                elapsed = 0u;
+                next.promotion_age = prior_fields.promotion_age;
+                next.streak = 1u;
+            } else {
+                if (!cuda_g133_advisory_epoch_after(current, prior_fields)) {
+                    return;
+                }
+                elapsed = cuda_g133_advisory_elapsed(
+                    prior_fields, current);
+                next.promotion_age = cuda_g133_advisory_age_add(
+                    prior_fields.promotion_age, elapsed);
+                if (cuda_g133_advisory_epoch_consecutive(
+                        prior_fields, current)) {
+                    next.streak =
+                        prior_fields.streak < CUDA_G133_STREAK_MAX
+                            ? prior_fields.streak + 1u :
+                        (uint32_t)CUDA_G133_STREAK_MAX;
+                } else {
+                    next.streak = 1u;
+                }
+            }
+        } else {
+            next.promotion_age =
+                (uint32_t)CUDA_G133_PROMOTION_AGE_MAX;
+            next.streak = 1u;
         }
-        const uint32_t next_streak =
-            elapsed == 1u && prior_streak < CUDA_G133_STREAK_MAX
-                ? prior_streak + 1u :
-            elapsed == 1u ? (uint32_t)CUDA_G133_STREAK_MAX : 1u;
-        const uint64_t next =
-            (current_epoch << CUDA_G133_STREAK_BITS) | next_streak;
         if (entry.g133_advisory.streak_epoch.compare_exchange_weak(
-                prior, next, std::memory_order_relaxed,
+                prior, cuda_g133_advisory_pack(next), std::memory_order_relaxed,
                 std::memory_order_relaxed)) {
             break;
         }
@@ -24239,10 +24370,13 @@ static int cuda_g133_ram_demotion_eligible(
 
 static void cuda_g133_advisory_budget_refresh(
         const ds4_gpu_g133_epoch &epoch) {
-    const uint64_t current = cuda_g133_advisory_epoch_key(epoch);
+    const uint64_t current = cuda_g133_advisory_pack(
+        cuda_g133_advisory_fields_from_epoch(epoch));
     uint64_t maximum = g_cuda_g133_advisory_budget.max_epoch.load(
         std::memory_order_relaxed);
-    while (cuda_g133_advisory_epoch_after(current, maximum)) {
+    while (cuda_g133_advisory_epoch_after(
+            cuda_g133_advisory_unpack(current),
+            cuda_g133_advisory_unpack(maximum))) {
         if (g_cuda_g133_advisory_budget.max_epoch.compare_exchange_weak(
                 maximum, current, std::memory_order_relaxed,
                 std::memory_order_relaxed)) {
@@ -24676,10 +24810,12 @@ static int cuda_moe_tiering_prepare(void) {
     }
     if (g133_enabled &&
         (!cuda_moe_tiering_u32_env(
-             "DS4_G133_KNOCK_X", 3u, 1u, 1000000u,
+             "DS4_G133_KNOCK_X", 3u, 1u,
+             (uint32_t)CUDA_G133_STREAK_MAX,
              &g133_knock_x) ||
          !cuda_moe_tiering_u32_env(
-             "DS4_G133_KNOCK_Y", 5u, 1u, 1000000u,
+             "DS4_G133_KNOCK_Y", 5u, 1u,
+             (uint32_t)CUDA_G133_STREAK_MAX,
              &g133_knock_y) ||
          !cuda_moe_tiering_double_env(
              "DS4_G133_DECAY", 0.98, 0.000001, 1.0,
@@ -24695,6 +24831,18 @@ static int cuda_moe_tiering_prepare(void) {
         fprintf(stderr,
                 "ds4: invalid DS4_G133_DECAY=%.17g; must satisfy 0 < decay < 1\n",
                 g133_decay);
+        return 0;
+    }
+    if (g133_enabled &&
+        (uint64_t)g133_knock_x + (uint64_t)g133_knock_y >
+            CUDA_G133_STREAK_MAX) {
+        fprintf(stderr,
+                "ds4: invalid DS4_G133_KNOCK_X+DS4_G133_KNOCK_Y=%llu; "
+                "must be <= %llu because G133 advisory streak is %u bits\n",
+                (unsigned long long)(
+                    (uint64_t)g133_knock_x + (uint64_t)g133_knock_y),
+                (unsigned long long)CUDA_G133_STREAK_MAX,
+                (unsigned)CUDA_G133_STREAK_BITS);
         return 0;
     }
     if (g133_enabled &&
@@ -27836,10 +27984,16 @@ static int cuda_moe_prefill_vram_seed(
                 bounded_touches * CUDA_G133_TOUCH_SCALE,
                 std::memory_order_relaxed);
             const uint32_t seed_streak = (uint32_t)std::min(
-                bounded_touches, (uint64_t)UINT32_MAX);
+                bounded_touches, CUDA_G133_STREAK_MAX);
+            cuda_g133_advisory_fields seed_fields =
+                cuda_g133_advisory_fields_from_epoch(ds4_gpu_g133_epoch{
+                    g_cuda_request_epoch,
+                    g_cuda_g133_decode_position_epoch});
+            seed_fields.streak = seed_streak;
+            seed_fields.promotion_age =
+                (uint32_t)CUDA_G133_PROMOTION_AGE_MAX;
             tier.g133_advisory.streak_epoch.store(
-                ((uint64_t)(uint32_t)g_cuda_g133_decode_position_epoch << 32) |
-                    seed_streak,
+                cuda_g133_advisory_pack(seed_fields),
                 std::memory_order_relaxed);
         }
     }

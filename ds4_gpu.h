@@ -50,6 +50,7 @@ int ds4_gpu_init(void);
  * epoch producer, so G133-off executes no indirect/no-op token hook. */
 extern int ds4_gpu_g133_enabled;
 ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void);
+int ds4_gpu_g133_validate_context(uint32_t ctx_size);
 
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
 /* Decode-thread-only host attribution.  The server owns token/request

@@ -20135,6 +20135,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     return 1;
 #else
     if (!ds4_backend_uses_graph(e->backend) || !e->metal_ready) return 1;
+    if (e->backend == DS4_BACKEND_CUDA &&
+        !ds4_gpu_g133_validate_context((uint32_t)ctx_size)) {
+        return 1;
+    }
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
