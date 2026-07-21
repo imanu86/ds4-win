@@ -20,6 +20,15 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 typedef struct ds4_gpu_async_read ds4_gpu_async_read;
 typedef struct ds4_gpu_dynamic_arena_txn ds4_gpu_dynamic_arena_txn;
 
+/* Decode-owned policy time.  A value is created once per target position and
+ * copied into every route request produced for that position. */
+typedef struct {
+    uint64_t request_epoch;
+    uint64_t position_epoch;
+} ds4_gpu_g133_epoch;
+
+typedef ds4_gpu_g133_epoch (*ds4_gpu_g133_position_begin_fn)(void);
+
 typedef struct {
     uint64_t gate_offset;
     uint64_t up_offset;
@@ -39,8 +48,8 @@ typedef struct {
 } ds4_gpu_dynamic_arena_load;
 
 int ds4_gpu_init(void);
-/* Advance decode-policy time once for each target-model position. */
-void ds4_gpu_g133_decode_position_begin(void);
+/* Initialization selects either the CUDA epoch producer or a no-op producer. */
+extern ds4_gpu_g133_position_begin_fn ds4_gpu_g133_decode_position_begin;
 
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
 /* Decode-thread-only host attribution.  The server owns token/request
@@ -797,6 +806,7 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch     g133_epoch,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key);
 
@@ -836,6 +846,7 @@ int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch     g133_epoch,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key);
 
@@ -873,7 +884,8 @@ int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t                n_expert,
         float                   clamp,
-        const ds4_gpu_tensor *x);
+        const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch     g133_epoch);
 
 int ds4_gpu_routed_moe_prepare_selected(
         const void             *model_map,

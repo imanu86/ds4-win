@@ -65,11 +65,19 @@ struct ds4_gpu_tensor {
     int owner;
 };
 
+struct ds4_gpu_g133_epoch {
+    uint64_t request_epoch;
+    uint64_t position_epoch;
+};
+
+typedef ds4_gpu_g133_epoch (*ds4_gpu_g133_position_begin_fn)(void);
+
 struct cuda_moe_route_request {
     volatile uint32_t sequence;
     uint32_t layer_index;
     uint32_t miss_count;
     uint32_t route_count;
+    ds4_gpu_g133_epoch g133_epoch;
     uint64_t gate_offset;
     uint64_t up_offset;
     uint64_t down_offset;
@@ -3108,10 +3116,45 @@ static int cuda_g133_tier_requested(void) {
     return enabled;
 }
 
-/* Core target-decode time exists independently of lazy cache/tiering setup so
- * the first CLI or benchmark position cannot be initialized back to zero. */
-static uint64_t g_cuda_g133_decode_epoch_generation = 1u;
+/* The decode thread owns this counter. Workers receive immutable copies in
+ * cuda_moe_route_request and never read it directly. */
 static uint64_t g_cuda_g133_decode_position_epoch = 0u;
+
+static ds4_gpu_g133_epoch cuda_g133_decode_position_noop(void) {
+    return ds4_gpu_g133_epoch{};
+}
+
+static ds4_gpu_g133_epoch cuda_g133_decode_position_enabled(void);
+
+extern "C" ds4_gpu_g133_position_begin_fn
+    ds4_gpu_g133_decode_position_begin = cuda_g133_decode_position_noop;
+
+static int cuda_g133_initialize_dispatch(void) {
+    static int initialized = 0;
+    static int valid = 1;
+    if (initialized) return valid;
+    initialized = 1;
+    if (!cuda_g133_tier_requested()) return 1;
+
+    const char *decay_env = getenv("DS4_G133_DECAY");
+    if (decay_env && decay_env[0]) {
+        char *end = NULL;
+        errno = 0;
+        const double decay = strtod(decay_env, &end);
+        while (end && (*end == ' ' || *end == '\t')) end++;
+        if (end == decay_env || errno != 0 || !end || *end != '\0' ||
+            !isfinite(decay) || !(decay > 0.0 && decay < 1.0)) {
+            fprintf(stderr,
+                    "ds4: invalid DS4_G133_DECAY=%s; must satisfy 0 < decay < 1\n",
+                    decay_env);
+            valid = 0;
+            return 0;
+        }
+    }
+    ds4_gpu_g133_decode_position_begin =
+        cuda_g133_decode_position_enabled;
+    return 1;
+}
 
 struct cuda_g133_telemetry_counters {
     std::atomic<uint64_t> upload_sync_wait_nanoseconds{0};
@@ -3195,10 +3238,106 @@ struct cuda_g130_attribution_state {
 static int g_cuda_g130_attribution_enabled;
 static thread_local cuda_g130_attribution_state *g_cuda_g130_attribution;
 
+typedef void (*cuda_g133_attribution_snapshot_fn)(
+    cuda_g130_attribution_state *state);
+typedef void (*cuda_g133_attribution_append_fn)(
+    cuda_g130_attribution_state *state, char *line, size_t line_size,
+    int *used, double divisor);
+
+static void cuda_g133_attribution_snapshot_noop(
+        cuda_g130_attribution_state *) {}
+static void cuda_g133_attribution_append_noop(
+        cuda_g130_attribution_state *, char *, size_t, int *, double) {}
+
+static void cuda_g133_attribution_snapshot_enabled(
+        cuda_g130_attribution_state *state) {
+    state->g133_upload_sync_wait_nanoseconds =
+        g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.load(
+            std::memory_order_relaxed);
+    state->g133_vram_hits = g_cuda_g133_telemetry.vram_hits.load(
+        std::memory_order_relaxed);
+    state->g133_ram_hits = g_cuda_g133_telemetry.ram_hits.load(
+        std::memory_order_relaxed);
+    state->g133_selected = g_cuda_g133_telemetry.selected.load(
+        std::memory_order_relaxed);
+    state->g133_promotions = g_cuda_g133_telemetry.promotions.load(
+        std::memory_order_relaxed);
+    state->g133_reaps = g_cuda_g133_telemetry.reaps.load(
+        std::memory_order_relaxed);
+    state->g133_knock_promotions =
+        g_cuda_g133_telemetry.knock_promotions.load(
+            std::memory_order_relaxed);
+    state->g133_thrash_guard_trips =
+        g_cuda_g133_telemetry.thrash_guard_trips.load(
+            std::memory_order_relaxed);
+}
+
+static void cuda_g133_attribution_append_enabled(
+        cuda_g130_attribution_state *state, char *line, size_t line_size,
+        int *used, double divisor) {
+    if (!used || *used <= 0 || (size_t)*used >= line_size) return;
+    const uint64_t upload_sync_wait_ns =
+        g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.load(
+            std::memory_order_relaxed) -
+        state->g133_upload_sync_wait_nanoseconds;
+    const uint64_t vram_hits =
+        g_cuda_g133_telemetry.vram_hits.load(std::memory_order_relaxed) -
+        state->g133_vram_hits;
+    const uint64_t ram_hits =
+        g_cuda_g133_telemetry.ram_hits.load(std::memory_order_relaxed) -
+        state->g133_ram_hits;
+    const uint64_t selected =
+        g_cuda_g133_telemetry.selected.load(std::memory_order_relaxed) -
+        state->g133_selected;
+    const uint64_t promotions =
+        g_cuda_g133_telemetry.promotions.load(std::memory_order_relaxed) -
+        state->g133_promotions;
+    const uint64_t reaps =
+        g_cuda_g133_telemetry.reaps.load(std::memory_order_relaxed) -
+        state->g133_reaps;
+    const uint64_t knock_promotions =
+        g_cuda_g133_telemetry.knock_promotions.load(
+            std::memory_order_relaxed) - state->g133_knock_promotions;
+    const uint64_t thrash_guard_trips =
+        g_cuda_g133_telemetry.thrash_guard_trips.load(
+            std::memory_order_relaxed) - state->g133_thrash_guard_trips;
+    const double vram_hit_pct = selected
+        ? 100.0 * (double)vram_hits / (double)selected : 0.0;
+    const double ram_hit_pct = selected
+        ? 100.0 * (double)ram_hits / (double)selected : 0.0;
+    const int wrote = snprintf(
+        line + *used, line_size - (size_t)*used,
+        " upload_sync_wait_ms=%.6f vram_hit_pct=%.6f"
+        " ram_hit_pct=%.6f promotions=%.6f"
+        " reaps=%.6f knock_promotions=%.6f"
+        " thrash_guard_trips=%.6f",
+        (double)upload_sync_wait_ns / 1.0e6 / divisor,
+        vram_hit_pct, ram_hit_pct,
+        (double)promotions / divisor, (double)reaps / divisor,
+        (double)knock_promotions / divisor,
+        (double)thrash_guard_trips / divisor);
+    if (wrote < 0 || (size_t)wrote >= line_size - (size_t)*used) {
+        *used = -1;
+    } else {
+        *used += wrote;
+    }
+}
+
+static cuda_g133_attribution_snapshot_fn g_cuda_g133_attribution_snapshot =
+    cuda_g133_attribution_snapshot_noop;
+static cuda_g133_attribution_append_fn g_cuda_g133_attribution_append =
+    cuda_g133_attribution_append_noop;
+
 static void cuda_g130_attribution_init(void) {
     const char *value = getenv("DS4_G130_U1_ATTRIBUTION");
     g_cuda_g130_attribution_enabled =
         value && value[0] && strcmp(value, "0") != 0;
+    if (cuda_g133_tier_requested()) {
+        g_cuda_g133_attribution_snapshot =
+            cuda_g133_attribution_snapshot_enabled;
+        g_cuda_g133_attribution_append =
+            cuda_g133_attribution_append_enabled;
+    }
 }
 
 /* This is the only disabled-path gate used by CUDA call sites.  Its global
@@ -3261,27 +3400,7 @@ extern "C" void ds4_gpu_g130_attribution_token_begin(
     state->current_span = CUDA_G130_ATTRIB_NONE;
     state->token_started = decode_started;
     state->span_started = state->token_started;
-    if (cuda_g133_tier_requested()) {
-        state->g133_upload_sync_wait_nanoseconds =
-            g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.load(
-                std::memory_order_relaxed);
-        state->g133_vram_hits = g_cuda_g133_telemetry.vram_hits.load(
-            std::memory_order_relaxed);
-        state->g133_ram_hits = g_cuda_g133_telemetry.ram_hits.load(
-            std::memory_order_relaxed);
-        state->g133_selected = g_cuda_g133_telemetry.selected.load(
-            std::memory_order_relaxed);
-        state->g133_promotions = g_cuda_g133_telemetry.promotions.load(
-            std::memory_order_relaxed);
-        state->g133_reaps = g_cuda_g133_telemetry.reaps.load(
-            std::memory_order_relaxed);
-        state->g133_knock_promotions =
-            g_cuda_g133_telemetry.knock_promotions.load(
-                std::memory_order_relaxed);
-        state->g133_thrash_guard_trips =
-            g_cuda_g133_telemetry.thrash_guard_trips.load(
-                std::memory_order_relaxed);
-    }
+    g_cuda_g133_attribution_snapshot(state);
     state->token_active = 1;
 }
 
@@ -3343,58 +3462,8 @@ extern "C" void ds4_gpu_g130_attribution_token_end(
             }
             used += wrote;
         }
-        if (used > 0 && (size_t)used < sizeof(line)) {
-            if (cuda_g133_tier_requested()) {
-                const uint64_t upload_sync_wait_ns =
-                    g_cuda_g133_telemetry.upload_sync_wait_nanoseconds.load(
-                        std::memory_order_relaxed) -
-                    state->g133_upload_sync_wait_nanoseconds;
-                const uint64_t vram_hits =
-                    g_cuda_g133_telemetry.vram_hits.load(
-                        std::memory_order_relaxed) - state->g133_vram_hits;
-                const uint64_t ram_hits =
-                    g_cuda_g133_telemetry.ram_hits.load(
-                        std::memory_order_relaxed) - state->g133_ram_hits;
-                const uint64_t selected =
-                    g_cuda_g133_telemetry.selected.load(
-                        std::memory_order_relaxed) - state->g133_selected;
-                const uint64_t promotions =
-                    g_cuda_g133_telemetry.promotions.load(
-                        std::memory_order_relaxed) - state->g133_promotions;
-                const uint64_t reaps =
-                    g_cuda_g133_telemetry.reaps.load(
-                        std::memory_order_relaxed) - state->g133_reaps;
-                const uint64_t knock_promotions =
-                    g_cuda_g133_telemetry.knock_promotions.load(
-                        std::memory_order_relaxed) -
-                    state->g133_knock_promotions;
-                const uint64_t thrash_guard_trips =
-                    g_cuda_g133_telemetry.thrash_guard_trips.load(
-                        std::memory_order_relaxed) -
-                    state->g133_thrash_guard_trips;
-                const double vram_hit_pct = selected
-                    ? 100.0 * (double)vram_hits / (double)selected : 0.0;
-                const double ram_hit_pct = selected
-                    ? 100.0 * (double)ram_hits / (double)selected : 0.0;
-                const int wrote = snprintf(
-                    line + used, sizeof(line) - (size_t)used,
-                    " upload_sync_wait_ms=%.6f vram_hit_pct=%.6f"
-                    " ram_hit_pct=%.6f promotions=%.6f"
-                    " reaps=%.6f knock_promotions=%.6f"
-                    " thrash_guard_trips=%.6f",
-                    (double)upload_sync_wait_ns / 1.0e6 / divisor,
-                    vram_hit_pct, ram_hit_pct,
-                    (double)promotions / divisor, (double)reaps / divisor,
-                    (double)knock_promotions / divisor,
-                    (double)thrash_guard_trips / divisor);
-                if (wrote < 0 || (size_t)wrote >=
-                        sizeof(line) - (size_t)used) {
-                    used = -1;
-                } else {
-                    used += wrote;
-                }
-            }
-        }
+        g_cuda_g133_attribution_append(
+            state, line, sizeof(line), &used, divisor);
         if (used > 0 && (size_t)used < sizeof(line)) {
             (void)snprintf(
                 line + used, sizeof(line) - (size_t)used,
@@ -6123,6 +6192,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 }
 
 extern "C" int ds4_gpu_init(void) {
+    if (!cuda_g133_initialize_dispatch()) return 0;
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_init();
 #endif
@@ -12789,6 +12859,9 @@ extern "C" void ds4_gpu_dynamic_arena_request_begin(void) {
     if (g_cuda_request_epoch != UINT64_MAX) {
         g_cuda_request_epoch++;
     }
+    /* G133 request generation is the authoritative arena request epoch; the
+     * per-request position counter starts over so streaks cannot bridge it. */
+    g_cuda_g133_decode_position_epoch = 0u;
     cuda_expert_recovery_trace_request_begin();
     cuda_moe_tiering_request_boundary_reset();
     cuda_prefill_mass_observer_reset();
@@ -21256,6 +21329,7 @@ __global__ static void moe_resolve_resident_routes_kernel(
         uint64_t down_offset,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
+        ds4_gpu_g133_epoch g133_epoch,
         uint32_t route_count) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     if (route_count == 0u || route_count > 6u) return;
@@ -21292,6 +21366,7 @@ __global__ static void moe_resolve_resident_routes_kernel(
     request->layer_index = layer_index;
     request->miss_count = miss_count;
     request->route_count = route_count;
+    request->g133_epoch = g133_epoch;
     request->gate_offset = gate_offset;
     request->up_offset = up_offset;
     request->down_offset = down_offset;
@@ -23187,9 +23262,6 @@ struct cuda_moe_tiering {
     uint32_t g133_promote_remaining;
     uint64_t g133_promote_request_epoch;
     uint64_t g133_promote_token_index;
-    uint64_t g133_decode_request_epoch;
-    uint64_t g133_decode_token_index;
-    int g133_decode_epoch_valid;
     double g133_decay;
     double g133_demotion_margin;
     std::vector<cuda_moe_tier_entry> entries;
@@ -23313,6 +23385,8 @@ struct cuda_moe_expert_cache {
     volatile int route_worker_ready;
     volatile int route_worker_failed;
     volatile uint32_t route_submitted_sequence;
+    volatile uint32_t route_consumed_sequence;
+    volatile uint32_t route_transient_read_sequence;
     int route_thread_started;
     int route_device;
     uint32_t route_sequence;
@@ -23750,35 +23824,30 @@ static size_t cuda_moe_tiering_entry_index(uint32_t layer, uint32_t expert) {
     return (size_t)layer * 256u + expert;
 }
 
-extern "C" void ds4_gpu_g133_decode_position_begin(void) {
-    if (!cuda_g133_tier_requested()) return;
-    if (g_cuda_g133_decode_position_epoch != UINT64_MAX) {
-        g_cuda_g133_decode_position_epoch++;
-    } else if (g_cuda_g133_decode_epoch_generation != UINT64_MAX) {
-        g_cuda_g133_decode_epoch_generation++;
-        g_cuda_g133_decode_position_epoch = 1u;
-    } else {
-        if (g_moe_tiering.g133_enabled) {
-            g_moe_tiering.failures++;
-            g_moe_tiering.g133_decode_epoch_valid = 0;
-        }
-        return;
+static ds4_gpu_g133_epoch cuda_g133_decode_position_enabled(void) {
+    if (g_cuda_request_epoch == 0u) {
+        /* Standalone layer benchmarks do not cross the session request hook. */
+        g_cuda_request_epoch = 1u;
     }
-    if (g_moe_tiering.g133_enabled) {
-        g_moe_tiering.g133_decode_request_epoch =
-            g_cuda_g133_decode_epoch_generation;
-        g_moe_tiering.g133_decode_token_index =
-            g_cuda_g133_decode_position_epoch;
-        g_moe_tiering.g133_decode_epoch_valid = 1;
+    if (g_cuda_request_epoch == UINT64_MAX ||
+        g_cuda_g133_decode_position_epoch == UINT64_MAX) {
+        return ds4_gpu_g133_epoch{};
     }
+    g_cuda_g133_decode_position_epoch++;
+    return ds4_gpu_g133_epoch{
+        g_cuda_request_epoch, g_cuda_g133_decode_position_epoch};
 }
 
-static void cuda_g133_refresh_entry(cuda_moe_tier_entry &entry) {
-    if (!g_moe_tiering.g133_enabled ||
-        !g_moe_tiering.g133_decode_epoch_valid) return;
-    const uint64_t request_epoch =
-        g_moe_tiering.g133_decode_request_epoch;
-    const uint64_t token_index = g_moe_tiering.g133_decode_token_index;
+static int cuda_g133_epoch_valid(const ds4_gpu_g133_epoch &epoch) {
+    return epoch.request_epoch != 0u && epoch.position_epoch != 0u;
+}
+
+static void cuda_g133_refresh_entry(
+        cuda_moe_tier_entry &entry,
+        const ds4_gpu_g133_epoch &epoch) {
+    if (!g_moe_tiering.g133_enabled || !cuda_g133_epoch_valid(epoch)) return;
+    const uint64_t request_epoch = epoch.request_epoch;
+    const uint64_t token_index = epoch.position_epoch;
     uint64_t elapsed = 0u;
     if (entry.g133_heat_request_epoch == 0u) {
         entry.g133_heat_request_epoch = request_epoch;
@@ -23825,13 +23894,17 @@ static void cuda_g133_refresh_entry(cuda_moe_tier_entry &entry) {
     }
 }
 
-static double cuda_g133_decayed_heat(cuda_moe_tier_entry &entry) {
-    cuda_g133_refresh_entry(entry);
+static double cuda_g133_decayed_heat(
+        cuda_moe_tier_entry &entry,
+        const ds4_gpu_g133_epoch &epoch) {
+    cuda_g133_refresh_entry(entry, epoch);
     return entry.g133_heat;
 }
 
-static int cuda_g133_ram_demotion_eligible(cuda_moe_tier_entry &entry) {
-    cuda_g133_refresh_entry(entry);
+static int cuda_g133_ram_demotion_eligible(
+        cuda_moe_tier_entry &entry,
+        const ds4_gpu_g133_epoch &epoch) {
+    cuda_g133_refresh_entry(entry, epoch);
     const double demote_threshold = std::max(
         0.0, (double)g_moe_tiering.g133_knock_x -
             g_moe_tiering.g133_demotion_margin);
@@ -24260,6 +24333,12 @@ static int cuda_moe_tiering_prepare(void) {
                 g133_knock_x, g133_demotion_margin);
         return 0;
     }
+    if (g133_enabled && !(g133_decay > 0.0 && g133_decay < 1.0)) {
+        fprintf(stderr,
+                "ds4: invalid DS4_G133_DECAY=%.17g; must satisfy 0 < decay < 1\n",
+                g133_decay);
+        return 0;
+    }
     if (g133_enabled &&
         (requested != CUDA_MOE_TIER_ENFORCE ||
          policy_requested != CUDA_MOE_TIER_POLICY_MASS_LFRU)) {
@@ -24420,12 +24499,6 @@ static int cuda_moe_tiering_prepare(void) {
     g_moe_tiering.g133_promote_remaining = g133_promote_budget;
     g_moe_tiering.g133_promote_request_epoch = UINT64_MAX;
     g_moe_tiering.g133_promote_token_index = UINT64_MAX;
-    g_moe_tiering.g133_decode_request_epoch =
-        g_cuda_g133_decode_epoch_generation;
-    g_moe_tiering.g133_decode_token_index =
-        g_cuda_g133_decode_position_epoch;
-    g_moe_tiering.g133_decode_epoch_valid =
-        g133_enabled && g_cuda_g133_decode_position_epoch != 0u;
     g_moe_tiering.g133_decay = g133_decay;
     g_moe_tiering.g133_demotion_margin = g133_demotion_margin;
     g_iq1_promotion = cuda_iq1_promotion();
@@ -24596,7 +24669,8 @@ static int cuda_moe_tiering_has_exact_vram(
 
 static int cuda_moe_tiering_pick_ram_slot(
         uint32_t current_layer, uint32_t current_expert,
-        size_t *victim_entry_out, int preferred_pageable = -1) {
+        size_t *victim_entry_out, const ds4_gpu_g133_epoch &g133_epoch,
+        int preferred_pageable = -1) {
     if (!victim_entry_out) return -1;
     *victim_entry_out = SIZE_MAX;
     const int open_router_pool_active =
@@ -24611,7 +24685,7 @@ static int cuda_moe_tiering_pick_ram_slot(
     cuda_moe_tier_entry &candidate = g_moe_tiering.entries[
         cuda_moe_tiering_entry_index(current_layer, current_expert)];
     const double candidate_score = g_moe_tiering.g133_enabled
-        ? cuda_g133_decayed_heat(candidate) : 0.0;
+        ? cuda_g133_decayed_heat(candidate, g133_epoch) : 0.0;
     for (uint32_t pass = 0; pass < (preferred_pageable < 0 ? 1u : 2u);
          pass++) {
         for (uint32_t slot = 0; slot < g_dynamic_arena.slots.size(); slot++) {
@@ -24666,11 +24740,11 @@ static int cuda_moe_tiering_pick_ram_slot(
                     continue;
                 }
                 if (g_moe_tiering.g133_enabled &&
-                    !cuda_g133_ram_demotion_eligible(entry)) {
+                    !cuda_g133_ram_demotion_eligible(entry, g133_epoch)) {
                     continue;
                 }
                 const double score = g_moe_tiering.g133_enabled
-                    ? cuda_g133_decayed_heat(entry)
+                    ? cuda_g133_decayed_heat(entry, g133_epoch)
                     : cuda_moe_tiering_lfru(entry, g_moe_tiering.call_tick);
                 if (g_moe_tiering.g133_enabled &&
                     candidate_score <=
@@ -25698,7 +25772,8 @@ static int cuda_q1_0_ssd_wrap_submit(
          fabs((double)record->weight) >= state.pinned_min_weight);
     size_t victim_entry_index = SIZE_MAX;
     const int slot_i = cuda_moe_tiering_pick_ram_slot(
-        layer, expert, &victim_entry_index, prefer_pinned ? 0 : 1);
+        layer, expert, &victim_entry_index, request.g133_epoch,
+        prefer_pinned ? 0 : 1);
     if (slot_i < 0) {
         state.backpressure++;
         return 3;
@@ -25993,7 +26068,7 @@ static int cuda_moe_tiering_load_to_ram(
     }
     size_t victim_entry_index = SIZE_MAX;
     const int slot_i = cuda_moe_tiering_pick_ram_slot(
-        layer, expert, &victim_entry_index);
+        layer, expert, &victim_entry_index, request.g133_epoch);
     if (slot_i < 0) {
         if (admission_denied) *admission_denied = 1;
         if (promotion_record && promotion_record->active) {
@@ -26216,7 +26291,8 @@ static int cuda_moe_tiering_load_to_ram(
 }
 
 static cuda_moe_tier_state cuda_moe_tiering_observe_route(
-        uint32_t layer, uint32_t expert, float weight) {
+        uint32_t layer, uint32_t expert, float weight,
+        const ds4_gpu_g133_epoch &g133_epoch) {
     cuda_moe_tier_entry &entry =
         g_moe_tiering.entries[cuda_moe_tiering_entry_index(layer, expert)];
     const cuda_moe_tier_state prior = entry.state;
@@ -26227,11 +26303,10 @@ static cuda_moe_tier_state cuda_moe_tiering_observe_route(
     entry.last_weight = weight;
     entry.frequency++;
     entry.last_call = g_moe_tiering.call_tick;
-    if (g_moe_tiering.g133_enabled) {
-        cuda_g133_refresh_entry(entry);
-        const uint64_t request_epoch =
-            g_moe_tiering.g133_decode_request_epoch;
-        const uint64_t token_index = g_moe_tiering.g133_decode_token_index;
+    if (g_moe_tiering.g133_enabled && cuda_g133_epoch_valid(g133_epoch)) {
+        cuda_g133_refresh_entry(entry, g133_epoch);
+        const uint64_t request_epoch = g133_epoch.request_epoch;
+        const uint64_t token_index = g133_epoch.position_epoch;
         if (entry.g133_last_touch_request_epoch != request_epoch ||
             entry.g133_last_touch_token_index != token_index) {
             const int consecutive =
@@ -26248,7 +26323,7 @@ static cuda_moe_tier_state cuda_moe_tiering_observe_route(
             entry.g133_last_touch_token_index = token_index;
         }
         entry.g133_heat += fabs((double)weight);
-        cuda_g133_refresh_entry(entry);
+        cuda_g133_refresh_entry(entry, g133_epoch);
         if (entry.state == CUDA_MOE_TIER_RAM_PROBATION &&
             entry.g133_ram_candidate) {
             entry.state = CUDA_MOE_TIER_RAM_WARM;
@@ -26656,7 +26731,8 @@ static int cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
 static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
         uint32_t layer, uint32_t expert, float weight,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        const ds4_gpu_g133_epoch &g133_epoch) {
     if (g_iq1_promotion.requested_slots == 0u) return 1;
     if (g_moe_tiering.mode != CUDA_MOE_TIER_ENFORCE ||
         !g_moe_tiering.compose_prefill_mass_tiering ||
@@ -26669,7 +26745,8 @@ static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
         return 0;
     }
     g_moe_tiering.selected++;
-    (void)cuda_moe_tiering_observe_route(layer, expert, weight);
+    (void)cuda_moe_tiering_observe_route(
+        layer, expert, weight, g133_epoch);
     return cuda_moe_tiering_stage_observed_quant_cold_to_2bit_ram(
         layer, expert, weight,
         gate_offset, up_offset, down_offset,
@@ -26678,13 +26755,14 @@ static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
 }
 
 static void cuda_moe_tiering_demote_cache_entry(
-        uint32_t layer, uint32_t expert) {
+        uint32_t layer, uint32_t expert,
+        const ds4_gpu_g133_epoch &g133_epoch = ds4_gpu_g133_epoch{}) {
     if (g_moe_tiering.mode == CUDA_MOE_TIER_OFF ||
         layer >= CUDA_MOE_LAYER_COUNT || expert >= 256u) return;
     cuda_moe_tier_entry &entry =
         g_moe_tiering.entries[cuda_moe_tiering_entry_index(layer, expert)];
     if (entry.state != CUDA_MOE_TIER_VRAM_PROTECTED) return;
-    cuda_g133_refresh_entry(entry);
+    cuda_g133_refresh_entry(entry, g133_epoch);
     if (entry.ram_slot < g_dynamic_arena.slots.size()) {
         entry.state = CUDA_MOE_TIER_RAM_WARM;
     } else {
@@ -26894,6 +26972,8 @@ static void cuda_moe_expert_cache_release(void) {
     g_moe_expert_cache.route_worker_ready = 0;
     g_moe_expert_cache.route_worker_failed = 0;
     g_moe_expert_cache.route_submitted_sequence = 0;
+    g_moe_expert_cache.route_consumed_sequence = 0;
+    g_moe_expert_cache.route_transient_read_sequence = 0;
     g_moe_expert_cache.route_sequence = 0;
     g_moe_expert_cache.route_calls = 0;
     g_moe_expert_cache.route_worker_jobs = 0;
@@ -27386,11 +27466,10 @@ static int cuda_moe_prefill_vram_seed(
             tier.g133_knock = (double)touches;
             tier.g133_touch_streak = touches >= (uint64_t)UINT32_MAX
                 ? UINT32_MAX : (uint32_t)touches;
-            tier.g133_heat_request_epoch =
-                g_moe_tiering.g133_decode_request_epoch;
+            tier.g133_heat_request_epoch = g_cuda_request_epoch;
             tier.g133_heat_token_index = 0u;
             tier.g133_last_touch_request_epoch = touches
-                ? g_moe_tiering.g133_decode_request_epoch : 0u;
+                ? g_cuda_request_epoch : 0u;
             tier.g133_last_touch_token_index = touches ? 0u : UINT64_MAX;
             tier.g133_ram_candidate =
                 touches >= g_moe_tiering.g133_knock_x;
@@ -28280,7 +28359,8 @@ struct cuda_moe_vram_promotion_reservation {
 static int cuda_moe_tiering_pick_vram_slot(
         cuda_moe_expert_cache *cache, const uint8_t *claimed,
         cuda_moe_tier_entry &candidate,
-        cuda_moe_vram_promotion_reservation *reservation) {
+        cuda_moe_vram_promotion_reservation *reservation,
+        const ds4_gpu_g133_epoch &g133_epoch) {
     if (!reservation) return -1;
     *reservation = cuda_moe_vram_promotion_reservation{};
     if (candidate.promoted_from_iq1_cold) {
@@ -28299,7 +28379,7 @@ static int cuda_moe_tiering_pick_vram_slot(
         return -1;
     }
     if (g_moe_tiering.g133_enabled) {
-        cuda_g133_refresh_entry(candidate);
+        cuda_g133_refresh_entry(candidate, g133_epoch);
         if (!candidate.g133_vram_candidate) {
             if (candidate.g133_ram_candidate) {
                 cuda_g133_telemetry_increment(
@@ -28307,9 +28387,8 @@ static int cuda_moe_tiering_pick_vram_slot(
             }
             return -1;
         }
-        const uint64_t request_epoch =
-            g_moe_tiering.g133_decode_request_epoch;
-        const uint64_t token_index = g_moe_tiering.g133_decode_token_index;
+        const uint64_t request_epoch = g133_epoch.request_epoch;
+        const uint64_t token_index = g133_epoch.position_epoch;
         if (request_epoch != g_moe_tiering.g133_promote_request_epoch ||
             token_index != g_moe_tiering.g133_promote_token_index) {
             g_moe_tiering.g133_promote_request_epoch = request_epoch;
@@ -28441,7 +28520,7 @@ static int cuda_moe_tiering_pick_vram_slot(
                 cache_entry.layer_index, cache_entry.expert_id)];
         if (tier_entry.state != CUDA_MOE_TIER_VRAM_PROTECTED) continue;
         const double score = g_moe_tiering.g133_enabled
-            ? cuda_g133_decayed_heat(tier_entry)
+            ? cuda_g133_decayed_heat(tier_entry, g133_epoch)
             : cuda_moe_tiering_mass_lfru_score(tier_entry);
         if (score < victim_score) {
             victim_score = score;
@@ -28453,7 +28532,7 @@ static int cuda_moe_tiering_pick_vram_slot(
         return -1;
     }
     const double candidate_score = g_moe_tiering.g133_enabled
-        ? cuda_g133_decayed_heat(candidate)
+        ? cuda_g133_decayed_heat(candidate, g133_epoch)
         : cuda_moe_tiering_mass_lfru_score(candidate);
     if (g_moe_tiering.g133_enabled) {
         const cuda_moe_cache_slot &victim_cache =
@@ -28461,7 +28540,7 @@ static int cuda_moe_tiering_pick_vram_slot(
         cuda_moe_tier_entry &victim = g_moe_tiering.entries[
             cuda_moe_tiering_entry_index(
                 victim_cache.layer_index, victim_cache.expert_id)];
-        cuda_g133_refresh_entry(victim);
+        cuda_g133_refresh_entry(victim, g133_epoch);
         const double demote_gate =
             (double)g_moe_tiering.g133_knock_x +
             (double)g_moe_tiering.g133_knock_y -
@@ -28493,7 +28572,7 @@ static int cuda_moe_tiering_pick_vram_slot(
 static void cuda_moe_tiering_commit_vram_reservations(
         cuda_moe_expert_cache *cache,
         const cuda_moe_vram_promotion_reservation *reservations,
-        uint32_t count) {
+        uint32_t count, const ds4_gpu_g133_epoch &g133_epoch) {
     if (!cache || !reservations) return;
     const uint64_t expert_bytes =
         cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
@@ -28505,7 +28584,8 @@ static void cuda_moe_tiering_commit_vram_reservations(
         }
         if (reservation.victim_valid) {
             cuda_moe_tiering_demote_cache_entry(
-                reservation.victim_layer, reservation.victim_expert);
+                reservation.victim_layer, reservation.victim_expert,
+                g133_epoch);
             const size_t old_map_index = cuda_moe_tiering_entry_index(
                 reservation.victim_layer, reservation.victim_expert);
             if (old_map_index < cache->host_slot_by_layer_expert.size() &&
@@ -28550,7 +28630,7 @@ static void cuda_moe_tiering_commit_vram_reservations(
 
 static void cuda_moe_tiering_refund_failed_promotions(
         const cuda_moe_vram_promotion_reservation *reservations,
-        uint32_t count) {
+        uint32_t count, const ds4_gpu_g133_epoch &g133_epoch) {
     if (!reservations) return;
     for (uint32_t i = 0; i < count; i++) {
         const cuda_moe_vram_promotion_reservation &reservation =
@@ -28575,9 +28655,41 @@ static void cuda_moe_tiering_refund_failed_promotions(
              * therefore restores the candidate and coherently demotes the
              * no-longer-valid victim before whole-cache invalidation. */
             cuda_moe_tiering_demote_cache_entry(
-                reservation.victim_layer, reservation.victim_expert);
+                reservation.victim_layer, reservation.victim_expert,
+                g133_epoch);
         }
     }
+}
+
+static int cuda_moe_tiering_finish_vram_reservations(
+        cuda_moe_expert_cache *cache, const uint32_t *admitted,
+        const cuda_moe_vram_promotion_reservation *reservations,
+        uint32_t count, const ds4_gpu_g133_epoch &g133_epoch,
+        int commit_on_success) {
+    const double sync_started = g_moe_tiering.g133_enabled
+        ? cuda_wall_sec() : 0.0;
+    const cudaError_t pending_error = cudaGetLastError();
+    const cudaError_t sync_error =
+        cudaStreamSynchronize(cache->route_upload_stream);
+    if (sync_started != 0.0) {
+        cuda_g133_telemetry_note_upload_sync_wait(
+            cuda_wall_sec() - sync_started);
+    }
+    const int transfer_ok =
+        pending_error == cudaSuccess && sync_error == cudaSuccess;
+    if (!transfer_ok || !commit_on_success) {
+        (void)cudaGetLastError();
+        cuda_moe_tiering_refund_failed_promotions(
+            reservations, count, g133_epoch);
+        if (count > 0u) cuda_moe_expert_cache_invalidate();
+        return transfer_ok;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        cache->slots[admitted[i]].state = CUDA_MOE_CACHE_VALID;
+    }
+    cuda_moe_tiering_commit_vram_reservations(
+        cache, reservations, count, g133_epoch);
+    return 1;
 }
 
 static int cuda_moe_tiering_enforce_request(
@@ -28758,6 +28870,19 @@ static int cuda_moe_tiering_enforce_request(
                 ok = 0;
                 break;
             }
+            /* A policy-denied SSD serve is independent of promotions already
+             * enqueued for other experts. Publish or refund those reservations
+             * before entering a potentially slow blocking read. */
+            if (admitted_count > 0u) {
+                if (!cuda_moe_tiering_finish_vram_reservations(
+                        cache, admitted, promotion_reservations,
+                        admitted_count, request.g133_epoch, 1)) {
+                    failure_reason = "resident-copy-before-transient";
+                    ok = 0;
+                    break;
+                }
+                admitted_count = 0u;
+            }
             /* Exact non-resident serve: SSD -> per-route host staging -> the
              * existing transient GPU buffers below. Admission denial must not
              * alter tier state or make decode availability policy-dependent. */
@@ -28773,6 +28898,12 @@ static int cuda_moe_tiering_enforce_request(
                 (uint64_t)expert * cache->gate_expert_bytes;
             const uint64_t down_src = request.down_offset +
                 (uint64_t)expert * cache->down_expert_bytes;
+            cache->route_transient_read_sequence = request.sequence;
+#ifdef _WIN32
+            MemoryBarrier();
+#else
+            __sync_synchronize();
+#endif
             if (!g_model_file_valid ||
                 !cuda_pread_full(&g_model_file, host_gate,
                                  cache->gate_expert_bytes, gate_src) ||
@@ -28808,7 +28939,8 @@ static int cuda_moe_tiering_enforce_request(
         cuda_moe_vram_promotion_reservation pending_reservation = {};
         const int cache_slot_i = have_ram ?
             cuda_moe_tiering_pick_vram_slot(
-                cache, claimed, tier, &pending_reservation) : -1;
+                cache, claimed, tier, &pending_reservation,
+                request.g133_epoch) : -1;
         const int promote = cache_slot_i >= 0;
         if (promote) {
             const uint32_t cache_slot = (uint32_t)cache_slot_i;
@@ -29030,39 +29162,17 @@ static int cuda_moe_tiering_enforce_request(
         cuda_nested_residual_gpu_cache_requested() &&
         cuda_nested_residual_layer_required(request.layer_index) ?
          cuda_wall_sec() : 0.0;
-    const double g133_upload_sync_wait_started = g_moe_tiering.g133_enabled
-        ? cuda_wall_sec() : 0.0;
-    const cudaError_t pending_error = cudaGetLastError();
-    const cudaError_t sync_error =
-        cudaStreamSynchronize(cache->route_upload_stream);
-    if (g133_upload_sync_wait_started != 0.0) {
-        cuda_g133_telemetry_note_upload_sync_wait(
-            cuda_wall_sec() - g133_upload_sync_wait_started);
-    }
+    const int transfers_ok = cuda_moe_tiering_finish_vram_reservations(
+        cache, admitted, promotion_reservations, admitted_count,
+        request.g133_epoch, ok);
     if (h2d_sync_started != 0.0) {
         g_nested_residual.profile_h2d_sync_calls++;
         g_nested_residual.profile_h2d_sync_seconds +=
             cuda_wall_sec() - h2d_sync_started;
     }
-    if (pending_error != cudaSuccess || sync_error != cudaSuccess) {
-        (void)cudaGetLastError();
+    if (!transfers_ok) {
         failure_reason = "upload-sync";
         ok = 0;
-    }
-    if (ok) {
-        for (uint32_t i = 0; i < admitted_count; i++) {
-            cache->slots[admitted[i]].state = CUDA_MOE_CACHE_VALID;
-        }
-        cuda_moe_tiering_commit_vram_reservations(
-            cache, promotion_reservations, admitted_count);
-    } else if (admitted_count > 0u) {
-        /* A failed asynchronous upload can have already changed both host and
-         * device maps. Refund provisional budgets and restore candidate tier
-         * state before invalidating the resident cache; success counters were
-         * deliberately not committed before this synchronization terminal. */
-        cuda_moe_tiering_refund_failed_promotions(
-            promotion_reservations, admitted_count);
-        cuda_moe_expert_cache_invalidate();
     }
     if (!ok) {
         fprintf(stderr,
@@ -29107,6 +29217,17 @@ static void *cuda_moe_route_worker(void *arg) {
         memcpy(&request, cache->route_request_host, sizeof(request));
         if (request.sequence != sequence) continue;
         consumed_sequence = sequence;
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+        cache->route_consumed_sequence = sequence;
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
         if (sequence <= 2u) {
             fprintf(stderr,
                     "ds4: [gpu-route-debug] request seq=%u layer=%u misses=%u\n",
@@ -29118,7 +29239,9 @@ static void *cuda_moe_route_worker(void *arg) {
             request.miss_count <= request.route_count &&
             request.layer_index < CUDA_MOE_LAYER_COUNT &&
             request.gate_expert_bytes == cache->gate_expert_bytes &&
-            request.down_expert_bytes == cache->down_expert_bytes;
+            request.down_expert_bytes == cache->down_expert_bytes &&
+            (!g_moe_tiering.g133_enabled ||
+             cuda_g133_epoch_valid(request.g133_epoch));
         if (request_valid &&
             !cuda_sparse_bake_validate_selected(
                 request.layer_index, request.selected,
@@ -29162,7 +29285,7 @@ static void *cuda_moe_route_worker(void *arg) {
                 }
                 (void)cuda_moe_tiering_observe_route(
                     request.layer_index, (uint32_t)expert_i,
-                    request.weights[route]);
+                    request.weights[route], request.g133_epoch);
             }
             if (!request_valid) {
                 fprintf(stderr,
@@ -29523,6 +29646,9 @@ static void *cuda_moe_route_worker(void *arg) {
 #else
         __sync_synchronize();
 #endif
+        if (cache->route_transient_read_sequence == sequence) {
+            cache->route_transient_read_sequence = 0u;
+        }
     }
     return NULL;
 }
@@ -32913,6 +33039,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
         uint32_t n_expert,
         uint32_t n_tokens,
         ds4_gpu_spex_queue *spex_queue,
+        ds4_gpu_g133_epoch g133_epoch,
         uint32_t split_out_dim,
         uint32_t *sequence_out) {
     const int compose_requested = cuda_moe_prefill_tier_compose_requested();
@@ -32998,6 +33125,31 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
         }
         return NULL;
     }
+    const uint32_t prior_sequence = cache->route_submitted_sequence;
+    if (prior_sequence != 0u) {
+        const double consume_deadline = cuda_wall_sec() + 5.0;
+        while (*(volatile uint32_t *)&cache->route_consumed_sequence !=
+               prior_sequence) {
+            if (cache->route_stop || cache->route_worker_failed ||
+                cuda_wall_sec() >= consume_deadline) {
+                fprintf(stderr,
+                        "ds4: CUDA route request snapshot was not consumed "
+                        "before reuse seq=%u\n",
+                        prior_sequence);
+                return NULL;
+            }
+#ifdef _WIN32
+            (void)SwitchToThread();
+#else
+            usleep(0);
+#endif
+        }
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+    }
     uint32_t sequence = ++cache->route_sequence;
     if (sequence == 0u) sequence = ++cache->route_sequence;
     const int nested_profile = g_nested_residual.profile_enabled &&
@@ -33023,6 +33175,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
         down_offset,
         gate_expert_bytes,
         down_expert_bytes,
+        g133_epoch,
         n_expert);
     const cudaError_t resolve_launch_error = cudaGetLastError();
     if (nested_profile) {
@@ -33075,7 +33228,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
         }
     }
     const double wait_started = cuda_wall_sec();
-    const double wait_deadline = wait_started + 5.0;
+    double wait_deadline = wait_started + 5.0;
     while (*(volatile uint32_t *)cache->route_ready_host != sequence) {
         if (cache->route_stop || cache->route_worker_failed) {
             fprintf(stderr,
@@ -33084,6 +33237,14 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
             abort();
         }
         if (cuda_wall_sec() >= wait_deadline) {
+            if (*(volatile uint32_t *)&cache->route_transient_read_sequence ==
+                    sequence) {
+                /* Admission-denied SSD service is a live worker operation,
+                 * not a dead worker. Extend readiness while it owns this
+                 * request so slow storage cannot turn into process abort. */
+                wait_deadline = cuda_wall_sec() + 5.0;
+                continue;
+            }
             fprintf(stderr,
                     "ds4: CUDA GPU-resident route worker timed out seq=%u\n",
                     sequence);
@@ -33182,12 +33343,14 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         const ds4_gpu_tensor *weights,
         uint32_t n_expert,
         uint32_t n_tokens,
-        ds4_gpu_spex_queue *spex_queue) {
+        ds4_gpu_spex_queue *spex_queue,
+        ds4_gpu_g133_epoch g133_epoch) {
     uint32_t sequence = 0;
     cuda_moe_expert_cache *cache = cuda_moe_gpu_resident_routes_begin(
         layer_index, gate_offset, up_offset, down_offset,
         gate_expert_bytes, down_expert_bytes, expert_in_dim,
-        selected, weights, n_expert, n_tokens, spex_queue, 0u, &sequence);
+        selected, weights, n_expert, n_tokens, spex_queue, g133_epoch,
+        0u, &sequence);
     return cuda_moe_gpu_resident_routes_finish(
         cache, sequence, layer_index, 0, 0u);
 }
@@ -33222,7 +33385,8 @@ static int routed_moe_launch(
         uint32_t n_tokens,
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key,
-        const int32_t *selected_host) {
+        const int32_t *selected_host,
+        ds4_gpu_g133_epoch g133_epoch) {
     g_moe_last_selected.valid = 0;
     /* Wave state belongs to this routed-MoE invocation. Decode can take the
      * resident-route path without calling selected-load, so stale prefill
@@ -33374,7 +33538,7 @@ static int routed_moe_launch(
                 gate_expert_bytes, down_expert_bytes,
                 expert_in_dim,
                 selected, weights, n_expert, n_tokens,
-                spex_queue, out_dim, &gpu_route_sequence);
+                spex_queue, g133_epoch, out_dim, &gpu_route_sequence);
             use_split_fused = gpu_route_cache != NULL && split_fused_requested;
             use_split_hit_miss = gpu_route_cache != NULL && split_hit_miss_requested;
         } else {
@@ -33384,7 +33548,7 @@ static int routed_moe_launch(
                 gate_expert_bytes, down_expert_bytes,
                 expert_in_dim,
                 selected, weights, n_expert, n_tokens,
-                spex_queue);
+                spex_queue, g133_epoch);
         }
     }
     if (!route_iq1_s && !route_q1_0 &&
@@ -34933,7 +35097,7 @@ static int routed_moe_launch(
     return ok;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, ds4_gpu_spex_queue *spex_queue, const ds4_gpu_spex_key *spex_key) {
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, ds4_gpu_g133_epoch g133_epoch, ds4_gpu_spex_queue *spex_queue, const ds4_gpu_spex_key *spex_key) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              layer_index,
                              gate_offset, up_offset, down_offset,
@@ -34942,7 +35106,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, NULL, n_expert, clamp, x, 1,
-                             spex_queue, spex_key, NULL);
+                             spex_queue, spex_key, NULL, g133_epoch);
 }
 
 static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
@@ -36034,7 +36198,8 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         const ds4_gpu_tensor *weights,
         uint32_t n_expert,
         float clamp,
-        const ds4_gpu_tensor *x) {
+        const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch g133_epoch) {
     g_q1_0_mixed_calls++;
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_state *attribution_state =
@@ -36587,7 +36752,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL,
-            NULL);
+            NULL, g133_epoch);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -36788,7 +36953,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &hot_selected_tensor, &hot_weights_tensor, NULL,
-            hot_count, clamp, x, 1u, NULL, NULL, NULL);
+            hot_count, clamp, x, 1u, NULL, NULL, NULL, g133_epoch);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -36854,7 +37019,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &cpu_gpu_selected_tensor, &cpu_gpu_weights_tensor, NULL,
-            cpu_count, clamp, x, 1u, NULL, NULL, NULL);
+            cpu_count, clamp, x, 1u, NULL, NULL, NULL, g133_epoch);
         if (cpu_gpu_ok) {
             add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
                 (float *)out->ptr, (const float *)out->ptr,
@@ -36916,12 +37081,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         for (uint32_t route = 0; route < cold_count; route++) {
             (void)cuda_moe_tiering_observe_route(
                 layer_index, (uint32_t)cold_selected[route],
-                cold_weights[route]);
+                cold_weights[route], g133_epoch);
         }
         for (uint32_t route = 0; route < cpu_count; route++) {
             (void)cuda_moe_tiering_observe_route(
                 layer_index, (uint32_t)cpu_selected[route],
-                cpu_weights[route]);
+                cpu_weights[route], g133_epoch);
         }
     }
     if (mixed_profile) {
@@ -36966,7 +37131,8 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             q1_down_expert_bytes, q1_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &cold_selected_tensor, &cold_weights_tensor, NULL,
-            cold_count, clamp, x, 1u, NULL, NULL, cold_selected);
+            cold_count, clamp, x, 1u, NULL, NULL, cold_selected,
+            g133_epoch);
     }
     if (mixed_profile) {
         g_q1_0_mixed_profile_current_sample = previous_profile_sample;
@@ -37078,7 +37244,8 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                     main_down_expert_bytes, main_down_row_bytes,
                     expert_in_dim, expert_mid_dim, out_dim,
                     &cpu_gpu_selected_tensor, &cpu_gpu_weights_tensor, NULL,
-                    cpu_count, clamp, x, 1u, NULL, NULL, NULL);
+                    cpu_count, clamp, x, 1u, NULL, NULL, NULL,
+                    g133_epoch);
                 if (mixed_join_ok) {
                     add_f32_u64_kernel<<<
                         (out_dim + 255u) / 256u, 256>>>(
@@ -37241,6 +37408,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch g133_epoch,
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key) {
     g_iq1_mixed_calls++;
@@ -37384,7 +37552,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                                main_down_expert_bytes, main_down_row_bytes,
                                expert_in_dim, expert_mid_dim, out_dim,
                                &hot_selected, &hot_weights, NULL, hot_count, clamp,
-                               x, 1u, NULL, NULL, NULL);
+                               x, 1u, NULL, NULL, NULL, g133_epoch);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -37477,7 +37645,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                            iq1_down_expert_bytes, iq1_down_row_bytes,
                            expert_in_dim, expert_mid_dim, out_dim,
                            &cold_selected, &cold_weight_tensor, NULL, 1u, clamp,
-                           x, 1u, NULL, NULL, NULL);
+                           x, 1u, NULL, NULL, NULL, g133_epoch);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -37497,7 +37665,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
     (void)cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
             layer_index, (uint32_t)cold_expert, cold_weight,
             main_gate_offset, main_up_offset, main_down_offset,
-            main_gate_expert_bytes, main_down_expert_bytes);
+            main_gate_expert_bytes, main_down_expert_bytes, g133_epoch);
     const double mixed_join_t = mixed_profile ? cuda_wall_sec() : 0.0;
     if (!cuda_iq1_mixed_debug_output("joined", out, out_dim)) {
         g_iq1_mixed_failures++;
@@ -37536,7 +37704,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, probs, n_expert, clamp, x, n_tokens,
-                             NULL, NULL, NULL);
+                             NULL, NULL, NULL, ds4_gpu_g133_epoch{});
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;

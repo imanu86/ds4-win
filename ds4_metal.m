@@ -33,6 +33,14 @@ enum {
 
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
+
+static ds4_gpu_g133_epoch ds4_gpu_g133_noop_position_begin(void) {
+    ds4_gpu_g133_epoch epoch = {0, 0};
+    return epoch;
+}
+
+ds4_gpu_g133_position_begin_fn ds4_gpu_g133_decode_position_begin =
+    ds4_gpu_g133_noop_position_begin;
 static id<MTLLibrary> g_library;
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
@@ -12916,8 +12924,10 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch     g133_epoch,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key) {
+    (void)g133_epoch;
     (void)spex_queue;
     (void)spex_key;
     (void)layer_index;
