@@ -209,6 +209,7 @@ static os_file_t g_q1_0_sidecar_file;
 static int g_q1_0_sidecar_file_valid;
 static const void *g_q1_0_sidecar_host_base;
 static uint64_t g_q1_0_sidecar_size;
+static uint64_t g_q1_0_source_generation = 1;
 
 enum {
     CUDA_NESTED_RESIDUAL_LAYER_COUNT = 43u,
@@ -658,6 +659,49 @@ struct cuda_iq1_s_vram_cache {
     std::vector<cuda_iq1_s_vram_cache_slot> slots;
 };
 static cuda_iq1_s_vram_cache g_iq1_s_vram_cache;
+struct cuda_q1_vram_lru_slot {
+    uint32_t layer;
+    uint32_t expert;
+    uint64_t age;
+    uint64_t source_generation;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint8_t valid;
+    uint8_t pending;
+};
+struct cuda_q1_vram_lru {
+    char *device_base;
+    char *gate;
+    char *up;
+    char *down;
+    cudaEvent_t reuse_ready;
+    uint64_t allocated_bytes;
+    uint64_t reserve_bytes;
+    uint64_t slot_bytes;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    uint64_t tick;
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t bytes_saved;
+    uint64_t h2d_bytes;
+    uint64_t failures;
+    uint32_t requested;
+    uint32_t capacity;
+    uint32_t count;
+    uint8_t attempted;
+    std::vector<cuda_q1_vram_lru_slot> slots;
+};
+static cuda_q1_vram_lru g_q1_vram_lru;
+
+static void cuda_q1_0_source_rebind(void) {
+    g_q1_0_source_generation++;
+    if (g_q1_0_source_generation == 0) {
+        g_q1_0_source_generation++;
+    }
+}
 struct cuda_iq1_mixed_gpu_plan_request {
     uint32_t sequence;
     uint32_t layer_index;
@@ -2155,6 +2199,7 @@ static void cuda_moe_expert_cache_invalidate(void);
 static void cuda_moe_expert_cache_release(void);
 static void cuda_iq1_s_ram_cache_release(void);
 static void cuda_iq1_s_vram_cache_release(void);
+static void cuda_q1_vram_lru_release(void);
 static void cuda_iq1_mixed_gpu_plan_release(void);
 static int cuda_iq1_mixed_debug_output(
     const char *phase, const ds4_gpu_tensor *tensor, uint32_t count);
@@ -3682,6 +3727,7 @@ static void cuda_iq1_s_sidecar_clear(void) {
 }
 
 static void cuda_q1_0_sidecar_clear(void) {
+    cuda_q1_0_source_rebind();
     cuda_q1_0_mixed_profile_reset(0);
     cuda_expert_recovery_trace_finalize();
     cuda_expert_recovery_trace_reset();
@@ -6270,6 +6316,10 @@ static void cuda_primary_dynamic_arena_release(int report) {
 }
 
 extern "C" void ds4_gpu_dynamic_arena_release(void) {
+    if (g_q1_0_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0 ||
+        g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        cuda_q1_0_source_rebind();
+    }
     cuda_q1_0_dynamic_arena_release(1);
     cuda_primary_dynamic_arena_release(1);
 }
@@ -6342,6 +6392,10 @@ static int cuda_dynamic_arena_bind(
             }
         }
         if (same) return 1;
+    }
+    if (g_dynamic_arena.backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0 ||
+        backing == CUDA_DYNAMIC_ARENA_BACKING_Q1_0) {
+        cuda_q1_0_source_rebind();
     }
     cuda_primary_dynamic_arena_release(1);
     try {
@@ -6479,6 +6533,7 @@ extern "C" int ds4_gpu_dynamic_arena_bind_q1_0(
         }
         if (same) return 1;
     }
+    cuda_q1_0_source_rebind();
     cuda_q1_0_dynamic_arena_release(0);
     try {
         arena.layers.assign(layers, layers + n_layer);
@@ -22421,6 +22476,9 @@ struct cuda_moe_gather {
     char *gate; uint64_t gate_cap;
     char *up;   uint64_t up_cap;
     char *down; uint64_t down_cap;
+    char *q1_active_gate;
+    char *q1_active_up;
+    char *q1_active_down;
     char *iq1_packed; uint64_t iq1_packed_cap;
     char *iq1_active_gate;
     char *iq1_active_up;
@@ -26102,6 +26160,211 @@ static void cuda_moe_expert_cache_release(void) {
     g_moe_expert_cache.route_ready_wait_seconds = 0.0;
 }
 
+static uint32_t cuda_q1_vram_lru_requested_slots(void) {
+    const char *env = getenv("DS4_Q1_VRAM_LRU_SLOTS");
+    if (!env || !env[0]) return 600u;
+    if (strcmp(env, "0") == 0 || strcmp(env, "off") == 0 ||
+        strcmp(env, "false") == 0 || strcmp(env, "disabled") == 0) {
+        return 0u;
+    }
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    while (end && (*end == ' ' || *end == '\t')) end++;
+    if (end == env || errno != 0 || !end || *end != '\0' ||
+        value > 65535ul) {
+        fprintf(stderr,
+                "ds4: invalid DS4_Q1_VRAM_LRU_SLOTS=%s; cache disabled\n",
+                env);
+        return 0u;
+    }
+    return (uint32_t)value;
+}
+
+static uint64_t cuda_q1_vram_lru_reserve_bytes(void) {
+    int present = 0;
+    const uint64_t configured = cuda_parse_mib_env(
+        "DS4_Q1_VRAM_LRU_RESERVE_MB", &present);
+    return present ? configured : 512ull * 1048576ull;
+}
+
+static void cuda_q1_vram_lru_release(void) {
+    cuda_q1_vram_lru &cache = g_q1_vram_lru;
+    if (cuda_q1_0_profile_requested() &&
+        (cache.attempted || cache.hits || cache.misses || cache.failures)) {
+        fprintf(stderr,
+                "ds4: [q1-vram-lru] result=summary requested=%u "
+                "capacity=%u count=%u allocated_bytes=%llu reserve_bytes=%llu "
+                "slot_bytes=%llu hits=%llu misses=%llu evictions=%llu "
+                "bytes_saved=%llu h2d_bytes=%llu failures=%llu\n",
+                cache.requested, cache.capacity, cache.count,
+                (unsigned long long)cache.allocated_bytes,
+                (unsigned long long)cache.reserve_bytes,
+                (unsigned long long)cache.slot_bytes,
+                (unsigned long long)cache.hits,
+                (unsigned long long)cache.misses,
+                (unsigned long long)cache.evictions,
+                (unsigned long long)cache.bytes_saved,
+                (unsigned long long)cache.h2d_bytes,
+                (unsigned long long)cache.failures);
+    }
+    if (cache.reuse_ready) (void)cudaEventDestroy(cache.reuse_ready);
+    if (cache.device_base) (void)cudaFree(cache.device_base);
+    cache = cuda_q1_vram_lru{};
+}
+
+/* Returns 1 when the packed gate/up/down slab is ready, otherwise 0 so the
+ * original compact-gather path remains the exact fallback. */
+static int cuda_q1_vram_lru_prepare(
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    cuda_q1_vram_lru &cache = g_q1_vram_lru;
+    const uint32_t requested = cuda_q1_vram_lru_requested_slots();
+    if (requested == 0u) return 0;
+    if (cache.device_base) {
+        return cache.gate_expert_bytes == gate_expert_bytes &&
+               cache.down_expert_bytes == down_expert_bytes ? 1 : 0;
+    }
+    if (cache.attempted) return 0;
+    cache.attempted = 1;
+    cache.requested = requested;
+    cache.reserve_bytes = cuda_q1_vram_lru_reserve_bytes();
+    if (gate_expert_bytes == 0 || down_expert_bytes == 0 ||
+        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2ull) {
+        cache.failures++;
+        return 0;
+    }
+    cache.slot_bytes = gate_expert_bytes * 2ull + down_expert_bytes;
+    cache.gate_expert_bytes = gate_expert_bytes;
+    cache.down_expert_bytes = down_expert_bytes;
+
+    size_t free_b = 0;
+    size_t total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        cache.failures++;
+        return 0;
+    }
+    uint64_t available = (uint64_t)free_b;
+    if (available > cache.reserve_bytes) available -= cache.reserve_bytes;
+    else available = 0;
+    const uint64_t budget_slots = available / cache.slot_bytes;
+    cache.capacity = budget_slots < requested ?
+        (uint32_t)budget_slots : requested;
+    if (cache.capacity == 0u ||
+        cache.slot_bytes > UINT64_MAX / cache.capacity) {
+        return 0;
+    }
+    cache.allocated_bytes = cache.slot_bytes * cache.capacity;
+    err = cudaMalloc((void **)&cache.device_base,
+                     (size_t)cache.allocated_bytes);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        cache.device_base = NULL;
+        cache.failures++;
+        return 0;
+    }
+    const uint64_t gate_plane_bytes =
+        (uint64_t)cache.capacity * gate_expert_bytes;
+    cache.gate = cache.device_base;
+    cache.up = cache.gate + gate_plane_bytes;
+    cache.down = cache.up + gate_plane_bytes;
+    err = cudaEventCreateWithFlags(&cache.reuse_ready,
+                                   cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(cache.device_base);
+        cache.device_base = NULL;
+        cache.gate = NULL;
+        cache.up = NULL;
+        cache.down = NULL;
+        cache.failures++;
+        return 0;
+    }
+    try {
+        cache.slots.resize(cache.capacity);
+    } catch (...) {
+        (void)cudaEventDestroy(cache.reuse_ready);
+        (void)cudaFree(cache.device_base);
+        cache.reuse_ready = NULL;
+        cache.device_base = NULL;
+        cache.gate = NULL;
+        cache.up = NULL;
+        cache.down = NULL;
+        cache.failures++;
+        return 0;
+    }
+    if (cuda_q1_0_profile_requested()) {
+        fprintf(stderr,
+                "ds4: [q1-vram-lru] result=ready requested=%u capacity=%u "
+                "allocated_bytes=%llu reserve_bytes=%llu slot_bytes=%llu "
+                "policy=global-lru key=layer-expert-generation-offsets\n",
+                cache.requested, cache.capacity,
+                (unsigned long long)cache.allocated_bytes,
+                (unsigned long long)cache.reserve_bytes,
+                (unsigned long long)cache.slot_bytes);
+    }
+    return 1;
+}
+
+/* A miss reserves an invalid slot until its H2D has been fenced to stream 0. */
+static int cuda_q1_vram_lru_resolve(
+        uint32_t layer,
+        uint32_t expert,
+        uint64_t source_generation,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        int *hit,
+        int *evicted) {
+    if (!hit || !evicted) return -1;
+    cuda_q1_vram_lru &cache = g_q1_vram_lru;
+    if (!cache.device_base || cache.capacity == 0u) return -1;
+    uint32_t empty = UINT32_MAX;
+    uint32_t lru = UINT32_MAX;
+    uint64_t oldest = UINT64_MAX;
+    for (uint32_t i = 0; i < cache.capacity; i++) {
+        cuda_q1_vram_lru_slot &slot = cache.slots[i];
+        if (slot.valid && slot.layer == layer && slot.expert == expert &&
+            slot.source_generation == source_generation &&
+            slot.gate_offset == gate_offset &&
+            slot.up_offset == up_offset &&
+            slot.down_offset == down_offset) {
+            slot.age = ++cache.tick;
+            cache.hits++;
+            cache.bytes_saved += cache.slot_bytes;
+            *hit = 1;
+            *evicted = 0;
+            return (int)i;
+        }
+        if (!slot.valid && !slot.pending) {
+            if (empty == UINT32_MAX) empty = i;
+            continue;
+        }
+        if (slot.valid && slot.age < oldest) {
+            oldest = slot.age;
+            lru = i;
+        }
+    }
+    const uint32_t victim = empty != UINT32_MAX ? empty : lru;
+    if (victim == UINT32_MAX) {
+        cache.failures++;
+        return -1;
+    }
+    cuda_q1_vram_lru_slot &slot = cache.slots[victim];
+    *evicted = slot.valid ? 1 : 0;
+    if (*evicted) cache.evictions++;
+    slot.valid = 0;
+    slot.pending = 1;
+    slot.layer = layer;
+    slot.expert = expert;
+    slot.age = ++cache.tick;
+    cache.misses++;
+    *hit = 0;
+    return (int)victim;
+}
+
 static void cuda_moe_gather_release(void) {
     if (g_prefill_union_stats.calls != 0) {
         const double dedup_ratio =
@@ -26154,6 +26417,7 @@ static void cuda_moe_gather_release(void) {
     g_prefill_wave_overlap_stats = {};
     g_moe_selected_prepared.valid = 0;
     g_moe_last_selected.valid = 0;
+    cuda_q1_vram_lru_release();
     if (g_moe_gather.gate) (void)cudaFree(g_moe_gather.gate);
     if (g_moe_gather.up) (void)cudaFree(g_moe_gather.up);
     if (g_moe_gather.down) (void)cudaFree(g_moe_gather.down);
@@ -26178,6 +26442,9 @@ static void cuda_moe_gather_release(void) {
     g_moe_gather.gate = NULL;
     g_moe_gather.up = NULL;
     g_moe_gather.down = NULL;
+    g_moe_gather.q1_active_gate = NULL;
+    g_moe_gather.q1_active_up = NULL;
+    g_moe_gather.q1_active_down = NULL;
     g_moe_gather.slot = NULL;
     g_moe_gather.route_ptrs = NULL;
     g_moe_gather.gate_cap = 0;
@@ -31348,12 +31615,24 @@ static int cuda_moe_selected_load_q1_0(
 
     const uint64_t cgate = (uint64_t)compact_count * gate_expert_bytes;
     const uint64_t cdown = (uint64_t)compact_count * down_expert_bytes;
-    if (!cuda_moe_gather_ensure(&g_moe_gather.gate, &g_moe_gather.gate_cap,
-                                cgate, "Q1_0 gather gate") ||
-        !cuda_moe_gather_ensure(&g_moe_gather.up, &g_moe_gather.up_cap,
-                                cgate, "Q1_0 gather up") ||
-        !cuda_moe_gather_ensure(&g_moe_gather.down, &g_moe_gather.down_cap,
-                                cdown, "Q1_0 gather down") ||
+    g_moe_gather.q1_active_gate = NULL;
+    g_moe_gather.q1_active_up = NULL;
+    g_moe_gather.q1_active_down = NULL;
+    const int q1_vram_lru_active =
+        cuda_q1_0_resident_transport_requested() &&
+        cuda_q1_vram_lru_prepare(
+            gate_expert_bytes, down_expert_bytes) > 0 &&
+        g_q1_vram_lru.capacity >= compact_count;
+    if ((!q1_vram_lru_active &&
+         (!cuda_moe_gather_ensure(&g_moe_gather.gate,
+                                  &g_moe_gather.gate_cap,
+                                  cgate, "Q1_0 gather gate") ||
+          !cuda_moe_gather_ensure(&g_moe_gather.up,
+                                  &g_moe_gather.up_cap,
+                                  cgate, "Q1_0 gather up") ||
+          !cuda_moe_gather_ensure(&g_moe_gather.down,
+                                  &g_moe_gather.down_cap,
+                                  cdown, "Q1_0 gather down"))) ||
         !cuda_moe_gather_ensure_i32(&g_moe_gather.slot, &g_moe_gather.slot_cap,
                                     slot_count, "Q1_0 gather slots")) {
         return 0;
@@ -31369,22 +31648,98 @@ static int cuda_moe_selected_load_q1_0(
             g_q1_0_resident_misses++;
             return 0;
         }
+        std::vector<int32_t> lru_slots;
+        std::vector<uint8_t> lru_hits;
+        std::vector<uint8_t> lru_new;
+        int lru_has_eviction = 0;
+        const uint64_t q1_source_generation =
+            g_q1_0_source_generation;
+        if (q1_vram_lru_active) {
+            try {
+                lru_slots.resize(compact_count);
+                lru_hits.resize(compact_count);
+                lru_new.resize(compact_count);
+            } catch (...) {
+                return 0;
+            }
+            for (uint32_t i = 0; i < compact_count; i++) {
+                int hit = 0;
+                int evicted = 0;
+                const int slot = cuda_q1_vram_lru_resolve(
+                    layer_index, (uint32_t)compact[i],
+                    q1_source_generation,
+                    gate_offset, up_offset, down_offset,
+                    &hit, &evicted);
+                if (slot < 0) {
+                    for (uint32_t j = 0; j < i; j++) {
+                        if (!lru_hits[j]) {
+                            g_q1_vram_lru.slots[(uint32_t)lru_slots[j]].pending = 0;
+                        }
+                    }
+                    return 0;
+                }
+                lru_slots[i] = slot;
+                lru_hits[i] = hit ? 1u : 0u;
+                lru_new[i] = !hit && !evicted ? 1u : 0u;
+                lru_has_eviction |= evicted;
+            }
+            for (uint32_t i = 0; i < slot_count; i++) {
+                slots[i] = lru_slots[(uint32_t)slots[i]];
+            }
+            /* An evicted slot may still feed an earlier stream-0 kernel. Make
+             * the upload stream wait for those consumers before overwriting. */
+            if (lru_has_eviction &&
+                (!cuda_ok(cudaEventRecord(g_q1_vram_lru.reuse_ready, 0),
+                          "Q1_0 VRAM LRU reuse ready") ||
+                 !cuda_ok(cudaStreamWaitEvent(
+                              g_model_upload_stream,
+                              g_q1_vram_lru.reuse_ready, 0),
+                          "Q1_0 VRAM LRU reuse wait"))) {
+                for (uint32_t i = 0; i < compact_count; i++) {
+                    if (!lru_hits[i]) {
+                        g_q1_vram_lru.slots[(uint32_t)lru_slots[i]].pending = 0;
+                    }
+                }
+                return cuda_moe_q1_resident_upload_fail(
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+                    attribution_state
+#endif
+                );
+            }
+        }
+
         uint64_t route_h2d_bytes = 0;
         for (uint32_t i = 0; i < compact_count; i++) {
+            if (q1_vram_lru_active && lru_hits[i]) continue;
             const uint32_t expert = (uint32_t)compact[i];
-            const uint64_t gate_dst = (uint64_t)i * gate_expert_bytes;
-            const uint64_t down_dst = (uint64_t)i * down_expert_bytes;
+            const uint32_t destination = q1_vram_lru_active ?
+                (uint32_t)lru_slots[i] : i;
+            const uint64_t gate_dst =
+                (uint64_t)destination * gate_expert_bytes;
+            const uint64_t down_dst =
+                (uint64_t)destination * down_expert_bytes;
             const cuda_dynamic_arena_copy_status status =
                 cuda_dynamic_arena_copy_expert_async(
                     *q1_arena,
                     model_map, layer_index, expert,
                     gate_offset, up_offset, down_offset,
-                    g_moe_gather.gate + gate_dst,
-                    g_moe_gather.up + gate_dst,
-                    g_moe_gather.down + down_dst,
+                    (q1_vram_lru_active ? g_q1_vram_lru.gate :
+                                         g_moe_gather.gate) + gate_dst,
+                    (q1_vram_lru_active ? g_q1_vram_lru.up :
+                                         g_moe_gather.up) + gate_dst,
+                    (q1_vram_lru_active ? g_q1_vram_lru.down :
+                                         g_moe_gather.down) + down_dst,
                     gate_expert_bytes, gate_expert_bytes,
                     down_expert_bytes);
             if (status != CUDA_DYNAMIC_ARENA_ENQUEUED) {
+                if (q1_vram_lru_active) {
+                    g_q1_vram_lru.failures++;
+                    for (uint32_t j = 0; j < compact_count; j++) {
+                        if (!lru_hits[j]) {
+                            g_q1_vram_lru.slots[(uint32_t)lru_slots[j]].pending = 0;
+                        }
+                    }
+                }
                 g_q1_0_resident_misses++;
                 return cuda_moe_q1_resident_upload_fail(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
@@ -31405,7 +31760,8 @@ static int cuda_moe_selected_load_q1_0(
         const int slots_h2d_ok = cuda_ok(
             cudaMemcpyAsync(g_moe_gather.slot, slots.data(),
                             (size_t)slot_count * sizeof(int32_t),
-                            cudaMemcpyHostToDevice, g_model_upload_stream),
+                            cudaMemcpyHostToDevice,
+                            q1_vram_lru_active ? 0 : g_model_upload_stream),
             "Q1_0 resident slots H2D");
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution_state) {
@@ -31414,6 +31770,14 @@ static int cuda_moe_selected_load_q1_0(
         }
 #endif
         if (!slots_h2d_ok) {
+            if (q1_vram_lru_active) {
+                g_q1_vram_lru.failures++;
+                for (uint32_t i = 0; i < compact_count; i++) {
+                    if (!lru_hits[i]) {
+                        g_q1_vram_lru.slots[(uint32_t)lru_slots[i]].pending = 0;
+                    }
+                }
+            }
             return cuda_moe_q1_resident_upload_fail(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
                 attribution_state
@@ -31423,16 +31787,47 @@ static int cuda_moe_selected_load_q1_0(
         /* The mixed dispatcher has already queued its hot IQ2 kernels on
          * stream 0. Fence only the cold Q1 consumer so resident uploads can
          * overlap that hot work instead of draining it on the host. */
-        if (!cuda_ok(cudaEventRecord(g_q1_upload_ready,
-                                     g_model_upload_stream),
-                     "Q1_0 resident upload ready") ||
-            !cuda_ok(cudaStreamWaitEvent(0, g_q1_upload_ready, 0),
-                     "Q1_0 resident upload wait")) {
+        const int expert_upload_enqueued = route_h2d_bytes != 0;
+        if ((!q1_vram_lru_active || expert_upload_enqueued) &&
+            (!cuda_ok(cudaEventRecord(g_q1_upload_ready,
+                                      g_model_upload_stream),
+                      "Q1_0 resident upload ready") ||
+             !cuda_ok(cudaStreamWaitEvent(0, g_q1_upload_ready, 0),
+                      "Q1_0 resident upload wait"))) {
+            if (q1_vram_lru_active) {
+                g_q1_vram_lru.failures++;
+                for (uint32_t i = 0; i < compact_count; i++) {
+                    if (!lru_hits[i]) {
+                        g_q1_vram_lru.slots[(uint32_t)lru_slots[i]].pending = 0;
+                    }
+                }
+            }
             return cuda_moe_q1_resident_upload_fail(
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
                 attribution_state
 #endif
             );
+        }
+        if (q1_vram_lru_active) {
+            for (uint32_t i = 0; i < compact_count; i++) {
+                if (lru_hits[i]) continue;
+                cuda_q1_vram_lru_slot &slot =
+                    g_q1_vram_lru.slots[(uint32_t)lru_slots[i]];
+                slot.pending = 0;
+                slot.source_generation = q1_source_generation;
+                slot.gate_offset = gate_offset;
+                slot.up_offset = up_offset;
+                slot.down_offset = down_offset;
+                slot.valid = 1;
+                if (lru_new[i] &&
+                    g_q1_vram_lru.count < g_q1_vram_lru.capacity) {
+                    g_q1_vram_lru.count++;
+                }
+            }
+            g_q1_vram_lru.h2d_bytes += route_h2d_bytes;
+            g_moe_gather.q1_active_gate = g_q1_vram_lru.gate;
+            g_moe_gather.q1_active_up = g_q1_vram_lru.up;
+            g_moe_gather.q1_active_down = g_q1_vram_lru.down;
         }
         g_q1_0_resident_hits += compact_count;
         g_q1_0_resident_h2d_bytes += route_h2d_bytes;
@@ -32109,9 +32504,12 @@ static int routed_moe_launch(
         }
         if (selected_loaded) {
             g_q1_0_selected_loads++;
-            gate_w = g_moe_gather.gate;
-            up_w = g_moe_gather.up;
-            down_w = g_moe_gather.down;
+            gate_w = g_moe_gather.q1_active_gate ?
+                g_moe_gather.q1_active_gate : g_moe_gather.gate;
+            up_w = g_moe_gather.q1_active_up ?
+                g_moe_gather.q1_active_up : g_moe_gather.up;
+            down_w = g_moe_gather.q1_active_down ?
+                g_moe_gather.q1_active_down : g_moe_gather.down;
             selected = &g_moe_gather.slot_tensor;
         } else {
             g_q1_0_selected_load_failures++;
