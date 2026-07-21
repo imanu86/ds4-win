@@ -765,6 +765,86 @@ static uint64_t g_q1_0_mixed_cold_one_calls;
 static uint64_t g_q1_0_mixed_cold_one_hot_routes;
 static uint64_t g_q1_0_mixed_cold_one_q1_routes;
 static uint64_t g_q1_0_mixed_cold_one_invariant_failures;
+
+enum {
+    /* At most six persistent jobs run at once; two logical cores remain for
+     * CUDA submission and the rest of the decode pipeline. */
+    CUDA_G132_CPU_LANE_MAX_WORKERS = 6u,
+    CUDA_G132_CPU_LANE_MAX_ROUTES = 8u,
+    CUDA_G132_CPU_LANE_LAYER_COUNT = 43u,
+};
+
+struct cuda_g132_cpu_lane;
+struct cuda_g132_cpu_lane_worker {
+    cuda_g132_cpu_lane *lane;
+    uint32_t index;
+    std::vector<float> output;
+    std::vector<float> mid;
+    std::vector<cuda_block_q8_K> xq;
+    std::vector<cuda_block_q8_K> midq;
+};
+
+struct cuda_g132_cpu_lane {
+    os_mutex_t mutex;
+    os_cond_t work_cond;
+    os_cond_t done_cond;
+    os_thread_t threads[CUDA_G132_CPU_LANE_MAX_WORKERS];
+    cuda_g132_cpu_lane_worker workers[CUDA_G132_CPU_LANE_MAX_WORKERS];
+    cudaStream_t bridge_stream;
+    cudaEvent_t input_source_ready;
+    cudaEvent_t input_copy_done;
+    cudaEvent_t partial_copy_done;
+    float *host_input;
+    float *host_partial;
+    float *device_partial;
+    std::vector<float> route_outputs;
+    const char *gate_ptrs[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    const char *up_ptrs[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    const char *down_ptrs[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    int32_t expert_ids[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    float route_weights[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    uint64_t generation;
+    uint64_t routes;
+    uint64_t overflow_routes;
+    uint64_t failures;
+    uint64_t input_d2h_bytes;
+    uint64_t partial_h2d_bytes;
+    uint64_t layer_calls[CUDA_G132_CPU_LANE_LAYER_COUNT];
+    uint64_t layer_routes[CUDA_G132_CPU_LANE_LAYER_COUNT];
+    double layer_cpu_seconds[CUDA_G132_CPU_LANE_LAYER_COUNT];
+    double layer_join_wait_seconds[CUDA_G132_CPU_LANE_LAYER_COUNT];
+    double cpu_started;
+    double cpu_finished;
+    uint64_t gate_row_bytes;
+    uint64_t down_row_bytes;
+    uint32_t expert_in_dim;
+    uint32_t expert_mid_dim;
+    uint32_t out_dim;
+    uint32_t layer_index;
+    uint32_t job_count;
+    uint32_t next_job;
+    uint32_t completed_jobs;
+    uint32_t worker_count;
+    uint32_t threads_started;
+    float clamp;
+    int requested;
+    int ready;
+    int failed_open;
+    int mutex_ready;
+    int work_cond_ready;
+    int done_cond_ready;
+    int job_active;
+    int input_ready;
+    int job_failed;
+    int stop;
+};
+
+static cuda_g132_cpu_lane g_g132_cpu_lane;
+static uint64_t g_g132_iq2xxs_grid[256];
+static int8_t g_g132_iq2xxs_signed_grid[256][128][8];
+
+static int cuda_g132_cpu_lane_init(void);
+static void cuda_g132_cpu_lane_release(void);
 static uint32_t g_q1_0_dual_sparse_entries;
 static uint64_t g_q1_0_dual_sparse_bytes;
 static double g_q1_0_dual_sparse_seconds;
@@ -1730,7 +1810,8 @@ static int cuda_expert_recovery_trace_capture(
         float gate_weight, const char *representation,
         uint64_t token_index, uint64_t call_tick,
         const ds4_gpu_tensor *input,
-        uint32_t input_dim) {
+        uint32_t input_dim,
+        const float *captured_host_input) {
     cuda_expert_recovery_trace_state &trace = g_expert_recovery_trace;
     if (!trace.enabled || !cuda_expert_recovery_trace_target(layer, expert)) {
         return !trace.failed;
@@ -1760,14 +1841,19 @@ static int cuda_expert_recovery_trace_capture(
     if (trace.vector_dim != input_dim) {
         return cuda_expert_recovery_trace_fail("shape_changed");
     }
-    const cudaError_t copy_error = cudaMemcpy(
-        trace.host_input.data(), input->ptr, (size_t)trace.vector_bytes,
-        cudaMemcpyDeviceToHost);
-    if (copy_error != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: expert recovery input D2H failed: %s\n",
-                cudaGetErrorString(copy_error));
-        return cuda_expert_recovery_trace_fail("input_d2h");
+    if (captured_host_input) {
+        memcpy(trace.host_input.data(), captured_host_input,
+               (size_t)trace.vector_bytes);
+    } else {
+        const cudaError_t copy_error = cudaMemcpy(
+            trace.host_input.data(), input->ptr, (size_t)trace.vector_bytes,
+            cudaMemcpyDeviceToHost);
+        if (copy_error != cudaSuccess) {
+            fprintf(stderr,
+                    "ds4: expert recovery input D2H failed: %s\n",
+                    cudaGetErrorString(copy_error));
+            return cuda_expert_recovery_trace_fail("input_d2h");
+        }
     }
     for (float value : trace.host_input) {
         if (!std::isfinite(value)) {
@@ -5807,6 +5893,7 @@ extern "C" int ds4_gpu_init(void) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
     }
+    if (!cuda_g132_cpu_lane_init()) return 0;
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
         const cublasMath_t math_mode =
@@ -5830,6 +5917,7 @@ extern "C" void ds4_gpu_cleanup(void) {
                 cudaGetErrorString(cleanup_sync_error));
     }
     cuda_q1_0_mixed_profile_finalize(cleanup_sync_error);
+    cuda_g132_cpu_lane_release();
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -34059,12 +34147,649 @@ static int cuda_iq1_mixed_debug_output(
     return nonfinite == 0u;
 }
 
+static float cuda_g132_f16_to_f32(uint16_t h) {
+    const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x03ffu;
+    uint32_t bits = 0;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign;
+        } else {
+            exp = 1u;
+            while ((mant & 0x0400u) == 0u) {
+                mant <<= 1u;
+                exp--;
+            }
+            mant &= 0x03ffu;
+            bits = sign | ((exp + 127u - 15u) << 23u) | (mant << 13u);
+        }
+    } else if (exp == 31u) {
+        bits = sign | 0x7f800000u | (mant << 13u);
+    } else {
+        bits = sign | ((exp + 127u - 15u) << 23u) | (mant << 13u);
+    }
+    float value = 0.0f;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static int32_t cuda_g132_dot_iq2_pair_16(
+        const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < 8u; i++) sum += (int32_t)grid0[i] * q8[i];
+    for (uint32_t i = 0; i < 8u; i++) sum += (int32_t)grid1[i] * q8[8u + i];
+    return sum;
+}
+
+static int32_t cuda_g132_dot_q2_16(
+        const uint8_t *q2, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < 16u; i++) {
+        sum += (int32_t)((q2[i] >> shift) & 3u) * q8[i];
+    }
+    return sum;
+}
+
+static int cuda_g132_quantize_row_q8_K(
+        const float *x, cuda_block_q8_K *y, uint32_t count) {
+    if (!x || !y || count == 0u || count % CUDA_QK_K != 0u) return 0;
+    const uint32_t blocks = count / CUDA_QK_K;
+    for (uint32_t b = 0; b < blocks; b++) {
+        float signed_max = 0.0f;
+        float abs_max = 0.0f;
+        for (uint32_t j = 0; j < CUDA_QK_K; j++) {
+            const float ax = fabsf(x[j]);
+            if (ax > abs_max) {
+                abs_max = ax;
+                signed_max = x[j];
+            }
+        }
+        if (abs_max == 0.0f) {
+            y[b].d = 0.0f;
+            memset(y[b].qs, 0, sizeof(y[b].qs));
+            memset(y[b].bsums, 0, sizeof(y[b].bsums));
+            x += CUDA_QK_K;
+            continue;
+        }
+        const float inverse_scale = -127.0f / signed_max;
+        for (uint32_t j = 0; j < CUDA_QK_K; j++) {
+            int value = (int)lrintf(inverse_scale * x[j]);
+            if (value > 127) value = 127;
+            if (value < -128) value = -128;
+            y[b].qs[j] = (int8_t)value;
+        }
+        for (uint32_t j = 0; j < CUDA_QK_K / 16u; j++) {
+            int sum = 0;
+            for (uint32_t i = 0; i < 16u; i++) {
+                sum += y[b].qs[j * 16u + i];
+            }
+            y[b].bsums[j] = (int16_t)sum;
+        }
+        y[b].d = 1.0f / inverse_scale;
+        x += CUDA_QK_K;
+    }
+    return 1;
+}
+
+static float cuda_g132_dot_iq2_xxs_q8_K(
+        uint32_t count,
+        const cuda_block_iq2_xxs *x,
+        const cuda_block_q8_K *y) {
+    const uint32_t blocks = count / CUDA_QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < blocks; i++) {
+        const float d = cuda_g132_f16_to_f32(x[i].d) * y[i].d;
+        const uint16_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        int32_t block_sum = 0;
+        for (uint32_t ib32 = 0; ib32 < CUDA_QK_K / 32u; ib32++) {
+            uint32_t aux32[2];
+            memcpy(aux32, q2, sizeof(aux32));
+            const uint8_t *aux8 = (const uint8_t *)aux32;
+            q2 += 4;
+            const int32_t level_scale = (int32_t)(2u * (aux32[1] >> 28u) + 1u);
+            int32_t sumi = 0;
+            for (uint32_t l = 0; l < 4u; l += 2u) {
+                const uint32_t sign0 = (aux32[1] >> (7u * l)) & 127u;
+                const uint32_t sign1 = (aux32[1] >> (7u * (l + 1u))) & 127u;
+                sumi += cuda_g132_dot_iq2_pair_16(
+                    g_g132_iq2xxs_signed_grid[aux8[l]][sign0],
+                    g_g132_iq2xxs_signed_grid[aux8[l + 1u]][sign1], q8);
+                q8 += 16;
+            }
+            block_sum += sumi * level_scale;
+        }
+        sumf += d * (float)block_sum;
+    }
+    return 0.125f * sumf;
+}
+
+static float cuda_g132_dot_q2_K_q8_K(
+        uint32_t count,
+        const cuda_block_q2_K *x,
+        const cuda_block_q8_K *y) {
+    const uint32_t blocks = count / CUDA_QK_K;
+    float sumf = 0.0f;
+    for (uint32_t i = 0; i < blocks; i++) {
+        const uint8_t *q2 = x[i].qs;
+        const int8_t *q8 = y[i].qs;
+        const uint8_t *scales = x[i].scales;
+        int min_sum = 0;
+        for (uint32_t j = 0; j < 16u; j++) {
+            min_sum += y[i].bsums[j] * (scales[j] >> 4u);
+        }
+        const float dall = y[i].d * cuda_g132_f16_to_f32(x[i].d);
+        const float dmin = y[i].d * cuda_g132_f16_to_f32(x[i].dmin);
+        int isum = 0;
+        uint32_t scale_index = 0;
+        for (uint32_t k = 0; k < CUDA_QK_K / 128u; k++) {
+            int shift = 0;
+            for (uint32_t j = 0; j < 4u; j++) {
+                int scale = scales[scale_index++] & 0x0f;
+                isum += scale * cuda_g132_dot_q2_16(q2, q8, shift);
+                scale = scales[scale_index++] & 0x0f;
+                isum += scale * cuda_g132_dot_q2_16(q2 + 16u, q8 + 16u, shift);
+                shift += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+        sumf += dall * (float)isum - dmin * (float)min_sum;
+    }
+    return sumf;
+}
+
+static int cuda_g132_cpu_lane_forward(
+        cuda_g132_cpu_lane_worker *worker, uint32_t job) {
+    cuda_g132_cpu_lane &lane = *worker->lane;
+    if (job >= lane.job_count || !lane.host_input ||
+        worker->output.size() != lane.out_dim ||
+        worker->mid.size() != lane.expert_mid_dim ||
+        worker->xq.size() != lane.expert_in_dim / CUDA_QK_K ||
+        worker->midq.size() != lane.expert_mid_dim / CUDA_QK_K) {
+        return 0;
+    }
+    if (!cuda_g132_quantize_row_q8_K(
+            lane.host_input, worker->xq.data(), lane.expert_in_dim)) {
+        return 0;
+    }
+    const char *gate_base = lane.gate_ptrs[job];
+    const char *up_base = lane.up_ptrs[job];
+    const char *down_base = lane.down_ptrs[job];
+    for (uint32_t row = 0; row < lane.expert_mid_dim; row++) {
+        const cuda_block_iq2_xxs *gate =
+            (const cuda_block_iq2_xxs *)(gate_base + row * lane.gate_row_bytes);
+        const cuda_block_iq2_xxs *up =
+            (const cuda_block_iq2_xxs *)(up_base + row * lane.gate_row_bytes);
+        float gate_value = cuda_g132_dot_iq2_xxs_q8_K(
+            lane.expert_in_dim, gate, worker->xq.data());
+        float up_value = cuda_g132_dot_iq2_xxs_q8_K(
+            lane.expert_in_dim, up, worker->xq.data());
+        if (lane.clamp > 1.0e-6f) {
+            if (gate_value > lane.clamp) gate_value = lane.clamp;
+            if (up_value > lane.clamp) up_value = lane.clamp;
+            if (up_value < -lane.clamp) up_value = -lane.clamp;
+        }
+        worker->mid[row] =
+            (gate_value / (1.0f + expf(-gate_value))) * up_value;
+    }
+    if (!cuda_g132_quantize_row_q8_K(
+            worker->mid.data(), worker->midq.data(), lane.expert_mid_dim)) {
+        return 0;
+    }
+    for (uint32_t row = 0; row < lane.out_dim; row++) {
+        const cuda_block_q2_K *down = (const cuda_block_q2_K *)(
+            down_base + row * lane.down_row_bytes);
+        worker->output[row] = cuda_g132_dot_q2_K_q8_K(
+            lane.expert_mid_dim, down, worker->midq.data());
+    }
+    /* Keep one output per route. The dispatcher reduces them in route order
+     * with the router weights, then performs one 16 KiB H2D for the layer. */
+    memcpy(lane.route_outputs.data() + (uint64_t)job * lane.out_dim,
+           worker->output.data(), (size_t)lane.out_dim * sizeof(float));
+    return 1;
+}
+
+static void *cuda_g132_cpu_lane_worker_main(void *arg) {
+    cuda_g132_cpu_lane_worker *worker = (cuda_g132_cpu_lane_worker *)arg;
+    cuda_g132_cpu_lane &lane = *worker->lane;
+    for (;;) {
+        os_mutex_lock(&lane.mutex);
+        while (!lane.stop &&
+               (!lane.job_active || !lane.input_ready ||
+                lane.next_job >= lane.job_count)) {
+            (void)os_cond_wait(&lane.work_cond, &lane.mutex);
+        }
+        if (lane.stop) {
+            os_mutex_unlock(&lane.mutex);
+            break;
+        }
+        const uint32_t job = lane.next_job++;
+        os_mutex_unlock(&lane.mutex);
+
+        const int ok = cuda_g132_cpu_lane_forward(worker, job);
+
+        os_mutex_lock(&lane.mutex);
+        if (!ok) lane.job_failed = 1;
+        lane.completed_jobs++;
+        if (lane.completed_jobs == lane.job_count) {
+            lane.cpu_finished = cuda_wall_sec();
+            os_cond_signal(&lane.done_cond);
+        }
+        os_mutex_unlock(&lane.mutex);
+    }
+    return NULL;
+}
+
+static void CUDART_CB cuda_g132_cpu_lane_input_ready_callback(void *arg) {
+    cuda_g132_cpu_lane *lane = (cuda_g132_cpu_lane *)arg;
+    os_mutex_lock(&lane->mutex);
+    if (lane->job_active) {
+        lane->cpu_started = cuda_wall_sec();
+        lane->input_ready = 1;
+        os_cond_broadcast(&lane->work_cond);
+    }
+    os_mutex_unlock(&lane->mutex);
+}
+
+static int cuda_g132_cpu_lane_init(void) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    const char *env = getenv("DS4_G132_CPU_LANE");
+    cudaError_t error = cudaSuccess;
+    lane.requested = env && strcmp(env, "1") == 0;
+    if (!lane.requested || lane.ready) return 1;
+    lane.stop = 0;
+
+    if (os_mutex_init(&lane.mutex) != 0) goto fail;
+    lane.mutex_ready = 1;
+    if (os_cond_init(&lane.work_cond) != 0) goto fail;
+    lane.work_cond_ready = 1;
+    if (os_cond_init(&lane.done_cond) != 0) goto fail;
+    lane.done_cond_ready = 1;
+
+    error = cudaMemcpyFromSymbol(
+        g_g132_iq2xxs_grid, cuda_iq2xxs_grid, sizeof(g_g132_iq2xxs_grid));
+    if (error != cudaSuccess) goto cuda_fail;
+    for (uint32_t grid = 0; grid < 256u; grid++) {
+        const uint8_t *values = (const uint8_t *)&g_g132_iq2xxs_grid[grid];
+        for (uint32_t sign_index = 0; sign_index < 128u; sign_index++) {
+            uint8_t parity = 0;
+            for (uint32_t bit = 0; bit < 7u; bit++) {
+                parity ^= (uint8_t)((sign_index >> bit) & 1u);
+            }
+            const uint8_t signs = (uint8_t)(sign_index | (parity << 7u));
+            for (uint32_t j = 0; j < 8u; j++) {
+                const int value = values[j];
+                g_g132_iq2xxs_signed_grid[grid][sign_index][j] =
+                    (int8_t)((signs & (1u << j)) ? -value : value);
+            }
+        }
+    }
+    error = cudaStreamCreateWithFlags(&lane.bridge_stream, cudaStreamNonBlocking);
+    if (error != cudaSuccess) goto cuda_fail;
+    error = cudaEventCreateWithFlags(
+        &lane.input_source_ready, cudaEventDisableTiming);
+    if (error != cudaSuccess) goto cuda_fail;
+    error = cudaEventCreateWithFlags(&lane.input_copy_done, cudaEventDisableTiming);
+    if (error != cudaSuccess) goto cuda_fail;
+    error = cudaEventCreateWithFlags(&lane.partial_copy_done, cudaEventDisableTiming);
+    if (error != cudaSuccess) goto cuda_fail;
+    error = cudaHostAlloc((void **)&lane.host_input,
+                          4096u * sizeof(float), cudaHostAllocDefault);
+    if (error != cudaSuccess) goto cuda_fail;
+    error = cudaHostAlloc((void **)&lane.host_partial,
+                          4096u * sizeof(float), cudaHostAllocDefault);
+    if (error != cudaSuccess) goto cuda_fail;
+    error = cudaMalloc((void **)&lane.device_partial, 4096u * sizeof(float));
+    if (error != cudaSuccess) goto cuda_fail;
+
+    {
+        const long cores = os_cpu_count();
+        lane.worker_count = cores > 2 ? (uint32_t)(cores - 2) : 1u;
+        if (lane.worker_count > CUDA_G132_CPU_LANE_MAX_WORKERS) {
+            lane.worker_count = CUDA_G132_CPU_LANE_MAX_WORKERS;
+        }
+    }
+    for (uint32_t i = 0; i < lane.worker_count; i++) {
+        lane.workers[i].lane = &lane;
+        lane.workers[i].index = i;
+        if (os_thread_create(&lane.threads[i],
+                             cuda_g132_cpu_lane_worker_main,
+                             &lane.workers[i]) != 0) {
+            goto fail;
+        }
+        lane.threads_started++;
+    }
+    lane.ready = 1;
+    fprintf(stderr,
+            "ds4: [g132-cpu-lane] result=ready workers=%u queue_capacity=%u "
+            "input_bytes=%u partial_bytes=%u source=mmap\n",
+            lane.worker_count, CUDA_G132_CPU_LANE_MAX_ROUTES,
+            4096u * (unsigned)sizeof(float), 4096u * (unsigned)sizeof(float));
+    return 1;
+
+cuda_fail:
+    fprintf(stderr, "ds4: [g132-cpu-lane] result=fail-open cuda_error=%s\n",
+            cudaGetErrorString(error));
+    (void)cudaGetLastError();
+fail:
+    lane.failures++;
+    lane.failed_open = 1;
+    cuda_g132_cpu_lane_release();
+    lane.requested = 1;
+    lane.failed_open = 1;
+    return 1;
+}
+
+static void cuda_g132_cpu_lane_release(void) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    if (lane.mutex_ready) {
+        os_mutex_lock(&lane.mutex);
+        lane.stop = 1;
+        if (lane.work_cond_ready) os_cond_broadcast(&lane.work_cond);
+        os_mutex_unlock(&lane.mutex);
+    }
+    for (uint32_t i = 0; i < lane.threads_started; i++) {
+        os_thread_join(lane.threads[i]);
+    }
+    if (lane.requested && cuda_q1_0_profile_requested()) {
+        fprintf(stderr,
+                "ds4: [g132-cpu-lane] result=summary routes=%llu "
+                "overflow_q1_routes=%llu input_d2h_bytes=%llu "
+                "partial_h2d_bytes=%llu failures=%llu\n",
+                (unsigned long long)lane.routes,
+                (unsigned long long)lane.overflow_routes,
+                (unsigned long long)lane.input_d2h_bytes,
+                (unsigned long long)lane.partial_h2d_bytes,
+                (unsigned long long)lane.failures);
+        for (uint32_t layer = 0; layer < CUDA_G132_CPU_LANE_LAYER_COUNT; layer++) {
+            if (lane.layer_calls[layer] == 0u) continue;
+            fprintf(stderr,
+                    "ds4: [g132-cpu-lane-layer] layer=%u calls=%llu routes=%llu "
+                    "cpu_seconds=%.9f join_wait_seconds=%.9f\n",
+                    layer,
+                    (unsigned long long)lane.layer_calls[layer],
+                    (unsigned long long)lane.layer_routes[layer],
+                    lane.layer_cpu_seconds[layer],
+                    lane.layer_join_wait_seconds[layer]);
+        }
+    }
+    if (lane.device_partial) (void)cudaFree(lane.device_partial);
+    if (lane.host_partial) (void)cudaFreeHost(lane.host_partial);
+    if (lane.host_input) (void)cudaFreeHost(lane.host_input);
+    if (lane.partial_copy_done) (void)cudaEventDestroy(lane.partial_copy_done);
+    if (lane.input_copy_done) (void)cudaEventDestroy(lane.input_copy_done);
+    if (lane.input_source_ready) (void)cudaEventDestroy(lane.input_source_ready);
+    if (lane.bridge_stream) (void)cudaStreamDestroy(lane.bridge_stream);
+    lane.device_partial = NULL;
+    lane.host_partial = NULL;
+    lane.host_input = NULL;
+    lane.partial_copy_done = NULL;
+    lane.input_copy_done = NULL;
+    lane.input_source_ready = NULL;
+    lane.bridge_stream = NULL;
+    lane.route_outputs.clear();
+    for (uint32_t i = 0; i < CUDA_G132_CPU_LANE_MAX_WORKERS; i++) {
+        lane.workers[i].output.clear();
+        lane.workers[i].mid.clear();
+        lane.workers[i].xq.clear();
+        lane.workers[i].midq.clear();
+    }
+    if (lane.done_cond_ready) os_cond_destroy(&lane.done_cond);
+    if (lane.work_cond_ready) os_cond_destroy(&lane.work_cond);
+    if (lane.mutex_ready) os_mutex_destroy(&lane.mutex);
+    lane.ready = 0;
+    lane.mutex_ready = 0;
+    lane.work_cond_ready = 0;
+    lane.done_cond_ready = 0;
+    lane.threads_started = 0;
+    lane.worker_count = 0;
+}
+
+static int cuda_g132_cpu_lane_requested(void) {
+    return g_g132_cpu_lane.requested && g_g132_cpu_lane.ready &&
+           !g_g132_cpu_lane.failed_open;
+}
+
+static int cuda_g132_cpu_lane_source_ptr(
+        const void *model_map, uint64_t model_size,
+        uint64_t base_offset, uint64_t expert_bytes,
+        uint32_t expert, const char **result) {
+    if (!result || model_map != g_model_host_base ||
+        model_size != g_model_registered_size || expert >= 256u ||
+        expert_bytes == 0u || expert_bytes > UINT64_MAX / 256u) {
+        return 0;
+    }
+    const uint64_t expert_offset = (uint64_t)expert * expert_bytes;
+    if (base_offset > model_size || expert_offset > model_size - base_offset ||
+        expert_bytes > model_size - base_offset - expert_offset) {
+        return 0;
+    }
+    /* This is the same tensor-offset arithmetic used by selected-load, but
+     * the CPU consumes the existing main-model mmap directly. */
+    *result = (const char *)model_map + base_offset + expert_offset;
+    return 1;
+}
+
+static int cuda_g132_cpu_lane_prepare_dispatch(
+        const void *model_map, uint64_t model_size, uint32_t layer_index,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const int32_t *experts, const float *weights, uint32_t count,
+        float clamp) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    const uint64_t expected_gate_row =
+        (uint64_t)(expert_in_dim / CUDA_QK_K) * sizeof(cuda_block_iq2_xxs);
+    const uint64_t expected_down_row =
+        (uint64_t)(expert_mid_dim / CUDA_QK_K) * sizeof(cuda_block_q2_K);
+    if (!cuda_g132_cpu_lane_requested() || !experts || !weights ||
+        count == 0u || count > CUDA_G132_CPU_LANE_MAX_ROUTES ||
+        layer_index >= CUDA_G132_CPU_LANE_LAYER_COUNT ||
+        expert_in_dim != 4096u || out_dim != 4096u ||
+        expert_mid_dim == 0u || expert_mid_dim % CUDA_QK_K != 0u ||
+        gate_row_bytes != expected_gate_row ||
+        down_row_bytes != expected_down_row ||
+        gate_expert_bytes < gate_row_bytes * expert_mid_dim ||
+        down_expert_bytes < down_row_bytes * out_dim) {
+        return 0;
+    }
+    for (uint32_t job = 0; job < count; job++) {
+        if (experts[job] < 0 || experts[job] >= 256 ||
+            !std::isfinite(weights[job]) ||
+            !cuda_g132_cpu_lane_source_ptr(
+                model_map, model_size, gate_offset, gate_expert_bytes,
+                (uint32_t)experts[job], &lane.gate_ptrs[job]) ||
+            !cuda_g132_cpu_lane_source_ptr(
+                model_map, model_size, up_offset, gate_expert_bytes,
+                (uint32_t)experts[job], &lane.up_ptrs[job]) ||
+            !cuda_g132_cpu_lane_source_ptr(
+                model_map, model_size, down_offset, down_expert_bytes,
+                (uint32_t)experts[job], &lane.down_ptrs[job])) {
+            return 0;
+        }
+    }
+    os_mutex_lock(&lane.mutex);
+    if (lane.job_active) {
+        os_mutex_unlock(&lane.mutex);
+        return 0;
+    }
+    try {
+        lane.route_outputs.resize((uint64_t)count * out_dim);
+        for (uint32_t i = 0; i < lane.worker_count; i++) {
+            lane.workers[i].output.resize(out_dim);
+            lane.workers[i].mid.resize(expert_mid_dim);
+            lane.workers[i].xq.resize(expert_in_dim / CUDA_QK_K);
+            lane.workers[i].midq.resize(expert_mid_dim / CUDA_QK_K);
+        }
+    } catch (...) {
+        os_mutex_unlock(&lane.mutex);
+        lane.failures++;
+        return 0;
+    }
+    memcpy(lane.expert_ids, experts, (size_t)count * sizeof(experts[0]));
+    memcpy(lane.route_weights, weights, (size_t)count * sizeof(weights[0]));
+    lane.gate_row_bytes = gate_row_bytes;
+    lane.down_row_bytes = down_row_bytes;
+    lane.expert_in_dim = expert_in_dim;
+    lane.expert_mid_dim = expert_mid_dim;
+    lane.out_dim = out_dim;
+    lane.layer_index = layer_index;
+    lane.job_count = count;
+    lane.next_job = 0;
+    lane.completed_jobs = 0;
+    lane.clamp = clamp;
+    lane.input_ready = 0;
+    lane.job_failed = 0;
+    lane.cpu_started = 0.0;
+    lane.cpu_finished = 0.0;
+    lane.generation++;
+    if (lane.generation == 0u) lane.generation++;
+    lane.job_active = 1;
+    os_mutex_unlock(&lane.mutex);
+    return 1;
+}
+
+static void cuda_g132_cpu_lane_cancel_dispatch(void) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    if (!lane.mutex_ready) return;
+    os_mutex_lock(&lane.mutex);
+    if (lane.job_active && !lane.input_ready) {
+        lane.job_active = 0;
+        lane.job_count = 0;
+    }
+    os_mutex_unlock(&lane.mutex);
+}
+
+static int cuda_g132_cpu_lane_record_input_source(void) {
+    /* Record before hot launch. The bridge stream waits on this point, so its
+     * D2H overlaps hot work instead of waiting for hot completion. */
+    return cuda_ok(cudaEventRecord(g_g132_cpu_lane.input_source_ready, 0),
+                   "G132 CPU lane input source event");
+}
+
+static int cuda_g132_cpu_lane_enqueue_input(const ds4_gpu_tensor *input) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    const size_t bytes = (size_t)lane.expert_in_dim * sizeof(float);
+    if (!input || !input->ptr || input->bytes < bytes ||
+        !cuda_ok(cudaStreamWaitEvent(
+                     lane.bridge_stream, lane.input_source_ready, 0),
+                 "G132 CPU lane input wait") ||
+        !cuda_ok(cudaMemcpyAsync(
+                     lane.host_input, input->ptr, bytes,
+                     cudaMemcpyDeviceToHost, lane.bridge_stream),
+                 "G132 CPU lane input D2H") ||
+        !cuda_ok(cudaEventRecord(lane.input_copy_done, lane.bridge_stream),
+                 "G132 CPU lane input copy event") ||
+        !cuda_ok(cudaLaunchHostFunc(
+                     lane.bridge_stream,
+                     cuda_g132_cpu_lane_input_ready_callback, &lane),
+                 "G132 CPU lane input callback")) {
+        (void)cudaStreamSynchronize(lane.bridge_stream);
+        cuda_g132_cpu_lane_cancel_dispatch();
+        lane.failures++;
+        return 0;
+    }
+    lane.input_d2h_bytes += bytes;
+    return 1;
+}
+
+static int cuda_g132_cpu_lane_wait_and_join(
+        ds4_gpu_tensor *out, uint32_t layer_index,
+        const float **captured_input) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    const double wait_started = cuda_wall_sec();
+    os_mutex_lock(&lane.mutex);
+    while (lane.job_active && lane.completed_jobs < lane.job_count) {
+        (void)os_cond_wait(&lane.done_cond, &lane.mutex);
+    }
+    const double wait_finished = cuda_wall_sec();
+    const uint32_t count = lane.job_count;
+    const int failed = lane.job_failed || count == 0u;
+    if (!failed) {
+        memset(lane.host_partial, 0, (size_t)lane.out_dim * sizeof(float));
+        for (uint32_t job = 0; job < count; job++) {
+            const float *route = lane.route_outputs.data() +
+                (uint64_t)job * lane.out_dim;
+            const float weight = lane.route_weights[job];
+            for (uint32_t i = 0; i < lane.out_dim; i++) {
+                lane.host_partial[i] += weight * route[i];
+            }
+        }
+    }
+    const double cpu_seconds = lane.cpu_finished >= lane.cpu_started
+        ? lane.cpu_finished - lane.cpu_started : 0.0;
+    lane.job_active = 0;
+    lane.input_ready = 0;
+    os_cond_broadcast(&lane.work_cond);
+    os_mutex_unlock(&lane.mutex);
+    if (failed) {
+        return 0;
+    }
+
+    const size_t bytes = (size_t)lane.out_dim * sizeof(float);
+    if (!cuda_ok(cudaMemcpyAsync(
+                     lane.device_partial, lane.host_partial, bytes,
+                     cudaMemcpyHostToDevice, lane.bridge_stream),
+                 "G132 CPU lane partial H2D") ||
+        !cuda_ok(cudaEventRecord(lane.partial_copy_done, lane.bridge_stream),
+                 "G132 CPU lane partial event") ||
+        !cuda_ok(cudaStreamWaitEvent(0, lane.partial_copy_done, 0),
+                 "G132 CPU lane join wait")) {
+        return 0;
+    }
+    /* Stream 0 already contains the hot (and any overflow-Q1) accumulation;
+     * the event wait publishes the one CPU partial after those writes. */
+    add_f32_u64_kernel<<<(lane.out_dim + 255u) / 256u, 256>>>(
+        (float *)out->ptr, (const float *)out->ptr,
+        lane.device_partial, lane.out_dim);
+    if (!cuda_ok(cudaGetLastError(), "G132 CPU lane output join")) {
+        return 0;
+    }
+    lane.routes += count;
+    lane.partial_h2d_bytes += bytes;
+    if (layer_index < CUDA_G132_CPU_LANE_LAYER_COUNT) {
+        lane.layer_calls[layer_index]++;
+        lane.layer_routes[layer_index] += count;
+        lane.layer_cpu_seconds[layer_index] += cpu_seconds;
+        lane.layer_join_wait_seconds[layer_index] +=
+            wait_finished - wait_started;
+    }
+    if (cuda_q1_0_profile_requested()) {
+        fprintf(stderr,
+                "ds4: [g132-cpu-lane-layer] layer=%u routes=%u "
+                "cpu_ms=%.6f join_wait_ms=%.6f\n",
+                layer_index, count, cpu_seconds * 1000.0,
+                (wait_finished - wait_started) * 1000.0);
+    }
+    if (captured_input) *captured_input = lane.host_input;
+    return 1;
+}
+
+static void cuda_g132_cpu_lane_discard_dispatch(void) {
+    cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+    if (!lane.mutex_ready) return;
+    os_mutex_lock(&lane.mutex);
+    while (lane.job_active && lane.input_ready &&
+           lane.completed_jobs < lane.job_count) {
+        (void)os_cond_wait(&lane.done_cond, &lane.mutex);
+    }
+    lane.job_active = 0;
+    lane.input_ready = 0;
+    lane.job_count = 0;
+    os_cond_broadcast(&lane.work_cond);
+    os_mutex_unlock(&lane.mutex);
+}
+
 enum cuda_q1_0_mixed_representation : uint8_t {
     CUDA_Q1_0_MIXED_UNKNOWN = 0,
     CUDA_Q1_0_MIXED_IQ2_VRAM = 1,
     CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM = 2,
     CUDA_Q1_0_MIXED_IQ2_TIER_RAM = 3,
     CUDA_Q1_0_MIXED_Q1_RESIDENT = 4,
+    CUDA_Q1_0_MIXED_IQ2_CPU_EXACT = 5,
 };
 
 static const char *cuda_q1_0_mixed_representation_name(
@@ -34074,6 +34799,7 @@ static const char *cuda_q1_0_mixed_representation_name(
     case CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM: return "iq2_snapshot_ram";
     case CUDA_Q1_0_MIXED_IQ2_TIER_RAM: return "iq2_tier_ram";
     case CUDA_Q1_0_MIXED_Q1_RESIDENT: return "q1_resident";
+    case CUDA_Q1_0_MIXED_IQ2_CPU_EXACT: return "iq2_cpu_exact";
     default: return "unknown";
     }
 }
@@ -34477,8 +35203,11 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     float hot_weights[CUDA_MOE_ROUTE_COUNT] = {0};
     int32_t cold_selected[CUDA_MOE_ROUTE_COUNT] = {0};
     float cold_weights[CUDA_MOE_ROUTE_COUNT] = {0};
+    int32_t cpu_selected[CUDA_G132_CPU_LANE_MAX_ROUTES] = {0};
+    float cpu_weights[CUDA_G132_CPU_LANE_MAX_ROUTES] = {0};
     uint32_t hot_count = 0;
     uint32_t cold_count = 0;
+    uint32_t cpu_count = 0;
     uint32_t iq2_vram = 0;
     uint32_t iq2_snapshot_ram = 0;
     uint32_t iq2_tier_ram = 0;
@@ -34541,6 +35270,14 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             representation = cuda_q1_0_mixed_resolve(
                 layer_index, (uint32_t)expert_i);
         }
+        if (representation == CUDA_Q1_0_MIXED_Q1_RESIDENT &&
+            cuda_g132_cpu_lane_requested()) {
+            if (cpu_count < CUDA_G132_CPU_LANE_MAX_ROUTES) {
+                representation = CUDA_Q1_0_MIXED_IQ2_CPU_EXACT;
+            } else {
+                g_g132_cpu_lane.overflow_routes++;
+            }
+        }
         const cuda_moe_tier_entry *tier =
             g_moe_tiering.entries.size() ==
                     (size_t)CUDA_MOE_LAYER_COUNT * 256u
@@ -34585,6 +35322,10 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 representation == CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM;
             iq2_tier_ram +=
                 representation == CUDA_Q1_0_MIXED_IQ2_TIER_RAM;
+        } else if (representation == CUDA_Q1_0_MIXED_IQ2_CPU_EXACT) {
+            cpu_selected[cpu_count] = expert_i;
+            cpu_weights[cpu_count] = weights_host[route];
+            cpu_count++;
         } else if (representation == CUDA_Q1_0_MIXED_Q1_RESIDENT) {
             cold_selected[cold_count] = expert_i;
             cold_weights[cold_count] = weights_host[route];
@@ -34614,18 +35355,19 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     g_q1_0_mixed_tier_route_entries += tier_route_entries;
 
     if (cold_one_requested) {
-        if (hot_count != CUDA_MOE_ROUTE_COUNT - 1u || cold_count != 1u) {
+        if (hot_count != CUDA_MOE_ROUTE_COUNT - 1u ||
+            cold_count + cpu_count != 1u) {
             fprintf(stderr,
                     "ds4: [q1-0-mixed] result=failed "
-                    "reason=cold-one-count layer=%u hot=%u q1=%u\n",
-                    layer_index, hot_count, cold_count);
+                    "reason=cold-one-count layer=%u hot=%u q1=%u cpu=%u\n",
+                    layer_index, hot_count, cold_count, cpu_count);
             g_q1_0_mixed_cold_one_invariant_failures++;
             g_q1_0_mixed_failures++;
             return 0;
         }
         g_q1_0_mixed_cold_one_calls++;
         g_q1_0_mixed_cold_one_hot_routes += hot_count;
-        g_q1_0_mixed_cold_one_q1_routes += cold_count;
+        g_q1_0_mixed_cold_one_q1_routes += cold_count + cpu_count;
     }
 
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
@@ -34643,7 +35385,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         mixed_profile_phase_started = classify_finished;
     }
 
-    if (cold_count == 0u) {
+    if (cold_count == 0u && cpu_count == 0u) {
         const double hot_branch_started = mixed_profile
             ? mixed_profile_phase_started : 0.0;
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
@@ -34689,7 +35431,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 layer_index, g_expert_recovery_trace.target_expert,
                 recovery_trace_rank, recovery_trace_weight,
                 recovery_trace_representation, recovery_trace_token_index,
-                g_moe_tiering.call_tick, x, expert_in_dim)) {
+                g_moe_tiering.call_tick, x, expert_in_dim, NULL)) {
             g_q1_0_mixed_failures++;
             return 0;
         }
@@ -34709,6 +35451,37 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     const uint64_t iq2_ssd_bytes_before = g_moe_tiering.ssd_bytes;
     const uint64_t iq2_cold_to_ram_before = g_moe_tiering.cold_to_ram;
 
+    int cpu_lane_active = 0;
+    if (cpu_count != 0u) {
+        cpu_lane_active = cuda_g132_cpu_lane_prepare_dispatch(
+            main_model_map, main_model_size, layer_index,
+            main_gate_offset, main_up_offset, main_down_offset,
+            main_gate_expert_bytes, main_gate_row_bytes,
+            main_down_expert_bytes, main_down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            cpu_selected, cpu_weights, cpu_count, clamp) &&
+            cuda_g132_cpu_lane_record_input_source();
+        if (!cpu_lane_active) {
+            cuda_g132_cpu_lane_cancel_dispatch();
+            g_g132_cpu_lane.failures++;
+            fprintf(stderr,
+                    "ds4: [g132-cpu-lane] result=fail-open layer=%u "
+                    "routes=%u fallback=q1\n",
+                    layer_index, cpu_count);
+            for (uint32_t route = 0; route < cpu_count; route++) {
+                cold_selected[cold_count] = cpu_selected[route];
+                cold_weights[cold_count] = cpu_weights[route];
+                cold_count++;
+            }
+            if (recovery_trace_representation &&
+                strcmp(recovery_trace_representation, "iq2_cpu_exact") == 0) {
+                recovery_trace_representation = "q1_resident";
+            }
+            cpu_count = 0;
+        }
+    }
+    const uint32_t fallback_route_count = cold_count + cpu_count;
+
     const uint64_t max_routes = CUDA_MOE_ROUTE_COUNT;
     const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
     const uint64_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -34723,11 +35496,12 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     const uint64_t off_cold_out = cuda_round_up(
         off_cold_weights + max_routes * sizeof(float), 256u);
     const uint64_t cold_down_bytes = std::max(
-        (uint64_t)cold_count * out_bytes, xq_bytes);
+        (uint64_t)fallback_route_count * out_bytes, xq_bytes);
     const uint64_t off_cold_down = cuda_round_up(
         off_cold_out + out_bytes, 256u);
     if (cold_down_bytes > UINT64_MAX - off_cold_down ||
         !cuda_iq1_mixed_scratch_ensure(off_cold_down + cold_down_bytes)) {
+        if (cpu_lane_active) cuda_g132_cpu_lane_cancel_dispatch();
         fprintf(stderr,
                 "ds4: [q1-0-mixed] result=failed reason=scratch "
                 "layer=%u requested=%llu cold_down=%llu\n",
@@ -34783,6 +35557,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     }
 #endif
     if (!metadata_h2d_ok) {
+        if (cpu_lane_active) cuda_g132_cpu_lane_cancel_dispatch();
         g_q1_0_mixed_failures++;
         return 0;
     }
@@ -34832,16 +35607,49 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                      "Q1_0 mixed empty IQ2 output");
     }
     if (!ok) {
+        if (cpu_lane_active) {
+            (void)cudaStreamSynchronize(g_g132_cpu_lane.bridge_stream);
+            cuda_g132_cpu_lane_cancel_dispatch();
+        }
         fprintf(stderr,
                 "ds4: [q1-0-mixed] result=failed reason=iq2-hot-launch "
                 "layer=%u hot=%u\n", layer_index, hot_count);
         g_q1_0_mixed_failures++;
         return 0;
     }
+    if (cpu_lane_active && !cuda_g132_cpu_lane_enqueue_input(x)) {
+        fprintf(stderr,
+                "ds4: [g132-cpu-lane] result=fail-open layer=%u "
+                "routes=%u reason=input-d2h fallback=q1\n",
+                layer_index, cpu_count);
+        for (uint32_t route = 0; route < cpu_count; route++) {
+            cold_selected[cold_count] = cpu_selected[route];
+            cold_weights[cold_count] = cpu_weights[route];
+            cold_count++;
+        }
+        cpu_count = 0;
+        cpu_lane_active = 0;
+        if (recovery_trace_representation &&
+            strcmp(recovery_trace_representation, "iq2_cpu_exact") == 0) {
+            recovery_trace_representation = "q1_resident";
+        }
+        if (!cuda_ok(cudaMemcpy(device_cold_selected, cold_selected,
+                                (size_t)cold_count * sizeof(int32_t),
+                                cudaMemcpyHostToDevice),
+                     "G132 fail-open cold selected H2D") ||
+            !cuda_ok(cudaMemcpy(device_cold_weights, cold_weights,
+                                (size_t)cold_count * sizeof(float),
+                                cudaMemcpyHostToDevice),
+                     "G132 fail-open cold weights H2D")) {
+            g_q1_0_mixed_failures++;
+            return 0;
+        }
+    }
     const uint64_t iq2_ssd_bytes_after_hot = g_moe_tiering.ssd_bytes;
     const uint64_t iq2_cold_to_ram_after_hot = g_moe_tiering.cold_to_ram;
     if (iq2_ssd_bytes_after_hot != iq2_ssd_bytes_before ||
         iq2_cold_to_ram_after_hot != iq2_cold_to_ram_before) {
+        if (cpu_lane_active) cuda_g132_cpu_lane_discard_dispatch();
         const uint64_t delta = iq2_ssd_bytes_after_hot >= iq2_ssd_bytes_before
             ? iq2_ssd_bytes_after_hot - iq2_ssd_bytes_before : 0;
         g_q1_0_mixed_iq2_ssd_bytes += delta;
@@ -34875,11 +35683,16 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 g_moe_tiering.calls++;
             }
         }
-        g_moe_tiering.selected += cold_count;
+        g_moe_tiering.selected += cold_count + cpu_count;
         for (uint32_t route = 0; route < cold_count; route++) {
             (void)cuda_moe_tiering_observe_route(
                 layer_index, (uint32_t)cold_selected[route],
                 cold_weights[route]);
+        }
+        for (uint32_t route = 0; route < cpu_count; route++) {
+            (void)cuda_moe_tiering_observe_route(
+                layer_index, (uint32_t)cpu_selected[route],
+                cpu_weights[route]);
         }
     }
     if (mixed_profile) {
@@ -34914,21 +35727,24 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         previous_profile_sample = g_q1_0_mixed_profile_current_sample;
         g_q1_0_mixed_profile_current_sample = &mixed_profile_sample;
     }
-    ok = routed_moe_launch(
-        &cold_out_tensor, gate, up, mid, &cold_down_tensor,
-        q1_model_map, q1_model_size, layer_index,
-        q1_gate_offset, q1_up_offset, q1_down_offset,
-        41u, 41u,
-        q1_gate_expert_bytes, q1_gate_row_bytes,
-        q1_down_expert_bytes, q1_down_row_bytes,
-        expert_in_dim, expert_mid_dim, out_dim,
-        &cold_selected_tensor, &cold_weights_tensor, NULL,
-        cold_count, clamp, x, 1u, NULL, NULL, cold_selected);
+    if (cold_count != 0u) {
+        ok = routed_moe_launch(
+            &cold_out_tensor, gate, up, mid, &cold_down_tensor,
+            q1_model_map, q1_model_size, layer_index,
+            q1_gate_offset, q1_up_offset, q1_down_offset,
+            41u, 41u,
+            q1_gate_expert_bytes, q1_gate_row_bytes,
+            q1_down_expert_bytes, q1_down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            &cold_selected_tensor, &cold_weights_tensor, NULL,
+            cold_count, clamp, x, 1u, NULL, NULL, cold_selected);
+    }
     if (mixed_profile) {
         g_q1_0_mixed_profile_current_sample = previous_profile_sample;
         mixed_profile_phase_started = cuda_wall_sec();
     }
     if (!ok) {
+        if (cpu_lane_active) cuda_g132_cpu_lane_discard_dispatch();
         fprintf(stderr,
                 "ds4: [q1-0-mixed] result=failed reason=q1-cold-launch "
                 "layer=%u q1=%u\n", layer_index, cold_count);
@@ -34959,11 +35775,114 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             attribution_state, CUDA_G130_ATTRIB_MIXED_JOIN);
     }
 #endif
-    add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
-        (float *)out->ptr, (const float *)out->ptr,
-        device_cold_out, out_dim);
-    const int mixed_join_ok =
-        cuda_ok(cudaGetLastError(), "Q1_0 mixed output join");
+    int mixed_join_ok = 1;
+    if (cold_count != 0u) {
+        add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
+            (float *)out->ptr, (const float *)out->ptr,
+            device_cold_out, out_dim);
+        mixed_join_ok =
+            cuda_ok(cudaGetLastError(), "Q1_0 mixed output join");
+    }
+    const float *cpu_captured_input = NULL;
+    if (mixed_join_ok && cpu_lane_active) {
+        const double cpu_join_started = mixed_profile ? cuda_wall_sec() : 0.0;
+        mixed_join_ok = cuda_g132_cpu_lane_wait_and_join(
+            out, layer_index, &cpu_captured_input);
+        if (!mixed_join_ok) {
+            /* The original Q1 routes are already in out. Fence the abandoned
+             * CPU partial, then recompute only the CPU-owned suffix through Q1
+             * so none of those routes are dropped or accumulated twice. */
+            cuda_g132_cpu_lane &lane = g_g132_cpu_lane;
+            lane.failures++;
+            lane.failed_open = 1;
+            cuda_g132_cpu_lane_discard_dispatch();
+            const cudaError_t bridge_fence =
+                cudaStreamSynchronize(lane.bridge_stream);
+            const cudaError_t output_fence = cudaStreamSynchronize(0);
+            if (bridge_fence != cudaSuccess) {
+                (void)cuda_ok(bridge_fence,
+                              "G132 fail-open bridge fence");
+            }
+            if (output_fence != cudaSuccess) {
+                (void)cuda_ok(output_fence,
+                              "G132 fail-open output fence");
+            }
+            (void)cudaGetLastError();
+
+            fprintf(stderr,
+                    "ds4: [g132-cpu-lane] result=fail-open layer=%u "
+                    "routes=%u reason=post-dispatch fallback=q1\n",
+                    layer_index, cpu_count);
+            const uint32_t cpu_q1_offset = cold_count;
+            for (uint32_t route = 0; route < cpu_count; route++) {
+                cold_selected[cold_count] = cpu_selected[route];
+                cold_weights[cold_count] = cpu_weights[route];
+                cold_count++;
+            }
+            if (recovery_trace_representation &&
+                strcmp(recovery_trace_representation,
+                       "iq2_cpu_exact") == 0) {
+                recovery_trace_representation = "q1_resident";
+            }
+            if (!cuda_ok(cudaMemcpy(
+                             device_cold_selected + cpu_q1_offset,
+                             cold_selected + cpu_q1_offset,
+                             (size_t)cpu_count * sizeof(int32_t),
+                             cudaMemcpyHostToDevice),
+                         "G132 post-dispatch cold selected H2D") ||
+                !cuda_ok(cudaMemcpy(
+                             device_cold_weights + cpu_q1_offset,
+                             cold_weights + cpu_q1_offset,
+                             (size_t)cpu_count * sizeof(float),
+                             cudaMemcpyHostToDevice),
+                         "G132 post-dispatch cold weights H2D")) {
+                mixed_join_ok = 0;
+            } else {
+                const ds4_gpu_tensor cpu_q1_selected_tensor = {
+                    device_cold_selected + cpu_q1_offset,
+                    (uint64_t)cpu_count * sizeof(int32_t), 0
+                };
+                const ds4_gpu_tensor cpu_q1_weights_tensor = {
+                    device_cold_weights + cpu_q1_offset,
+                    (uint64_t)cpu_count * sizeof(float), 0
+                };
+                mixed_join_ok = routed_moe_launch(
+                    &cold_out_tensor, gate, up, mid, &cold_down_tensor,
+                    q1_model_map, q1_model_size, layer_index,
+                    q1_gate_offset, q1_up_offset, q1_down_offset,
+                    41u, 41u,
+                    q1_gate_expert_bytes, q1_gate_row_bytes,
+                    q1_down_expert_bytes, q1_down_row_bytes,
+                    expert_in_dim, expert_mid_dim, out_dim,
+                    &cpu_q1_selected_tensor, &cpu_q1_weights_tensor, NULL,
+                    cpu_count, clamp, x, 1u, NULL, NULL,
+                    cold_selected + cpu_q1_offset);
+                if (mixed_join_ok) {
+                    add_f32_u64_kernel<<<
+                        (out_dim + 255u) / 256u, 256>>>(
+                        (float *)out->ptr, (const float *)out->ptr,
+                        device_cold_out, out_dim);
+                    mixed_join_ok = cuda_ok(
+                        cudaGetLastError(),
+                        "G132 post-dispatch Q1 output join");
+                }
+            }
+            cpu_count = 0;
+            cpu_lane_active = 0;
+        }
+        if (mixed_profile && cold_count == 0u) {
+            const double cpu_join_finished = cuda_wall_sec();
+            mixed_profile_sample.q1_entry_calls++;
+            mixed_profile_sample.q1_selected_load_calls++;
+            mixed_profile_sample.q1_prepare_calls++;
+            mixed_profile_sample.q1_kernel_calls++;
+            mixed_profile_sample.q1_kernel_device_calls++;
+            mixed_profile_sample.q1_kernel_fenced_calls++;
+            mixed_profile_sample.q1_kernel_seconds +=
+                cpu_join_finished - cpu_join_started;
+            mixed_profile_phase_started = cpu_join_finished;
+        }
+    }
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     if (attribution) {
         (void)cuda_g130_attribution_switch(
@@ -34971,6 +35890,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     }
 #endif
     if (!mixed_join_ok) {
+        if (cpu_lane_active) cuda_g132_cpu_lane_discard_dispatch();
         if (join_begin) (void)cudaEventDestroy(join_begin);
         if (join_end) (void)cudaEventDestroy(join_end);
         g_q1_0_mixed_failures++;
@@ -35000,7 +35920,8 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             layer_index, g_expert_recovery_trace.target_expert,
             recovery_trace_rank, recovery_trace_weight,
             recovery_trace_representation, recovery_trace_token_index,
-            g_moe_tiering.call_tick, x, expert_in_dim)) {
+            g_moe_tiering.call_tick, x, expert_in_dim,
+            cpu_captured_input)) {
         g_q1_0_mixed_failures++;
         return 0;
     }
@@ -35048,7 +35969,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         cuda_q1_0_mixed_profile_record_completed(
             mixed_profile_sample,
             publish_finished - mixed_profile_call_started,
-            hot_count, cold_count, 1);
+            hot_count, fallback_route_count, 1);
     }
     return 1;
 }
