@@ -28,7 +28,7 @@ typedef struct {
     volatile LONG active;
     volatile LONG cancel_sequence;
 #else
-    int unused;
+    volatile uint32_t cancel_sequence;
 #endif
 } os_pread_cancellable_t;
 

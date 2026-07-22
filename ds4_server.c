@@ -8512,6 +8512,17 @@ static server_config parse_options(int argc, char **argv) {
 #ifndef DS4_SERVER_TEST
 int main(int argc, char **argv) {
     os_console_init();
+    const char *g73_selftest = getenv("DS4_G73_OPEN_SELFTEST");
+    if (g73_selftest && strcmp(g73_selftest, "1") == 0) {
+#ifdef DS4_NO_GPU
+        fprintf(stderr,
+                "ds4: [g73-open-selftest] result=failed reason=no-gpu-build\n");
+        return 1;
+#else
+        return ds4_gpu_g73_open_selftest(argv && argv[0] ? argv[0] : NULL)
+            ? 0 : 1;
+#endif
+    }
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {

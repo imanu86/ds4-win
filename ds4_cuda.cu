@@ -94,6 +94,8 @@ struct cuda_g73_route_outcomes {
     uint64_t served_promoted;
     uint64_t served_selected_fallback;
     uint64_t served_terminal_exact;
+    uint64_t clamped;
+    uint64_t request_refused;
 };
 
 struct ds4_gpu_async_read {
@@ -1357,12 +1359,7 @@ static int g_cuda_g73_open_enabled;
 
 static int cuda_moe_split_hit_miss_requested(void);
 static int cuda_moe_split_fused_requested(void);
-typedef int (*cuda_moe_split_requested_fn)(void);
-static int cuda_moe_split_disabled(void) { return 0; }
-static cuda_moe_split_requested_fn g_cuda_moe_split_hit_miss_dispatch =
-    cuda_moe_split_hit_miss_requested;
-static cuda_moe_split_requested_fn g_cuda_moe_split_fused_dispatch =
-    cuda_moe_split_fused_requested;
+static void cuda_g73_route_dispatch_init(void);
 
 /* G73 owns exact IQ2 serving. Inheriting any Q1/IQ1 serving or promotion
  * control would make that ownership dependent on the parent environment.
@@ -3246,10 +3243,6 @@ static int cuda_g133_initialize_dispatch(void) {
         return 0;
     }
     g_cuda_g73_open_enabled = cuda_g73_open_requested();
-    if (g_cuda_g73_open_enabled) {
-        g_cuda_moe_split_hit_miss_dispatch = cuda_moe_split_disabled;
-        g_cuda_moe_split_fused_dispatch = cuda_moe_split_disabled;
-    }
     if (!cuda_g133_tier_requested()) return 1;
 
     const char *decay_env = getenv("DS4_G133_DECAY");
@@ -6461,6 +6454,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 
 extern "C" int ds4_gpu_init(void) {
     if (!cuda_g133_initialize_dispatch()) return 0;
+    cuda_g73_route_dispatch_init();
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_init();
 #endif
@@ -23811,7 +23805,10 @@ struct cuda_moe_expert_cache {
 };
 static cuda_moe_expert_cache g_moe_expert_cache;
 
+template <bool G73>
 static void *cuda_moe_route_worker(void *arg);
+static os_thread_fn g_cuda_moe_route_worker_dispatch =
+    cuda_moe_route_worker<false>;
 
 static void cuda_moe_route_memory_barrier(void) {
 #ifdef _WIN32
@@ -25768,6 +25765,34 @@ static uint32_t cuda_deadline_remaining_ms(double absolute_deadline) {
         (double)(UINT32_MAX - 1u));
 }
 
+/* Waiting to enqueue work is deadline-bounded. Once an exact H2D has been
+ * accepted by CUDA, however, abandoning or reusing its buffers would drop a
+ * serve. Poll the launched copy through completion; crossing the token budget
+ * is telemetry, while a CUDA error means the device itself is unusable. */
+static cudaError_t cuda_g73_finish_launched_copy(
+        cudaStream_t stream, double absolute_deadline, uint32_t layer,
+        const char *site) {
+    int budget_overrun_logged = 0;
+    for (;;) {
+        const cudaError_t status = cudaStreamQuery(stream);
+        if (status == cudaSuccess) return cudaSuccess;
+        if (status != cudaErrorNotReady) return status;
+        if (!budget_overrun_logged && absolute_deadline > 0.0 &&
+            cuda_wall_sec() >= absolute_deadline) {
+            fprintf(stderr,
+                    "ds4: [g73-open] budget_overrun layer=%u site=%s "
+                    "phase=launched-exact-h2d action=complete\n",
+                    layer, site ? site : "unknown");
+            budget_overrun_logged = 1;
+        }
+#ifdef _WIN32
+        (void)SwitchToThread();
+#else
+        usleep(0);
+#endif
+    }
+}
+
 static int cuda_g73_open_rotation_record_context_init(
         cuda_q1_0_promotion_record_context *record,
         const cuda_moe_route_request &request, uint32_t expert,
@@ -26742,6 +26767,10 @@ static int cuda_q1_0_ssd_wrap_submit(
     }
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
     os_mutex_lock(&state.mutex);
+    if (state.failed || state.stop) {
+        os_mutex_unlock(&state.mutex);
+        return 0;
+    }
     for (const cuda_q1_0_ssd_wrap_job &job : state.jobs) {
         if (job.state != CUDA_Q1_0_SSD_WRAP_FREE &&
             job.layer == layer && job.expert == expert) {
@@ -26771,9 +26800,23 @@ static int cuda_q1_0_ssd_wrap_submit(
     cuda_dynamic_arena_slot &slot =
         g_dynamic_arena.slots[(uint32_t)slot_i];
     const int replacing = victim_entry_index != SIZE_MAX;
+    if (g73_open_rotation == 2) {
+        os_mutex_lock(&state.mutex);
+        cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
+            "selftest-stop-after-writer-claim");
+        os_mutex_unlock(&state.mutex);
+    }
     uint32_t ring_slot = UINT32_MAX;
     uint32_t job_index = UINT32_MAX;
     os_mutex_lock(&state.mutex);
+    /* The writer claim is deliberately acquired outside this mutex, then
+     * revalidated here. fail_and_release_all_locked() and publication are thus
+     * mutually exclusive: teardown wins by making the new claim unpublishable. */
+    if (state.failed || state.stop) {
+        cuda_dynamic_arena_slot_writer_release(&slot);
+        os_mutex_unlock(&state.mutex);
+        return 0;
+    }
     for (uint32_t i = 0; i < state.jobs.size(); i++) {
         if (state.jobs[i].state == CUDA_Q1_0_SSD_WRAP_FREE) {
             job_index = i;
@@ -29210,7 +29253,7 @@ static cuda_moe_expert_cache *cuda_moe_expert_cache_prepare(
             }
             if (gpu_routes &&
                 os_thread_create(&g_moe_expert_cache.route_thread,
-                                 cuda_moe_route_worker,
+                                 g_cuda_moe_route_worker_dispatch,
                                  &g_moe_expert_cache) != 0) {
                 fprintf(stderr, "ds4: CUDA GPU-resident route worker creation failed\n");
                 cuda_moe_expert_cache_release();
@@ -29759,12 +29802,14 @@ static int cuda_moe_tiering_finish_vram_reservations(
         cuda_moe_expert_cache *cache, const uint32_t *admitted,
         const cuda_moe_vram_promotion_reservation *reservations,
         uint32_t count, const ds4_gpu_g133_epoch &g133_epoch,
-        int commit_on_success) {
+        int commit_on_success, double absolute_deadline) {
     const double sync_started = g_moe_tiering.g133_enabled
         ? cuda_wall_sec() : 0.0;
     const cudaError_t pending_error = cudaGetLastError();
-    const cudaError_t sync_error =
-        cudaStreamSynchronize(cache->route_upload_stream);
+    const cudaError_t sync_error = cuda_g73_finish_launched_copy(
+        cache->route_upload_stream, absolute_deadline,
+        count > 0u ? reservations[0].candidate_layer : 0u,
+        "tiering-reservation");
     if (sync_started != 0.0) {
         cuda_g133_telemetry_note_upload_sync_wait(
             cuda_wall_sec() - sync_started);
@@ -29793,7 +29838,6 @@ static void cuda_g73_classify_request(
     if (!outcomes || !out_of_mask) return;
     *outcomes = cuda_g73_route_outcomes{};
     memset(out_of_mask, 0, CUDA_MOE_ROUTE_COUNT);
-    if (!g_cuda_g73_open_enabled) return;
     for (uint32_t route = 0; route < request.route_count; route++) {
         const int32_t expert_i = request.selected[route];
         if (expert_i < 0 || expert_i >= 256) continue;
@@ -29815,11 +29859,12 @@ static void cuda_g73_classify_request(
 static void cuda_g73_publish_pending_outcomes(
         cuda_moe_expert_cache *cache, uint32_t sequence,
         const cuda_g73_route_outcomes &outcomes) {
-    if (!cache || !g_cuda_g73_open_enabled) return;
+    if (!cache) return;
     cache->route_g73_outcomes = outcomes;
     cache->route_g73_outcome_sequence = sequence;
 }
 
+template <bool G73>
 static int cuda_moe_tiering_enforce_request(
         cuda_moe_expert_cache *cache,
         const cuda_moe_route_request &request,
@@ -29844,7 +29889,9 @@ static int cuda_moe_tiering_enforce_request(
     uint32_t admitted_count = 0;
     cuda_g73_route_outcomes g73_outcomes = {};
     uint8_t g73_out_of_mask[CUDA_MOE_ROUTE_COUNT] = {0};
-    cuda_g73_classify_request(request, &g73_outcomes, g73_out_of_mask);
+    if constexpr (G73) {
+        cuda_g73_classify_request(request, &g73_outcomes, g73_out_of_mask);
+    }
     int ok = 1;
     const char *failure_reason = "none";
     const double transient_request_deadline = request.absolute_deadline > 0.0
@@ -29947,7 +29994,7 @@ static int cuda_moe_tiering_enforce_request(
             (!g_moe_tiering.compose_prefill_mass_tiering ||
              g_moe_tiering.compose_router_open) &&
             tier.state == CUDA_MOE_TIER_SSD_COLD &&
-            !g_cuda_g73_open_enabled) {
+            !G73) {
             /* Mixed 5+1 keeps the five high-weight routes exact. An open
              * snapshot miss must first enter the pinned probation pool;
              * only the minimum-weight sixth route executes as IQ1_S and is
@@ -29963,7 +30010,7 @@ static int cuda_moe_tiering_enforce_request(
             (!g_moe_tiering.compose_prefill_mass_tiering ||
              g_moe_tiering.compose_router_open) &&
             tier.state != CUDA_MOE_TIER_SSD_COLD &&
-            !g_cuda_g73_open_enabled) {
+            !G73) {
             if (tier.state == CUDA_MOE_TIER_VRAM_PROTECTED) {
                 /* A protected entry must have been resolved as a device-map
                  * hit before the miss worker. Never create a second resident
@@ -29999,7 +30046,7 @@ static int cuda_moe_tiering_enforce_request(
             const int serve_transient_on_admission_denial =
                 g_moe_tiering.compose_prefill_mass_tiering &&
                 (ram_admission_denied ||
-                 (g_cuda_g73_open_enabled &&
+                 (G73 &&
                   g_moe_tiering.compose_router_open));
             if (g_moe_tiering.compose_prefill_mass_tiering &&
                 !serve_transient_on_admission_denial) {
@@ -30015,7 +30062,8 @@ static int cuda_moe_tiering_enforce_request(
             if (admitted_count > 0u) {
                 if (!cuda_moe_tiering_finish_vram_reservations(
                         cache, admitted, promotion_reservations,
-                        admitted_count, request.g133_epoch, 1)) {
+                        admitted_count, request.g133_epoch, 1,
+                        request.absolute_deadline)) {
                     failure_reason = "resident-copy-before-transient";
                     ok = 0;
                     break;
@@ -30309,14 +30357,16 @@ static int cuda_moe_tiering_enforce_request(
             g_moe_tiering.transient++;
             g_moe_tiering.ram_h2d_bytes +=
                 cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
-            if (g_cuda_g73_open_enabled) {
+            if constexpr (G73) {
                 if (g73_out_of_mask[route]) g73_outcomes.served_transient++;
                 cuda_g73_open_maybe_schedule_rotation(
                     request, route, expert, tier);
             }
         }
-        if (g_cuda_g73_open_enabled && g73_out_of_mask[route] && have_ram) {
-            g73_outcomes.served_promoted++;
+        if constexpr (G73) {
+            if (g73_out_of_mask[route] && have_ram) {
+                g73_outcomes.served_promoted++;
+            }
         }
         if (from_nested && !cuda_nested_residual_gpu_join_requested()) {
             const uint64_t native_bytes =
@@ -30332,7 +30382,7 @@ static int cuda_moe_tiering_enforce_request(
          cuda_wall_sec() : 0.0;
     const int transfers_ok = cuda_moe_tiering_finish_vram_reservations(
         cache, admitted, promotion_reservations, admitted_count,
-        request.g133_epoch, ok);
+        request.g133_epoch, ok, request.absolute_deadline);
     if (h2d_sync_started != 0.0) {
         g_nested_residual.profile_h2d_sync_calls++;
         g_nested_residual.profile_h2d_sync_seconds +=
@@ -30342,8 +30392,10 @@ static int cuda_moe_tiering_enforce_request(
         failure_reason = "upload-sync";
         ok = 0;
     }
-    if (ok) cuda_g73_publish_pending_outcomes(
-        cache, request.sequence, g73_outcomes);
+    if constexpr (G73) {
+        if (ok) cuda_g73_publish_pending_outcomes(
+            cache, request.sequence, g73_outcomes);
+    }
     if (!ok) {
         fprintf(stderr,
                 "ds4: [tiering-enforce] result=failed layer=%u sequence=%u "
@@ -30354,6 +30406,7 @@ static int cuda_moe_tiering_enforce_request(
     return ok;
 }
 
+template <bool G73>
 static void *cuda_moe_route_worker(void *arg) {
     cuda_moe_expert_cache *cache = (cuda_moe_expert_cache *)arg;
     if (!cache || cudaSetDevice(cache->route_device) != cudaSuccess) {
@@ -30443,7 +30496,7 @@ static void *cuda_moe_route_worker(void *arg) {
                 request_valid = 0;
             }
         }
-        if (g_cuda_g73_open_enabled) {
+        if constexpr (G73) {
             /* Background rotation is fail-open: publication failures disable
              * future rotation, while the transient exact serving path stays live. */
             (void)cuda_q1_0_ssd_wrap_poll();
@@ -30519,7 +30572,7 @@ static void *cuda_moe_route_worker(void *arg) {
                 }
             }
             if (request_valid) {
-                if (g_cuda_g73_open_enabled) {
+                if constexpr (G73) {
                     cuda_g73_route_outcomes g73_outcomes = {};
                     uint8_t g73_out_of_mask[CUDA_MOE_ROUTE_COUNT] = {0};
                     cuda_g73_classify_request(
@@ -30530,7 +30583,7 @@ static void *cuda_moe_route_worker(void *arg) {
                 cache->route_all_hit_observed++;
                 cache->hits += request.route_count;
                 cache->calls++;
-                if (g_cuda_g73_open_enabled) {
+                if constexpr (G73) {
                     cuda_moe_route_memory_barrier();
                     *cache->route_ready_host = sequence;
                     cuda_moe_route_memory_barrier();
@@ -30571,7 +30624,7 @@ static void *cuda_moe_route_worker(void *arg) {
         uint32_t admitted[CUDA_MOE_ROUTE_COUNT] = {0};
         uint32_t admitted_count = 0;
         if (ok && g_moe_tiering.mode == CUDA_MOE_TIER_ENFORCE) {
-            ok = cuda_moe_tiering_enforce_request(
+            ok = cuda_moe_tiering_enforce_request<G73>(
                 cache, request, claimed.data());
             if (cache->route_worker_safe_leaked) return NULL;
         }
@@ -33130,7 +33183,9 @@ static int cuda_moe_selected_load(
                     gate_expert_bytes, gate_expert_bytes,
                     down_expert_bytes);
             if (arena_status == CUDA_DYNAMIC_ARENA_FATAL) {
-                (void)cudaStreamSynchronize(g_model_upload_stream);
+                (void)cuda_g73_finish_launched_copy(
+                    g_model_upload_stream, absolute_deadline, layer_index,
+                    "selected-arena-error-cleanup");
                 return 0;
             }
             arena_resident[i] =
@@ -33492,7 +33547,9 @@ static int cuda_moe_selected_load(
                 g_moe_gather.up + gate_dst,
                 g_moe_gather.down + down_dst)) {
             (void)cudaGetLastError();
-            const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+            const int fenced = cuda_g73_finish_launched_copy(
+                g_model_upload_stream, absolute_deadline, layer_index,
+                "selected-prefetch-cleanup") == cudaSuccess;
             cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
             if (cache) cuda_moe_expert_cache_invalidate();
             return 0;
@@ -33539,7 +33596,9 @@ static int cuda_moe_selected_load(
         }
     }
     if (!fill_ok) {
-        const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+        const int fenced = cuda_g73_finish_launched_copy(
+            g_model_upload_stream, absolute_deadline, layer_index,
+            "selected-fill-cleanup") == cudaSuccess;
         cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
         if (cache) cuda_moe_expert_cache_invalidate();
         return 0;
@@ -33574,7 +33633,9 @@ static int cuda_moe_selected_load(
             if (!cuda_moe_expert_cache_copy_to_compact_async(
                     cache, (uint32_t)cache_slots[i], i)) {
                 (void)cudaGetLastError();
-                const int fenced = cudaStreamSynchronize(g_model_upload_stream) == cudaSuccess;
+                const int fenced = cuda_g73_finish_launched_copy(
+                    g_model_upload_stream, absolute_deadline, layer_index,
+                    "selected-cache-cleanup") == cudaSuccess;
                 cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, fenced, 0);
                 if (cache) cuda_moe_expert_cache_invalidate();
                 return 0;
@@ -33599,7 +33660,10 @@ static int cuda_moe_selected_load(
     const double iq1_sync_t0 =
         iq1_profile && iq1_upload_experts != 0 ? cuda_wall_sec() : 0.0;
     if (upload_sync_required &&
-        !cuda_ok(cudaStreamSynchronize(g_model_upload_stream), "moe compact upload sync")) {
+        !cuda_ok(cuda_g73_finish_launched_copy(
+                     g_model_upload_stream, absolute_deadline, layer_index,
+                     "selected-compact-upload"),
+                 "moe compact upload completion")) {
         if (iq1_vram_pending_slot >= 0)
             g_iq1_s_vram_cache.failures++;
         cuda_spex_prefetch_release(spex_queue, spex_prefetch_slot, 0, 0);
@@ -33871,18 +33935,18 @@ static void cuda_g73_classify_fallback(
     }
 }
 
-/* Bounded escape terminal: no file operation, eviction, admission, or whole
- * tensor mapping is involved. The model mmap is the immutable exact authority;
- * the selected IQ2 experts are synchronously copied into the already-standard
- * compact execution buffers. Any impossible range or CUDA failure is a hard
- * model/device error, never a refused or silently dropped route. */
+/* Exact escape terminal. Resource acquisition before this point is bounded by
+ * absolute_deadline. The immutable mmap is the final exact authority, and an
+ * accepted expert H2D is execution, not a cancellable wait: it always completes
+ * before the compact buffers are published. Slow success logs budget_overrun;
+ * only corrupt ranges or genuine CUDA/device errors are fatal. */
 static void cuda_g73_terminal_exact_load(
         const void *model_map, uint64_t model_size, uint32_t layer,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t route_count,
         const ds4_gpu_tensor *selected_arg,
-        cuda_g73_route_outcomes *outcomes) {
+        cuda_g73_route_outcomes *outcomes, double absolute_deadline) {
     if (!model_map || model_map != g_model_host_base || !selected_arg ||
         !selected_arg->ptr || route_count == 0u ||
         route_count > CUDA_MOE_ROUTE_COUNT || n_total_expert != 256u) {
@@ -33941,28 +34005,40 @@ static void cuda_g73_terminal_exact_load(
                 down_src > model_size || down_expert_bytes > model_size - down_src) {
                 cuda_g73_hard_error(layer, "terminal-corrupt-model-range");
             }
-            if (cudaMemcpy(
+            if (cudaMemcpyAsync(
                     g_moe_gather.gate + (uint64_t)i * gate_expert_bytes,
                     (const char *)model_map + gate_src,
-                    (size_t)gate_expert_bytes, cudaMemcpyHostToDevice) !=
+                    (size_t)gate_expert_bytes, cudaMemcpyHostToDevice,
+                    g_model_upload_stream) !=
                     cudaSuccess ||
-                cudaMemcpy(
+                cudaMemcpyAsync(
                     g_moe_gather.up + (uint64_t)i * gate_expert_bytes,
                     (const char *)model_map + up_src,
-                    (size_t)gate_expert_bytes, cudaMemcpyHostToDevice) !=
+                    (size_t)gate_expert_bytes, cudaMemcpyHostToDevice,
+                    g_model_upload_stream) !=
                     cudaSuccess ||
-                cudaMemcpy(
+                cudaMemcpyAsync(
                     g_moe_gather.down + (uint64_t)i * down_expert_bytes,
                     (const char *)model_map + down_src,
-                    (size_t)down_expert_bytes, cudaMemcpyHostToDevice) !=
+                    (size_t)down_expert_bytes, cudaMemcpyHostToDevice,
+                    g_model_upload_stream) !=
                     cudaSuccess) {
+                /* A CUDA API error is device loss/corruption, not lateness. */
                 cuda_g73_hard_error(layer, "terminal-exact-h2d");
             }
         }
-        if (cudaMemcpy(g_moe_gather.slot, slots.data(),
+        if (cudaMemcpyAsync(g_moe_gather.slot, slots.data(),
                        (size_t)route_count * sizeof(int32_t),
-                       cudaMemcpyHostToDevice) != cudaSuccess) {
+                       cudaMemcpyHostToDevice, g_model_upload_stream) !=
+                cudaSuccess) {
             cuda_g73_hard_error(layer, "terminal-slot-h2d");
+        }
+        if (cuda_g73_finish_launched_copy(
+                g_model_upload_stream, absolute_deadline, layer,
+                "terminal-exact") != cudaSuccess) {
+            /* The copy was allowed to finish even after a budget overrun. A
+             * non-success here is therefore a genuine CUDA hard failure. */
+            cuda_g73_hard_error(layer, "terminal-exact-completion");
         }
         g_moe_gather.slot_tensor = {
             g_moe_gather.slot,
@@ -33978,12 +34054,19 @@ static void cuda_g73_terminal_exact_load(
     }
 }
 
-static void cuda_g73_commit_outcomes(
-        uint32_t layer, const cuda_g73_route_outcomes &outcomes) {
+static int cuda_g73_outcomes_conserved(
+        const cuda_g73_route_outcomes &outcomes) {
     const uint64_t served = outcomes.served_transient +
         outcomes.served_promoted + outcomes.served_selected_fallback +
         outcomes.served_terminal_exact;
-    if (outcomes.out_of_mask_routes != served) {
+    return outcomes.out_of_mask_routes ==
+            served + outcomes.clamped + outcomes.request_refused &&
+        outcomes.clamped == 0u && outcomes.request_refused == 0u;
+}
+
+static void cuda_g73_commit_outcomes(
+        uint32_t layer, const cuda_g73_route_outcomes &outcomes) {
+    if (!cuda_g73_outcomes_conserved(outcomes)) {
         cuda_g73_hard_error(layer, "outcome-conservation-before-commit");
     }
     cuda_g133_telemetry_increment(
@@ -34001,6 +34084,126 @@ static void cuda_g73_commit_outcomes(
     cuda_g133_telemetry_increment(
         g_cuda_g133_telemetry.served_terminal_exact,
         outcomes.served_terminal_exact);
+}
+
+extern "C" int ds4_gpu_g73_open_selftest(const char *read_path) {
+    int ok = 1;
+    os_file_t file;
+    os_file_init(&file);
+    if (!read_path || os_file_open_read(&file, read_path) != 0) {
+        fprintf(stderr,
+                "ds4: [g73-open-selftest] result=failed phase=open-read\n");
+        return 0;
+    }
+    char byte = 0;
+    os_pread_cancellable_t cancelled_state;
+    os_pread_cancellable_init(&cancelled_state);
+    (void)os_pread_cancel(&cancelled_state, 7u);
+    errno = 0;
+    const int64_t cancelled = os_pread_cancellable_timeout(
+        &file, &byte, 1u, 0u, &cancelled_state, 7u, 1000u);
+    if (cancelled != -1 || errno != ECANCELED) ok = 0;
+
+    os_pread_cancellable_t deadline_state;
+    os_pread_cancellable_init(&deadline_state);
+    errno = 0;
+    const int64_t timed_out = os_pread_cancellable_timeout(
+        &file, &byte, 1u, 0u, &deadline_state, 9u, 0u);
+    if (timed_out != -1 || errno != ETIMEDOUT) ok = 0;
+    os_file_close(&file);
+
+    cuda_g73_route_outcomes outcomes = {};
+    outcomes.out_of_mask_routes = 4u;
+    outcomes.served_transient = 1u;
+    outcomes.served_promoted = 1u;
+    outcomes.served_selected_fallback = 1u;
+    outcomes.served_terminal_exact = 1u;
+    if (!cuda_g73_outcomes_conserved(outcomes)) ok = 0;
+    outcomes.out_of_mask_routes = 5u;
+    outcomes.clamped = 1u;
+    if (cuda_g73_outcomes_conserved(outcomes)) ok = 0;
+
+    cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
+    if (os_mutex_init(&state.mutex) != 0 || os_cond_init(&state.cond) != 0) {
+        fprintf(stderr,
+                "ds4: [g73-open-selftest] result=failed phase=sync-init\n");
+        return 0;
+    }
+    state.mutex_ready = 1;
+    state.cond_ready = 1;
+    state.enabled = 1;
+    state.failed = 0;
+    state.stop = 0;
+    state.jobs.resize(4u);
+    state.ring_busy.assign(2u, 0u);
+    state.queue_capacity = 4u;
+
+    cuda_moe_tier_entry empty = {};
+    empty.ram_slot = UINT32_MAX;
+    empty.state = CUDA_MOE_TIER_SSD_COLD;
+    g_moe_tiering.entries.assign(
+        (size_t)CUDA_MOE_LAYER_COUNT * 256u, empty);
+    g_dynamic_arena.slots.resize(2u);
+    for (cuda_dynamic_arena_slot &slot : g_dynamic_arena.slots) {
+        slot = cuda_dynamic_arena_slot{};
+        slot.layer = UINT32_MAX;
+        slot.expert = UINT32_MAX;
+        slot.state = DS4_GPU_ARENA_FREE;
+    }
+    static char synthetic_ring[2] = {0, 0};
+    g_dynamic_arena.slot_bytes = 1u;
+    g_dynamic_arena.ssd_wrap_ssd_ring_base = synthetic_ring;
+    g_q1_0_ssd_wrap_reserved_slots.assign(2u, 0u);
+
+    cuda_moe_route_request request = {};
+    request.layer_index = 0u;
+    request.route_count = 1u;
+    request.absolute_deadline = cuda_wall_sec() + 1.0;
+    cuda_q1_0_promotion_record_context record = {};
+    record.active = 1;
+    record.layer = 0u;
+    record.expert = 1u;
+    record.destination_bytes = 1u;
+    const int submitted = cuda_q1_0_ssd_wrap_submit(
+        request, 0u, 1u, &record, 1);
+    if (submitted != 1) ok = 0;
+    os_mutex_lock(&state.mutex);
+    cuda_q1_0_ssd_wrap_fail_and_release_all_locked("selftest-teardown");
+    os_mutex_unlock(&state.mutex);
+    for (const cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+        if (job.state != CUDA_Q1_0_SSD_WRAP_FREE) ok = 0;
+    }
+    for (const cuda_dynamic_arena_slot &slot : g_dynamic_arena.slots) {
+        if (cuda_dynamic_arena_slot_refs_load(&slot.cpu_lane_slot_refs) != 0u) {
+            ok = 0;
+        }
+    }
+    for (uint8_t reserved : g_q1_0_ssd_wrap_reserved_slots) {
+        if (reserved != 0u) ok = 0;
+    }
+
+    state.failed = 0;
+    state.stop = 0;
+    record = cuda_q1_0_promotion_record_context{};
+    record.active = 1;
+    record.layer = 0u;
+    record.expert = 2u;
+    record.destination_bytes = 1u;
+    const int raced = cuda_q1_0_ssd_wrap_submit(
+        request, 0u, 2u, &record, 2);
+    if (raced != 0) ok = 0;
+    for (const cuda_dynamic_arena_slot &slot : g_dynamic_arena.slots) {
+        if (cuda_dynamic_arena_slot_refs_load(&slot.cpu_lane_slot_refs) != 0u) {
+            ok = 0;
+        }
+    }
+
+    fprintf(stderr,
+            "ds4: [g73-open-selftest] result=%s "
+            "pread_cancel=real pread_deadline=real rotator=real "
+            "teardown_submit_race=real invariant=real\n",
+            ok ? "passed" : "failed");
+    return ok;
 }
 
 extern "C" uint32_t ds4_gpu_routed_moe_last_selected(
@@ -34463,6 +34666,7 @@ static int cuda_moe_selected_load_q1_0(
     return 1;
 }
 
+template <bool G73>
 static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
         uint32_t layer_index,
         uint64_t gate_offset,
@@ -34616,7 +34820,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
         down_expert_bytes,
         g133_epoch,
         absolute_deadline,
-        g_cuda_g73_open_enabled ? 1u : 0u,
+        G73 ? 1u : 0u,
         n_expert);
     const cudaError_t resolve_launch_error = cudaGetLastError();
     if (nested_profile) {
@@ -34837,6 +35041,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
     return cache;
 }
 
+template <bool G73>
 static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         uint32_t layer_index,
         uint64_t gate_offset,
@@ -34853,7 +35058,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         ds4_gpu_g133_epoch g133_epoch,
         double absolute_deadline) {
     uint32_t sequence = 0;
-    cuda_moe_expert_cache *cache = cuda_moe_gpu_resident_routes_begin(
+    cuda_moe_expert_cache *cache = cuda_moe_gpu_resident_routes_begin<G73>(
         layer_index, gate_offset, up_offset, down_offset,
         gate_expert_bytes, down_expert_bytes, expert_in_dim,
         selected, weights, n_expert, n_tokens, spex_queue, g133_epoch,
@@ -34862,7 +35067,8 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         cache, sequence, layer_index, 0, 0u);
 }
 
-static int routed_moe_launch(
+template <bool G73>
+static int routed_moe_launch_impl(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
         ds4_gpu_tensor *up,
@@ -34895,7 +35101,7 @@ static int routed_moe_launch(
         const int32_t *selected_host,
         ds4_gpu_g133_epoch g133_epoch) {
     const double g73_absolute_deadline =
-        g_cuda_g73_open_enabled && n_tokens == 1u
+        G73 && n_tokens == 1u
         ? cuda_wall_sec() + cuda_g133_transient_io_timeout_seconds()
         : 0.0;
     cuda_g73_route_outcomes g73_outcomes = {};
@@ -34973,7 +35179,7 @@ static int routed_moe_launch(
     if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
         up_offset > model_size || gate_bytes > model_size - up_offset ||
         down_offset > model_size || down_bytes > model_size - down_offset) {
-        if (g_cuda_g73_open_enabled) {
+        if constexpr (G73) {
             cuda_g73_hard_error(layer_index, "model-range-contract");
         }
         return 0;
@@ -35034,10 +35240,10 @@ static int routed_moe_launch(
     cuda_moe_expert_cache *gpu_route_cache = NULL;
     const int split_hit_miss_requested =
         (route_iq1_s || route_q1_0) ? 0 :
-            g_cuda_moe_split_hit_miss_dispatch();
+            (G73 ? 0 : cuda_moe_split_hit_miss_requested());
     const int split_fused_requested =
         (route_iq1_s || route_q1_0) ? 0 :
-            g_cuda_moe_split_fused_dispatch();
+            (G73 ? 0 : cuda_moe_split_fused_requested());
     if (split_hit_miss_requested && split_fused_requested) {
         fprintf(stderr,
                 "ds4: split hit/miss and fused split are mutually exclusive\n");
@@ -35050,7 +35256,7 @@ static int routed_moe_launch(
         if (!sparse_bake_layer &&
             (split_hit_miss_requested || split_fused_requested) &&
             getenv("DS4_CUDA_MOE_PROFILE") == NULL) {
-            gpu_route_cache = cuda_moe_gpu_resident_routes_begin(
+            gpu_route_cache = cuda_moe_gpu_resident_routes_begin<G73>(
                 layer_index,
                 gate_offset, up_offset, down_offset,
                 gate_expert_bytes, down_expert_bytes,
@@ -35061,7 +35267,7 @@ static int routed_moe_launch(
             use_split_fused = gpu_route_cache != NULL && split_fused_requested;
             use_split_hit_miss = gpu_route_cache != NULL && split_hit_miss_requested;
         } else {
-            gpu_route_cache = cuda_moe_gpu_resident_routes_submit(
+            gpu_route_cache = cuda_moe_gpu_resident_routes_submit<G73>(
                 layer_index,
                 gate_offset, up_offset, down_offset,
                 gate_expert_bytes, down_expert_bytes,
@@ -35079,7 +35285,7 @@ static int routed_moe_launch(
             g_nested_residual.gpu_cache_failures++;
             g_nested_residual.hard_failure = 1;
         }
-        if (!g_cuda_g73_open_enabled) {
+        if constexpr (!G73) {
             fprintf(stderr,
                     "ds4: %s decode route unavailable at layer=%u; refusing fallback\n",
                     nested_gpu_cache_requested ?
@@ -35093,7 +35299,7 @@ static int routed_moe_launch(
                 layer_index);
     }
     if (gpu_route_cache) {
-        if (g_cuda_g73_open_enabled) {
+        if constexpr (G73) {
             const uint32_t expected_outcome_sequence = gpu_route_sequence != 0u
                 ? gpu_route_sequence : gpu_route_cache->route_submitted_sequence;
             if (gpu_route_cache->route_g73_outcome_sequence !=
@@ -35209,7 +35415,7 @@ static int routed_moe_launch(
                                     n_total_expert, n_expert, n_tokens,
                                     selected, weights, probs,
                                      spex_queue, spex_key, route_iq1_s,
-                                     g_cuda_g73_open_enabled
+                                     G73
                                          ? cuda_g73_io_deadline(
                                                g73_absolute_deadline)
                                          : 0.0);
@@ -35217,7 +35423,7 @@ static int routed_moe_launch(
             if (selected_loaded) g_iq1_s_selected_loads++;
             else g_iq1_s_selected_load_failures++;
         }
-        if (!selected_loaded && !g_cuda_g73_open_enabled &&
+        if (!selected_loaded && !G73 &&
             (g_moe_gather.wave_fail_closed || nested_layer_required ||
              g_nested_residual.hard_failure)) {
             ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
@@ -35230,7 +35436,7 @@ static int routed_moe_launch(
             return 0;
         }
         if (selected_loaded) {
-            if (g_cuda_g73_open_enabled) {
+            if constexpr (G73) {
                 cuda_g73_classify_fallback(
                     layer_index, g_moe_gather.h_sel.data(), n_expert,
                     0, &g73_outcomes);
@@ -35265,7 +35471,7 @@ static int routed_moe_launch(
             selected = &g_moe_gather.slot_tensor;   /* kernels index compact slots */
         } else {
             ds4_gpu_spex_queue_cancel(spex_queue, spex_key);
-            if (g_cuda_g73_open_enabled) {
+            if constexpr (G73) {
                 fprintf(stderr,
                         "ds4: [g73-open] bounded selected-load unavailable "
                         "at layer=%u; using exact mmap terminal\n",
@@ -35274,7 +35480,8 @@ static int routed_moe_launch(
                     model_map, model_size, layer_index,
                     gate_offset, up_offset, down_offset,
                     gate_expert_bytes, down_expert_bytes,
-                    n_total_expert, n_expert, selected, &g73_outcomes);
+                    n_total_expert, n_expert, selected, &g73_outcomes,
+                    g73_absolute_deadline);
                 g73_outcomes_ready = 1;
                 gate_w = g_moe_gather.gate;
                 up_w = g_moe_gather.up;
@@ -35322,34 +35529,41 @@ static int routed_moe_launch(
         up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
         down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     }
-    if ((!gate_w || !up_w || !down_w) && g_cuda_g73_open_enabled) {
-        cuda_g73_terminal_exact_load(
-            model_map, model_size, layer_index,
-            gate_offset, up_offset, down_offset,
-            gate_expert_bytes, down_expert_bytes,
-            n_total_expert, n_expert, selected, &g73_outcomes);
-        g73_outcomes_ready = 1;
-        gate_w = g_moe_gather.gate;
-        up_w = g_moe_gather.up;
-        down_w = g_moe_gather.down;
-        selected = &g_moe_gather.slot_tensor;
+    if constexpr (G73) {
+        if (!gate_w || !up_w || !down_w) {
+            cuda_g73_terminal_exact_load(
+                model_map, model_size, layer_index,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, down_expert_bytes,
+                n_total_expert, n_expert, selected, &g73_outcomes,
+                g73_absolute_deadline);
+            g73_outcomes_ready = 1;
+            gate_w = g_moe_gather.gate;
+            up_w = g_moe_gather.up;
+            down_w = g_moe_gather.down;
+            selected = &g_moe_gather.slot_tensor;
+        }
     }
     if (!gate_w || !up_w || !down_w) return 0;
-    if (g_cuda_g73_open_enabled && !g73_outcomes_ready) {
-        try {
-            g_moe_gather.h_sel.resize(n_expert);
-        } catch (...) {
-            cuda_g73_hard_error(layer_index, "whole-map-classification-allocation");
+    if constexpr (G73) {
+        if (!g73_outcomes_ready) {
+            try {
+                g_moe_gather.h_sel.resize(n_expert);
+            } catch (...) {
+                cuda_g73_hard_error(
+                    layer_index, "whole-map-classification-allocation");
+            }
+            if (cudaMemcpy(g_moe_gather.h_sel.data(), selected->ptr,
+                           (size_t)n_expert * sizeof(int32_t),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cuda_g73_hard_error(
+                    layer_index, "whole-map-classification-d2h");
+            }
+            cuda_g73_classify_fallback(
+                layer_index, g_moe_gather.h_sel.data(), n_expert,
+                1, &g73_outcomes);
+            g73_outcomes_ready = 1;
         }
-        if (cudaMemcpy(g_moe_gather.h_sel.data(), selected->ptr,
-                       (size_t)n_expert * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-            cuda_g73_hard_error(layer_index, "whole-map-classification-d2h");
-        }
-        cuda_g73_classify_fallback(
-            layer_index, g_moe_gather.h_sel.data(), n_expert,
-            1, &g73_outcomes);
-        g73_outcomes_ready = 1;
     }
 
     int ok = 1;
@@ -36641,7 +36855,7 @@ static int routed_moe_launch(
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
         }
-        if (g_cuda_g73_open_enabled) {
+        if constexpr (G73) {
             if (!g73_outcomes_ready) {
                 cuda_g73_hard_error(layer_index, "missing-launch-outcomes");
             }
@@ -36696,8 +36910,25 @@ static int routed_moe_launch(
     return ok;
 }
 
+/* One init-time dispatch is the entire G73 hot-route seam. The OFF target is
+ * the compile-time-false M1 specialization: it contains no G73 flag load or
+ * runtime G73 branch. The two former split-policy indirect calls are direct
+ * calls inside that specialization, so this adds no net hot-route indirection. */
+static auto g_cuda_routed_moe_launch_dispatch =
+    &routed_moe_launch_impl<false>;
+
+static void cuda_g73_route_dispatch_init(void) {
+    if (g_cuda_g73_open_enabled) {
+        g_cuda_routed_moe_launch_dispatch = &routed_moe_launch_impl<true>;
+        g_cuda_moe_route_worker_dispatch = cuda_moe_route_worker<true>;
+    } else {
+        g_cuda_routed_moe_launch_dispatch = &routed_moe_launch_impl<false>;
+        g_cuda_moe_route_worker_dispatch = cuda_moe_route_worker<false>;
+    }
+}
+
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, ds4_gpu_g133_epoch g133_epoch, ds4_gpu_spex_queue *spex_queue, const ds4_gpu_spex_key *spex_key) {
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+    return g_cuda_routed_moe_launch_dispatch(out, gate, up, mid, down, model_map, model_size,
                              layer_index,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -38347,7 +38578,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 attribution_state, CUDA_G130_ATTRIB_HOT_ROUTE);
         }
 #endif
-        const int ok = routed_moe_launch(
+        const int ok = g_cuda_routed_moe_launch_dispatch(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
             main_gate_offset, main_up_offset, main_down_offset,
@@ -38548,7 +38779,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 attribution_state, CUDA_G130_ATTRIB_HOT_ROUTE);
         }
 #endif
-        ok = routed_moe_launch(
+        ok = g_cuda_routed_moe_launch_dispatch(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
             main_gate_offset, main_up_offset, main_down_offset,
@@ -38614,7 +38845,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         ds4_gpu_tensor cpu_gpu_down_tensor = {
             device_cold_down, cold_down_bytes, 0
         };
-        int cpu_gpu_ok = routed_moe_launch(
+        int cpu_gpu_ok = g_cuda_routed_moe_launch_dispatch(
             &cpu_gpu_out_tensor, gate, up, mid, &cpu_gpu_down_tensor,
             main_model_map, main_model_size, layer_index,
             main_gate_offset, main_up_offset, main_down_offset,
@@ -38732,7 +38963,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         g_q1_0_mixed_profile_current_sample = &mixed_profile_sample;
     }
     if (cold_count != 0u) {
-        ok = routed_moe_launch(
+        ok = g_cuda_routed_moe_launch_dispatch(
             &cold_out_tensor, gate, up, mid, &cold_down_tensor,
             q1_model_map, q1_model_size, layer_index,
             q1_gate_offset, q1_up_offset, q1_down_offset,
@@ -38845,7 +39076,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                     device_cold_weights + cpu_gpu_offset,
                     (uint64_t)cpu_count * sizeof(float), 0
                 };
-                mixed_join_ok = routed_moe_launch(
+                mixed_join_ok = g_cuda_routed_moe_launch_dispatch(
                     &cold_out_tensor, gate, up, mid, &cold_down_tensor,
                     main_model_map, main_model_size, layer_index,
                     main_gate_offset, main_up_offset, main_down_offset,
@@ -39159,7 +39390,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
 
     ds4_gpu_tensor hot_selected = { d_hot_selected, hot_count * sizeof(int32_t), 0 };
     ds4_gpu_tensor hot_weights = { d_hot_weights, hot_count * sizeof(float), 0 };
-    int ok = routed_moe_launch(out, gate, up, mid, down,
+    int ok = g_cuda_routed_moe_launch_dispatch(out, gate, up, mid, down,
                                main_model_map, main_model_size, layer_index,
                                main_gate_offset, main_up_offset, main_down_offset,
                                main_gate_type, main_down_type,
@@ -39252,7 +39483,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
     ds4_gpu_tensor cold_weight_tensor = { d_cold_weight, sizeof(float), 0 };
     ds4_gpu_tensor cold_out = { d_cold_out, out_bytes, 0 };
     ds4_gpu_tensor cold_down = { d_cold_down, cold_down_bytes, 0 };
-    ok = routed_moe_launch(&cold_out, gate, up, mid, &cold_down,
+    ok = g_cuda_routed_moe_launch_dispatch(&cold_out, gate, up, mid, &cold_down,
                            iq1_model_map, iq1_model_size, layer_index,
                            iq1_gate_offset, iq1_up_offset, iq1_down_offset,
                            19u, iq1_down_type,
@@ -39316,7 +39547,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
 
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *probs, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
+    return g_cuda_routed_moe_launch_dispatch(out, gate, up, mid, down, model_map, model_size,
                              layer_index,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

@@ -228,7 +228,7 @@ Assert-True ($guardJoinAt -ge 0 -and $guardAbortAt -gt $guardJoinAt) `
 
 # R4: observation and policy remain inside the route worker before enforce/upload.
 $observeAt = $routeWorker.IndexOf('cuda_moe_tiering_observe_route(')
-$enforceAt = $routeWorker.IndexOf('cuda_moe_tiering_enforce_request(')
+$enforceAt = $routeWorker.IndexOf('cuda_moe_tiering_enforce_request<G73>(')
 Assert-True ($observeAt -ge 0 -and $enforceAt -gt $observeAt) `
     'decode heat observation must precede route-worker enforcement'
 Assert-True ($routeWorker.Contains('cuda_moe_route_worker_publish_completed')) `
@@ -297,11 +297,11 @@ $enforce = Slice-Between 'static int cuda_moe_tiering_enforce_request(' `
     'static void *cuda_moe_route_worker(void *arg) {'
 $reservationFinish = Slice-Between 'static int cuda_moe_tiering_finish_vram_reservations(' `
     'static int cuda_moe_tiering_enforce_request('
-$syncAt = $reservationFinish.IndexOf('cudaStreamSynchronize(cache->route_upload_stream)')
+$syncAt = $reservationFinish.IndexOf('cuda_g73_finish_launched_copy(')
 $commitAt = $reservationFinish.IndexOf('cuda_moe_tiering_commit_vram_reservations(')
 $refundAt = $reservationFinish.IndexOf('cuda_moe_tiering_refund_failed_promotions(')
 Assert-True ($syncAt -ge 0 -and $commitAt -gt $syncAt) `
-    'promotion counters and tier state must commit only after upload sync'
+    'promotion counters and tier state must commit only after launched upload completion'
 Assert-True ($refundAt -gt $syncAt) `
     'failed promotions must have a provisional-budget refund path'
 $deniedAt = $enforce.IndexOf('serve_transient_on_admission_denial')

@@ -1,4 +1,5 @@
 #include "os_file.h"
+#include "os_clock.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -220,7 +221,8 @@ void os_pread_cancellable_reset(os_pread_cancellable_t *state) {
 #ifdef _WIN32
     if (state) InterlockedExchange(&state->cancel_sequence, 0);
 #else
-    (void)state;
+    if (state) __atomic_store_n(
+        &state->cancel_sequence, 0u, __ATOMIC_RELEASE);
 #endif
 }
 
@@ -235,9 +237,9 @@ int os_pread_cancel(os_pread_cancellable_t *state, uint32_t sequence) {
     if (CancelIoEx(state->file, &state->overlapped)) return 1;
     return GetLastError() == ERROR_NOT_FOUND;
 #else
-    (void)state;
-    (void)sequence;
-    return 0;
+    if (!state) return 0;
+    __atomic_store_n(&state->cancel_sequence, sequence, __ATOMIC_RELEASE);
+    return 1;
 #endif
 }
 
@@ -252,6 +254,10 @@ int64_t os_pread_cancellable_timeout(
     uint64_t done = 0;
 #ifdef _WIN32
     const ULONGLONG started_tick = GetTickCount64();
+    if (len != 0u && timeout_ms == 0u) {
+        errno = ETIMEDOUT;
+        return -1;
+    }
     os_pread_cancellable_t local_state;
     if (!state) {
         os_pread_cancellable_init(&local_state);
@@ -307,21 +313,32 @@ int64_t os_pread_cancellable_timeout(
                 const DWORD waited = WaitForSingleObject(ev, wait_ms);
                 if (waited == WAIT_TIMEOUT) {
                     (void)CancelIoEx(f->h, &state->overlapped);
-                    (void)GetOverlappedResult(
-                        f->h, &state->overlapped, &got, TRUE);
+                    /* CancelIoEx only requests cancellation. Give the kernel a
+                     * small, explicitly bounded completion window, then inspect
+                     * the result without an implicit infinite wait. Rotator
+                     * state and its buffers are process-lifetime objects if a
+                     * pathological driver fails to complete cancellation. */
+                    const DWORD cancelled = WaitForSingleObject(ev, 50u);
+                    if (cancelled == WAIT_OBJECT_0) {
+                        (void)GetOverlappedResult(
+                            f->h, &state->overlapped, &got, FALSE);
+                    }
                     InterlockedExchange(&state->active, 0);
                     state->file = INVALID_HANDLE_VALUE;
-                    CloseHandle(ev);
+                    if (cancelled == WAIT_OBJECT_0) CloseHandle(ev);
                     errno = ETIMEDOUT;
                     return -1;
                 }
                 if (waited != WAIT_OBJECT_0) {
                     (void)CancelIoEx(f->h, &state->overlapped);
-                    (void)GetOverlappedResult(
-                        f->h, &state->overlapped, &got, TRUE);
+                    const DWORD cancelled = WaitForSingleObject(ev, 50u);
+                    if (cancelled == WAIT_OBJECT_0) {
+                        (void)GetOverlappedResult(
+                            f->h, &state->overlapped, &got, FALSE);
+                    }
                     InterlockedExchange(&state->active, 0);
                     state->file = INVALID_HANDLE_VALUE;
-                    CloseHandle(ev);
+                    if (cancelled == WAIT_OBJECT_0) CloseHandle(ev);
                     errno = EIO;
                     return -1;
                 }
@@ -352,15 +369,43 @@ int64_t os_pread_cancellable_timeout(
     state->file = INVALID_HANDLE_VALUE;
     CloseHandle(ev);
 #else
-    (void)state;
-    (void)sequence;
-    (void)timeout_ms;
+    os_pread_cancellable_t local_state;
+    if (!state) {
+        os_pread_cancellable_init(&local_state);
+        state = &local_state;
+    }
+    const double deadline = timeout_ms == UINT32_MAX ? 0.0 :
+        os_monotonic_sec() + (double)timeout_ms * 0.001;
+    const uint64_t max_chunk = 1024u * 1024u;
     while (done < len) {
+        if (__atomic_load_n(
+                &state->cancel_sequence, __ATOMIC_ACQUIRE) == sequence) {
+            errno = ECANCELED;
+            return -1;
+        }
+        if (deadline != 0.0 && os_monotonic_sec() >= deadline) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
         const uint64_t remaining = len - done;
-        size_t chunk = remaining > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)remaining;
+        size_t chunk = remaining > max_chunk ? (size_t)max_chunk :
+            (size_t)remaining;
+        if (chunk > (size_t)SSIZE_MAX) chunk = (size_t)SSIZE_MAX;
         ssize_t n = pread(f->fd, (char *)buf + done, chunk, (off_t)(off + done));
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                if (__atomic_load_n(
+                        &state->cancel_sequence, __ATOMIC_ACQUIRE) ==
+                        sequence) {
+                    errno = ECANCELED;
+                    return -1;
+                }
+                if (deadline != 0.0 && os_monotonic_sec() >= deadline) {
+                    errno = ETIMEDOUT;
+                    return -1;
+                }
+                continue;
+            }
             return -1;
         }
         if (n == 0) break;

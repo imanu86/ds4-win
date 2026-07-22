@@ -46,6 +46,7 @@ typedef struct {
 } ds4_gpu_dynamic_arena_load;
 
 int ds4_gpu_init(void);
+int ds4_gpu_g73_open_selftest(const char *read_path);
 /* Cached at initialization. The decode path branches once before calling the
  * epoch producer, so G133-off executes no indirect/no-op token hook. */
 extern int ds4_gpu_g133_enabled;

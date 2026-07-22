@@ -9,6 +9,13 @@ $preset = Get-Content -LiteralPath $presetPath -Raw
 function Assert-Contains([string]$Text, [string]$Needle, [string]$Message) {
     if (-not $Text.Contains($Needle)) { throw $Message }
 }
+function Slice-Between([string]$Text, [string]$Start, [string]$End) {
+    $begin = $Text.IndexOf($Start)
+    if ($begin -lt 0) { throw "missing slice start: $Start" }
+    $finish = $Text.IndexOf($End, $begin + $Start.Length)
+    if ($finish -lt 0) { throw "missing slice end: $End" }
+    return $Text.Substring($begin, $finish - $begin)
+}
 
 $tokens = $null
 $errors = $null
@@ -25,10 +32,38 @@ Assert-Contains $source 'cuda_g73_terminal_exact_load(' 'missing exact mmap term
 Assert-Contains $source 'terminal-corrupt-model-range' 'corrupt terminal range must be a hard error'
 Assert-Contains $osFile 'os_pread_cancellable_timeout(' 'platform reads lack a cancellable timeout API'
 Assert-Contains $osFile 'CancelIoEx' 'Windows timed read does not cancel the overlapped operation'
+$pread = Slice-Between $osFile 'int64_t os_pread_cancellable_timeout(' `
+    'int64_t os_pread_cancellable('
+Assert-Contains $pread 'const uint64_t max_chunk = 1024u * 1024u;' `
+    'POSIX cancellable pread is not chunk-bounded'
+Assert-Contains $pread '__atomic_load_n(' 'POSIX cancellable pread ignores cancellation'
+Assert-Contains $pread 'os_monotonic_sec() >= deadline' 'POSIX cancellable pread ignores its deadline'
+Assert-Contains $pread 'WaitForSingleObject(ev, 50u)' 'Windows post-cancel completion wait is not bounded'
+if ($pread -match 'GetOverlappedResult\([\s\S]*?TRUE\)') {
+    throw 'Windows cancellable pread still contains an infinite GetOverlappedResult wait'
+}
+$terminal = Slice-Between $source 'static void cuda_g73_terminal_exact_load(' `
+    'static int cuda_g73_outcomes_conserved('
+Assert-Contains $terminal 'double absolute_deadline' 'terminal exact does not receive the token deadline'
+Assert-Contains $terminal 'cudaMemcpyAsync(' 'terminal exact does not launch exact H2D asynchronously'
+Assert-Contains $terminal 'cuda_g73_finish_launched_copy(' 'terminal exact does not complete a launched serve'
+if ($terminal.Contains('cudaStreamSynchronize(')) { throw 'terminal exact has an unbounded stream wait' }
+$reservationFinish = Slice-Between $source `
+    'static int cuda_moe_tiering_finish_vram_reservations(' `
+    'static void cuda_g73_classify_request('
+if ($reservationFinish.Contains('cudaStreamSynchronize(')) {
+    throw 'tiering reservation completion has an unbounded stream wait'
+}
 Assert-Contains $source 'cuda_g73_open_maybe_schedule_rotation(' 'missing G133-to-SSD-wrap rotator seam'
 Assert-Contains $source 'g73_open_rotation' 'SSD-wrap jobs must distinguish exact G73 rotation from Q1 promotion'
 Assert-Contains $source 'cuda_q1_0_ssd_wrap_fail_and_release_all_locked(' 'missing atomic rotator teardown'
 Assert-Contains $source 'cuda_q1_0_ssd_wrap_job_release_locked(&job);' 'rotator teardown does not release every job'
+$submit = Slice-Between $source 'static int cuda_q1_0_ssd_wrap_submit(' `
+    'static void cuda_g73_open_maybe_schedule_rotation('
+Assert-Contains $submit 'if (state.failed || state.stop) {' `
+    'rotator submission does not recheck teardown state under the mutex'
+Assert-Contains $submit 'cuda_dynamic_arena_slot_writer_release(&slot);' `
+    'rotator teardown-race refusal does not release its writer claim'
 Assert-Contains $source 'request-boundary-deadline' 'request-boundary rotator flush is not bounded'
 Assert-Contains $osThread 'os_cond_timedwait_ms(' 'rotator condition wait is not timed'
 Assert-Contains $source 'using exact mmap terminal' 'missing never-refusing terminal fallback'
@@ -45,11 +80,28 @@ if ($source -match 'g_cuda_g133_telemetry\.(clamped|request_refused)\s*[,\)]') {
     throw 'clamped/request_refused has a producer; both must remain structural zero'
 }
 
-Assert-Contains $source 'g_cuda_moe_split_hit_miss_dispatch' 'missing init-time split dispatch'
+Assert-Contains $source 'g_cuda_routed_moe_launch_dispatch' 'missing init-time routed-MoE dispatch'
+Assert-Contains $source '&routed_moe_launch_impl<false>' 'OFF does not select the M1 specialization'
+$routeImpl = Slice-Between $source 'static int routed_moe_launch_impl(' `
+    'static auto g_cuda_routed_moe_launch_dispatch'
+if ($routeImpl.Contains('g_cuda_g73_open_enabled')) {
+    throw 'OFF hot routed-MoE specialization loads g_cuda_g73_open_enabled'
+}
+$workerImpl = Slice-Between $source 'static void *cuda_moe_route_worker(void *arg) {' `
+    'static int cuda_moe_expert_cache_copy_to_compact_async('
+if ($workerImpl.Contains('g_cuda_g73_open_enabled')) {
+    throw 'OFF route-worker specialization loads g_cuda_g73_open_enabled'
+}
 Assert-Contains $source 'cuda_g133_attribution_append_enabled' 'missing original OFF attribution formatter'
 Assert-Contains $source 'cuda_g73_attribution_append_enabled' 'missing isolated G73 attribution formatter'
 Assert-Contains $source 'g_cuda_g133_attribution_append =' 'formatter is not selected at initialization'
 Assert-Contains $source 'cuda_g73_validate_hermetic_environment()' 'missing runtime hermetic validation'
+Assert-Contains $source 'ds4_gpu_g73_open_selftest(' 'missing real in-process G73 self-test'
+Assert-Contains $source 'selftest-stop-after-writer-claim' 'self-test does not exercise teardown versus submit'
+Assert-Contains $source 'os_pread_cancellable_timeout(' 'self-test does not exercise real pread timeout/cancel'
+if (Test-Path -LiteralPath (Join-Path $root 'tests\test_g73_open_fault_model.ps1')) {
+    throw 'fake PowerShell G73 state machine still exists'
+}
 
 foreach ($setting in @(
         '$env:DS4_G73_OPEN = ''1''',
