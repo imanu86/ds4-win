@@ -1756,6 +1756,10 @@ static int cuda_expert_recovery_trace_configure(void) {
     uint64_t layer = 0;
     uint64_t expert = 0;
     uint64_t max_samples = 0;
+    const int sidecar_provenance_present =
+        g_q1_0_sidecar_size != 0u ||
+        getenv("DS4_Q1_0_EXPERT_SIDECAR_BYTES") != NULL ||
+        getenv("DS4_Q1_0_EXPERT_SIDECAR_SHA256") != NULL;
     if (!cuda_expert_recovery_trace_env_u64(
             "DS4_EXPERT_RECOVERY_TRACE_LAYER", 0u, 42u, &layer) ||
         !cuda_expert_recovery_trace_env_u64(
@@ -1768,13 +1772,8 @@ static int cuda_expert_recovery_trace_configure(void) {
             16u * 1024u * 1024u, &trace.byte_budget) ||
         !cuda_expert_recovery_trace_env_u64(
             "DS4_MODEL_BYTES", 1u, UINT64_MAX, &trace.model_bytes) ||
-        !cuda_expert_recovery_trace_env_u64(
-            "DS4_Q1_0_EXPERT_SIDECAR_BYTES", 1u, UINT64_MAX,
-            &trace.sidecar_bytes) ||
         !cuda_expert_recovery_trace_env_sha256(
             "DS4_MODEL_SHA256", trace.model_sha256) ||
-        !cuda_expert_recovery_trace_env_sha256(
-            "DS4_Q1_0_EXPERT_SIDECAR_SHA256", trace.sidecar_sha256) ||
         !cuda_expert_recovery_trace_env_sha256(
             "DS4_EXPERT_RECOVERY_BUILD_MANIFEST_SHA256",
             trace.build_manifest_sha256) ||
@@ -1785,6 +1784,18 @@ static int cuda_expert_recovery_trace_configure(void) {
             "DS4_EXPERT_RECOVERY_EXECUTABLE_SHA256",
             trace.executable_sha256)) {
         return cuda_expert_recovery_trace_fail("configuration");
+    }
+    if (sidecar_provenance_present) {
+        if (!cuda_expert_recovery_trace_env_u64(
+                "DS4_Q1_0_EXPERT_SIDECAR_BYTES", 1u, UINT64_MAX,
+                &trace.sidecar_bytes) ||
+            !cuda_expert_recovery_trace_env_sha256(
+                "DS4_Q1_0_EXPERT_SIDECAR_SHA256", trace.sidecar_sha256)) {
+            return cuda_expert_recovery_trace_fail("configuration");
+        }
+    } else {
+        memset(trace.sidecar_sha256, '0', 64u);
+        trace.sidecar_sha256[64] = '\0';
     }
     if (!g_model_file_valid || trace.model_bytes != g_model_file_size ||
         trace.sidecar_bytes != g_q1_0_sidecar_size) {
@@ -2038,6 +2049,61 @@ static int cuda_expert_recovery_trace_capture(
     }
     return 1;
 #endif
+}
+
+static int cuda_expert_recovery_trace_capture_exact_route(
+        uint32_t layer,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        const ds4_gpu_tensor *input,
+        uint32_t input_dim) {
+    if (!g_expert_recovery_trace.enabled ||
+        layer != g_expert_recovery_trace.target_layer) {
+        return !g_expert_recovery_trace.failed;
+    }
+    const uint64_t token_index = cuda_expert_recovery_trace_layer_call(layer);
+    if (token_index == UINT64_MAX) return 0;
+    if (!selected || !weights || n_expert > 6u) {
+        return cuda_expert_recovery_trace_fail("exact_route_contract");
+    }
+    int32_t selected_host[6] = {0};
+    float weights_host[6] = {0};
+    cudaError_t copy_error = cudaMemcpy(
+        selected_host, selected->ptr, (size_t)n_expert * sizeof(int32_t),
+        cudaMemcpyDeviceToHost);
+    if (copy_error == cudaSuccess) {
+        copy_error = cudaMemcpy(
+            weights_host, weights->ptr, (size_t)n_expert * sizeof(float),
+            cudaMemcpyDeviceToHost);
+    }
+    if (copy_error != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: expert recovery exact route D2H failed: %s\n",
+                cudaGetErrorString(copy_error));
+        return cuda_expert_recovery_trace_fail("exact_route_d2h");
+    }
+    uint32_t recovery_trace_rank = UINT32_MAX;
+    float recovery_trace_weight = 0.0f;
+    for (uint32_t route = 0; route < n_expert; route++) {
+        const int32_t expert = selected_host[route];
+        if (expert < 0 || expert >= 256) {
+            return cuda_expert_recovery_trace_fail("exact_expert_range");
+        }
+        if (cuda_expert_recovery_trace_target(layer, (uint32_t)expert)) {
+            if (recovery_trace_rank != UINT32_MAX) {
+                return cuda_expert_recovery_trace_fail(
+                    "duplicate_target_route");
+            }
+            recovery_trace_rank = route;
+            recovery_trace_weight = weights_host[route];
+        }
+    }
+    if (recovery_trace_rank == UINT32_MAX) return 1;
+    return cuda_expert_recovery_trace_capture(
+        layer, g_expert_recovery_trace.target_expert,
+        recovery_trace_rank, recovery_trace_weight, "iq2_exact",
+        token_index, token_index + 1u, input, input_dim, NULL);
 }
 
 static void cuda_expert_recovery_trace_finalize(void) {
@@ -13676,6 +13742,10 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;
+    if (!g_expert_recovery_trace.configured &&
+        !cuda_expert_recovery_trace_configure()) {
+        return 0;
+    }
     if (!cuda_expert_recovery_trace_bind_model_map(model_map, model_size)) {
         return 0;
     }
@@ -14039,10 +14109,6 @@ extern "C" int ds4_gpu_set_q1_0_sidecar(
     }
     g_q1_0_sidecar_host_base = model_map;
     g_q1_0_sidecar_size = model_size;
-    if (!cuda_expert_recovery_trace_configure()) {
-        cuda_q1_0_sidecar_clear();
-        return 0;
-    }
     fprintf(stderr,
             "ds4: CUDA Q1_0 routed-expert sidecar installed: %.2f GiB\n",
             (double)model_size / 1073741824.0);
@@ -35720,15 +35786,16 @@ static int routed_moe_launch(
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, ds4_gpu_g133_epoch g133_epoch, ds4_gpu_spex_queue *spex_queue, const ds4_gpu_spex_key *spex_key) {
-    return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
-                             layer_index,
-                             gate_offset, up_offset, down_offset,
-                             gate_type, down_type,
-                             gate_expert_bytes, gate_row_bytes,
-                             down_expert_bytes, down_row_bytes,
-                             expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, NULL, n_expert, clamp, x, 1,
-                             spex_queue, spex_key, NULL, g133_epoch);
+    const int ok = routed_moe_launch(
+        out, gate, up, mid, down, model_map, model_size, layer_index,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+        down_row_bytes, expert_in_dim, expert_mid_dim, out_dim,
+        selected, weights, NULL, n_expert, clamp, x, 1, spex_queue,
+        spex_key, NULL, g133_epoch);
+    return ok && (!g_expert_recovery_trace.enabled ||
+        cuda_expert_recovery_trace_capture_exact_route(
+            layer_index, selected, weights, n_expert, x, expert_in_dim));
 }
 
 static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
