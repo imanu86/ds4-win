@@ -44,7 +44,7 @@ Require-Literal $core 'g134_committed_draft_prefix(synthetic_drafts, 2, 5,' 'hos
 Require-Literal $core 'G134 prompt-lookup self-test failed; refusing opt-in' 'fail-closed startup self-test'
 
 Require-Literal $core 'metal_graph_verify_g134_exact' 'n2k2 exact verifier'
-Require-Literal $core 'metal_graph_encode_decode_layer(g,' 'normal exact decode machinery reuse'
+Require-Literal $core 'metal_graph_encode_decode_layer_with_speculation(g,' 'G134 exact decode specialization'
 Require-Literal $core 'metal_graph_encode_output_head(g, model, weights,' 'normal exact output-head reuse'
 Require-Literal $core 'g->spec_logits' 'multi-position logits reuse'
 Require-Literal $core 'metal_graph_capture_prefix1_attn_state' 'bonus-only frontier capture'
@@ -56,7 +56,7 @@ Require-Literal $core '(uint64_t)visible_raw + n_inputs > s->graph.raw_cap' 'str
 
 $verifier = Slice-Between $core 'static bool metal_graph_verify_g134_exact(' `
     '/* Pick a raw SWA cache size for Metal.'
-Require-Literal $verifier 'epochs[j].speculative_position = j + 1u;' 'verifier speculative marks'
+Require-Literal $verifier 'speculation[j].position = j + 1u;' 'verifier sideband marks'
 if ($verifier.Contains('ds4_gpu_g133_decode_position_begin()')) {
     throw 'G134 verifier must not allocate committed G133 epochs'
 }
@@ -75,19 +75,34 @@ if ($fallback.Contains('ds4_session_eval(s, first_token')) {
     throw 'G134 fallback must not invoke native-MTP-probing ds4_session_eval'
 }
 
-Require-Literal $gpuHeader 'uint32_t speculative_position;' 'speculative position mark'
+Require-Regex $gpuHeader 'typedef struct\s*\{\s*uint64_t request_epoch;\s*uint64_t position_epoch;\s*\}\s*ds4_gpu_g133_epoch;' 'base epoch exact pre-C3 layout'
+Require-Regex $gpuHeader 'typedef struct\s*\{\s*uint32_t position;\s*\}\s*ds4_gpu_g134_speculation;' 'G134 sideband position mark'
+Require-Regex $cuda 'struct cuda_moe_route_request\s*\{[\s\S]*?ds4_gpu_g133_epoch g133_epoch;\s*uint64_t gate_offset;' 'base G133 route request has no speculative field'
+Require-Literal $cuda 'g_speculative_route_mark' 'sequence-tagged G134 route sideband'
 Require-Literal $gpuHeader 'ds4_gpu_speculative_observation_begin' 'deferred observation begin API'
 Require-Literal $gpuHeader 'ds4_gpu_speculative_observation_finish' 'deferred observation finish API'
 Require-Literal $cuda 'cuda_speculative_observation_record_route(' 'route observation buffer'
 Require-Literal $cuda 'cuda_speculative_observation_record_iq1_stage(' 'IQ1 tier action buffer'
+Require-Literal $cuda 'cuda_speculative_observation_record_vram_promotion(' 'VRAM decision buffer'
 Require-Literal $cuda 'for (uint32_t position = 1u; position <= committed_positions; position++)' 'accepted-only position-major flush'
-Require-Regex $cuda 'cuda_speculative_epoch_valid\(g133_epoch\)\)\s*\{\s*cuda_speculative_observation_record_route[\s\S]*?return prior;' 'speculative tier observation deferral'
+Require-Regex $cuda 'cuda_speculative_position_valid\(speculative_position\)\)\s*\{\s*cuda_speculative_observation_record_route[\s\S]*?return prior;' 'speculative tier observation deferral'
+Require-Literal $cuda 'g_moe_tiering.speculative_warms++;' 'designed RAM-prefetch counter'
+Require-Literal $cuda 'entry.state != CUDA_MOE_TIER_RAM_PROBATION' 'speculative RAM never evicts warm entries'
+
+$vramPick = Slice-Between $cuda 'static int cuda_moe_tiering_pick_vram_slot(' `
+    'static void cuda_moe_tiering_commit_vram_reservations('
+Require-Literal $vramPick 'if (cuda_speculative_position_valid(speculative_position)) return -1;' 'G133 budget commit-only guard'
+$vramCommit = Slice-Between $cuda 'static void cuda_moe_tiering_commit_vram_reservations(' `
+    'static void cuda_moe_tiering_refund_failed_promotions('
+Require-Literal $vramCommit 'if (cuda_speculative_position_valid(speculative_position)) return;' 'VRAM commit-only guard'
 
 Require-Literal $core 'getenv("DS4_G134_SPECDEC_VERIFY")' 'behavioral verify gate'
 Require-Literal $core 'g134_behavioral_verify_replay' 'plain-decode replay verifier'
 Require-Literal $core 'metal_graph_eval_token_raw_swa(&s->graph' 'normal decode recomputation'
 Require-Literal $core 'memcmp(plain_logits, verifier_logits' 'final-logits identity assertion'
-Require-Literal $core 'acceptance-shape coverage is runtime-dependent' 'honest runtime coverage label'
+Require-Literal $core 'shape coverage is runtime-dependent' 'honest runtime coverage label'
+Require-Literal $core 'Policy/residency state is advisory and explicitly out of' 'verify policy-state exclusion'
+Require-Literal $core 'replay can inherit speculative RAM warms' 'verify accepted policy delta'
 
 Require-Literal $core 'spec_pass_count=%" PRIu64' 'spec pass attribution'
 foreach ($field in @('drafted=%', 'accepted=%', 'bonus=%', 'fallback_passes=%', 'accept_rate=%.6f')) {

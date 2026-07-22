@@ -20,15 +20,18 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 typedef struct ds4_gpu_async_read ds4_gpu_async_read;
 typedef struct ds4_gpu_dynamic_arena_txn ds4_gpu_dynamic_arena_txn;
 
-/* Decode-owned policy time.  A value is created once per committed target
- * position and copied into every route request produced for that position.
- * Speculative verifiers use a 1-based speculative_position instead; their
- * advisory/tiering observations are buffered until that position commits. */
+/* Decode-owned policy time.  A value is created once per target position and
+ * copied into every route request produced for that position. */
 typedef struct {
     uint64_t request_epoch;
     uint64_t position_epoch;
-    uint32_t speculative_position;
 } ds4_gpu_g133_epoch;
+
+/* G134-only sideband.  Keeping the speculative mark out of the base epoch
+ * preserves the exact G133 ABI and ordinary decode plumbing when G134 is off. */
+typedef struct {
+    uint32_t position;
+} ds4_gpu_g134_speculation;
 
 typedef struct {
     uint64_t gate_offset;
@@ -813,6 +816,7 @@ int ds4_gpu_routed_moe_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x,
         ds4_gpu_g133_epoch     g133_epoch,
+        const ds4_gpu_g134_speculation *g134_speculation,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key);
 
@@ -853,6 +857,7 @@ int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x,
         ds4_gpu_g133_epoch     g133_epoch,
+        const ds4_gpu_g134_speculation *g134_speculation,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key);
 
@@ -891,7 +896,8 @@ int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         uint32_t                n_expert,
         float                   clamp,
         const ds4_gpu_tensor *x,
-        ds4_gpu_g133_epoch     g133_epoch);
+        ds4_gpu_g133_epoch     g133_epoch,
+        const ds4_gpu_g134_speculation *g134_speculation);
 
 int ds4_gpu_routed_moe_prepare_selected(
         const void             *model_map,

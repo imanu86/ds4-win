@@ -35,7 +35,7 @@ static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 
 static ds4_gpu_g133_epoch ds4_gpu_g133_noop_position_begin(void) {
-    ds4_gpu_g133_epoch epoch = {0, 0, 0};
+    ds4_gpu_g133_epoch epoch = {0, 0};
     return epoch;
 }
 
@@ -12937,9 +12937,11 @@ int ds4_gpu_routed_moe_one_tensor(
         float                   clamp,
         const ds4_gpu_tensor *x,
         ds4_gpu_g133_epoch     g133_epoch,
+        const ds4_gpu_g134_speculation *g134_speculation,
         ds4_gpu_spex_queue   *spex_queue,
         const ds4_gpu_spex_key *spex_key) {
     (void)g133_epoch;
+    (void)g134_speculation;
     (void)spex_queue;
     (void)spex_key;
     (void)layer_index;

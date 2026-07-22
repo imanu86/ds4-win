@@ -11186,7 +11186,7 @@ static bool metal_graph_matmul_plain_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
-static bool metal_graph_encode_decode_layer(
+static bool metal_graph_encode_decode_layer_with_speculation(
         ds4_gpu_graph  *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
@@ -11197,7 +11197,8 @@ static bool metal_graph_encode_decode_layer(
         uint32_t                raw_row,
         uint32_t                n_raw,
         int                     token,
-        ds4_gpu_g133_epoch     g133_epoch) {
+        ds4_gpu_g133_epoch     g133_epoch,
+        const ds4_gpu_g134_speculation *g134_speculation) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
@@ -11925,7 +11926,8 @@ static bool metal_graph_encode_decode_layer(
                 DS4_N_EXPERT_USED,
                 DS4_SWIGLU_CLAMP_EXP,
                 g->ffn_norm,
-                g133_epoch) != 0;
+                g133_epoch,
+                g134_speculation) != 0;
     } else if (ok && iq1_mixed_cold_one) {
         const ds4_tensor *iq1_gate = g_iq1_s_sidecar.gate[il];
         const ds4_tensor *iq1_up = g_iq1_s_sidecar.up[il];
@@ -11971,6 +11973,7 @@ static bool metal_graph_encode_decode_layer(
                 DS4_SWIGLU_CLAMP_EXP,
                 g->ffn_norm,
                 g133_epoch,
+                g134_speculation,
                 g->spex_prefetch,
                 g->spex_prefetch ? &spex_key : NULL) != 0;
     } else if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
@@ -11994,6 +11997,7 @@ static bool metal_graph_encode_decode_layer(
                                                   g->router_selected, g->router_weights,
                                                   DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->ffn_norm,
                                                     g133_epoch,
+                                                    g134_speculation,
                                                     route.sidecar ? NULL : g->spex_prefetch,
                                                    !route.sidecar && g->spex_prefetch
                                                        ? &spex_key : NULL) != 0;
@@ -12107,6 +12111,25 @@ static bool metal_graph_encode_decode_layer(
         metal_graph_debug_dump_tensor("hc_ffn_post", g->after_ffn_hc, hc_dim, il, pos);
     }
     return ok;
+}
+
+/* Preserve the exact ordinary G133 call shape. Only the G134 verifier selects
+ * the sideband-specialized implementation directly. */
+static bool metal_graph_encode_decode_layer(
+        ds4_gpu_graph  *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        uint32_t                pos,
+        ds4_gpu_tensor       *raw_cache,
+        uint32_t                raw_cap,
+        uint32_t                raw_row,
+        uint32_t                n_raw,
+        int                     token,
+        ds4_gpu_g133_epoch     g133_epoch) {
+    return metal_graph_encode_decode_layer_with_speculation(
+        g, model, layer, il, pos, raw_cache, raw_cap, raw_row, n_raw, token,
+        g133_epoch, NULL);
 }
 
 /* Encode the final HC collapse, output norm, and vocab projection on Metal. */
@@ -16225,12 +16248,11 @@ static bool metal_graph_verify_g134_exact(
     ds4_gpu_tensor *saved_after = g->after_ffn_hc;
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = true;
-    ds4_gpu_g133_epoch epochs[DS4_G134_VERIFY_MAX] = {{0}};
+    ds4_gpu_g134_speculation speculation[DS4_G134_VERIFY_MAX] = {{0}};
     for (uint32_t j = 0; j < n_inputs; j++) {
-        /* Policy time belongs only to committed target positions.  CUDA uses
-         * this mark to buffer route observations without advancing the G133
-         * epoch or tiering clocks during the speculative pass. */
-        epochs[j].speculative_position = j + 1u;
+        /* Policy time belongs only to committed target positions.  The G134
+         * sideband buffers scarce decisions without changing the G133 epoch. */
+        speculation[j].position = j + 1u;
     }
 
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -16239,7 +16261,7 @@ static bool metal_graph_verify_g134_exact(
             const uint32_t pos = start + j;
             g->cur_hc = cur[j];
             g->after_ffn_hc = next[j];
-            ok = metal_graph_encode_decode_layer(g,
+            ok = metal_graph_encode_decode_layer_with_speculation(g,
                                                   model,
                                                   &weights->layer[il],
                                                   il,
@@ -16249,7 +16271,8 @@ static bool metal_graph_verify_g134_exact(
                                                   pos % g->raw_cap,
                                                   metal_graph_raw_span_for_batch(g, pos, 1),
                                                   tokens[j],
-                                                  epochs[j]);
+                                                  (ds4_gpu_g133_epoch){0},
+                                                  &speculation[j]);
             if (ok && j == 0) {
                 ok = metal_graph_capture_prefix1_attn_state(g, il) &&
                      metal_graph_capture_prefix1_index_state(g, il);
@@ -16767,8 +16790,11 @@ static int g134_committed_draft_prefix(const int *drafts, int matched_drafts,
 
 /* Model-free startup contract for host lookup and prefix bookkeeping only.
  * GPU logits, KV rollback, EOS and context-boundary behavior require a loaded
- * model; DS4_G134_SPECDEC_VERIFY=1 checks those candidate passes at runtime by
- * replaying their committed prefix through ordinary one-token decode. */
+ * model. DS4_G134_SPECDEC_VERIFY=1 asserts output identity: verifier top ids
+ * and the final committed logits must match ordinary one-token decode (the
+ * latter by memcmp). Policy/residency state is advisory and explicitly out of
+ * scope under the racy-tolerant M1 contract; replay may inherit designed
+ * speculative RAM warms, while scarce changes occur only for accepted rows. */
 static bool g134_prompt_lookup_self_test(void) {
     const int history[] = {9, 2, 3, 8, 2};
     int drafts[2] = {-1, -1};
@@ -20482,7 +20508,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (s->g134_specdec_verify) {
         fprintf(stderr,
                 "ds4: G134 behavioral verify enabled; candidate passes replay "
-                "plain decode (acceptance-shape coverage is runtime-dependent)\n");
+                "plain decode and assert output identity (logits memcmp); "
+                "advisory policy/residency state is out of scope, acceptance-"
+                "shape coverage is runtime-dependent\n");
     }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->model, &e->weights, &e->weights.layer[0],
@@ -21205,8 +21233,11 @@ static void g134_behavioral_verify_assert(bool condition, const char *what,
 }
 
 /* Rebuild the accepted verifier frontier with the ordinary one-token path.
- * This diagnostic mode deliberately leaves that replayed state live, making
- * the post-call checkpoint/KV/logits state exactly the state being checked. */
+ * This diagnostic asserts output identity: per-row greedy tops and the final
+ * committed logits (memcmp). It deliberately leaves replayed KV/logits live.
+ * Advisory policy/residency identity is out of scope by the M1 racy-tolerant
+ * contract: replay can inherit speculative RAM warms, and that accepted delta
+ * is allowed because scarce budget/VRAM decisions remain commit-only. */
 static bool g134_behavioral_verify_replay(ds4_session *s,
                                            const int *inputs,
                                            int committed_inputs,
