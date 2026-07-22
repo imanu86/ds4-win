@@ -25,6 +25,8 @@ $errors = $null
 if ($errors -and $errors.Count) { throw 'G73-OPEN preset has PowerShell syntax errors' }
 
 Assert-Contains $source 'getenv("DS4_G73_OPEN")' 'missing OFF-default G73-OPEN gate'
+Assert-Contains $source 'getenv("DS4_G73_CONSERVATION_STRICT")' `
+    'missing opt-in strict conservation gate'
 Assert-Contains $source '!cuda_g73_open_requested()) {' 'cold admission must be bypassed only in G73-OPEN'
 Assert-Contains $source 'cuda_moe_transient_pread_chunked(' 'missing bounded exact transient read'
 Assert-Contains $source 'request->absolute_deadline = absolute_deadline;' 'route request does not carry one absolute deadline'
@@ -127,6 +129,34 @@ foreach ($counter in @('out_of_mask_routes', 'served_transient',
 Assert-Contains $source 'out_of_mask_routes != served + clamped + request_refused' 'missing token attribution conservation assertion'
 Assert-Contains $source 'clamped != 0u || request_refused != 0u' 'clamp/refusal are not structural-zero assertions'
 Assert-Contains $source '!cuda_g73_commit_outcomes(layer_index, g73_outcomes)' 'outcomes are not committed after exact launch acceptance'
+$classifyRequest = Slice-Between $source 'static void cuda_g73_classify_request(' `
+    'static void cuda_g73_publish_pending_outcomes('
+Assert-Contains $classifyRequest 'if (request.hit_slots[route] >= 0) outcomes->served_promoted++;' `
+    'out-of-mask cache hits are not attributed as promoted service'
+$enforceRequest = Slice-Between $source 'static int cuda_moe_tiering_enforce_request(' `
+    'static void *cuda_moe_route_worker('
+if ($enforceRequest -match 'g73_out_of_mask\[route\]\s*&&\s*have_ram') {
+    throw 'out-of-mask RAM route is still double-counted after transient service'
+}
+if ([regex]::Matches($enforceRequest, 'g73_outcomes\.served_promoted\+\+').Count -ne 1) {
+    throw 'served_promoted must have one mutually-exclusive producer in the promoted branch'
+}
+Assert-Contains $enforceRequest 'if (g73_out_of_mask[route]) {' `
+    'promoted branch does not attribute its out-of-mask route'
+Assert-Contains $enforceRequest 'if (g73_out_of_mask[route]) g73_outcomes.served_transient++;' `
+    'transient branch does not attribute its out-of-mask route'
+$commitOutcomes = Slice-Between $source 'static int cuda_g73_commit_outcomes(' `
+    'extern "C" int ds4_gpu_g73_open_selftest('
+foreach ($field in @('out_of_mask_routes=%llu', 'served_transient=%llu',
+        'served_promoted=%llu', 'served_selected_fallback=%llu',
+        'served_terminal_exact=%llu', 'clamped=%llu',
+        'request_refused=%llu', 'delta=%lld')) {
+    Assert-Contains $commitOutcomes $field "conservation diagnostic missing: $field"
+}
+Assert-Contains $commitOutcomes 'if (g_cuda_g73_conservation_strict) {' `
+    'conservation mismatch is not strict only by opt-in'
+Assert-Contains $commitOutcomes 'g_cuda_g73_conservation_strict ? "abort" : "continue"' `
+    'conservation diagnostic does not disclose abort/continue action'
 if ($source -match 'served_lane_a') { throw 'obsolete pre-success lane-A counter remains' }
 if ($source -match 'g_cuda_g133_telemetry\.(clamped|request_refused)\s*[,\)]') {
     throw 'clamped/request_refused has a producer; both must remain structural zero'

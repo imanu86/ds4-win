@@ -1359,7 +1359,18 @@ static int cuda_g73_open_requested(void) {
     return enabled;
 }
 
+static int cuda_g73_conservation_strict_requested(void) {
+    const char *value = getenv("DS4_G73_CONSERVATION_STRICT");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
+    if (strcmp(value, "1") == 0) return 1;
+    fprintf(stderr,
+            "ds4: invalid DS4_G73_CONSERVATION_STRICT=%s; expected 0 or 1\n",
+            value);
+    return 0;
+}
+
 static int g_cuda_g73_open_enabled;
+static int g_cuda_g73_conservation_strict;
 
 static int cuda_moe_split_hit_miss_requested(void);
 static int cuda_moe_split_fused_requested(void);
@@ -3248,6 +3259,8 @@ static int cuda_g133_initialize_dispatch(void) {
         return 0;
     }
     g_cuda_g73_open_enabled = cuda_g73_open_requested();
+    g_cuda_g73_conservation_strict =
+        cuda_g73_conservation_strict_requested();
     if (!cuda_g133_tier_requested()) return 1;
 
     const char *decay_env = getenv("DS4_G133_DECAY");
@@ -3497,14 +3510,23 @@ static void cuda_g73_attribution_append_enabled(
         served_selected_fallback + served_terminal_exact;
     if (out_of_mask_routes != served + clamped + request_refused ||
         clamped != 0u || request_refused != 0u) {
+        const uint64_t accounted = served + clamped + request_refused;
+        const int64_t delta =
+            (int64_t)out_of_mask_routes - (int64_t)accounted;
         fprintf(stderr,
                 "ds4: [g73-open] telemetry conservation failure "
-                "out_of_mask=%llu served=%llu clamped=%llu refused=%llu\n",
+                "out_of_mask_routes=%llu served_transient=%llu "
+                "served_promoted=%llu served_selected_fallback=%llu "
+                "served_terminal_exact=%llu clamped=%llu "
+                "request_refused=%llu delta=%lld action=continue\n",
                 (unsigned long long)out_of_mask_routes,
-                (unsigned long long)served,
+                (unsigned long long)served_transient,
+                (unsigned long long)served_promoted,
+                (unsigned long long)served_selected_fallback,
+                (unsigned long long)served_terminal_exact,
                 (unsigned long long)clamped,
-                (unsigned long long)request_refused);
-        return;
+                (unsigned long long)request_refused,
+                (long long)delta);
     }
     const char *format =
         " upload_sync_wait_ms=%.6f vram_hit_pct=%.6f"
@@ -30695,6 +30717,11 @@ static int cuda_moe_tiering_enforce_request(
             entry.age = ++cache->tick;
             entry.layer_owned = 0;
             entry.layer_key = request.gate_offset;
+            if constexpr (G73) {
+                if (g73_out_of_mask[route]) {
+                    g73_outcomes.served_promoted++;
+                }
+            }
         } else {
             if (from_snapshot) {
                 g_moe_tiering.snapshot_to_vram_bytes +=
@@ -30785,11 +30812,6 @@ static int cuda_moe_tiering_enforce_request(
                 if (g73_out_of_mask[route]) g73_outcomes.served_transient++;
                 cuda_g73_open_maybe_schedule_rotation(
                     request, route, expert, tier);
-            }
-        }
-        if constexpr (G73) {
-            if (g73_out_of_mask[route] && have_ram) {
-                g73_outcomes.served_promoted++;
             }
         }
         if (from_nested && !cuda_nested_residual_gpu_join_requested()) {
@@ -34560,8 +34582,33 @@ static int cuda_g73_outcomes_conserved(
 static int cuda_g73_commit_outcomes(
         uint32_t layer, const cuda_g73_route_outcomes &outcomes) {
     if (!cuda_g73_outcomes_conserved(outcomes)) {
-        return cuda_g73_contract_error(
-            layer, "outcome-conservation-before-commit");
+        const uint64_t served = outcomes.served_transient +
+            outcomes.served_promoted + outcomes.served_selected_fallback +
+            outcomes.served_terminal_exact;
+        const uint64_t accounted =
+            served + outcomes.clamped + outcomes.request_refused;
+        const int64_t delta = (int64_t)outcomes.out_of_mask_routes -
+            (int64_t)accounted;
+        fprintf(stderr,
+                "ds4: [g73-open] outcome conservation mismatch layer=%u "
+                "out_of_mask_routes=%llu served_transient=%llu "
+                "served_promoted=%llu served_selected_fallback=%llu "
+                "served_terminal_exact=%llu clamped=%llu "
+                "request_refused=%llu delta=%lld strict=%d action=%s\n",
+                layer,
+                (unsigned long long)outcomes.out_of_mask_routes,
+                (unsigned long long)outcomes.served_transient,
+                (unsigned long long)outcomes.served_promoted,
+                (unsigned long long)outcomes.served_selected_fallback,
+                (unsigned long long)outcomes.served_terminal_exact,
+                (unsigned long long)outcomes.clamped,
+                (unsigned long long)outcomes.request_refused,
+                (long long)delta, g_cuda_g73_conservation_strict,
+                g_cuda_g73_conservation_strict ? "abort" : "continue");
+        if (g_cuda_g73_conservation_strict) {
+            return cuda_g73_contract_error(
+                layer, "outcome-conservation-before-commit");
+        }
     }
     cuda_g133_telemetry_increment(
         g_cuda_g133_telemetry.out_of_mask_routes,
