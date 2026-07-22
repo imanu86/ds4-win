@@ -49,11 +49,55 @@ $env:DS4_CUDA_MOE_SPLIT_HIT_MISS = '0'
 $env:DS4_CUDA_MOE_SPLIT_FUSED = '0'
 
 # Q1/IQ1 are neither serving tiers nor shadow substitutes in this preset.
-Remove-Item Env:\DS4_Q1_0_MIXED_COLD_ONE -ErrorAction SilentlyContinue
-Remove-Item Env:\DS4_IQ1_S_MIXED_COLD_K -ErrorAction SilentlyContinue
-Remove-Item Env:\DS4_Q1_0_SNAPSHOT_BACKING -ErrorAction SilentlyContinue
-Remove-Item Env:\DS4_Q1_0_DYNAMIC_PROMOTION -ErrorAction SilentlyContinue
-Remove-Item Env:\DS4_Q1_0_SELECTED_LOAD -ErrorAction SilentlyContinue
-Remove-Item Env:\DS4_Q1_0_EXPERT_SIDECAR -ErrorAction SilentlyContinue
-Remove-Item Env:\DS4_IQ1_S_EXPERT_SIDECAR -ErrorAction SilentlyContinue
+# Keep only the DS4_Q1_0_SSD_WRAP_* and DS4_Q1_0_IQ2_PINNED_* transport
+# namespaces; G73 consumes those controls for exact background rotation.
+$g73ForbiddenQuantServing = @(
+    'DS4_Q1_0_RESIDENT_ARENA',
+    'DS4_Q1_0_DUAL_ARENA',
+    'DS4_Q1_0_DUAL_SPARSE_COMPANION',
+    'DS4_Q1_0_DYNAMIC_ARENA_GB',
+    'DS4_Q1_0_PAGEABLE_OVERFLOW',
+    'DS4_Q1_0_MIXED_COLD_ONE',
+    'DS4_Q1_0_SNAPSHOT_BACKING',
+    'DS4_Q1_0_DYNAMIC_PROMOTION',
+    'DS4_Q1_0_SELECTED_LOAD',
+    'DS4_Q1_0_EXPERT_SIDECAR',
+    'DS4_Q1_0_EXPERT_SIDECAR_BYTES',
+    'DS4_Q1_0_EXPERT_SIDECAR_SHA256',
+    'DS4_Q1_0_PROMOTION_SSD_WRAP',
+    'DS4_Q1_0_PROMOTION_PROBATION_SLOTS',
+    'DS4_Q1_0_PROMOTION_MIN_TOUCHES',
+    'DS4_Q1_0_PROMOTION_MIN_WEIGHT',
+    'DS4_Q1_0_PROMOTION_MIN_MASS',
+    'DS4_Q1_0_PROMOTION_REQUEST_BUDGET',
+    'DS4_Q1_0_PROMOTION_WINDOW_CALLS',
+    'DS4_Q1_0_PROMOTION_WINDOW_BUDGET',
+    'DS4_Q1_0_LAYER_FIRST',
+    'DS4_Q1_0_LAYER_LAST',
+    'DS4_Q1_0_MIXED_TRACE',
+    'DS4_Q1_0_PROFILE',
+    'DS4_IQ1_PROMOTION_PROBATION_SLOTS',
+    'DS4_IQ1_PROMOTION_MIN_TOUCHES',
+    'DS4_IQ1_PROMOTION_MIN_WEIGHT',
+    'DS4_IQ1_PROMOTION_MIN_MASS',
+    'DS4_IQ1_PROMOTION_REQUEST_BUDGET',
+    'DS4_IQ1_PROMOTION_WINDOW_CALLS',
+    'DS4_IQ1_PROMOTION_WINDOW_BUDGET',
+    'DS4_IQ1_S_EXPERT_SIDECAR',
+    'DS4_IQ1_S_LAYER_FIRST',
+    'DS4_IQ1_S_LAYER_LAST',
+    'DS4_IQ1_S_MIXED_COLD_K',
+    'DS4_IQ1_S_PACKED_H2D',
+    'DS4_IQ1_S_PROFILE',
+    'DS4_IQ1_S_RAM_CACHE_GB',
+    'DS4_IQ1_S_RAM_CACHE_PAGEABLE',
+    'DS4_IQ1_S_RAM_CACHE_PRELOAD_ALL',
+    'DS4_IQ1_S_VRAM_CACHE_PER_LAYER',
+    'DS4_IQ1_MIXED_DEBUG',
+    'DS4_IQ1_MIXED_GPU_PLAN',
+    'DS4_IQ1_MIXED_NO_MAIN_SYNC'
+)
+foreach ($quantServingVar in $g73ForbiddenQuantServing) {
+    Remove-Item -LiteralPath "Env:$quantServingVar" -ErrorAction SilentlyContinue
+}
 Remove-Item Env:\DS4_REAP_MASK_FILE -ErrorAction SilentlyContinue

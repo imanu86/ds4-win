@@ -50,6 +50,9 @@ void os_pread_cancellable_reset(os_pread_cancellable_t *state);
 int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
                              uint64_t off, os_pread_cancellable_t *state,
                              uint32_t sequence);
+int64_t os_pread_cancellable_timeout(
+    const os_file_t *f, void *buf, uint64_t len, uint64_t off,
+    os_pread_cancellable_t *state, uint32_t sequence, uint32_t timeout_ms);
 int os_pread_cancel(os_pread_cancellable_t *state, uint32_t sequence);
 FILE *os_fopen(const char *path_utf8, const char *mode);
 

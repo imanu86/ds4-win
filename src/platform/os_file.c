@@ -241,15 +241,17 @@ int os_pread_cancel(os_pread_cancellable_t *state, uint32_t sequence) {
 #endif
 }
 
-int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
-                             uint64_t off, os_pread_cancellable_t *state,
-                             uint32_t sequence) {
+int64_t os_pread_cancellable_timeout(
+        const os_file_t *f, void *buf, uint64_t len, uint64_t off,
+        os_pread_cancellable_t *state, uint32_t sequence,
+        uint32_t timeout_ms) {
     if (!os_file_valid(f) || (!buf && len != 0)) {
         errno = EINVAL;
         return -1;
     }
     uint64_t done = 0;
 #ifdef _WIN32
+    const ULONGLONG started_tick = GetTickCount64();
     os_pread_cancellable_t local_state;
     if (!state) {
         os_pread_cancellable_init(&local_state);
@@ -296,8 +298,35 @@ int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
                         &state->cancel_sequence, 0, 0) == (LONG)sequence) {
                     (void)CancelIoEx(f->h, &state->overlapped);
                 }
+                DWORD wait_ms = INFINITE;
+                if (timeout_ms != UINT32_MAX) {
+                    const ULONGLONG elapsed = GetTickCount64() - started_tick;
+                    wait_ms = elapsed >= timeout_ms ? 0u :
+                        (DWORD)(timeout_ms - elapsed);
+                }
+                const DWORD waited = WaitForSingleObject(ev, wait_ms);
+                if (waited == WAIT_TIMEOUT) {
+                    (void)CancelIoEx(f->h, &state->overlapped);
+                    (void)GetOverlappedResult(
+                        f->h, &state->overlapped, &got, TRUE);
+                    InterlockedExchange(&state->active, 0);
+                    state->file = INVALID_HANDLE_VALUE;
+                    CloseHandle(ev);
+                    errno = ETIMEDOUT;
+                    return -1;
+                }
+                if (waited != WAIT_OBJECT_0) {
+                    (void)CancelIoEx(f->h, &state->overlapped);
+                    (void)GetOverlappedResult(
+                        f->h, &state->overlapped, &got, TRUE);
+                    InterlockedExchange(&state->active, 0);
+                    state->file = INVALID_HANDLE_VALUE;
+                    CloseHandle(ev);
+                    errno = EIO;
+                    return -1;
+                }
                 ok = GetOverlappedResult(
-                    f->h, &state->overlapped, &got, TRUE);
+                    f->h, &state->overlapped, &got, FALSE);
                 if (!ok) err = GetLastError();
             }
             if (!ok) {
@@ -325,6 +354,7 @@ int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
 #else
     (void)state;
     (void)sequence;
+    (void)timeout_ms;
     while (done < len) {
         const uint64_t remaining = len - done;
         size_t chunk = remaining > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)remaining;
@@ -338,6 +368,13 @@ int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
     }
 #endif
     return (int64_t)done;
+}
+
+int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
+                             uint64_t off, os_pread_cancellable_t *state,
+                             uint32_t sequence) {
+    return os_pread_cancellable_timeout(
+        f, buf, len, off, state, sequence, UINT32_MAX);
 }
 
 int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {

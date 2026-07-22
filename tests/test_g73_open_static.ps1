@@ -1,6 +1,8 @@
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $source = Get-Content -LiteralPath (Join-Path $root 'ds4_cuda.cu') -Raw
+$osFile = Get-Content -LiteralPath (Join-Path $root 'src\platform\os_file.c') -Raw
+$osThread = Get-Content -LiteralPath (Join-Path $root 'src\platform\os_thread.h') -Raw
 $presetPath = Join-Path $root 'tests\g73_open.env.ps1'
 $preset = Get-Content -LiteralPath $presetPath -Raw
 
@@ -17,13 +19,37 @@ if ($errors -and $errors.Count) { throw 'G73-OPEN preset has PowerShell syntax e
 Assert-Contains $source 'getenv("DS4_G73_OPEN")' 'missing OFF-default G73-OPEN gate'
 Assert-Contains $source '!cuda_g73_open_requested()) {' 'cold admission must be bypassed only in G73-OPEN'
 Assert-Contains $source 'cuda_moe_transient_pread_chunked(' 'missing bounded exact transient read'
+Assert-Contains $source 'request->absolute_deadline = absolute_deadline;' 'route request does not carry one absolute deadline'
+Assert-Contains $source 'cuda_moe_fill_span_bounded(' 'selected fallback is not deadline bounded'
+Assert-Contains $source 'cuda_g73_terminal_exact_load(' 'missing exact mmap terminal'
+Assert-Contains $source 'terminal-corrupt-model-range' 'corrupt terminal range must be a hard error'
+Assert-Contains $osFile 'os_pread_cancellable_timeout(' 'platform reads lack a cancellable timeout API'
+Assert-Contains $osFile 'CancelIoEx' 'Windows timed read does not cancel the overlapped operation'
 Assert-Contains $source 'cuda_g73_open_maybe_schedule_rotation(' 'missing G133-to-SSD-wrap rotator seam'
 Assert-Contains $source 'g73_open_rotation' 'SSD-wrap jobs must distinguish exact G73 rotation from Q1 promotion'
-Assert-Contains $source 'falling back to exact selected-load' 'missing request fail-open fallback'
-foreach ($counter in @('out_of_mask_routes', 'served_transient', 'served_lane_a',
-        'served_promoted', 'clamped', 'rotation_promotions', 'rotation_reaps')) {
+Assert-Contains $source 'cuda_q1_0_ssd_wrap_fail_and_release_all_locked(' 'missing atomic rotator teardown'
+Assert-Contains $source 'cuda_q1_0_ssd_wrap_job_release_locked(&job);' 'rotator teardown does not release every job'
+Assert-Contains $source 'request-boundary-deadline' 'request-boundary rotator flush is not bounded'
+Assert-Contains $osThread 'os_cond_timedwait_ms(' 'rotator condition wait is not timed'
+Assert-Contains $source 'using exact mmap terminal' 'missing never-refusing terminal fallback'
+foreach ($counter in @('out_of_mask_routes', 'served_transient',
+        'served_promoted', 'served_selected_fallback', 'served_terminal_exact',
+        'clamped', 'request_refused', 'rotation_promotions', 'rotation_reaps')) {
     Assert-Contains $source $counter "missing G73 attribution counter: $counter"
 }
+Assert-Contains $source 'out_of_mask_routes != served + clamped + request_refused' 'missing token attribution conservation assertion'
+Assert-Contains $source 'clamped != 0u || request_refused != 0u' 'clamp/refusal are not structural-zero assertions'
+Assert-Contains $source 'cuda_g73_commit_outcomes(layer_index, g73_outcomes);' 'outcomes are not committed after exact launch acceptance'
+if ($source -match 'served_lane_a') { throw 'obsolete pre-success lane-A counter remains' }
+if ($source -match 'g_cuda_g133_telemetry\.(clamped|request_refused)\s*[,\)]') {
+    throw 'clamped/request_refused has a producer; both must remain structural zero'
+}
+
+Assert-Contains $source 'g_cuda_moe_split_hit_miss_dispatch' 'missing init-time split dispatch'
+Assert-Contains $source 'cuda_g133_attribution_append_enabled' 'missing original OFF attribution formatter'
+Assert-Contains $source 'cuda_g73_attribution_append_enabled' 'missing isolated G73 attribution formatter'
+Assert-Contains $source 'g_cuda_g133_attribution_append =' 'formatter is not selected at initialization'
+Assert-Contains $source 'cuda_g73_validate_hermetic_environment()' 'missing runtime hermetic validation'
 
 foreach ($setting in @(
         '$env:DS4_G73_OPEN = ''1''',
@@ -37,8 +63,13 @@ foreach ($setting in @(
     Assert-Contains $preset $setting "preset missing: $setting"
 }
 foreach ($q1 in @('DS4_Q1_0_MIXED_COLD_ONE', 'DS4_IQ1_S_MIXED_COLD_K',
-        'DS4_Q1_0_SELECTED_LOAD', 'DS4_Q1_0_EXPERT_SIDECAR')) {
-    Assert-Contains $preset "Remove-Item Env:\$q1" "preset does not disable $q1"
+        'DS4_Q1_0_SELECTED_LOAD', 'DS4_Q1_0_EXPERT_SIDECAR',
+        'DS4_Q1_0_RESIDENT_ARENA', 'DS4_Q1_0_DUAL_ARENA',
+        'DS4_Q1_0_DUAL_SPARSE_COMPANION', 'DS4_Q1_0_PAGEABLE_OVERFLOW',
+        'DS4_IQ1_PROMOTION_PROBATION_SLOTS')) {
+    Assert-Contains $preset "'$q1'" "preset does not disable $q1"
+    Assert-Contains $source "`"$q1`"" "runtime validation does not reject $q1"
 }
+Assert-Contains $preset 'Remove-Item -LiteralPath "Env:$quantServingVar"' 'preset namespace clearing is not data-driven'
 
 Write-Host 'G73-OPEN static contract passed'

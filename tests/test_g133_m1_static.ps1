@@ -359,14 +359,18 @@ Assert-True ($osFile.Contains('CancelIoEx(state->file, &state->overlapped)') -an
              $source.Contains('os_pread_cancel(&cache->route_transient_pread, sequence)') -and
              -not $source.Contains('CancelSynchronousIo')) `
     'Windows transient cancellation must target the live OVERLAPPED with CancelIoEx'
-$cancellablePread = Slice-TextBetween $osFile 'int64_t os_pread_cancellable(' `
-    'int64_t os_pread('
+$cancellablePread = Slice-TextBetween $osFile `
+    'int64_t os_pread_cancellable_timeout(' `
+    'int64_t os_pread_cancellable('
 $armAt = $cancellablePread.IndexOf('InterlockedExchange(&state->active, 1);')
 $cancelCheckAt = $cancellablePread.IndexOf('&state->cancel_sequence, 0, 0')
 Assert-True ($armAt -ge 0 -and $cancelCheckAt -gt $armAt -and
              ([regex]::Matches($cancellablePread,
                  '&state->cancel_sequence, 0, 0')).Count -ge 2) `
     'cancellable pread must arm before checking cancel and recheck after submission'
+Assert-True ($cancellablePread.Contains('WaitForSingleObject') -and
+             $cancellablePread.Contains('CancelIoEx')) `
+    'cancellable pread timeout must cancel blocked Windows I/O'
 $genericPreadAt = $osFile.IndexOf('int64_t os_pread(')
 Assert-True ($genericPreadAt -ge 0) 'missing generic os_pread'
 $genericPread = $osFile.Substring($genericPreadAt)

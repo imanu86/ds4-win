@@ -33,6 +33,12 @@ static inline int os_cond_init(os_cond_t *c) {
 static inline int os_cond_wait(os_cond_t *c, os_mutex_t *m) {
     return SleepConditionVariableSRW(c, m, INFINITE, 0) ? 0 : -1;
 }
+/* Returns 0 when signalled, 1 on timeout, and -1 on any other error. */
+static inline int os_cond_timedwait_ms(
+        os_cond_t *c, os_mutex_t *m, uint32_t timeout_ms) {
+    if (SleepConditionVariableSRW(c, m, (DWORD)timeout_ms, 0)) return 0;
+    return GetLastError() == ERROR_TIMEOUT ? 1 : -1;
+}
 static inline void os_cond_signal(os_cond_t *c) { WakeConditionVariable(c); }
 static inline void os_cond_broadcast(os_cond_t *c) { WakeAllConditionVariable(c); }
 static inline void os_cond_destroy(os_cond_t *c) { (void)c; }
@@ -54,6 +60,8 @@ long os_cpu_count(void);
 
 #else
 #include <pthread.h>
+#include <errno.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef pthread_mutex_t os_mutex_t;
@@ -70,6 +78,20 @@ static inline void os_mutex_unlock(os_mutex_t *m) { pthread_mutex_unlock(m); }
 static inline void os_mutex_destroy(os_mutex_t *m) { pthread_mutex_destroy(m); }
 static inline int os_cond_init(os_cond_t *c) { return pthread_cond_init(c, NULL); }
 static inline int os_cond_wait(os_cond_t *c, os_mutex_t *m) { return pthread_cond_wait(c, m); }
+/* Returns 0 when signalled, 1 on timeout, and -1 on any other error. */
+static inline int os_cond_timedwait_ms(
+        os_cond_t *c, os_mutex_t *m, uint32_t timeout_ms) {
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return -1;
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    const int rc = pthread_cond_timedwait(c, m, &deadline);
+    return rc == 0 ? 0 : (rc == ETIMEDOUT ? 1 : -1);
+}
 static inline void os_cond_signal(os_cond_t *c) { pthread_cond_signal(c); }
 static inline void os_cond_broadcast(os_cond_t *c) { pthread_cond_broadcast(c); }
 static inline void os_cond_destroy(os_cond_t *c) { pthread_cond_destroy(c); }
