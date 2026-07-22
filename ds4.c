@@ -20173,6 +20173,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             q1_0_pageable_overflow_requested();
         const int q1_0_dynamic_promotion =
             q1_0_dynamic_promotion_requested();
+        const char *g73_open_env = getenv("DS4_G73_OPEN");
+        const bool g73_open =
+            g73_open_env && strcmp(g73_open_env, "1") == 0;
         const char *arena_gb_env = getenv("DS4_CUDA_DYNAMIC_ARENA_GB");
         const double arena_gb = arena_gb_env && arena_gb_env[0]
             ? strtod(arena_gb_env, NULL) : 0.0;
@@ -20285,10 +20288,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                         requested, &allocated, &slots)) {
                     fprintf(stderr,
                             "ds4: CUDA primary dynamic arena requested but unavailable%s\n",
-                            q1_0_dual_arena > 0
+                            g73_open
+                                ? "; G73 terminal BOOT CONFIG ERROR"
+                                : q1_0_dual_arena > 0
                                 ? "; Q1_0 dual mode failed closed"
                                 : "; continuing with pageable fallback");
-                    if (q1_0_dual_arena > 0) {
+                    if (q1_0_dual_arena > 0 || g73_open) {
                         ds4_gpu_dynamic_arena_release();
                         metal_graph_free(&s->graph);
                         free(s);

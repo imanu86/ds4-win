@@ -111,8 +111,11 @@ try {
     # One sustained decode creates >64 route candidates inside a single live
     # rotation window (6 routes/token), instead of resetting pressure through
     # singleton requests. The stderr checks below require real rotator evidence.
-    [void](Invoke-Gate ($Port + 1) `
-        'Write a numbered list from 1 through 128, one short item per number.' 128)
+    $sustained = Invoke-Gate ($Port + 1) `
+        'Write a numbered list from 1 through 128, one short item per number.' 128
+    if ($sustained.usage.completion_tokens -ne 128) {
+        throw "sustained gate generated $($sustained.usage.completion_tokens) tokens; expected 128"
+    }
 } finally {
     Stop-GateServer $g73Process
     Stop-GateServer $offProcess

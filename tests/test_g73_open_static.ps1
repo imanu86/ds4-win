@@ -28,7 +28,7 @@ Assert-Contains $source '!cuda_g73_open_requested()) {' 'cold admission must be 
 Assert-Contains $source 'cuda_moe_transient_pread_chunked(' 'missing bounded exact transient read'
 Assert-Contains $source 'request->absolute_deadline = absolute_deadline;' 'route request does not carry one absolute deadline'
 Assert-Contains $source 'cuda_moe_fill_span_bounded(' 'selected fallback is not deadline bounded'
-Assert-Contains $source 'cuda_g73_terminal_exact_load(' 'missing exact mmap terminal'
+Assert-Contains $source 'cuda_g73_terminal_exact_load(' 'missing exact preallocated terminal'
 Assert-Contains $source 'terminal-corrupt-model-range' 'corrupt terminal range must be a hard error'
 Assert-Contains $osFile 'os_pread_cancellable_timeout(' 'platform reads lack a cancellable timeout API'
 Assert-Contains $osFile 'CancelIoEx' 'Windows timed read does not cancel the overlapped operation'
@@ -36,18 +36,24 @@ $pread = Slice-Between $osFile 'int64_t os_pread_cancellable_timeout(' `
     'int64_t os_pread_cancellable('
 Assert-Contains $pread 'const uint64_t max_chunk = 1024u * 1024u;' `
     'POSIX cancellable pread is not chunk-bounded'
-Assert-Contains $pread '__atomic_load_n(' 'POSIX cancellable pread ignores cancellation'
+Assert-Contains $pread 'atomic_load_explicit(' 'POSIX cancellable pread ignores cancellation'
 Assert-Contains $pread 'os_monotonic_sec() >= deadline' 'POSIX cancellable pread ignores its deadline'
-Assert-Contains $pread 'WaitForSingleObject(ev, 50u)' 'Windows post-cancel completion wait is not bounded'
+Assert-Contains $pread 'WaitForSingleObject(state->event, 50u)' 'Windows post-cancel completion wait is not bounded'
 if ($pread -match 'GetOverlappedResult\([\s\S]*?TRUE\)') {
     throw 'Windows cancellable pread still contains an infinite GetOverlappedResult wait'
 }
-$terminal = Slice-Between $source 'static void cuda_g73_terminal_exact_load(' `
+$terminal = Slice-Between $source 'static int cuda_g73_terminal_exact_load(' `
     'static int cuda_g73_outcomes_conserved('
 Assert-Contains $terminal 'double absolute_deadline' 'terminal exact does not receive the token deadline'
-Assert-Contains $terminal 'cudaMemcpyAsync(' 'terminal exact does not launch exact H2D asynchronously'
-Assert-Contains $terminal 'cuda_g73_finish_launched_copy(' 'terminal exact does not complete a launched serve'
+Assert-Contains $terminal 'cuda_g73_terminal_read_part(' 'terminal exact does not use bounded file reads'
+Assert-Contains $terminal 'cudaMemcpy(' 'terminal exact does not perform its completing H2D'
+if ($terminal.Contains('cudaMalloc(') -or $terminal.Contains('.resize(') -or
+    $terminal.Contains('model_map +')) {
+    throw 'terminal exact performs serving-path acquisition or mmap access'
+}
 if ($terminal.Contains('cudaStreamSynchronize(')) { throw 'terminal exact has an unbounded stream wait' }
+Assert-Contains $source 'BOOT CONFIG ERROR: terminal' 'terminal preallocation failure is not a boot error'
+Assert-Contains $source 'os_pread_cancellable_pending(' 'persistent I/O slots do not prevent buffer reuse'
 $reservationFinish = Slice-Between $source `
     'static int cuda_moe_tiering_finish_vram_reservations(' `
     'static void cuda_g73_classify_request('
@@ -57,7 +63,7 @@ if ($reservationFinish.Contains('cudaStreamSynchronize(')) {
 Assert-Contains $source 'cuda_g73_open_maybe_schedule_rotation(' 'missing G133-to-SSD-wrap rotator seam'
 Assert-Contains $source 'g73_open_rotation' 'SSD-wrap jobs must distinguish exact G73 rotation from Q1 promotion'
 Assert-Contains $source 'cuda_q1_0_ssd_wrap_fail_and_release_all_locked(' 'missing atomic rotator teardown'
-Assert-Contains $source 'cuda_q1_0_ssd_wrap_job_release_locked(&job);' 'rotator teardown does not release every job'
+Assert-Contains $source 'RAM_COMMITTING is unreleasable' 'rotator commit ownership is not held through publication'
 $submit = Slice-Between $source 'static int cuda_q1_0_ssd_wrap_submit(' `
     'static void cuda_g73_open_maybe_schedule_rotation('
 Assert-Contains $submit 'if (state.failed || state.stop) {' `
@@ -66,7 +72,7 @@ Assert-Contains $submit 'cuda_dynamic_arena_slot_writer_release(&slot);' `
     'rotator teardown-race refusal does not release its writer claim'
 Assert-Contains $source 'request-boundary-deadline' 'request-boundary rotator flush is not bounded'
 Assert-Contains $osThread 'os_cond_timedwait_ms(' 'rotator condition wait is not timed'
-Assert-Contains $source 'using exact mmap terminal' 'missing never-refusing terminal fallback'
+Assert-Contains $source 'using preallocated exact terminal' 'missing never-refusing terminal fallback'
 foreach ($counter in @('out_of_mask_routes', 'served_transient',
         'served_promoted', 'served_selected_fallback', 'served_terminal_exact',
         'clamped', 'request_refused', 'rotation_promotions', 'rotation_reaps')) {
@@ -74,7 +80,7 @@ foreach ($counter in @('out_of_mask_routes', 'served_transient',
 }
 Assert-Contains $source 'out_of_mask_routes != served + clamped + request_refused' 'missing token attribution conservation assertion'
 Assert-Contains $source 'clamped != 0u || request_refused != 0u' 'clamp/refusal are not structural-zero assertions'
-Assert-Contains $source 'cuda_g73_commit_outcomes(layer_index, g73_outcomes);' 'outcomes are not committed after exact launch acceptance'
+Assert-Contains $source '!cuda_g73_commit_outcomes(layer_index, g73_outcomes)' 'outcomes are not committed after exact launch acceptance'
 if ($source -match 'served_lane_a') { throw 'obsolete pre-success lane-A counter remains' }
 if ($source -match 'g_cuda_g133_telemetry\.(clamped|request_refused)\s*[,\)]') {
     throw 'clamped/request_refused has a producer; both must remain structural zero'

@@ -10,7 +10,19 @@
 #endif
 #include <windows.h>
 #else
+#include <aio.h>
+#ifndef __cplusplus
+#include <stdatomic.h>
+#endif
 #include <unistd.h>
+#endif
+
+#ifndef _WIN32
+#ifdef __cplusplus
+typedef uint32_t os_atomic_uint32_t;
+#else
+typedef _Atomic uint32_t os_atomic_uint32_t;
+#endif
 #endif
 
 typedef struct {
@@ -24,11 +36,14 @@ typedef struct {
 typedef struct {
 #ifdef _WIN32
     HANDLE file;
+    HANDLE event;
     OVERLAPPED overlapped;
     volatile LONG active;
     volatile LONG cancel_sequence;
 #else
-    volatile uint32_t cancel_sequence;
+    struct aiocb aio;
+    os_atomic_uint32_t active;
+    os_atomic_uint32_t cancel_sequence;
 #endif
 } os_pread_cancellable_t;
 
@@ -46,7 +61,10 @@ int os_file_valid(const os_file_t *f);
 uint64_t os_file_size(const os_file_t *f);
 int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off);
 void os_pread_cancellable_init(os_pread_cancellable_t *state);
+int os_pread_cancellable_prepare(os_pread_cancellable_t *state);
 void os_pread_cancellable_reset(os_pread_cancellable_t *state);
+int os_pread_cancellable_pending(os_pread_cancellable_t *state);
+void os_pread_cancellable_destroy(os_pread_cancellable_t *state);
 int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
                              uint64_t off, os_pread_cancellable_t *state,
                              uint32_t sequence);
