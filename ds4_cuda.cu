@@ -3163,27 +3163,7 @@ static cuda_g134_dispatch_staging *g_cuda_g134_dispatch_staging;
 static os_mutex_t g_cuda_g134_dispatch_staging_mutex;
 static int g_cuda_g134_dispatch_staging_mutex_ready = 0;
 
-typedef int (*cuda_g134_dispatch_selection_d2h_fn)(
-        int32_t *selected_host,
-        float *weights_host,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t n_expert);
-static int cuda_g134_dispatch_selection_d2h_legacy(
-        int32_t *selected_host,
-        float *weights_host,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t n_expert);
-static int cuda_g134_dispatch_selection_d2h(
-        int32_t *selected_host,
-        float *weights_host,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t n_expert);
-static cuda_g134_dispatch_selection_d2h_fn
-    g_cuda_g134_dispatch_selection_d2h =
-        cuda_g134_dispatch_selection_d2h_legacy;
+static void cuda_g134_dispatch_select_enabled(void);
 
 static int cuda_g134_initialize_dispatch(void) {
     static int initialized = 0;
@@ -3201,7 +3181,7 @@ static int cuda_g134_initialize_dispatch(void) {
         return 0;
     }
     g_cuda_g134_dispatch_enabled = 1;
-    g_cuda_g134_dispatch_selection_d2h = cuda_g134_dispatch_selection_d2h;
+    cuda_g134_dispatch_select_enabled();
     return 1;
 }
 
@@ -3225,7 +3205,34 @@ static int cuda_g134_dispatch_staging_init(void) {
     return 1;
 }
 
-static int cuda_g134_dispatch_selection_d2h(
+template <bool DispatchPlan>
+static int cuda_q1_0_mixed_selection_d2h(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert);
+
+template <>
+static int cuda_q1_0_mixed_selection_d2h<false>(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert) {
+    return
+        cuda_ok(cudaMemcpy(selected_host, selected->ptr,
+                           (size_t)n_expert * sizeof(int32_t),
+                           cudaMemcpyDeviceToHost),
+                "Q1_0 mixed selected D2H") &&
+        cuda_ok(cudaMemcpy(weights_host, weights->ptr,
+                           (size_t)n_expert * sizeof(float),
+                           cudaMemcpyDeviceToHost),
+                "Q1_0 mixed weights D2H");
+}
+
+template <>
+static int cuda_q1_0_mixed_selection_d2h<true>(
         int32_t *selected_host,
         float *weights_host,
         const ds4_gpu_tensor *selected,
@@ -3257,23 +3264,6 @@ static int cuda_g134_dispatch_selection_d2h(
     }
     os_mutex_unlock(&g_cuda_g134_dispatch_staging_mutex);
     return ok;
-}
-
-static int cuda_g134_dispatch_selection_d2h_legacy(
-        int32_t *selected_host,
-        float *weights_host,
-        const ds4_gpu_tensor *selected,
-        const ds4_gpu_tensor *weights,
-        uint32_t n_expert) {
-    return
-        cuda_ok(cudaMemcpy(selected_host, selected->ptr,
-                           (size_t)n_expert * sizeof(int32_t),
-                           cudaMemcpyDeviceToHost),
-                "Q1_0 mixed selected D2H") &&
-        cuda_ok(cudaMemcpy(weights_host, weights->ptr,
-                           (size_t)n_expert * sizeof(float),
-                           cudaMemcpyDeviceToHost),
-                "Q1_0 mixed weights D2H");
 }
 
 struct cuda_g133_telemetry_counters {
@@ -33333,6 +33323,7 @@ static int cuda_moe_q1_resident_upload_fail(
     return 0;
 }
 
+template <bool DispatchPlan>
 static int cuda_moe_selected_load_q1_0(
         const void *model_map, uint64_t model_size,
         uint32_t layer_index,
@@ -33340,8 +33331,7 @@ static int cuda_moe_selected_load_q1_0(
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg,
-        const int32_t *selected_host_arg,
-        int g134_bounded_lru) {
+        const int32_t *selected_host_arg) {
     if (!g_q1_0_sidecar_file_valid ||
         model_map != g_q1_0_sidecar_host_base ||
         model_size != g_q1_0_sidecar_size ||
@@ -33470,7 +33460,7 @@ static int cuda_moe_selected_load_q1_0(
             g_q1_0_source_generation;
         if (q1_vram_lru_active) {
             const int fixed_plan_lru =
-                g134_bounded_lru &&
+                DispatchPlan &&
                 selected_host_arg &&
                 compact_count <= CUDA_MOE_ROUTE_COUNT;
             if (!fixed_plan_lru) {
@@ -34140,6 +34130,40 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         cache, sequence, layer_index, 0, 0u);
 }
 
+template <bool DispatchPlan>
+static int routed_moe_launch_impl(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer_index,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_spex_queue *spex_queue,
+        const ds4_gpu_spex_key *spex_key,
+        const int32_t *selected_host,
+        ds4_gpu_g133_epoch g133_epoch);
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -34171,7 +34195,48 @@ static int routed_moe_launch(
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key,
         const int32_t *selected_host,
-        int g134_bounded_lru,
+        ds4_gpu_g133_epoch g133_epoch) {
+    return routed_moe_launch_impl<false>(
+        out, gate, up, mid, down, model_map, model_size, layer_index,
+        gate_offset, up_offset, down_offset, gate_type, down_type,
+        gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim, selected, weights, probs,
+        n_expert, clamp, x, n_tokens, spex_queue, spex_key, selected_host,
+        g133_epoch);
+}
+
+template <bool DispatchPlan>
+static int routed_moe_launch_impl(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint32_t layer_index,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint32_t gate_type,
+        uint32_t down_type,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *probs,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        uint32_t n_tokens,
+        ds4_gpu_spex_queue *spex_queue,
+        const ds4_gpu_spex_key *spex_key,
+        const int32_t *selected_host,
         ds4_gpu_g133_epoch g133_epoch) {
     g_moe_last_selected.valid = 0;
     /* Wave state belongs to this routed-MoE invocation. Decode can take the
@@ -34416,12 +34481,11 @@ static int routed_moe_launch(
                 CUDA_G130_ATTRIB_SELECTED_LOAD);
         }
 #endif
-        const int selected_loaded = cuda_moe_selected_load_q1_0(
+        const int selected_loaded = cuda_moe_selected_load_q1_0<DispatchPlan>(
             model_map, model_size, layer_index,
             gate_offset, up_offset, down_offset,
             gate_expert_bytes, down_expert_bytes,
-            n_total_expert, n_expert, n_tokens, selected, selected_host,
-            g134_bounded_lru);
+            n_total_expert, n_expert, n_tokens, selected, selected_host);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution_state) {
             (void)cuda_g130_attribution_switch(
@@ -35893,7 +35957,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, NULL, n_expert, clamp, x, 1,
-                             spex_queue, spex_key, NULL, 0, g133_epoch);
+                             spex_queue, spex_key, NULL, g133_epoch);
 }
 
 static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
@@ -37269,7 +37333,102 @@ static int cuda_g134_dispatch_plan_build(
     return 1;
 }
 
+template <bool DispatchPlan>
+static int ds4_gpu_routed_moe_mixed_q1_0_one_tensor_impl(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *main_model_map,
+        uint64_t main_model_size,
+        uint32_t layer_index,
+        uint64_t main_gate_offset,
+        uint64_t main_up_offset,
+        uint64_t main_down_offset,
+        uint32_t main_gate_type,
+        uint32_t main_down_type,
+        uint64_t main_gate_expert_bytes,
+        uint64_t main_gate_row_bytes,
+        uint64_t main_down_expert_bytes,
+        uint64_t main_down_row_bytes,
+        const void *q1_model_map,
+        uint64_t q1_model_size,
+        uint64_t q1_gate_offset,
+        uint64_t q1_up_offset,
+        uint64_t q1_down_offset,
+        uint64_t q1_gate_expert_bytes,
+        uint64_t q1_gate_row_bytes,
+        uint64_t q1_down_expert_bytes,
+        uint64_t q1_down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch g133_epoch);
+
+static auto g_cuda_g134_mixed_q1_0_launch =
+    ds4_gpu_routed_moe_mixed_q1_0_one_tensor_impl<false>;
+
+static void cuda_g134_dispatch_select_enabled(void) {
+    g_cuda_g134_mixed_q1_0_launch =
+        ds4_gpu_routed_moe_mixed_q1_0_one_tensor_impl<true>;
+}
+
 extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *main_model_map,
+        uint64_t main_model_size,
+        uint32_t layer_index,
+        uint64_t main_gate_offset,
+        uint64_t main_up_offset,
+        uint64_t main_down_offset,
+        uint32_t main_gate_type,
+        uint32_t main_down_type,
+        uint64_t main_gate_expert_bytes,
+        uint64_t main_gate_row_bytes,
+        uint64_t main_down_expert_bytes,
+        uint64_t main_down_row_bytes,
+        const void *q1_model_map,
+        uint64_t q1_model_size,
+        uint64_t q1_gate_offset,
+        uint64_t q1_up_offset,
+        uint64_t q1_down_offset,
+        uint64_t q1_gate_expert_bytes,
+        uint64_t q1_gate_row_bytes,
+        uint64_t q1_down_expert_bytes,
+        uint64_t q1_down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x,
+        ds4_gpu_g133_epoch g133_epoch) {
+    return g_cuda_g134_mixed_q1_0_launch(
+        out, gate, up, mid, down, main_model_map, main_model_size,
+        layer_index, main_gate_offset, main_up_offset, main_down_offset,
+        main_gate_type, main_down_type, main_gate_expert_bytes,
+        main_gate_row_bytes, main_down_expert_bytes, main_down_row_bytes,
+        q1_model_map, q1_model_size, q1_gate_offset, q1_up_offset,
+        q1_down_offset, q1_gate_expert_bytes, q1_gate_row_bytes,
+        q1_down_expert_bytes, q1_down_row_bytes, expert_in_dim,
+        expert_mid_dim, out_dim, selected, weights, n_expert, clamp, x,
+        g133_epoch);
+}
+
+template <bool DispatchPlan>
+static int ds4_gpu_routed_moe_mixed_q1_0_one_tensor_impl(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
         ds4_gpu_tensor *up,
@@ -37512,7 +37671,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     }
 #endif
     const int mixed_selection_d2h_ok =
-        g_cuda_g134_dispatch_selection_d2h(
+        cuda_q1_0_mixed_selection_d2h<DispatchPlan>(
             selected_host, weights_host, selected, weights, n_expert);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     if (attribution) {
@@ -37566,7 +37725,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     const char *recovery_trace_representation = NULL;
     const int cold_one_requested =
         cuda_q1_0_mixed_cold_one_requested();
-    if (g_cuda_g134_dispatch_enabled) {
+    if (DispatchPlan) {
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -37900,7 +38059,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 attribution_state, CUDA_G130_ATTRIB_HOT_ROUTE);
         }
 #endif
-        const int ok = routed_moe_launch(
+        const int ok = routed_moe_launch_impl<DispatchPlan>(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
             main_gate_offset, main_up_offset, main_down_offset,
@@ -37909,7 +38068,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL,
-            NULL, 0, g133_epoch);
+            NULL, g133_epoch);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -38101,7 +38260,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                 attribution_state, CUDA_G130_ATTRIB_HOT_ROUTE);
         }
 #endif
-        ok = routed_moe_launch(
+        ok = routed_moe_launch_impl<DispatchPlan>(
             out, gate, up, mid, down,
             main_model_map, main_model_size, layer_index,
             main_gate_offset, main_up_offset, main_down_offset,
@@ -38110,7 +38269,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &hot_selected_tensor, &hot_weights_tensor, NULL,
-            hot_count, clamp, x, 1u, NULL, NULL, NULL, 0, g133_epoch);
+            hot_count, clamp, x, 1u, NULL, NULL, NULL, g133_epoch);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -38167,7 +38326,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         ds4_gpu_tensor cpu_gpu_down_tensor = {
             device_cold_down, cold_down_bytes, 0
         };
-        int cpu_gpu_ok = routed_moe_launch(
+        int cpu_gpu_ok = routed_moe_launch_impl<DispatchPlan>(
             &cpu_gpu_out_tensor, gate, up, mid, &cpu_gpu_down_tensor,
             main_model_map, main_model_size, layer_index,
             main_gate_offset, main_up_offset, main_down_offset,
@@ -38176,7 +38335,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &cpu_gpu_selected_tensor, &cpu_gpu_weights_tensor, NULL,
-            cpu_count, clamp, x, 1u, NULL, NULL, NULL, 0, g133_epoch);
+            cpu_count, clamp, x, 1u, NULL, NULL, NULL, g133_epoch);
         if (cpu_gpu_ok) {
             add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
                 (float *)out->ptr, (const float *)out->ptr,
@@ -38285,7 +38444,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         g_q1_0_mixed_profile_current_sample = &mixed_profile_sample;
     }
     if (cold_count != 0u) {
-        ok = routed_moe_launch(
+        ok = routed_moe_launch_impl<DispatchPlan>(
             &cold_out_tensor, gate, up, mid, &cold_down_tensor,
             q1_model_map, q1_model_size, layer_index,
             q1_gate_offset, q1_up_offset, q1_down_offset,
@@ -38295,7 +38454,6 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             expert_in_dim, expert_mid_dim, out_dim,
             &cold_selected_tensor, &cold_weights_tensor, NULL,
             cold_count, clamp, x, 1u, NULL, NULL, cold_selected,
-            g_cuda_g134_dispatch_enabled,
             g133_epoch);
     }
     if (mixed_profile) {
@@ -38399,7 +38557,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                     device_cold_weights + cpu_gpu_offset,
                     (uint64_t)cpu_count * sizeof(float), 0
                 };
-                mixed_join_ok = routed_moe_launch(
+                mixed_join_ok = routed_moe_launch_impl<DispatchPlan>(
                     &cold_out_tensor, gate, up, mid, &cold_down_tensor,
                     main_model_map, main_model_size, layer_index,
                     main_gate_offset, main_up_offset, main_down_offset,
@@ -38409,7 +38567,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                     expert_in_dim, expert_mid_dim, out_dim,
                     &cpu_gpu_selected_tensor, &cpu_gpu_weights_tensor, NULL,
                     cpu_count, clamp, x, 1u, NULL, NULL, NULL,
-                    0, g133_epoch);
+                    g133_epoch);
                 if (mixed_join_ok) {
                     add_f32_u64_kernel<<<
                         (out_dim + 255u) / 256u, 256>>>(
@@ -38721,7 +38879,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                                main_down_expert_bytes, main_down_row_bytes,
                                expert_in_dim, expert_mid_dim, out_dim,
                                &hot_selected, &hot_weights, NULL, hot_count, clamp,
-                               x, 1u, NULL, NULL, NULL, 0, g133_epoch);
+                               x, 1u, NULL, NULL, NULL, g133_epoch);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -38814,7 +38972,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                            iq1_down_expert_bytes, iq1_down_row_bytes,
                            expert_in_dim, expert_mid_dim, out_dim,
                            &cold_selected, &cold_weight_tensor, NULL, 1u, clamp,
-                           x, 1u, NULL, NULL, NULL, 0, g133_epoch);
+                           x, 1u, NULL, NULL, NULL, g133_epoch);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -38878,7 +39036,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, probs, n_expert, clamp, x, n_tokens,
-                             NULL, NULL, NULL, 0, ds4_gpu_g133_epoch{});
+                             NULL, NULL, NULL, ds4_gpu_g133_epoch{});
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
