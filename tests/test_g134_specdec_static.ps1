@@ -79,6 +79,15 @@ Require-Regex $gpuHeader 'typedef struct\s*\{\s*uint64_t request_epoch;\s*uint64
 Require-Regex $gpuHeader 'typedef struct\s*\{\s*uint32_t position;\s*\}\s*ds4_gpu_g134_speculation;' 'G134 sideband position mark'
 Require-Regex $cuda 'struct cuda_moe_route_request\s*\{[\s\S]*?ds4_gpu_g133_epoch g133_epoch;\s*uint64_t gate_offset;' 'base G133 route request has no speculative field'
 Require-Literal $cuda 'g_speculative_route_mark' 'sequence-tagged G134 route sideband'
+Require-Literal $cuda 'static int g_cuda_g134_specdec_enabled = 0;' 'GPU init-time cached G134 flag'
+Require-Literal $cuda 'g_cuda_g134_specdec_enabled = env && strcmp(env, "1") == 0;' 'GPU G134 strict opt-in cache'
+Require-Literal $cuda 'if (!cuda_g134_specdec_initialize_dispatch()) return 0;' 'GPU init caches G134 flag'
+$routeWorker = Slice-Between $cuda 'static void *cuda_moe_route_worker(' `
+    'static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin('
+Require-Regex $routeWorker 'uint32_t speculative_position = 0u;\s*if \(cuda_g134_specdec_enabled\(\)\) \{\s*const uint64_t speculative_mark =\s*g_speculative_route_mark\.load\(std::memory_order_acquire\);' 'route mark load guarded by cached G134 flag'
+$oneTensor = Slice-Between $cuda 'extern "C" int ds4_gpu_routed_moe_one_tensor(' `
+    'static int cuda_iq1_mixed_scratch_ensure('
+Require-Regex $oneTensor 'uint32_t speculative_position = 0u;\s*if \(cuda_g134_specdec_enabled\(\)\) \{\s*speculative_position =\s*g134_speculation \? g134_speculation->position : 0u;\s*\}' 'ordinary routed-MoE G134 param read guarded by cached flag'
 Require-Literal $gpuHeader 'ds4_gpu_speculative_observation_begin' 'deferred observation begin API'
 Require-Literal $gpuHeader 'ds4_gpu_speculative_observation_finish' 'deferred observation finish API'
 Require-Literal $cuda 'cuda_speculative_observation_record_route(' 'route observation buffer'

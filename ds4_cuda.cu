@@ -3156,6 +3156,20 @@ static int g_speculative_observation_active = 0;
 /* Route requests retain their exact G133 layout. G134 publishes this separate
  * sequence-tagged mark only for its serialized verifier requests. */
 static std::atomic<uint64_t> g_speculative_route_mark{0u};
+static int g_cuda_g134_specdec_enabled = 0;
+
+static int cuda_g134_specdec_enabled(void) {
+    return g_cuda_g134_specdec_enabled;
+}
+
+static int cuda_g134_specdec_initialize_dispatch(void) {
+    static int initialized = 0;
+    if (initialized) return 1;
+    initialized = 1;
+    const char *env = getenv("DS4_G134_SPECDEC");
+    g_cuda_g134_specdec_enabled = env && strcmp(env, "1") == 0;
+    return 1;
+}
 
 extern "C" int ds4_gpu_g133_enabled = 0;
 extern "C" ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void);
@@ -6223,6 +6237,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 
 extern "C" int ds4_gpu_init(void) {
     if (!cuda_g133_initialize_dispatch()) return 0;
+    if (!cuda_g134_specdec_initialize_dispatch()) return 0;
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_init();
 #endif
@@ -30059,11 +30074,14 @@ static void *cuda_moe_route_worker(void *arg) {
         cuda_moe_route_request request;
         memcpy(&request, cache->route_request_host, sizeof(request));
         if (request.sequence != sequence) continue;
-        const uint64_t speculative_mark =
-            g_speculative_route_mark.load(std::memory_order_acquire);
-        const uint32_t speculative_position =
-            (uint32_t)(speculative_mark >> 32u) == sequence
-                ? (uint32_t)speculative_mark : 0u;
+        uint32_t speculative_position = 0u;
+        if (cuda_g134_specdec_enabled()) {
+            const uint64_t speculative_mark =
+                g_speculative_route_mark.load(std::memory_order_acquire);
+            speculative_position =
+                (uint32_t)(speculative_mark >> 32u) == sequence
+                    ? (uint32_t)speculative_mark : 0u;
+        }
         consumed_sequence = sequence;
 #ifdef _WIN32
         MemoryBarrier();
@@ -34024,7 +34042,8 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
     }
     uint32_t sequence = ++cache->route_sequence;
     if (sequence == 0u) sequence = ++cache->route_sequence;
-    if (cuda_speculative_position_valid(speculative_position)) {
+    if (cuda_g134_specdec_enabled() &&
+        cuda_speculative_position_valid(speculative_position)) {
         g_speculative_route_mark.store(
             ((uint64_t)sequence << 32u) | speculative_position,
             std::memory_order_release);
@@ -36044,6 +36063,11 @@ static int routed_moe_launch(
 }
 
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint32_t layer_index, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, ds4_gpu_g133_epoch g133_epoch, const ds4_gpu_g134_speculation *g134_speculation, ds4_gpu_spex_queue *spex_queue, const ds4_gpu_spex_key *spex_key) {
+    uint32_t speculative_position = 0u;
+    if (cuda_g134_specdec_enabled()) {
+        speculative_position =
+            g134_speculation ? g134_speculation->position : 0u;
+    }
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              layer_index,
                              gate_offset, up_offset, down_offset,
@@ -36053,7 +36077,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, NULL, n_expert, clamp, x, 1,
                              spex_queue, spex_key, NULL, g133_epoch,
-                             g134_speculation ? g134_speculation->position : 0u);
+                             speculative_position);
 }
 
 static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
@@ -37148,8 +37172,11 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         const ds4_gpu_tensor *x,
         ds4_gpu_g133_epoch g133_epoch,
         const ds4_gpu_g134_speculation *g134_speculation) {
-    const uint32_t speculative_position =
-        g134_speculation ? g134_speculation->position : 0u;
+    uint32_t speculative_position = 0u;
+    if (cuda_g134_specdec_enabled()) {
+        speculative_position =
+            g134_speculation ? g134_speculation->position : 0u;
+    }
     g_q1_0_mixed_calls++;
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_state *attribution_state =
@@ -38383,8 +38410,11 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
         const ds4_gpu_g134_speculation *g134_speculation,
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key) {
-    const uint32_t speculative_position =
-        g134_speculation ? g134_speculation->position : 0u;
+    uint32_t speculative_position = 0u;
+    if (cuda_g134_specdec_enabled()) {
+        speculative_position =
+            g134_speculation ? g134_speculation->position : 0u;
+    }
     g_iq1_mixed_calls++;
     const int mixed_profile = getenv("DS4_IQ1_S_PROFILE") != NULL;
     const int no_main_sync = getenv("DS4_IQ1_MIXED_NO_MAIN_SYNC") != NULL;
