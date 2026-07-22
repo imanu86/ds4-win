@@ -3160,18 +3160,120 @@ struct cuda_g134_dispatch_staging {
     float weights[CUDA_G134_DISPATCH_ROUTE_COUNT];
 };
 static cuda_g134_dispatch_staging *g_cuda_g134_dispatch_staging;
+static os_mutex_t g_cuda_g134_dispatch_staging_mutex;
+static int g_cuda_g134_dispatch_staging_mutex_ready = 0;
+
+typedef int (*cuda_g134_dispatch_selection_d2h_fn)(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert);
+static int cuda_g134_dispatch_selection_d2h_legacy(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert);
+static int cuda_g134_dispatch_selection_d2h(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert);
+static cuda_g134_dispatch_selection_d2h_fn
+    g_cuda_g134_dispatch_selection_d2h =
+        cuda_g134_dispatch_selection_d2h_legacy;
 
 static int cuda_g134_initialize_dispatch(void) {
+    static int initialized = 0;
+    static int valid = 1;
+    if (initialized) return valid;
+    initialized = 1;
+
     const char *value = getenv("DS4_G134_DISPATCH");
     if (!value || !value[0] || strcmp(value, "0") == 0) return 1;
     if (strcmp(value, "1") != 0) {
         fprintf(stderr,
                 "ds4: invalid DS4_G134_DISPATCH=%s; expected 0 or 1\n",
                 value);
+        valid = 0;
         return 0;
     }
     g_cuda_g134_dispatch_enabled = 1;
+    g_cuda_g134_dispatch_selection_d2h = cuda_g134_dispatch_selection_d2h;
     return 1;
+}
+
+static int cuda_g134_dispatch_staging_init(void) {
+    if (!g_cuda_g134_dispatch_enabled) return 1;
+    if (!g_cuda_g134_dispatch_staging_mutex_ready) {
+        if (os_mutex_init(&g_cuda_g134_dispatch_staging_mutex) != 0) {
+            fprintf(stderr,
+                    "ds4: G134 dispatch staging mutex initialization failed\n");
+            return 0;
+        }
+        g_cuda_g134_dispatch_staging_mutex_ready = 1;
+    }
+    if (!cuda_ok(cudaHostAlloc(
+                     (void **)&g_cuda_g134_dispatch_staging,
+                     sizeof(*g_cuda_g134_dispatch_staging),
+                     cudaHostAllocPortable),
+                 "G134 dispatch staging alloc")) {
+        return 0;
+    }
+    return 1;
+}
+
+static int cuda_g134_dispatch_selection_d2h(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert) {
+    cuda_g134_dispatch_staging *staging = g_cuda_g134_dispatch_staging;
+    if (!staging || !g_cuda_g134_dispatch_staging_mutex_ready) return 0;
+    /* Decode is serialized today, but the global pinned staging record still
+     * needs an enforced owner while the D2H fence and host memcpy are coupled. */
+    os_mutex_lock(&g_cuda_g134_dispatch_staging_mutex);
+    const int ok =
+        cuda_ok(cudaMemcpyAsync(
+                    staging->selected, selected->ptr,
+                    (size_t)n_expert * sizeof(int32_t),
+                    cudaMemcpyDeviceToHost, 0),
+                "G134 dispatch selected D2H") &&
+        cuda_ok(cudaMemcpyAsync(
+                    staging->weights, weights->ptr,
+                    (size_t)n_expert * sizeof(float),
+                    cudaMemcpyDeviceToHost, 0),
+                "G134 dispatch weights D2H") &&
+        cuda_ok(cudaStreamSynchronize(0),
+                "G134 dispatch selection ready");
+    if (ok) {
+        memcpy(selected_host, staging->selected,
+               (size_t)n_expert * sizeof(int32_t));
+        memcpy(weights_host, staging->weights,
+               (size_t)n_expert * sizeof(float));
+    }
+    os_mutex_unlock(&g_cuda_g134_dispatch_staging_mutex);
+    return ok;
+}
+
+static int cuda_g134_dispatch_selection_d2h_legacy(
+        int32_t *selected_host,
+        float *weights_host,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_expert) {
+    return
+        cuda_ok(cudaMemcpy(selected_host, selected->ptr,
+                           (size_t)n_expert * sizeof(int32_t),
+                           cudaMemcpyDeviceToHost),
+                "Q1_0 mixed selected D2H") &&
+        cuda_ok(cudaMemcpy(weights_host, weights->ptr,
+                           (size_t)n_expert * sizeof(float),
+                           cudaMemcpyDeviceToHost),
+                "Q1_0 mixed weights D2H");
 }
 
 struct cuda_g133_telemetry_counters {
@@ -6222,12 +6324,7 @@ extern "C" int ds4_gpu_init(void) {
     cuda_q1_0_mixed_profile_reset(1);
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
-    if (g_cuda_g134_dispatch_enabled &&
-        !cuda_ok(cudaHostAlloc(
-                     (void **)&g_cuda_g134_dispatch_staging,
-                     sizeof(*g_cuda_g134_dispatch_staging),
-                     cudaHostAllocPortable),
-                 "G134 dispatch staging alloc")) {
+    if (!cuda_g134_dispatch_staging_init()) {
         return 0;
     }
     cudaDeviceProp prop;
@@ -6263,6 +6360,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_cuda_g134_dispatch_staging) {
         (void)cudaFreeHost(g_cuda_g134_dispatch_staging);
         g_cuda_g134_dispatch_staging = NULL;
+    }
+    if (g_cuda_g134_dispatch_staging_mutex_ready) {
+        os_mutex_destroy(&g_cuda_g134_dispatch_staging_mutex);
+        g_cuda_g134_dispatch_staging_mutex_ready = 0;
     }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
@@ -33239,7 +33340,8 @@ static int cuda_moe_selected_load_q1_0(
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
         const ds4_gpu_tensor *selected_arg,
-        const int32_t *selected_host_arg) {
+        const int32_t *selected_host_arg,
+        int g134_bounded_lru) {
     if (!g_q1_0_sidecar_file_valid ||
         model_map != g_q1_0_sidecar_host_base ||
         model_size != g_q1_0_sidecar_size ||
@@ -33354,21 +33456,23 @@ static int cuda_moe_selected_load_q1_0(
             g_q1_0_resident_misses++;
             return 0;
         }
-        int32_t lru_slots_plan[CUDA_MOE_ROUTE_COUNT] = {0};
-        uint8_t lru_hits_plan[CUDA_MOE_ROUTE_COUNT] = {0};
-        uint8_t lru_new_plan[CUDA_MOE_ROUTE_COUNT] = {0};
         std::vector<int32_t> lru_slots_legacy;
         std::vector<uint8_t> lru_hits_legacy;
         std::vector<uint8_t> lru_new_legacy;
-        int32_t *lru_slots = lru_slots_plan;
-        uint8_t *lru_hits = lru_hits_plan;
-        uint8_t *lru_new = lru_new_plan;
+        int32_t lru_slots_plan[CUDA_MOE_ROUTE_COUNT] = {0};
+        uint8_t lru_hits_plan[CUDA_MOE_ROUTE_COUNT] = {0};
+        uint8_t lru_new_plan[CUDA_MOE_ROUTE_COUNT] = {0};
+        int32_t *lru_slots = NULL;
+        uint8_t *lru_hits = NULL;
+        uint8_t *lru_new = NULL;
         int lru_has_eviction = 0;
         const uint64_t q1_source_generation =
             g_q1_0_source_generation;
         if (q1_vram_lru_active) {
-            const int fixed_plan_lru = g_cuda_g134_dispatch_enabled &&
-                selected_host_arg && compact_count <= CUDA_MOE_ROUTE_COUNT;
+            const int fixed_plan_lru =
+                g134_bounded_lru &&
+                selected_host_arg &&
+                compact_count <= CUDA_MOE_ROUTE_COUNT;
             if (!fixed_plan_lru) {
                 try {
                     lru_slots_legacy.resize(compact_count);
@@ -33380,6 +33484,10 @@ static int cuda_moe_selected_load_q1_0(
                 lru_slots = lru_slots_legacy.data();
                 lru_hits = lru_hits_legacy.data();
                 lru_new = lru_new_legacy.data();
+            } else {
+                lru_slots = lru_slots_plan;
+                lru_hits = lru_hits_plan;
+                lru_new = lru_new_plan;
             }
             for (uint32_t i = 0; i < compact_count; i++) {
                 int hit = 0;
@@ -34063,6 +34171,7 @@ static int routed_moe_launch(
         ds4_gpu_spex_queue *spex_queue,
         const ds4_gpu_spex_key *spex_key,
         const int32_t *selected_host,
+        int g134_bounded_lru,
         ds4_gpu_g133_epoch g133_epoch) {
     g_moe_last_selected.valid = 0;
     /* Wave state belongs to this routed-MoE invocation. Decode can take the
@@ -34311,7 +34420,8 @@ static int routed_moe_launch(
             model_map, model_size, layer_index,
             gate_offset, up_offset, down_offset,
             gate_expert_bytes, down_expert_bytes,
-            n_total_expert, n_expert, n_tokens, selected, selected_host);
+            n_total_expert, n_expert, n_tokens, selected, selected_host,
+            g134_bounded_lru);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution_state) {
             (void)cuda_g130_attribution_switch(
@@ -35783,7 +35893,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, NULL, n_expert, clamp, x, 1,
-                             spex_queue, spex_key, NULL, g133_epoch);
+                             spex_queue, spex_key, NULL, 0, g133_epoch);
 }
 
 static int cuda_iq1_mixed_scratch_ensure(uint64_t bytes) {
@@ -37401,40 +37511,9 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             attribution_state, CUDA_G130_ATTRIB_SELECTION_D2H);
     }
 #endif
-    int mixed_selection_d2h_ok = 0;
-    if (g_cuda_g134_dispatch_enabled) {
-        cuda_g134_dispatch_staging *staging =
-            g_cuda_g134_dispatch_staging;
-        mixed_selection_d2h_ok = staging &&
-            cuda_ok(cudaMemcpyAsync(
-                        staging->selected, selected->ptr,
-                        (size_t)n_expert * sizeof(int32_t),
-                        cudaMemcpyDeviceToHost, 0),
-                    "G134 dispatch selected D2H") &&
-            cuda_ok(cudaMemcpyAsync(
-                        staging->weights, weights->ptr,
-                        (size_t)n_expert * sizeof(float),
-                        cudaMemcpyDeviceToHost, 0),
-                    "G134 dispatch weights D2H") &&
-            cuda_ok(cudaStreamSynchronize(0),
-                    "G134 dispatch selection ready");
-        if (mixed_selection_d2h_ok) {
-            memcpy(selected_host, staging->selected,
-                   (size_t)n_expert * sizeof(int32_t));
-            memcpy(weights_host, staging->weights,
-                   (size_t)n_expert * sizeof(float));
-        }
-    } else {
-        mixed_selection_d2h_ok =
-            cuda_ok(cudaMemcpy(selected_host, selected->ptr,
-                               (size_t)n_expert * sizeof(int32_t),
-                               cudaMemcpyDeviceToHost),
-                    "Q1_0 mixed selected D2H") &&
-            cuda_ok(cudaMemcpy(weights_host, weights->ptr,
-                               (size_t)n_expert * sizeof(float),
-                               cudaMemcpyDeviceToHost),
-                    "Q1_0 mixed weights D2H");
-    }
+    const int mixed_selection_d2h_ok =
+        g_cuda_g134_dispatch_selection_d2h(
+            selected_host, weights_host, selected, weights, n_expert);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     if (attribution) {
         (void)cuda_g130_attribution_switch(
@@ -37830,7 +37909,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             selected, weights, NULL, n_expert, clamp, x, 1u, NULL, NULL,
-            NULL, g133_epoch);
+            NULL, 0, g133_epoch);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -38031,7 +38110,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &hot_selected_tensor, &hot_weights_tensor, NULL,
-            hot_count, clamp, x, 1u, NULL, NULL, NULL, g133_epoch);
+            hot_count, clamp, x, 1u, NULL, NULL, NULL, 0, g133_epoch);
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
         if (attribution) {
             (void)cuda_g130_attribution_switch(
@@ -38097,7 +38176,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             main_down_expert_bytes, main_down_row_bytes,
             expert_in_dim, expert_mid_dim, out_dim,
             &cpu_gpu_selected_tensor, &cpu_gpu_weights_tensor, NULL,
-            cpu_count, clamp, x, 1u, NULL, NULL, NULL, g133_epoch);
+            cpu_count, clamp, x, 1u, NULL, NULL, NULL, 0, g133_epoch);
         if (cpu_gpu_ok) {
             add_f32_u64_kernel<<<(out_dim + 255u) / 256u, 256>>>(
                 (float *)out->ptr, (const float *)out->ptr,
@@ -38216,6 +38295,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             expert_in_dim, expert_mid_dim, out_dim,
             &cold_selected_tensor, &cold_weights_tensor, NULL,
             cold_count, clamp, x, 1u, NULL, NULL, cold_selected,
+            g_cuda_g134_dispatch_enabled,
             g133_epoch);
     }
     if (mixed_profile) {
@@ -38329,7 +38409,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
                     expert_in_dim, expert_mid_dim, out_dim,
                     &cpu_gpu_selected_tensor, &cpu_gpu_weights_tensor, NULL,
                     cpu_count, clamp, x, 1u, NULL, NULL, NULL,
-                    g133_epoch);
+                    0, g133_epoch);
                 if (mixed_join_ok) {
                     add_f32_u64_kernel<<<
                         (out_dim + 255u) / 256u, 256>>>(
@@ -38641,7 +38721,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                                main_down_expert_bytes, main_down_row_bytes,
                                expert_in_dim, expert_mid_dim, out_dim,
                                &hot_selected, &hot_weights, NULL, hot_count, clamp,
-                               x, 1u, NULL, NULL, NULL, g133_epoch);
+                               x, 1u, NULL, NULL, NULL, 0, g133_epoch);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -38734,7 +38814,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_iq1_one_tensor(
                            iq1_down_expert_bytes, iq1_down_row_bytes,
                            expert_in_dim, expert_mid_dim, out_dim,
                            &cold_selected, &cold_weight_tensor, NULL, 1u, clamp,
-                           x, 1u, NULL, NULL, NULL, g133_epoch);
+                           x, 1u, NULL, NULL, NULL, 0, g133_epoch);
     if (!ok) {
         g_iq1_mixed_failures++;
         return 0;
@@ -38798,7 +38878,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, probs, n_expert, clamp, x, n_tokens,
-                             NULL, NULL, NULL, ds4_gpu_g133_epoch{});
+                             NULL, NULL, NULL, 0, ds4_gpu_g133_epoch{});
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
