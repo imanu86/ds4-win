@@ -28,7 +28,7 @@ NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
 NVCCFLAGS ?= -O3 --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
-CORE_OBJS = ds4.o ds4_spex_predict.o ds4_cuda.o $(PLATFORM_OBJS)
+CORE_OBJS = ds4.o ds4_spex_predict.o ds4_cuda.o ds4_bake.o $(PLATFORM_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_spex_predict.o $(PLATFORM_OBJS)
 METAL_LDLIBS := $(LDLIBS)
 endif
