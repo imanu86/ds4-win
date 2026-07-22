@@ -3149,6 +3149,31 @@ static int cuda_g133_initialize_dispatch(void) {
     return 1;
 }
 
+/* G134 is a structural dispatch experiment only.  Resolve the environment
+ * once at CUDA startup so the disabled decode path is one predictable branch
+ * and never performs a per-layer getenv. */
+static int g_cuda_g134_dispatch_enabled = 0;
+
+enum : uint32_t { CUDA_G134_DISPATCH_ROUTE_COUNT = 6u };
+struct cuda_g134_dispatch_staging {
+    int32_t selected[CUDA_G134_DISPATCH_ROUTE_COUNT];
+    float weights[CUDA_G134_DISPATCH_ROUTE_COUNT];
+};
+static cuda_g134_dispatch_staging *g_cuda_g134_dispatch_staging;
+
+static int cuda_g134_initialize_dispatch(void) {
+    const char *value = getenv("DS4_G134_DISPATCH");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return 1;
+    if (strcmp(value, "1") != 0) {
+        fprintf(stderr,
+                "ds4: invalid DS4_G134_DISPATCH=%s; expected 0 or 1\n",
+                value);
+        return 0;
+    }
+    g_cuda_g134_dispatch_enabled = 1;
+    return 1;
+}
+
 struct cuda_g133_telemetry_counters {
     std::atomic<uint64_t> upload_sync_wait_nanoseconds{0};
     std::atomic<uint64_t> vram_hits{0};
@@ -3190,6 +3215,8 @@ enum cuda_g130_attribution_span {
     CUDA_G130_ATTRIB_KERNEL_LAUNCH_ENQUEUE,
     CUDA_G130_ATTRIB_MIXED_JOIN,
     CUDA_G130_ATTRIB_PROMOTION_STAGING,
+    CUDA_G130_ATTRIB_DISPATCH_PLAN,
+    CUDA_G130_ATTRIB_DISPATCH_LEGACY,
     CUDA_G130_ATTRIB_COUNT
 };
 
@@ -3204,6 +3231,8 @@ static const char *const g_cuda_g130_attribution_span_names[] = {
     "kernel_launch_enqueue",
     "mixed_join",
     "promotion_staging",
+    "dispatch_plan",
+    "dispatch_legacy",
 };
 
 struct cuda_g130_attribution_state {
@@ -6186,12 +6215,21 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
 
 extern "C" int ds4_gpu_init(void) {
     if (!cuda_g133_initialize_dispatch()) return 0;
+    if (!cuda_g134_initialize_dispatch()) return 0;
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     cuda_g130_attribution_init();
 #endif
     cuda_q1_0_mixed_profile_reset(1);
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
+    if (g_cuda_g134_dispatch_enabled &&
+        !cuda_ok(cudaHostAlloc(
+                     (void **)&g_cuda_g134_dispatch_staging,
+                     sizeof(*g_cuda_g134_dispatch_staging),
+                     cudaHostAllocPortable),
+                 "G134 dispatch staging alloc")) {
+        return 0;
+    }
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
@@ -6222,6 +6260,10 @@ extern "C" void ds4_gpu_cleanup(void) {
     }
     cuda_q1_0_mixed_profile_finalize(cleanup_sync_error);
     cuda_g132_cpu_lane_release();
+    if (g_cuda_g134_dispatch_staging) {
+        (void)cudaFreeHost(g_cuda_g134_dispatch_staging);
+        g_cuda_g134_dispatch_staging = NULL;
+    }
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
         g_cublas_ready = 0;
@@ -33312,19 +33354,32 @@ static int cuda_moe_selected_load_q1_0(
             g_q1_0_resident_misses++;
             return 0;
         }
-        std::vector<int32_t> lru_slots;
-        std::vector<uint8_t> lru_hits;
-        std::vector<uint8_t> lru_new;
+        int32_t lru_slots_plan[CUDA_MOE_ROUTE_COUNT] = {0};
+        uint8_t lru_hits_plan[CUDA_MOE_ROUTE_COUNT] = {0};
+        uint8_t lru_new_plan[CUDA_MOE_ROUTE_COUNT] = {0};
+        std::vector<int32_t> lru_slots_legacy;
+        std::vector<uint8_t> lru_hits_legacy;
+        std::vector<uint8_t> lru_new_legacy;
+        int32_t *lru_slots = lru_slots_plan;
+        uint8_t *lru_hits = lru_hits_plan;
+        uint8_t *lru_new = lru_new_plan;
         int lru_has_eviction = 0;
         const uint64_t q1_source_generation =
             g_q1_0_source_generation;
         if (q1_vram_lru_active) {
-            try {
-                lru_slots.resize(compact_count);
-                lru_hits.resize(compact_count);
-                lru_new.resize(compact_count);
-            } catch (...) {
-                return 0;
+            const int fixed_plan_lru = g_cuda_g134_dispatch_enabled &&
+                selected_host_arg && compact_count <= CUDA_MOE_ROUTE_COUNT;
+            if (!fixed_plan_lru) {
+                try {
+                    lru_slots_legacy.resize(compact_count);
+                    lru_hits_legacy.resize(compact_count);
+                    lru_new_legacy.resize(compact_count);
+                } catch (...) {
+                    return 0;
+                }
+                lru_slots = lru_slots_legacy.data();
+                lru_hits = lru_hits_legacy.data();
+                lru_new = lru_new_legacy.data();
             }
             for (uint32_t i = 0; i < compact_count; i++) {
                 int hit = 0;
@@ -36786,6 +36841,324 @@ static cuda_q1_0_mixed_representation cuda_q1_0_mixed_resolve(
     return CUDA_Q1_0_MIXED_UNKNOWN;
 }
 
+struct cuda_g134_dispatch_plan {
+    static_assert(CUDA_MOE_ROUTE_COUNT == CUDA_G134_DISPATCH_ROUTE_COUNT,
+                  "G134 staging must cover every routed expert");
+    int32_t hot_selected[CUDA_MOE_ROUTE_COUNT];
+    float hot_weights[CUDA_MOE_ROUTE_COUNT];
+    int32_t cold_selected[CUDA_MOE_ROUTE_COUNT];
+    float cold_weights[CUDA_MOE_ROUTE_COUNT];
+    int32_t cpu_selected[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    float cpu_weights[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    cuda_q1_0_mixed_representation
+        cpu_representations[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    uint32_t cpu_slot_identities[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    uint64_t cpu_slot_generations[CUDA_G132_CPU_LANE_MAX_ROUTES];
+    cuda_q1_0_mixed_representation
+        route_representations[CUDA_MOE_ROUTE_COUNT];
+    const cuda_moe_tier_entry *route_tiers[CUDA_MOE_ROUTE_COUNT];
+    uint8_t route_cpu_admitted[CUDA_MOE_ROUTE_COUNT];
+    uint32_t route_cpu_slot_identities[CUDA_MOE_ROUTE_COUNT];
+    uint64_t route_cpu_slot_generations[CUDA_MOE_ROUTE_COUNT];
+    uint32_t hot_count;
+    uint32_t cold_count;
+    uint32_t cpu_count;
+    uint32_t iq2_vram;
+    uint32_t iq2_snapshot_ram;
+    uint32_t iq2_tier_ram;
+    uint32_t tier_route_entries;
+    uint32_t recovery_trace_rank;
+    float recovery_trace_weight;
+    const char *recovery_trace_representation;
+};
+
+struct cuda_g134_dispatch_resolver {
+    uint32_t layer;
+    int snapshot_backing;
+    int open_tier_valid;
+    const cuda_moe_tier_entry *layer_tiers;
+};
+
+static cuda_q1_0_mixed_representation cuda_g134_dispatch_resolve(
+        const cuda_g134_dispatch_resolver &resolver, uint32_t expert) {
+    if (resolver.snapshot_backing) {
+        if (cuda_moe_tiering_has_exact_vram(resolver.layer, expert)) {
+            return CUDA_Q1_0_MIXED_IQ2_VRAM;
+        }
+        char *gate = NULL;
+        char *up = NULL;
+        char *down = NULL;
+        return cuda_q1_0_resident_ram_ptrs(
+                    resolver.layer, expert, &gate, &up, &down)
+            ? CUDA_Q1_0_MIXED_Q1_RESIDENT
+            : CUDA_Q1_0_MIXED_UNKNOWN;
+    }
+    if (!resolver.open_tier_valid || !resolver.layer_tiers) {
+        return CUDA_Q1_0_MIXED_UNKNOWN;
+    }
+    const cuda_moe_tier_entry &tier = resolver.layer_tiers[expert];
+    if (cuda_moe_tiering_has_exact_vram(resolver.layer, expert)) {
+        return tier.state == CUDA_MOE_TIER_VRAM_PROTECTED
+            ? CUDA_Q1_0_MIXED_IQ2_VRAM
+            : CUDA_Q1_0_MIXED_UNKNOWN;
+    }
+    char *gate = NULL;
+    char *up = NULL;
+    char *down = NULL;
+    if (cuda_moe_tiering_snapshot_ram_ptrs(
+            resolver.layer, expert, &gate, &up, &down)) {
+        return tier.state == CUDA_MOE_TIER_RAM_PROBATION ||
+               tier.state == CUDA_MOE_TIER_RAM_WARM
+            ? CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM
+            : CUDA_Q1_0_MIXED_UNKNOWN;
+    }
+    if (cuda_moe_tiering_ram_ptrs(
+            resolver.layer, expert, &gate, &up, &down)) {
+        return tier.state == CUDA_MOE_TIER_RAM_PROBATION ||
+               tier.state == CUDA_MOE_TIER_RAM_WARM
+            ? CUDA_Q1_0_MIXED_IQ2_TIER_RAM
+            : CUDA_Q1_0_MIXED_UNKNOWN;
+    }
+    if (tier.state != CUDA_MOE_TIER_SSD_COLD || tier.has_2bit_ram) {
+        return CUDA_Q1_0_MIXED_UNKNOWN;
+    }
+    return cuda_q1_0_resident_ram_ptrs(
+                resolver.layer, expert, &gate, &up, &down)
+        ? CUDA_Q1_0_MIXED_Q1_RESIDENT
+        : CUDA_Q1_0_MIXED_UNKNOWN;
+}
+
+/* Colibri-style phased dispatch: finish all host resolution for one layer,
+ * freeze the arrays consumed by the existing batched launch wrappers, then
+ * execute.  No kernel, tensor layout, route order, or arithmetic changes. */
+static int cuda_g134_dispatch_plan_build(
+        cuda_g134_dispatch_plan *plan,
+        uint32_t layer_index,
+        const int32_t *selected_host,
+        const float *weights_host,
+        uint32_t n_expert,
+        int cold_one_requested,
+        cuda_dynamic_arena *q1_arena,
+        cuda_g132_cpu_lane_reservation_set *cpu_lane_reservations) {
+    if (!plan || !selected_host || !weights_host || !q1_arena ||
+        !cpu_lane_reservations) return 0;
+    memset(plan, 0, sizeof(*plan));
+    plan->recovery_trace_rank = UINT32_MAX;
+
+    const size_t expected_tier_entries =
+        (size_t)CUDA_MOE_LAYER_COUNT * 256u;
+    const int tier_table_valid =
+        g_moe_tiering.entries.size() == expected_tier_entries;
+    const int snapshot_backing = cuda_q1_0_snapshot_backing_requested();
+    const cuda_g134_dispatch_resolver resolver = {
+        layer_index,
+        snapshot_backing,
+        g_moe_tiering.mode == CUDA_MOE_TIER_ENFORCE &&
+            g_moe_tiering.compose_prefill_mass_tiering &&
+            g_moe_tiering.compose_router_open && tier_table_valid,
+        tier_table_valid
+            ? g_moe_tiering.entries.data() + (size_t)layer_index * 256u
+            : NULL,
+    };
+    if (!cold_one_requested) cuda_q1_0_mixed_capture_router_mode();
+
+    uint32_t cold_slot = UINT32_MAX;
+    if (cold_one_requested) {
+        if (!cuda_q1_0_dual_sparse_companion_requested() ||
+            n_expert != CUDA_MOE_ROUTE_COUNT ||
+            !g_q1_0_dual_sparse_snapshot.ready) {
+            fprintf(stderr,
+                    "ds4: [q1-0-mixed] result=failed "
+                    "reason=cold-one-contract layer=%u routes=%u\n",
+                    layer_index, n_expert);
+            g_q1_0_mixed_cold_one_invariant_failures++;
+            g_q1_0_mixed_failures++;
+            return 0;
+        }
+        cold_slot = 0u;
+        for (uint32_t route = 1; route < n_expert; route++) {
+            if (weights_host[route] < weights_host[cold_slot]) {
+                cold_slot = route;
+            }
+        }
+    }
+
+    for (uint32_t route = 0; route < n_expert; route++) {
+        const int32_t expert_i = selected_host[route];
+        if (expert_i < 0 || expert_i >= 256) {
+            fprintf(stderr,
+                    "ds4: [q1-0-mixed] result=failed reason=expert-range "
+                    "layer=%u route=%u expert=%d\n",
+                    layer_index, route, (int)expert_i);
+            g_q1_0_mixed_failures++;
+            return 0;
+        }
+        cuda_q1_0_mixed_representation representation;
+        if (cold_one_requested) {
+            if (!cuda_q1_0_dual_sparse_pair_contains(
+                    layer_index, (uint32_t)expert_i)) {
+                fprintf(stderr,
+                        "ds4: [q1-0-mixed] result=failed "
+                        "reason=dual-sparse-parity layer=%u route=%u expert=%d\n",
+                        layer_index, route, (int)expert_i);
+                g_q1_0_mixed_cold_one_invariant_failures++;
+                g_q1_0_mixed_failures++;
+                return 0;
+            }
+            representation = route == cold_slot
+                ? CUDA_Q1_0_MIXED_Q1_RESIDENT
+                : (cuda_moe_tiering_has_exact_vram(
+                        layer_index, (uint32_t)expert_i)
+                    ? CUDA_Q1_0_MIXED_IQ2_VRAM
+                    : CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM);
+        } else {
+            representation = cuda_g134_dispatch_resolve(
+                resolver, (uint32_t)expert_i);
+        }
+        plan->route_representations[route] = representation;
+        plan->route_tiers[route] = resolver.layer_tiers
+            ? &resolver.layer_tiers[(uint32_t)expert_i] : NULL;
+        plan->tier_route_entries += plan->route_tiers[route] != NULL;
+        plan->iq2_vram += representation == CUDA_Q1_0_MIXED_IQ2_VRAM;
+        plan->iq2_snapshot_ram +=
+            representation == CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM;
+        plan->iq2_tier_ram +=
+            representation == CUDA_Q1_0_MIXED_IQ2_TIER_RAM;
+    }
+
+    if (cuda_g132_cpu_lane_requested()) {
+        for (uint32_t route = 0; route < n_expert; route++) {
+            const cuda_q1_0_mixed_representation representation =
+                plan->route_representations[route];
+            if (representation == CUDA_Q1_0_MIXED_Q1_RESIDENT) {
+                g_g132_cpu_lane.skipped_cold++;
+            }
+            if (representation != CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM &&
+                representation != CUDA_Q1_0_MIXED_IQ2_TIER_RAM) continue;
+            const cuda_moe_tier_entry *tier = plan->route_tiers[route];
+            if (!tier || (tier->state != CUDA_MOE_TIER_RAM_WARM &&
+                          tier->state != CUDA_MOE_TIER_RAM_PROBATION)) {
+                g_g132_cpu_lane.not_pinned++;
+            }
+        }
+        const cuda_moe_tier_state admission_states[2] = {
+            CUDA_MOE_TIER_RAM_WARM,
+            CUDA_MOE_TIER_RAM_PROBATION,
+        };
+        uint32_t admitted = 0;
+        for (uint32_t state_i = 0; state_i < 2u; state_i++) {
+            for (uint32_t route = 0; route < n_expert; route++) {
+                const cuda_q1_0_mixed_representation representation =
+                    plan->route_representations[route];
+                if (representation != CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM &&
+                    representation != CUDA_Q1_0_MIXED_IQ2_TIER_RAM) continue;
+                const cuda_moe_tier_entry *tier = plan->route_tiers[route];
+                if (!tier || tier->state != admission_states[state_i]) continue;
+                const int32_t expert_i = selected_host[route];
+                const char *resident_gate = NULL;
+                const char *resident_up = NULL;
+                const char *resident_down = NULL;
+                uint32_t slot_identity = UINT32_MAX;
+                uint64_t slot_generation = 0;
+                int reservation_busy = 0;
+                if (!cuda_g132_cpu_lane_reserve_resident_iq2_ptrs(
+                        layer_index, (uint32_t)expert_i, representation,
+                        &resident_gate, &resident_up, &resident_down,
+                        &slot_identity, &slot_generation,
+                        &reservation_busy)) {
+                    if (reservation_busy) {
+                        g_g132_cpu_lane.reservation_rejected++;
+                    } else {
+                        g_g132_cpu_lane.not_pinned++;
+                    }
+                    continue;
+                }
+                if (admitted >= g_g132_cpu_lane.max_experts_per_layer) {
+                    cuda_g132_cpu_lane_release_slot(slot_identity);
+                    g_g132_cpu_lane.cap_rejected++;
+                    continue;
+                }
+                cpu_lane_reservations->add(slot_identity);
+                plan->route_cpu_admitted[route] = 1u;
+                plan->route_cpu_slot_identities[route] = slot_identity;
+                plan->route_cpu_slot_generations[route] = slot_generation;
+                admitted++;
+                g_g132_cpu_lane.resident_hits++;
+            }
+        }
+    }
+
+    const int trace_requested = cuda_q1_0_mixed_trace_requested();
+    for (uint32_t route = 0; route < n_expert; route++) {
+        const int32_t expert_i = selected_host[route];
+        const cuda_q1_0_mixed_representation source_representation =
+            plan->route_representations[route];
+        const cuda_q1_0_mixed_representation representation =
+            plan->route_cpu_admitted[route]
+                ? CUDA_Q1_0_MIXED_IQ2_CPU_EXACT : source_representation;
+        const cuda_moe_tier_entry *tier = plan->route_tiers[route];
+        if (cuda_expert_recovery_trace_target(
+                layer_index, (uint32_t)expert_i)) {
+            if (plan->recovery_trace_rank != UINT32_MAX) {
+                cuda_expert_recovery_trace_fail("duplicate_target_route");
+                g_q1_0_mixed_failures++;
+                return 0;
+            }
+            plan->recovery_trace_rank = route;
+            plan->recovery_trace_weight = weights_host[route];
+            plan->recovery_trace_representation =
+                cuda_q1_0_mixed_representation_name(representation);
+        }
+        if (trace_requested) {
+            fprintf(stderr,
+                    "ds4: [q1-0-mixed-route] layer=%u route=%u expert=%d "
+                    "weight=%.9g representation=%s tier=%u has_2bit_ram=%u "
+                    "source_representation=%s cpu_slot=%u "
+                    "cpu_slot_generation=%llu cpu_pageable=%u "
+                    "primary_snapshot=%llu q1_snapshot=%llu\n",
+                    layer_index, route, (int)expert_i, weights_host[route],
+                    cuda_q1_0_mixed_representation_name(representation),
+                    tier ? (unsigned)tier->state : 0u,
+                    tier ? (unsigned)tier->has_2bit_ram : 0u,
+                    cuda_q1_0_mixed_representation_name(source_representation),
+                    plan->route_cpu_admitted[route]
+                        ? plan->route_cpu_slot_identities[route] : UINT32_MAX,
+                    (unsigned long long)(plan->route_cpu_admitted[route]
+                        ? plan->route_cpu_slot_generations[route] : 0u),
+                    plan->route_cpu_admitted[route] ? 0u : UINT32_MAX,
+                    (unsigned long long)g_moe_tiering.snapshot_generation,
+                    (unsigned long long)q1_arena->snapshot_generation);
+            g_q1_0_mixed_trace_rows++;
+        }
+        if (representation == CUDA_Q1_0_MIXED_IQ2_VRAM ||
+            representation == CUDA_Q1_0_MIXED_IQ2_SNAPSHOT_RAM ||
+            representation == CUDA_Q1_0_MIXED_IQ2_TIER_RAM) {
+            plan->hot_selected[plan->hot_count] = expert_i;
+            plan->hot_weights[plan->hot_count++] = weights_host[route];
+        } else if (representation == CUDA_Q1_0_MIXED_IQ2_CPU_EXACT) {
+            const uint32_t slot = plan->cpu_count++;
+            plan->cpu_selected[slot] = expert_i;
+            plan->cpu_weights[slot] = weights_host[route];
+            plan->cpu_representations[slot] = source_representation;
+            plan->cpu_slot_identities[slot] =
+                plan->route_cpu_slot_identities[route];
+            plan->cpu_slot_generations[slot] =
+                plan->route_cpu_slot_generations[route];
+        } else if (representation == CUDA_Q1_0_MIXED_Q1_RESIDENT) {
+            plan->cold_selected[plan->cold_count] = expert_i;
+            plan->cold_weights[plan->cold_count++] = weights_host[route];
+        } else {
+            fprintf(stderr,
+                    "ds4: [q1-0-mixed] result=failed reason=unresolved "
+                    "layer=%u route=%u expert=%d router=unchanged\n",
+                    layer_index, route, (int)expert_i);
+            g_q1_0_mixed_failures++;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -37028,15 +37401,40 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             attribution_state, CUDA_G130_ATTRIB_SELECTION_D2H);
     }
 #endif
-    const int mixed_selection_d2h_ok =
-        cuda_ok(cudaMemcpy(selected_host, selected->ptr,
-                           (size_t)n_expert * sizeof(int32_t),
-                           cudaMemcpyDeviceToHost),
-                "Q1_0 mixed selected D2H") &&
-        cuda_ok(cudaMemcpy(weights_host, weights->ptr,
-                           (size_t)n_expert * sizeof(float),
-                           cudaMemcpyDeviceToHost),
-                "Q1_0 mixed weights D2H");
+    int mixed_selection_d2h_ok = 0;
+    if (g_cuda_g134_dispatch_enabled) {
+        cuda_g134_dispatch_staging *staging =
+            g_cuda_g134_dispatch_staging;
+        mixed_selection_d2h_ok = staging &&
+            cuda_ok(cudaMemcpyAsync(
+                        staging->selected, selected->ptr,
+                        (size_t)n_expert * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, 0),
+                    "G134 dispatch selected D2H") &&
+            cuda_ok(cudaMemcpyAsync(
+                        staging->weights, weights->ptr,
+                        (size_t)n_expert * sizeof(float),
+                        cudaMemcpyDeviceToHost, 0),
+                    "G134 dispatch weights D2H") &&
+            cuda_ok(cudaStreamSynchronize(0),
+                    "G134 dispatch selection ready");
+        if (mixed_selection_d2h_ok) {
+            memcpy(selected_host, staging->selected,
+                   (size_t)n_expert * sizeof(int32_t));
+            memcpy(weights_host, staging->weights,
+                   (size_t)n_expert * sizeof(float));
+        }
+    } else {
+        mixed_selection_d2h_ok =
+            cuda_ok(cudaMemcpy(selected_host, selected->ptr,
+                               (size_t)n_expert * sizeof(int32_t),
+                               cudaMemcpyDeviceToHost),
+                    "Q1_0 mixed selected D2H") &&
+            cuda_ok(cudaMemcpy(weights_host, weights->ptr,
+                               (size_t)n_expert * sizeof(float),
+                               cudaMemcpyDeviceToHost),
+                    "Q1_0 mixed weights D2H");
+    }
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
     if (attribution) {
         (void)cuda_g130_attribution_switch(
@@ -37089,6 +37487,58 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
     const char *recovery_trace_representation = NULL;
     const int cold_one_requested =
         cuda_q1_0_mixed_cold_one_requested();
+    if (g_cuda_g134_dispatch_enabled) {
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, CUDA_G130_ATTRIB_DISPATCH_PLAN);
+        }
+#endif
+        cuda_g134_dispatch_plan dispatch_plan;
+        if (!cuda_g134_dispatch_plan_build(
+                &dispatch_plan, layer_index, selected_host, weights_host,
+                n_expert, cold_one_requested, q1_arena,
+                &cpu_lane_reservations)) {
+            return 0;
+        }
+        memcpy(hot_selected, dispatch_plan.hot_selected,
+               sizeof(hot_selected));
+        memcpy(hot_weights, dispatch_plan.hot_weights,
+               sizeof(hot_weights));
+        memcpy(cold_selected, dispatch_plan.cold_selected,
+               sizeof(cold_selected));
+        memcpy(cold_weights, dispatch_plan.cold_weights,
+               sizeof(cold_weights));
+        memcpy(cpu_selected, dispatch_plan.cpu_selected,
+               sizeof(cpu_selected));
+        memcpy(cpu_weights, dispatch_plan.cpu_weights,
+               sizeof(cpu_weights));
+        memcpy(cpu_representations, dispatch_plan.cpu_representations,
+               sizeof(cpu_representations));
+        memcpy(cpu_slot_identities, dispatch_plan.cpu_slot_identities,
+               sizeof(cpu_slot_identities));
+        memcpy(cpu_slot_generations, dispatch_plan.cpu_slot_generations,
+               sizeof(cpu_slot_generations));
+        memcpy(route_representations, dispatch_plan.route_representations,
+               sizeof(route_representations));
+        hot_count = dispatch_plan.hot_count;
+        cold_count = dispatch_plan.cold_count;
+        cpu_count = dispatch_plan.cpu_count;
+        iq2_vram = dispatch_plan.iq2_vram;
+        iq2_snapshot_ram = dispatch_plan.iq2_snapshot_ram;
+        iq2_tier_ram = dispatch_plan.iq2_tier_ram;
+        tier_route_entries = dispatch_plan.tier_route_entries;
+        recovery_trace_rank = dispatch_plan.recovery_trace_rank;
+        recovery_trace_weight = dispatch_plan.recovery_trace_weight;
+        recovery_trace_representation =
+            dispatch_plan.recovery_trace_representation;
+    } else {
+#ifndef DS4_G130_ATTRIB_COMPILED_OUT
+        if (attribution) {
+            (void)cuda_g130_attribution_switch(
+                attribution_state, CUDA_G130_ATTRIB_DISPATCH_LEGACY);
+        }
+#endif
     uint32_t cold_slot = UINT32_MAX;
     if (cold_one_requested) {
         if (!cuda_q1_0_dual_sparse_companion_requested() ||
@@ -37314,6 +37764,7 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
             g_q1_0_mixed_failures++;
             return 0;
         }
+    }
     }
     if (q1_0_mixed_exact_iq2_resolver &&
         !cuda_q1_0_snapshot_backing_requested() &&
