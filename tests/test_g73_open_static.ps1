@@ -50,7 +50,12 @@ $terminal = Slice-Between $source 'static int cuda_g73_terminal_exact_load(' `
 Assert-Contains $terminal 'double absolute_deadline' 'terminal exact does not receive the token deadline'
 Assert-Contains $terminal 'cuda_g73_terminal_read_part(' 'terminal exact does not use bounded file reads'
 Assert-Contains $source 'os_pread_plain(' 'terminal exact lacks its plain synchronous read path'
-Assert-Contains $terminal 'cuda_g73_terminal_mutex_guard' 'terminal shared scratch is not serialized'
+Assert-Contains $source 'cuda_g73_terminal_mutex_guard g73_terminal_guard;' `
+    'terminal caller lacks scoped mutex ownership'
+Assert-Contains $source 'g73_terminal_guard.held_for(&g_cuda_g73_terminal)' `
+    'terminal storage consumption is not ownership-asserted'
+Assert-Contains $terminal 'assert(terminal.mutex_owned);' `
+    'terminal loader does not require caller-held ownership'
 Assert-Contains $terminal 'budget_overrun' 'terminal overruns are not explicitly logged'
 Assert-Contains $terminal 'WDDM offers' 'accepted WDDM bandwidth assumption is undocumented'
 Assert-Contains $terminal 'cudaMemcpy(' 'terminal exact does not perform its completing H2D'
@@ -89,6 +94,12 @@ Assert-Contains $releaseAll 'os_cond_timedwait_ms(' `
     'release-all does not bounded-await committing jobs'
 Assert-Contains $releaseAll 'writer claim/slot safe-leaked ' `
     'release-all lacks the permanent dead-slot terminal'
+Assert-Contains $source 'state.tier_generation++' `
+    'tier reset does not advance the rotator publication generation'
+Assert-Contains $source 'local.tier_generation != state.tier_generation' `
+    'rotator publisher does not revalidate tier generation'
+Assert-Contains $source 'retained_entries->swap(g_moe_tiering.entries)' `
+    'tier reset does not retain entries referenced by a stalled publisher'
 $submit = Slice-Between $source 'static int cuda_q1_0_ssd_wrap_submit(' `
     'static void cuda_g73_open_maybe_schedule_rotation('
 Assert-Contains $submit 'if (state.failed || state.stop) {' `
@@ -131,6 +142,10 @@ Assert-Contains $source 'g_cuda_g133_attribution_append =' 'formatter is not sel
 Assert-Contains $source 'cuda_g73_validate_hermetic_environment()' 'missing runtime hermetic validation'
 Assert-Contains $source 'ds4_gpu_g73_open_selftest(' 'missing real in-process G73 self-test'
 Assert-Contains $source 'selftest-stop-after-writer-claim' 'self-test does not exercise teardown versus submit'
+Assert-Contains $source 'selftest-teardown-during-committing' `
+    'self-test does not exercise teardown during COMMITTING publication'
+Assert-Contains $source 'teardown_during_committing=generation-abandon' `
+    'self-test does not assert generation-abandon publication'
 Assert-Contains $source 'os_pread_cancellable_timeout(' 'self-test does not exercise real pread timeout/cancel'
 Assert-Contains $osFileHeader 'unsigned char opaque[256];' `
     'POSIX cancellable state is not ABI-opaque'

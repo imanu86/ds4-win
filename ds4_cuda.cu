@@ -4,6 +4,7 @@
 #include <cublas_v2.h>
 
 #include <stdint.h>
+#include <assert.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -2535,6 +2536,7 @@ static void cuda_prefill_mass_observer_reset(void);
 static void cuda_prefill_mass_observer_finalize(void);
 static void cuda_prefill_mass_observer_release(int report);
 static void cuda_moe_tiering_request_boundary_reset(void);
+static int cuda_q1_0_ssd_wrap_tier_reset_begin(void);
 static int cuda_moe_route_worker_drain_completed(const char *site);
 static int cuda_g133_shared_policy_active(void);
 static int cuda_prefill_mass_observer_needs_weights(void);
@@ -7013,6 +7015,7 @@ struct cuda_g73_terminal_state {
     uint64_t slot_bytes;
     uint64_t device_bytes;
     int mutex_ready;
+    int mutex_owned;
     int ready;
 };
 
@@ -25082,7 +25085,7 @@ static void cuda_moe_tiering_report_and_reset(int flush_ssd_wrap) {
             (unsigned long long)g_iq1_promotion.q1_0_record_failures,
             (unsigned long long)g_iq1_promotion.failures);
     }
-    cuda_moe_tiering_clear_owned_slots();
+    if (!cuda_q1_0_ssd_wrap_tier_reset_begin()) return;
     g_dynamic_arena.tiering_exclusive = 0;
     g_moe_tiering = cuda_moe_tiering();
     g_iq1_promotion = cuda_iq1_promotion();
@@ -26014,6 +26017,7 @@ enum cuda_q1_0_ssd_wrap_job_state : uint8_t {
     CUDA_Q1_0_SSD_WRAP_RAM_READY,
     CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING,
     CUDA_Q1_0_SSD_WRAP_FAILED,
+    CUDA_Q1_0_SSD_WRAP_DEAD,
 };
 
 struct cuda_q1_0_ssd_wrap_job {
@@ -26047,6 +26051,7 @@ struct cuda_q1_0_ssd_wrap_job {
     uint8_t writer_claimed;
     uint8_t g73_open_rotation;
     uint8_t commit_safe_leaked;
+    uint64_t tier_generation;
 };
 
 struct cuda_q1_0_ssd_wrap_state {
@@ -26078,6 +26083,11 @@ struct cuda_q1_0_ssd_wrap_state {
     int stop;
     int failed;
     int commit_safe_leaked;
+    uint64_t tier_generation;
+    uint64_t generation_abandons;
+    int selftest_stall_committing_publication;
+    int selftest_committing_publication_stalled;
+    int selftest_release_committing_publication;
     uint64_t enqueue_sequence;
     uint64_t wave_sequence;
     uint64_t requested;
@@ -26114,6 +26124,55 @@ struct cuda_q1_0_ssd_wrap_state {
 };
 static cuda_q1_0_ssd_wrap_state g_q1_0_ssd_wrap;
 
+static int cuda_q1_0_ssd_wrap_tier_reset_begin(void) {
+    cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
+    if (!state.mutex_ready) {
+        cuda_moe_tiering_clear_owned_slots();
+        return 1;
+    }
+    os_mutex_lock(&state.mutex);
+    uint32_t committing = 0u;
+    for (const cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+        if (job.state == CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING) committing++;
+    }
+    std::vector<cuda_moe_tier_entry> *retained_entries = NULL;
+    if (committing != 0u) {
+        retained_entries = new (std::nothrow)
+            std::vector<cuda_moe_tier_entry>();
+        if (!retained_entries) {
+            os_mutex_unlock(&state.mutex);
+            fprintf(stderr,
+                    "ds4: [q1-0-ssd-wrap] tier reset deferred: unable to "
+                    "retain entries for %u committing publisher(s)\n",
+                    committing);
+            return 0;
+        }
+    }
+    state.tier_generation++;
+    if (state.tier_generation == 0u) state.tier_generation++;
+    if (committing != 0u) {
+        for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+            if (job.state != CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING) continue;
+            job.commit_safe_leaked = 1u;
+        }
+        state.commit_safe_leaked = 1;
+        g_cuda_dynamic_arena_storage_safe_leaked = 1;
+    }
+    cuda_moe_tiering_clear_owned_slots();
+    if (retained_entries) {
+        /* A timed-out publisher may have captured an entry address before its
+         * generation check. Move that allocation out of the reset object and
+         * deliberately leak it until process exit; freeing it is never safe. */
+        retained_entries->swap(g_moe_tiering.entries);
+        fprintf(stderr,
+                "ds4: [q1-0-ssd-wrap] retained tier entries permanently "
+                "for %u generation-invalidated publisher(s)\n",
+                committing);
+    }
+    os_mutex_unlock(&state.mutex);
+    return 1;
+}
+
 static const char *cuda_q1_0_ssd_wrap_state_name(
         cuda_q1_0_ssd_wrap_job_state state) {
     switch (state) {
@@ -26122,6 +26181,7 @@ static const char *cuda_q1_0_ssd_wrap_state_name(
     case CUDA_Q1_0_SSD_WRAP_RAM_READY:     return "RAM_READY";
     case CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING:return "RAM_COMMITTING";
     case CUDA_Q1_0_SSD_WRAP_FAILED:         return "FAILED";
+    case CUDA_Q1_0_SSD_WRAP_DEAD:           return "DEAD";
     default:                                return "FREE";
     }
 }
@@ -26682,6 +26742,7 @@ static void cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
         for (uint32_t i = 0; i < state.jobs.size(); i++) {
             cuda_q1_0_ssd_wrap_job &job = state.jobs[i];
             if (job.state == CUDA_Q1_0_SSD_WRAP_FREE) continue;
+            if (job.commit_safe_leaked) continue;
             if (job.state == CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING) {
                 if (!job.commit_safe_leaked) committing++;
                 continue;
@@ -26764,18 +26825,32 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         return 1;
     }
     local = state.jobs[index];
+    local.tier_generation = state.tier_generation;
+    state.jobs[index].tier_generation = state.tier_generation;
+    cuda_dynamic_arena_slot *slot = local.slot < g_dynamic_arena.slots.size()
+        ? &g_dynamic_arena.slots[local.slot] : NULL;
+    char *slot_host_ptr = slot ? slot->host_ptr : NULL;
     state.jobs[index].state = CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING;
     /* Publication owns only the arena writer claim. Teardown can take the
      * rotator mutex, release other jobs, and bounded-await this marker. */
     os_mutex_unlock(&state.mutex);
+
+    if (state.selftest_stall_committing_publication) {
+        os_mutex_lock(&state.mutex);
+        state.selftest_committing_publication_stalled = 1;
+        os_cond_broadcast(&state.cond);
+        while (!state.selftest_release_committing_publication) {
+            (void)os_cond_wait(&state.cond, &state.mutex);
+        }
+        os_mutex_unlock(&state.mutex);
+    }
 
     int ok = local.failure_reason == NULL;
     const char *reason = local.failure_reason;
     uint64_t stale_delta = 0u;
     uint64_t host_copy_bytes = 0u;
     double host_copy_seconds = 0.0;
-    if (ok && (local.slot >= g_dynamic_arena.slots.size() ||
-        local.request_epoch == 0u ||
+    if (ok && (!slot || !slot_host_ptr || local.request_epoch == 0u ||
         local.record.request_epoch != local.request_epoch ||
         local.record.first_eligible_call <=
             local.record.observation_call)) {
@@ -26783,8 +26858,6 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         reason = "stale_or_epoch";
         stale_delta++;
     }
-    cuda_dynamic_arena_slot *slot = ok ?
-        &g_dynamic_arena.slots[local.slot] : NULL;
     if (ok && (!local.writer_claimed ||
                cuda_dynamic_arena_slot_refs_load(
                    &slot->cpu_lane_slot_refs) !=
@@ -26792,6 +26865,37 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         ok = 0;
         reason = "writer_claim_lost";
         stale_delta++;
+    }
+    uint64_t slot_checksum = 0u;
+    if (ok) {
+        const double copy_started = cuda_wall_sec();
+        memcpy(slot_host_ptr, local.read_base,
+               (size_t)g_dynamic_arena.slot_bytes);
+        host_copy_bytes = g_dynamic_arena.slot_bytes;
+        host_copy_seconds = cuda_wall_sec() - copy_started;
+        slot_checksum = cuda_dynamic_arena_fnv1a64(
+            (const uint8_t *)slot_host_ptr, g_dynamic_arena.slot_bytes);
+    }
+
+    os_mutex_lock(&state.mutex);
+    if (local.tier_generation != state.tier_generation) {
+        /* Reset retained the old entry allocation and invalidated this
+         * publisher before replacing tier state. The copied slot stays
+         * writer-claimed and permanently dead; no tier or slot metadata is
+         * read or written after observing the generation change. */
+        state.host_copy_bytes += host_copy_bytes;
+        state.host_copy_seconds += host_copy_seconds;
+        state.generation_abandons++;
+        if (index < state.jobs.size()) {
+            state.jobs[index].state = CUDA_Q1_0_SSD_WRAP_DEAD;
+            state.jobs[index].failure_reason = "tier-generation-changed";
+            state.jobs[index].commit_safe_leaked = 1u;
+        }
+        state.commit_safe_leaked = 1;
+        g_cuda_dynamic_arena_storage_safe_leaked = 1;
+        os_cond_broadcast(&state.cond);
+        os_mutex_unlock(&state.mutex);
+        return 0;
     }
     if (ok && local.replacing) {
         if (local.victim_entry_index >= g_moe_tiering.entries.size()) {
@@ -26819,13 +26923,6 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         ok = 0;
         reason = "destination_stale";
         stale_delta++;
-    }
-    if (ok) {
-        const double copy_started = cuda_wall_sec();
-        memcpy(slot->host_ptr, local.read_base,
-               (size_t)g_dynamic_arena.slot_bytes);
-        host_copy_bytes = g_dynamic_arena.slot_bytes;
-        host_copy_seconds = cuda_wall_sec() - copy_started;
     }
     if (ok && local.replacing) {
         cuda_moe_tier_entry &victim =
@@ -26868,8 +26965,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         if (local.replacing) {
             slot->content_generation = ++g_dynamic_arena.next_generation;
         }
-        slot->checksum = cuda_dynamic_arena_fnv1a64(
-            (const uint8_t *)slot->host_ptr, g_dynamic_arena.slot_bytes);
+        slot->checksum = slot_checksum;
         slot->last_dma_sequence = 0;
         slot->state = DS4_GPU_ARENA_READY;
         cuda_moe_tier_entry &entry = g_moe_tiering.entries[
@@ -26929,7 +27025,6 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
         }
     }
-    os_mutex_lock(&state.mutex);
     state.stale += stale_delta;
     state.host_copy_bytes += host_copy_bytes;
     state.host_copy_seconds += host_copy_seconds;
@@ -26960,6 +27055,12 @@ static int cuda_q1_0_ssd_wrap_finish_one(
     os_cond_broadcast(&state.cond);
     os_mutex_unlock(&state.mutex);
     return ok;
+}
+
+static void *cuda_q1_0_ssd_wrap_selftest_finish_one(void *arg) {
+    const uint32_t index = *(const uint32_t *)arg;
+    (void)cuda_q1_0_ssd_wrap_finish_one(index, 1);
+    return NULL;
 }
 
 static int cuda_q1_0_ssd_wrap_poll_internal(int force) {
@@ -34231,18 +34332,33 @@ static int cuda_g73_terminal_read_part(
 
 struct cuda_g73_terminal_mutex_guard {
     cuda_g73_terminal_state *terminal;
-    explicit cuda_g73_terminal_mutex_guard(cuda_g73_terminal_state *state)
-        : terminal(state) {
+    cuda_g73_terminal_mutex_guard() : terminal(NULL) {}
+    int lock(cuda_g73_terminal_state *state) {
+        assert(!terminal);
+        if (!state->mutex_ready) return 0;
+        terminal = state;
         os_mutex_lock(&terminal->mutex);
+        assert(!terminal->mutex_owned);
+        terminal->mutex_owned = 1;
+        return 1;
     }
-    ~cuda_g73_terminal_mutex_guard() { os_mutex_unlock(&terminal->mutex); }
+    int held_for(const cuda_g73_terminal_state *state) const {
+        return terminal == state && state->mutex_owned;
+    }
+    ~cuda_g73_terminal_mutex_guard() {
+        if (!terminal) return;
+        assert(terminal->mutex_owned);
+        terminal->mutex_owned = 0;
+        os_mutex_unlock(&terminal->mutex);
+    }
 };
 
 /* Exact escape terminal: zero shared-resource dependency and zero mmap faults
  * on the serving path. A dedicated startup-opened plain fd supplies <=1 MiB
  * synchronous chunks; the absolute deadline is checked between chunks and an
  * overrun is logged, but this last resort completes. One dedicated mutex owns
- * the bounce, device slots, and route-pointer publication across direct callers. */
+ * the bounce, device slots, and route-pointer publication across direct callers.
+ * The routed-MoE caller owns that mutex until all consumers are enqueued. */
 static int cuda_g73_terminal_exact_load(
         const void *model_map, uint64_t model_size, uint32_t layer,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -34259,7 +34375,7 @@ static int cuda_g73_terminal_exact_load(
     if (!terminal.mutex_ready) {
         return cuda_g73_contract_error(layer, "terminal-mutex");
     }
-    cuda_g73_terminal_mutex_guard terminal_guard(&terminal);
+    assert(terminal.mutex_owned);
     const uint64_t slot_bytes =
         gate_expert_bytes * 2u + down_expert_bytes;
     if (!terminal.ready || terminal.slot_bytes != slot_bytes ||
@@ -34511,11 +34627,115 @@ extern "C" int ds4_gpu_g73_open_selftest(const char *read_path) {
         }
     }
 
+    /* Stall the real publisher after it enters COMMITTING, then execute the
+     * production teardown/reset handshake. Reset must retain old entries and
+     * the resumed publisher must abandon before touching either metadata set. */
+    state.failed = 0;
+    state.stop = 0;
+    state.commit_safe_leaked = 0;
+    state.generation_abandons = 0u;
+    state.selftest_stall_committing_publication = 1;
+    state.selftest_committing_publication_stalled = 0;
+    state.selftest_release_committing_publication = 0;
+    for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+        job = cuda_q1_0_ssd_wrap_job{};
+    }
+    const uint32_t publishing_entry_index = 3u;
+    static char publishing_source = 0x2a;
+    static char publishing_destination = 0;
+    cuda_dynamic_arena_slot &publishing_slot = g_dynamic_arena.slots[0];
+    publishing_slot = cuda_dynamic_arena_slot{};
+    publishing_slot.host_ptr = &publishing_destination;
+    publishing_slot.layer = 0u;
+    publishing_slot.expert = publishing_entry_index;
+    publishing_slot.content_generation = 17u;
+    publishing_slot.state = DS4_GPU_ARENA_LOADING;
+    if (!cuda_dynamic_arena_slot_writer_try_acquire(&publishing_slot)) ok = 0;
+    cuda_moe_tier_entry &publishing_entry =
+        g_moe_tiering.entries[publishing_entry_index];
+    publishing_entry.ram_slot = 0u;
+    publishing_entry.ram_generation = 17u;
+    publishing_entry.state = CUDA_MOE_TIER_RAM_PROBATION;
+    cuda_moe_tier_entry *retained_entry = &publishing_entry;
+    cuda_q1_0_ssd_wrap_job &publishing_job = state.jobs[0];
+    publishing_job.state = CUDA_Q1_0_SSD_WRAP_RAM_READY;
+    publishing_job.record.request_epoch = 1u;
+    publishing_job.record.observation_call = 1u;
+    publishing_job.record.first_eligible_call = 2u;
+    publishing_job.request_epoch = 1u;
+    publishing_job.bytes_read = 1u;
+    publishing_job.layer = 0u;
+    publishing_job.expert = publishing_entry_index;
+    publishing_job.slot = 0u;
+    publishing_job.ring_slot = 0u;
+    publishing_job.read_base = &publishing_source;
+    publishing_job.writer_claimed = 1u;
+    publishing_job.g73_open_rotation = 1u;
+    const uint64_t tier_generation_before = state.tier_generation;
+    const uint32_t publishing_job_index = 0u;
+    os_thread_t publishing_thread;
+    int publishing_thread_started = os_thread_create(
+        &publishing_thread, cuda_q1_0_ssd_wrap_selftest_finish_one,
+        (void *)&publishing_job_index) == 0;
+    if (!publishing_thread_started) {
+        ok = 0;
+    } else {
+        os_mutex_lock(&state.mutex);
+        while (!state.selftest_committing_publication_stalled) {
+            if (os_cond_timedwait_ms(&state.cond, &state.mutex, 1000u) != 0) {
+                ok = 0;
+                break;
+            }
+        }
+        os_mutex_unlock(&state.mutex);
+        os_mutex_lock(&state.mutex);
+        cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
+            "selftest-teardown-during-committing");
+        os_mutex_unlock(&state.mutex);
+        if (!cuda_q1_0_ssd_wrap_tier_reset_begin()) ok = 0;
+        if (state.tier_generation == tier_generation_before) ok = 0;
+        const uint32_t retained_ram_slot = retained_entry->ram_slot;
+        const uint64_t retained_ram_generation =
+            retained_entry->ram_generation;
+        const cuda_moe_tier_state retained_state = retained_entry->state;
+
+        g_moe_tiering = cuda_moe_tiering();
+        g_moe_tiering.entries.assign(
+            (size_t)CUDA_MOE_LAYER_COUNT * 256u, empty);
+        cuda_moe_tier_entry &replacement_entry =
+            g_moe_tiering.entries[publishing_entry_index];
+        replacement_entry.ram_slot = 91u;
+        replacement_entry.ram_generation = 12345u;
+        replacement_entry.state = CUDA_MOE_TIER_VRAM_PROTECTED;
+        os_mutex_lock(&state.mutex);
+        state.selftest_release_committing_publication = 1;
+        os_cond_broadcast(&state.cond);
+        os_mutex_unlock(&state.mutex);
+        os_thread_join(publishing_thread);
+
+        if (state.generation_abandons != 1u ||
+            state.jobs[0].state != CUDA_Q1_0_SSD_WRAP_DEAD ||
+            !state.jobs[0].commit_safe_leaked ||
+            cuda_dynamic_arena_slot_refs_load(
+                &publishing_slot.cpu_lane_slot_refs) !=
+                    CUDA_DYNAMIC_ARENA_SLOT_WRITER ||
+            publishing_slot.state != DS4_GPU_ARENA_FREE ||
+            retained_entry->ram_slot != retained_ram_slot ||
+            retained_entry->ram_generation != retained_ram_generation ||
+            retained_entry->state != retained_state ||
+            replacement_entry.ram_slot != 91u ||
+            replacement_entry.ram_generation != 12345u ||
+            replacement_entry.state != CUDA_MOE_TIER_VRAM_PROTECTED) {
+            ok = 0;
+        }
+    }
+
     fprintf(stderr,
             "ds4: [g73-open-selftest] result=%s "
             "pread_cancel=start-then-cancel "
             "pread_deadline=start-then-cancel "
             "rotator=production sequential_consistency_hook=real "
+            "teardown_during_committing=generation-abandon "
             "invariant=real\n",
             ok ? "passed" : "failed");
     return ok;
@@ -35437,6 +35657,7 @@ static int routed_moe_launch_impl(
         : g73_absolute_deadline;
     cuda_g73_route_outcomes g73_outcomes = {};
     int g73_outcomes_ready = 0;
+    cuda_g73_terminal_mutex_guard g73_terminal_guard;
     g_moe_last_selected.valid = 0;
     /* Wave state belongs to this routed-MoE invocation. Decode can take the
      * resident-route path without calling selected-load, so stale prefill
@@ -35811,6 +36032,10 @@ static int routed_moe_launch_impl(
                         "ds4: [g73-open] bounded selected-load unavailable "
                         "at layer=%u; using preallocated exact terminal\n",
                         layer_index);
+                if (!g73_terminal_guard.lock(&g_cuda_g73_terminal)) {
+                    return cuda_g73_contract_error(
+                        layer_index, "terminal-mutex");
+                }
                 if (!cuda_g73_terminal_exact_load(
                     model_map, model_size, layer_index,
                     gate_offset, up_offset, down_offset,
@@ -35820,6 +36045,7 @@ static int routed_moe_launch_impl(
                     return 0;
                 }
                 g73_outcomes_ready = 1;
+                assert(g73_terminal_guard.held_for(&g_cuda_g73_terminal));
                 gate_w = g_cuda_g73_terminal.device_slots;
                 up_w = gate_w + gate_expert_bytes;
                 down_w = up_w + gate_expert_bytes;
@@ -35869,6 +36095,9 @@ static int routed_moe_launch_impl(
     }
     if constexpr (G73) {
         if (!gate_w || !up_w || !down_w) {
+            if (!g73_terminal_guard.lock(&g_cuda_g73_terminal)) {
+                return cuda_g73_contract_error(layer_index, "terminal-mutex");
+            }
             if (!cuda_g73_terminal_exact_load(
                 model_map, model_size, layer_index,
                 gate_offset, up_offset, down_offset,
@@ -35878,6 +36107,7 @@ static int routed_moe_launch_impl(
                 return 0;
             }
             g73_outcomes_ready = 1;
+            assert(g73_terminal_guard.held_for(&g_cuda_g73_terminal));
             gate_w = g_cuda_g73_terminal.device_slots;
             up_w = gate_w + gate_expert_bytes;
             down_w = up_w + gate_expert_bytes;
@@ -35901,6 +36131,12 @@ static int routed_moe_launch_impl(
                 return 0;
             }
             g73_outcomes_ready = 1;
+        }
+        if (gate_w == g_cuda_g73_terminal.device_slots ||
+            mixed_route_ptrs == g_cuda_g73_terminal.device_route_ptrs) {
+            /* Terminal storage is consumed by the launches below. Ownership
+             * must extend through their enqueue, not merely through loading. */
+            assert(g73_terminal_guard.held_for(&g_cuda_g73_terminal));
         }
     }
 
