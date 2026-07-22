@@ -1329,6 +1329,20 @@ static int cuda_q1_0_dynamic_promotion_requested(void) {
     return value && strcmp(value, "1") == 0;
 }
 
+static int cuda_g73_open_requested(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("DS4_G73_OPEN");
+        enabled = value && strcmp(value, "1") == 0;
+        if (value && value[0] && strcmp(value, "0") != 0 && !enabled) {
+            fprintf(stderr,
+                    "ds4: invalid DS4_G73_OPEN=%s; expected 0 or 1\n",
+                    value);
+        }
+    }
+    return enabled;
+}
+
 enum {
     CUDA_Q1_0_SSD_WRAP_SSD_RING_SLOTS = 2,
     CUDA_Q1_0_SSD_WRAP_H2D_RING_SLOTS = 2,
@@ -1338,6 +1352,7 @@ enum {
 };
 
 static int cuda_q1_0_ssd_wrap_requested(void) {
+    if (cuda_g73_open_requested()) return 1;
     const char *value = getenv("DS4_Q1_0_PROMOTION_SSD_WRAP");
     if (!value || !value[0] || strcmp(value, "0") == 0) return 0;
     if (strcmp(value, "1") == 0) return 1;
@@ -1402,12 +1417,24 @@ static int cuda_q1_0_ssd_wrap_arena_partition(
     }
     const int requested = cuda_q1_0_ssd_wrap_requested();
     if (requested <= 0) return requested == 0;
-    if (!cuda_q1_0_dynamic_promotion_requested()) {
+    if (!cuda_q1_0_dynamic_promotion_requested() &&
+        !cuda_g73_open_requested()) {
         fprintf(stderr,
                 "ds4: [q1-0-ssd-wrap] result=failed reason=dynamic-promotion-required\n");
         return 0;
     }
     const uint64_t total_chunks = requested_bytes / slot_bytes;
+    if (cuda_g73_open_requested()) {
+        /* G73 keeps the ledger's full 30 GiB / 4,551-expert snapshot capacity;
+         * the four bounded SSD/H2D ring chunks are transport overhead. */
+        if (total_chunks > UINT64_MAX - CUDA_Q1_0_SSD_WRAP_RING_SLOTS) {
+            return 0;
+        }
+        *pinned_chunks_out =
+            total_chunks + CUDA_Q1_0_SSD_WRAP_RING_SLOTS;
+        *pageable_chunks_out = 0u;
+        return 1;
+    }
     double pinned_gib = 1.5;
     if (total_chunks <= CUDA_Q1_0_SSD_WRAP_RING_SLOTS ||
         !cuda_q1_0_ssd_wrap_double_env(
@@ -3158,6 +3185,13 @@ struct cuda_g133_telemetry_counters {
     std::atomic<uint64_t> reaps{0};
     std::atomic<uint64_t> knock_promotions{0};
     std::atomic<uint64_t> thrash_guard_trips{0};
+    std::atomic<uint64_t> out_of_mask_routes{0};
+    std::atomic<uint64_t> served_transient{0};
+    std::atomic<uint64_t> served_lane_a{0};
+    std::atomic<uint64_t> served_promoted{0};
+    std::atomic<uint64_t> clamped{0};
+    std::atomic<uint64_t> rotation_promotions{0};
+    std::atomic<uint64_t> rotation_reaps{0};
 };
 static cuda_g133_telemetry_counters g_cuda_g133_telemetry;
 
@@ -3226,6 +3260,13 @@ struct cuda_g130_attribution_state {
     uint64_t g133_reaps;
     uint64_t g133_knock_promotions;
     uint64_t g133_thrash_guard_trips;
+    uint64_t g73_out_of_mask_routes;
+    uint64_t g73_served_transient;
+    uint64_t g73_served_lane_a;
+    uint64_t g73_served_promoted;
+    uint64_t g73_clamped;
+    uint64_t g73_rotation_promotions;
+    uint64_t g73_rotation_reaps;
 };
 
 static int g_cuda_g130_attribution_enabled;
@@ -3263,6 +3304,26 @@ static void cuda_g133_attribution_snapshot_enabled(
     state->g133_thrash_guard_trips =
         g_cuda_g133_telemetry.thrash_guard_trips.load(
             std::memory_order_relaxed);
+    state->g73_out_of_mask_routes =
+        g_cuda_g133_telemetry.out_of_mask_routes.load(
+            std::memory_order_relaxed);
+    state->g73_served_transient =
+        g_cuda_g133_telemetry.served_transient.load(
+            std::memory_order_relaxed);
+    state->g73_served_lane_a =
+        g_cuda_g133_telemetry.served_lane_a.load(
+            std::memory_order_relaxed);
+    state->g73_served_promoted =
+        g_cuda_g133_telemetry.served_promoted.load(
+            std::memory_order_relaxed);
+    state->g73_clamped = g_cuda_g133_telemetry.clamped.load(
+        std::memory_order_relaxed);
+    state->g73_rotation_promotions =
+        g_cuda_g133_telemetry.rotation_promotions.load(
+            std::memory_order_relaxed);
+    state->g73_rotation_reaps =
+        g_cuda_g133_telemetry.rotation_reaps.load(
+            std::memory_order_relaxed);
 }
 
 static void cuda_g133_attribution_append_enabled(
@@ -3294,21 +3355,56 @@ static void cuda_g133_attribution_append_enabled(
     const uint64_t thrash_guard_trips =
         g_cuda_g133_telemetry.thrash_guard_trips.load(
             std::memory_order_relaxed) - state->g133_thrash_guard_trips;
+    const uint64_t out_of_mask_routes =
+        g_cuda_g133_telemetry.out_of_mask_routes.load(
+            std::memory_order_relaxed) - state->g73_out_of_mask_routes;
+    const uint64_t served_transient =
+        g_cuda_g133_telemetry.served_transient.load(
+            std::memory_order_relaxed) - state->g73_served_transient;
+    const uint64_t served_lane_a =
+        g_cuda_g133_telemetry.served_lane_a.load(
+            std::memory_order_relaxed) - state->g73_served_lane_a;
+    const uint64_t served_promoted =
+        g_cuda_g133_telemetry.served_promoted.load(
+            std::memory_order_relaxed) - state->g73_served_promoted;
+    const uint64_t clamped = g_cuda_g133_telemetry.clamped.load(
+            std::memory_order_relaxed) - state->g73_clamped;
+    const uint64_t rotation_promotions =
+        g_cuda_g133_telemetry.rotation_promotions.load(
+            std::memory_order_relaxed) - state->g73_rotation_promotions;
+    const uint64_t rotation_reaps =
+        g_cuda_g133_telemetry.rotation_reaps.load(
+            std::memory_order_relaxed) - state->g73_rotation_reaps;
     const double vram_hit_pct = selected
         ? 100.0 * (double)vram_hits / (double)selected : 0.0;
     const double ram_hit_pct = selected
         ? 100.0 * (double)ram_hits / (double)selected : 0.0;
-    const int wrote = snprintf(
-        line + *used, line_size - (size_t)*used,
+    const char *format = cuda_g73_open_requested() ?
         " upload_sync_wait_ms=%.6f vram_hit_pct=%.6f"
         " ram_hit_pct=%.6f promotions=%.6f"
         " reaps=%.6f knock_promotions=%.6f"
-        " thrash_guard_trips=%.6f",
+        " thrash_guard_trips=%.6f out_of_mask_routes=%.6f"
+        " served_transient=%.6f served_lane_a=%.6f"
+        " served_promoted=%.6f clamped=%.6f"
+        " rotation_promotions=%.6f rotation_reaps=%.6f" :
+        " upload_sync_wait_ms=%.6f vram_hit_pct=%.6f"
+        " ram_hit_pct=%.6f promotions=%.6f"
+        " reaps=%.6f knock_promotions=%.6f"
+        " thrash_guard_trips=%.6f";
+    const int wrote = snprintf(
+        line + *used, line_size - (size_t)*used, format,
         (double)upload_sync_wait_ns / 1.0e6 / divisor,
         vram_hit_pct, ram_hit_pct,
         (double)promotions / divisor, (double)reaps / divisor,
         (double)knock_promotions / divisor,
-        (double)thrash_guard_trips / divisor);
+        (double)thrash_guard_trips / divisor,
+        (double)out_of_mask_routes / divisor,
+        (double)served_transient / divisor,
+        (double)served_lane_a / divisor,
+        (double)served_promoted / divisor,
+        (double)clamped / divisor,
+        (double)rotation_promotions / divisor,
+        (double)rotation_reaps / divisor);
     if (wrote < 0 || (size_t)wrote >= line_size - (size_t)*used) {
         *used = -1;
     } else {
@@ -24740,6 +24836,20 @@ static int cuda_moe_tiering_prepare(void) {
         return 0;
     }
     const char *iq1_mixed = getenv("DS4_IQ1_S_MIXED_COLD_K");
+    if (cuda_g73_open_requested() &&
+        (!g133_enabled || requested != CUDA_MOE_TIER_ENFORCE ||
+         !compose_requested || !compose_router_open ||
+         configured_reserve_slots <= 0 ||
+         !cuda_moe_gpu_routes_requested() ||
+         cuda_q1_0_mixed_cold_one_requested() ||
+         (iq1_mixed && strcmp(iq1_mixed, "1") == 0) ||
+         cuda_q1_0_snapshot_backing_requested())) {
+        fprintf(stderr,
+                "ds4: DS4_G73_OPEN=1 requires G133 enforce/mass-LFRU, "
+                "composed open routing, reserved arena slots, GPU routes, "
+                "and Q1/IQ1 serving disabled\n");
+        return 0;
+    }
     if (!promotion_q1_0 && promotion_probation_slots > 0 &&
         (requested != CUDA_MOE_TIER_ENFORCE || !compose_requested ||
          !compose_router_open ||
@@ -25456,6 +25566,47 @@ static int cuda_q1_0_promotion_record_context_init(
             &record->destination_down_offset, &record->destination_bytes);
 }
 
+static int cuda_g73_open_rotation_record_context_init(
+        cuda_q1_0_promotion_record_context *record,
+        const cuda_moe_route_request &request, uint32_t expert,
+        float weight, const cuda_moe_tier_entry &entry) {
+    if (!record || g_cuda_request_epoch == 0u ||
+        g_moe_tiering.call_tick == UINT64_MAX) {
+        return 0;
+    }
+    memset(record, 0, sizeof(*record));
+    record->active = 1;
+    record->request_epoch = g_cuda_request_epoch;
+    record->current_call = g_moe_tiering.call_tick;
+    record->observation_call = g_moe_tiering.call_tick;
+    record->first_eligible_call = g_moe_tiering.call_tick + 1u;
+    record->layer = request.layer_index;
+    record->expert = expert;
+    record->weight = weight;
+    record->touch_count = entry.frequency;
+    record->mass = entry.mass;
+    record->destination_model_size = g_model_file_size;
+    record->destination_gate_base_offset = request.gate_offset;
+    record->destination_up_base_offset = request.up_offset;
+    record->destination_down_base_offset = request.down_offset;
+    record->destination_gate_stride = request.gate_expert_bytes;
+    record->destination_up_stride = request.gate_expert_bytes;
+    record->destination_down_stride = request.down_expert_bytes;
+    record->destination_gate_bytes = request.gate_expert_bytes;
+    record->destination_up_bytes = request.gate_expert_bytes;
+    record->destination_down_bytes = request.down_expert_bytes;
+    return cuda_q1_0_promotion_checked_triplet(
+        record->destination_gate_base_offset,
+        record->destination_up_base_offset,
+        record->destination_down_base_offset,
+        expert, record->destination_gate_stride,
+        record->destination_up_stride, record->destination_down_stride,
+        record->destination_gate_bytes, record->destination_up_bytes,
+        record->destination_down_bytes, record->destination_model_size,
+        &record->destination_gate_offset, &record->destination_up_offset,
+        &record->destination_down_offset, &record->destination_bytes);
+}
+
 enum cuda_q1_0_ssd_wrap_job_state : uint8_t {
     CUDA_Q1_0_SSD_WRAP_FREE = 0,
     CUDA_Q1_0_SSD_WRAP_REQUESTED,
@@ -25493,6 +25644,7 @@ struct cuda_q1_0_ssd_wrap_job {
     uint8_t prefill_wave;
     uint8_t destination_pageable;
     uint8_t writer_claimed;
+    uint8_t g73_open_rotation;
 };
 
 struct cuda_q1_0_ssd_wrap_state {
@@ -25739,6 +25891,12 @@ static int cuda_q1_0_ssd_wrap_read_job(
 
 static void *cuda_q1_0_ssd_wrap_worker(void *) {
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
+#ifdef _WIN32
+    if (cuda_g73_open_requested()) {
+        (void)SetThreadPriority(
+            GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    }
+#endif
     for (;;) {
         std::vector<uint32_t> selected;
         uint8_t prefill_wave = 0;
@@ -25894,11 +26052,13 @@ static int cuda_q1_0_ssd_wrap_init(void) {
     if (requested <= 0) return requested == 0;
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
     if (state.enabled) return !state.failed;
-    if (!cuda_q1_0_dynamic_promotion_requested() ||
+    if ((!cuda_q1_0_dynamic_promotion_requested() &&
+         !cuda_g73_open_requested()) ||
         !g_model_file_valid || g_model_file_size == 0u ||
         !cuda_q1_0_ssd_wrap_sha_env_valid("DS4_MODEL_SHA256") ||
-        !cuda_q1_0_ssd_wrap_sha_env_valid(
-            "DS4_Q1_0_EXPERT_SIDECAR_SHA256") ||
+        (!cuda_g73_open_requested() &&
+         !cuda_q1_0_ssd_wrap_sha_env_valid(
+             "DS4_Q1_0_EXPERT_SIDECAR_SHA256")) ||
         !g_dynamic_arena.host_base || g_dynamic_arena.slots.empty() ||
         g_dynamic_arena.ssd_wrap_ssd_ring_slots !=
             CUDA_Q1_0_SSD_WRAP_SSD_RING_SLOTS ||
@@ -26153,6 +26313,10 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 cuda_g133_telemetry_increment(
                     g_cuda_g133_telemetry.reaps);
             }
+            if (local.g73_open_rotation) {
+                cuda_g133_telemetry_increment(
+                    g_cuda_g133_telemetry.rotation_reaps);
+            }
         }
     }
     if (ok) {
@@ -26172,7 +26336,8 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         entry.ram_generation = slot->content_generation;
         entry.vram_eligible_after_call = local.record.first_eligible_call;
         entry.has_2bit_ram = 1;
-        entry.promoted_from_iq1_cold = 1;
+        entry.promoted_from_iq1_cold =
+            local.g73_open_rotation ? 0u : 1u;
         entry.state = g_moe_tiering.g133_enabled &&
                 cuda_g133_ram_candidate_relaxed(entry)
             ? CUDA_MOE_TIER_RAM_WARM : CUDA_MOE_TIER_RAM_PROBATION;
@@ -26182,18 +26347,25 @@ static int cuda_q1_0_ssd_wrap_finish_one(
         }
         g_moe_tiering.cold_to_ram++;
         g_moe_tiering.ssd_bytes += local.bytes_read;
-        g_iq1_promotion.cold_to_2bit_ram++;
-        g_iq1_promotion.promotion_2bit_ssd_bytes += local.bytes_read;
-        g_iq1_promotion.promotion_2bit_ssd_seconds += local.io_seconds;
-        g_iq1_promotion.q1_0_stage_successes++;
-        g_iq1_promotion.q1_0_next_call_guards++;
-        g_iq1_promotion.q1_0_record_successes++;
+        if (!local.g73_open_rotation) {
+            g_iq1_promotion.cold_to_2bit_ram++;
+            g_iq1_promotion.promotion_2bit_ssd_bytes += local.bytes_read;
+            g_iq1_promotion.promotion_2bit_ssd_seconds += local.io_seconds;
+            g_iq1_promotion.q1_0_stage_successes++;
+            g_iq1_promotion.q1_0_next_call_guards++;
+            g_iq1_promotion.q1_0_record_successes++;
+        } else {
+            cuda_g133_telemetry_increment(
+                g_cuda_g133_telemetry.rotation_promotions);
+        }
         state.successes++;
         if (slot->pageable) state.pageable_ready++;
         else state.pinned_ready++;
-        cuda_q1_0_promotion_record_emit(
-            "success", "success", "staged", &local.record,
-            "exact_iq2_ram", local.slot, slot->content_generation);
+        if (!local.g73_open_rotation) {
+            cuda_q1_0_promotion_record_emit(
+                "success", "success", "staged", &local.record,
+                "exact_iq2_ram", local.slot, slot->content_generation);
+        }
     } else {
         if (!local.replacing && local.slot < g_dynamic_arena.slots.size()) {
             cuda_dynamic_arena_slot &failed_slot =
@@ -26207,14 +26379,18 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 failed_slot.checksum = 0;
             }
         }
-        g_iq1_promotion.q1_0_record_failures++;
-        g_iq1_promotion.failures++;
-        g_moe_tiering.failures++;
+        if (!local.g73_open_rotation) {
+            g_iq1_promotion.q1_0_record_failures++;
+            g_iq1_promotion.failures++;
+            g_moe_tiering.failures++;
+        }
         state.failures++;
         state.failed = 1;
-        cuda_q1_0_promotion_record_emit(
-            "failure", "failed", reason ? reason : "ssd_wrap_failed",
-            &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
+        if (!local.g73_open_rotation) {
+            cuda_q1_0_promotion_record_emit(
+                "failure", "failed", reason ? reason : "ssd_wrap_failed",
+                &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
+        }
     }
     os_mutex_lock(&state.mutex);
     if (index < state.jobs.size()) {
@@ -26255,7 +26431,8 @@ static int cuda_q1_0_ssd_wrap_poll(void) {
 
 static int cuda_q1_0_ssd_wrap_submit(
         const cuda_moe_route_request &request, uint32_t layer,
-        uint32_t expert, cuda_q1_0_promotion_record_context *record) {
+        uint32_t expert, cuda_q1_0_promotion_record_context *record,
+        int g73_open_rotation = 0) {
     if (!record || !record->active || !cuda_q1_0_ssd_wrap_init() ||
         !cuda_q1_0_ssd_wrap_poll()) {
         return 0;
@@ -26333,6 +26510,7 @@ static int cuda_q1_0_ssd_wrap_submit(
     job.victim_entry_index = victim_entry_index;
     job.replacing = replacing ? 1u : 0u;
     job.writer_claimed = 1u;
+    job.g73_open_rotation = g73_open_rotation ? 1u : 0u;
     job.prefill_wave =
         g_prefill_mass_observer.enabled &&
         !g_prefill_mass_observer.finalized ? 1u : 0u;
@@ -26358,8 +26536,10 @@ static int cuda_q1_0_ssd_wrap_submit(
         job.read_base = slot.host_ptr;
     }
     g_q1_0_ssd_wrap_reserved_slots[(uint32_t)slot_i] = 1u;
-    record->record_id = ++g_iq1_promotion.q1_0_record_attempts;
-    record->attempt_started = 1;
+    if (!g73_open_rotation) {
+        record->record_id = ++g_iq1_promotion.q1_0_record_attempts;
+        record->attempt_started = 1;
+    }
     job.record = *record;
     state.requested++;
     state.attempts++;
@@ -26367,15 +26547,37 @@ static int cuda_q1_0_ssd_wrap_submit(
     state.ranges_requested += job.ranges_requested;
     const uint64_t depth = cuda_q1_0_ssd_wrap_queue_depth_locked();
     state.max_queue_depth = std::max(state.max_queue_depth, depth);
-    g_iq1_promotion.q1_0_stage_attempts++;
+    if (!g73_open_rotation) g_iq1_promotion.q1_0_stage_attempts++;
     os_cond_signal(&state.cond);
     os_mutex_unlock(&state.mutex);
-    cuda_q1_0_promotion_record_emit(
-        "attempt", "attempt", "admitted", record,
-        slot.pageable ? "exact_iq2_pageable_pending" :
-                        "exact_iq2_pinned_pending",
-        (uint32_t)slot_i, 0u);
+    if (!g73_open_rotation) {
+        cuda_q1_0_promotion_record_emit(
+            "attempt", "attempt", "admitted", record,
+            slot.pageable ? "exact_iq2_pageable_pending" :
+                            "exact_iq2_pinned_pending",
+            (uint32_t)slot_i, 0u);
+    }
     return 1;
+}
+
+static void cuda_g73_open_maybe_schedule_rotation(
+        const cuda_moe_route_request &request, uint32_t route,
+        uint32_t expert, cuda_moe_tier_entry &entry) {
+    if (!cuda_g73_open_requested() ||
+        entry.state != CUDA_MOE_TIER_SSD_COLD ||
+        route >= request.route_count ||
+        !cuda_g133_ram_candidate(entry, request.g133_epoch)) {
+        return;
+    }
+    cuda_q1_0_promotion_record_context record;
+    if (!cuda_g73_open_rotation_record_context_init(
+            &record, request, expert, request.weights[route], entry)) {
+        return;
+    }
+    /* Serving already uses the exact transient buffers. Rotation is advisory:
+     * queue/backpressure/failure may cost a future read, never this request. */
+    (void)cuda_q1_0_ssd_wrap_submit(
+        request, request.layer_index, expert, &record, 1);
 }
 
 static void cuda_q1_0_ssd_wrap_flush(void) {
@@ -26808,6 +27010,22 @@ static cuda_moe_tier_state cuda_moe_tiering_observe_route(
     cuda_moe_tier_entry &entry =
         g_moe_tiering.entries[cuda_moe_tiering_entry_index(layer, expert)];
     const cuda_moe_tier_state prior = entry.state;
+    if (cuda_g73_open_requested()) {
+        char *snapshot_gate = NULL;
+        char *snapshot_up = NULL;
+        char *snapshot_down = NULL;
+        const int in_prefill_snapshot = cuda_moe_tiering_snapshot_ram_ptrs(
+            layer, expert, &snapshot_gate, &snapshot_up, &snapshot_down);
+        if (!in_prefill_snapshot) {
+            cuda_g133_telemetry_increment(
+                g_cuda_g133_telemetry.out_of_mask_routes);
+            if (prior == CUDA_MOE_TIER_VRAM_PROTECTED &&
+                entry.ram_slot < g_dynamic_arena.slots.size()) {
+                cuda_g133_telemetry_increment(
+                    g_cuda_g133_telemetry.served_promoted);
+            }
+        }
+    }
     if (g_moe_tiering.g133_enabled && cuda_g133_epoch_valid(g133_epoch)) {
         cuda_g133_record_observation(entry, g133_epoch, (double)weight);
     }
@@ -29237,6 +29455,8 @@ static int cuda_moe_tiering_enforce_request(
     cuda_moe_vram_promotion_reservation
         promotion_reservations[CUDA_MOE_ROUTE_COUNT] = {};
     uint32_t admitted_count = 0;
+    uint64_t g73_served_transient = 0u;
+    uint64_t g73_served_promoted = 0u;
     int ok = 1;
     const char *failure_reason = "none";
     const double transient_request_deadline = cuda_wall_sec() +
@@ -29337,7 +29557,8 @@ static int cuda_moe_tiering_enforce_request(
         if (!have_ram &&
             (!g_moe_tiering.compose_prefill_mass_tiering ||
              g_moe_tiering.compose_router_open) &&
-            tier.state == CUDA_MOE_TIER_SSD_COLD) {
+            tier.state == CUDA_MOE_TIER_SSD_COLD &&
+            !cuda_g73_open_requested()) {
             /* Mixed 5+1 keeps the five high-weight routes exact. An open
              * snapshot miss must first enter the pinned probation pool;
              * only the minimum-weight sixth route executes as IQ1_S and is
@@ -29352,7 +29573,8 @@ static int cuda_moe_tiering_enforce_request(
         if (!have_ram &&
             (!g_moe_tiering.compose_prefill_mass_tiering ||
              g_moe_tiering.compose_router_open) &&
-            tier.state != CUDA_MOE_TIER_SSD_COLD) {
+            tier.state != CUDA_MOE_TIER_SSD_COLD &&
+            !cuda_g73_open_requested()) {
             if (tier.state == CUDA_MOE_TIER_VRAM_PROTECTED) {
                 /* A protected entry must have been resolved as a device-map
                  * hit before the miss worker. Never create a second resident
@@ -29387,7 +29609,9 @@ static int cuda_moe_tiering_enforce_request(
         if (!have_ram) {
             const int serve_transient_on_admission_denial =
                 g_moe_tiering.compose_prefill_mass_tiering &&
-                ram_admission_denied;
+                (ram_admission_denied ||
+                 (cuda_g73_open_requested() &&
+                  g_moe_tiering.compose_router_open));
             if (g_moe_tiering.compose_prefill_mass_tiering &&
                 !serve_transient_on_admission_denial) {
                 g_moe_tiering.forbidden_cold_ssd_to_vram++;
@@ -29696,6 +29920,14 @@ static int cuda_moe_tiering_enforce_request(
             g_moe_tiering.transient++;
             g_moe_tiering.ram_h2d_bytes +=
                 cache->gate_expert_bytes * 2ull + cache->down_expert_bytes;
+            if (cuda_g73_open_requested()) {
+                g73_served_transient++;
+                cuda_g73_open_maybe_schedule_rotation(
+                    request, route, expert, tier);
+            }
+        }
+        if (cuda_g73_open_requested() && from_probation) {
+            g73_served_promoted++;
         }
         if (from_nested && !cuda_nested_residual_gpu_join_requested()) {
             const uint64_t native_bytes =
@@ -29720,6 +29952,14 @@ static int cuda_moe_tiering_enforce_request(
     if (!transfers_ok) {
         failure_reason = "upload-sync";
         ok = 0;
+    }
+    if (ok && cuda_g73_open_requested()) {
+        cuda_g133_telemetry_increment(
+            g_cuda_g133_telemetry.served_transient,
+            g73_served_transient);
+        cuda_g133_telemetry_increment(
+            g_cuda_g133_telemetry.served_promoted,
+            g73_served_promoted);
     }
     if (!ok) {
         fprintf(stderr,
@@ -29819,6 +30059,11 @@ static void *cuda_moe_route_worker(void *arg) {
             if (!cuda_moe_tiering_advance_call_tick("gpu-route-request")) {
                 request_valid = 0;
             }
+        }
+        if (cuda_g73_open_requested()) {
+            /* Background rotation is fail-open: publication failures disable
+             * future rotation, while the transient exact serving path stays live. */
+            (void)cuda_q1_0_ssd_wrap_poll();
         }
         if (g_moe_tiering.mode != CUDA_MOE_TIER_OFF && request_valid) {
             g_moe_tiering.calls++;
@@ -34139,9 +34384,11 @@ static int routed_moe_launch(
         cuda_model_range_in_window(model_map, down_offset, down_bytes);
     cuda_moe_expert_cache *gpu_route_cache = NULL;
     const int split_hit_miss_requested =
-        (route_iq1_s || route_q1_0) ? 0 : cuda_moe_split_hit_miss_requested();
+        (route_iq1_s || route_q1_0 || cuda_g73_open_requested()) ?
+            0 : cuda_moe_split_hit_miss_requested();
     const int split_fused_requested =
-        (route_iq1_s || route_q1_0) ? 0 : cuda_moe_split_fused_requested();
+        (route_iq1_s || route_q1_0 || cuda_g73_open_requested()) ?
+            0 : cuda_moe_split_fused_requested();
     if (split_hit_miss_requested && split_fused_requested) {
         fprintf(stderr,
                 "ds4: split hit/miss and fused split are mutually exclusive\n");
@@ -34182,12 +34429,18 @@ static int routed_moe_launch(
             g_nested_residual.gpu_cache_failures++;
             g_nested_residual.hard_failure = 1;
         }
+        if (!cuda_g73_open_requested()) {
+            fprintf(stderr,
+                    "ds4: %s decode route unavailable at layer=%u; refusing fallback\n",
+                    nested_gpu_cache_requested ?
+                        "nested residual GPU-cache" : "expert tiering",
+                    layer_index);
+            return 0;
+        }
         fprintf(stderr,
-                "ds4: %s decode route unavailable at layer=%u; refusing fallback\n",
-                nested_gpu_cache_requested ?
-                    "nested residual GPU-cache" : "expert tiering",
+                "ds4: [g73-open] exact transient route unavailable at layer=%u; "
+                "falling back to exact selected-load\n",
                 layer_index);
-        return 0;
     }
     if (gpu_route_cache) {
         gate_w = gpu_route_cache->gate;
