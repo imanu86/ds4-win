@@ -27258,6 +27258,71 @@ static void cuda_g73_open_maybe_schedule_rotation(
         request, request.layer_index, expert, &record, 1);
 }
 
+static int cuda_q1_0_ssd_wrap_release_boundary_jobs_locked(
+        const char *reason) {
+    cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
+    const double commit_deadline = cuda_wall_sec() + 0.050;
+    for (;;) {
+        uint32_t committing = 0u;
+        for (uint32_t i = 0; i < state.jobs.size(); i++) {
+            cuda_q1_0_ssd_wrap_job &job = state.jobs[i];
+            if (job.state == CUDA_Q1_0_SSD_WRAP_FREE) continue;
+            if (job.state == CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING) {
+                committing++;
+                continue;
+            }
+            if (job.state == CUDA_Q1_0_SSD_WRAP_FAILED ||
+                job.state == CUDA_Q1_0_SSD_WRAP_DEAD ||
+                job.commit_safe_leaked ||
+                job.state == CUDA_Q1_0_SSD_WRAP_SSD_INFLIGHT) {
+                cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
+                    reason ? reason : "request-boundary-transport-failure");
+                return 0;
+            }
+            /* RAM_READY jobs were force-published before this locked pass.
+             * A REQUESTED job is cleanly discardable because route workers are
+             * quiescent and the SSD worker has not acquired its ring buffer. */
+            job.failure_reason = reason ? reason : "request-boundary-release";
+            state.dropped++;
+            cuda_q1_0_ssd_wrap_job_release_locked(&job);
+        }
+        if (committing == 0u) {
+            state.stop = 0;
+            os_pread_cancellable_reset(&state.pread);
+            os_cond_broadcast(&state.cond);
+            return !state.failed;
+        }
+        const uint32_t remaining_ms =
+            cuda_deadline_remaining_ms(commit_deadline);
+        if (remaining_ms == 0u) {
+            /* Round-5 terminal: the publisher may hold raw slot and tier-entry
+             * pointers. Latch the rotator and preserve both allocations plus
+             * the writer claim forever; re-arming this case would permit reuse. */
+            state.failed = 1;
+            state.stop = 1;
+            for (uint32_t i = 0; i < state.jobs.size(); i++) {
+                cuda_q1_0_ssd_wrap_job &job = state.jobs[i];
+                if (job.state != CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING ||
+                    job.commit_safe_leaked) {
+                    continue;
+                }
+                job.commit_safe_leaked = 1u;
+                state.commit_safe_leaked = 1;
+                g_cuda_dynamic_arena_storage_safe_leaked = 1;
+                fprintf(stderr,
+                        "ds4: [q1-0-ssd-wrap] commit deadline expired "
+                        "job=%u slot=%u; writer claim/slot safe-leaked "
+                        "permanently\n",
+                        i, job.slot);
+            }
+            os_cond_broadcast(&state.cond);
+            return 0;
+        }
+        (void)os_cond_timedwait_ms(
+            &state.cond, &state.mutex, remaining_ms);
+    }
+}
+
 static void cuda_q1_0_ssd_wrap_flush(void) {
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
     if (!state.enabled || !state.mutex_ready) return;
@@ -27280,45 +27345,51 @@ static void cuda_q1_0_ssd_wrap_flush(void) {
             cuda_deadline_remaining_ms(absolute_deadline);
         if (remaining_ms == 0u) {
             uint32_t active_sequence = 0u;
-            for (const cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+            for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
                 if (job.state == CUDA_Q1_0_SSD_WRAP_SSD_INFLIGHT) {
                     active_sequence = job.io_sequence;
                     break;
                 }
             }
-            os_mutex_unlock(&state.mutex);
-            if (active_sequence != 0u) {
-                (void)os_pread_cancel(&state.pread, active_sequence);
+            if (active_sequence == 0u) {
+                /* The worker never acquired these clean requests. Release in
+                 * job-table order; the final forced poll below still publishes
+                 * every RAM_READY owner before the rotator is re-armed. */
+                for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+                    if (job.state != CUDA_Q1_0_SSD_WRAP_REQUESTED) continue;
+                    job.failure_reason = "request-boundary-release";
+                    state.dropped++;
+                    cuda_q1_0_ssd_wrap_job_release_locked(&job);
+                }
+                os_mutex_unlock(&state.mutex);
+                break;
             }
+            os_mutex_unlock(&state.mutex);
+            (void)os_pread_cancel(&state.pread, active_sequence);
             os_mutex_lock(&state.mutex);
             cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
-                "request-boundary-deadline");
+                "request-boundary-transport-stall");
             os_mutex_unlock(&state.mutex);
             fprintf(stderr,
                     "ds4: [g73-open] advisory rotator detached at request "
-                    "boundary after bounded flush deadline\n");
+                    "boundary after bounded transport deadline\n");
             return;
         }
         (void)os_cond_timedwait_ms(
             &state.cond, &state.mutex, remaining_ms);
         os_mutex_unlock(&state.mutex);
     }
-    /* RAM_READY publication is deliberately not forced here. Copying and
-     * checksumming an arbitrary ready queue is advisory work and cannot be
-     * charged to request start. Detach every leftover owner before the caller
-     * is allowed to reset tier state. */
+    /* Request-boundary teardown has three explicit cases:
+     *  1. Normal: force-publish completed RAM_READY jobs, deterministically
+     *     release clean queued owners/reservations/claims, then re-arm.
+     *  2. Stalled publication: bounded-await RAM_COMMITTING; expiry retains the
+     *     round-5 generation guard and safe-leaks its entry block/slot claim.
+     *  3. Transport failure/stall: retain the permanent failed/stop latch.
+     * No tier reset may run until one of these ownership terminals is reached. */
+    if (!cuda_q1_0_ssd_wrap_poll_internal(1)) return;
     os_mutex_lock(&state.mutex);
-    int owns_work = 0;
-    for (const cuda_q1_0_ssd_wrap_job &job : state.jobs) {
-        if (job.state != CUDA_Q1_0_SSD_WRAP_FREE) {
-            owns_work = 1;
-            break;
-        }
-    }
-    if (owns_work) {
-        cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
-            "request-boundary-detach");
-    }
+    (void)cuda_q1_0_ssd_wrap_release_boundary_jobs_locked(
+        "request-boundary-release");
     os_mutex_unlock(&state.mutex);
 }
 
@@ -34579,20 +34650,105 @@ extern "C" int ds4_gpu_g73_open_selftest(const char *read_path) {
         slot.expert = UINT32_MAX;
         slot.state = DS4_GPU_ARENA_FREE;
     }
-    static char synthetic_ring[2] = {0, 0};
+    static char synthetic_ring[2] = {0x11, 0x22};
+    static char synthetic_slots[2] = {0, 0};
     g_dynamic_arena.slot_bytes = 1u;
     g_dynamic_arena.ssd_wrap_ssd_ring_base = synthetic_ring;
     g_q1_0_ssd_wrap_reserved_slots.assign(2u, 0u);
+    for (uint32_t i = 0; i < g_dynamic_arena.slots.size(); i++) {
+        g_dynamic_arena.slots[i].host_ptr = &synthetic_slots[i];
+    }
 
     cuda_moe_route_request request = {};
     request.layer_index = 0u;
     request.route_count = 1u;
     request.absolute_deadline = cuda_wall_sec() + 1.0;
+    request.g133_epoch.request_epoch = 1u;
+    request.g133_epoch.position_epoch = 1u;
     cuda_q1_0_promotion_record_context record = {};
     record.active = 1;
     record.layer = 0u;
     record.expert = 1u;
     record.destination_bytes = 1u;
+    record.request_epoch = 1u;
+    record.observation_call = 1u;
+    record.current_call = 1u;
+    record.first_eligible_call = 2u;
+    const uint64_t rotation_promotions_before = state.successes;
+    const int first_request_submitted = cuda_q1_0_ssd_wrap_submit(
+        request, 0u, 1u, &record, 1);
+    if (first_request_submitted != 1) ok = 0;
+    os_mutex_lock(&state.mutex);
+    for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+        if (job.state == CUDA_Q1_0_SSD_WRAP_REQUESTED &&
+            job.layer == 0u && job.expert == 1u) {
+            job.bytes_read = 1u;
+            job.state = CUDA_Q1_0_SSD_WRAP_RAM_READY;
+        }
+    }
+    os_mutex_unlock(&state.mutex);
+    cuda_q1_0_ssd_wrap_flush();
+
+    request.g133_epoch.request_epoch = 2u;
+    request.g133_epoch.position_epoch = 1u;
+    record = cuda_q1_0_promotion_record_context{};
+    record.active = 1;
+    record.layer = 0u;
+    record.expert = 2u;
+    record.destination_bytes = 1u;
+    record.request_epoch = 2u;
+    record.observation_call = 2u;
+    record.current_call = 2u;
+    record.first_eligible_call = 3u;
+    const int second_request_submitted = cuda_q1_0_ssd_wrap_submit(
+        request, 0u, 2u, &record, 1);
+    if (second_request_submitted != 1) ok = 0;
+    os_mutex_lock(&state.mutex);
+    for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+        if (job.state == CUDA_Q1_0_SSD_WRAP_REQUESTED &&
+            job.layer == 0u && job.expert == 2u) {
+            job.bytes_read = 1u;
+            job.state = CUDA_Q1_0_SSD_WRAP_RAM_READY;
+        }
+    }
+    os_mutex_unlock(&state.mutex);
+    cuda_q1_0_ssd_wrap_flush();
+    const uint64_t rotation_promotions_after = state.successes;
+    const int cross_request_rearm_ok =
+        !state.failed && !state.stop && second_request_submitted == 1 &&
+        rotation_promotions_after == rotation_promotions_before + 2u &&
+        g_moe_tiering.entries[1u].ram_slot != UINT32_MAX &&
+        g_moe_tiering.entries[2u].ram_slot != UINT32_MAX;
+    if (!cross_request_rearm_ok) ok = 0;
+
+    /* Restore empty synthetic ownership, then retain the original fatal
+     * teardown-versus-submit assertion as an independent transport case. */
+    g_moe_tiering.entries.assign(
+        (size_t)CUDA_MOE_LAYER_COUNT * 256u, empty);
+    for (uint32_t i = 0; i < g_dynamic_arena.slots.size(); i++) {
+        g_dynamic_arena.slots[i] = cuda_dynamic_arena_slot{};
+        g_dynamic_arena.slots[i].host_ptr = &synthetic_slots[i];
+        g_dynamic_arena.slots[i].layer = UINT32_MAX;
+        g_dynamic_arena.slots[i].expert = UINT32_MAX;
+        g_dynamic_arena.slots[i].state = DS4_GPU_ARENA_FREE;
+    }
+    for (cuda_q1_0_ssd_wrap_job &job : state.jobs) {
+        job = cuda_q1_0_ssd_wrap_job{};
+    }
+    state.ring_busy.assign(2u, 0u);
+    g_q1_0_ssd_wrap_reserved_slots.assign(2u, 0u);
+    state.failed = 0;
+    state.stop = 0;
+    request.g133_epoch.request_epoch = 3u;
+    record = cuda_q1_0_promotion_record_context{};
+    record.active = 1;
+    record.layer = 0u;
+    record.expert = 1u;
+    record.destination_bytes = 1u;
+    record.request_epoch = 3u;
+    record.observation_call = 3u;
+    record.current_call = 3u;
+    record.first_eligible_call = 4u;
     const int submitted = cuda_q1_0_ssd_wrap_submit(
         request, 0u, 1u, &record, 1);
     if (submitted != 1) ok = 0;
@@ -34735,9 +34891,15 @@ extern "C" int ds4_gpu_g73_open_selftest(const char *read_path) {
             "pread_cancel=start-then-cancel "
             "pread_deadline=start-then-cancel "
             "rotator=production sequential_consistency_hook=real "
+            "cross_request_rearm=%s first_submit=%d second_submit=%d "
+            "promotion_delta=%llu "
             "teardown_during_committing=generation-abandon "
             "invariant=real\n",
-            ok ? "passed" : "failed");
+            ok ? "passed" : "failed",
+            cross_request_rearm_ok ? "second-submit-promoted" : "failed",
+            first_request_submitted, second_request_submitted,
+            (unsigned long long)(rotation_promotions_after -
+                                 rotation_promotions_before));
     return ok;
 }
 

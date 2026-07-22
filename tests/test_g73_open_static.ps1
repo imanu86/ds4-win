@@ -106,7 +106,17 @@ Assert-Contains $submit 'if (state.failed || state.stop) {' `
     'rotator submission does not recheck teardown state under the mutex'
 Assert-Contains $submit 'cuda_dynamic_arena_slot_writer_release(&slot);' `
     'rotator teardown-race refusal does not release its writer claim'
-Assert-Contains $source 'request-boundary-deadline' 'request-boundary rotator flush is not bounded'
+Assert-Contains $source 'request-boundary-transport-stall' 'request-boundary transport stall is not fatal'
+Assert-Contains $source 'cuda_q1_0_ssd_wrap_release_boundary_jobs_locked(' `
+    'missing normal request-boundary release/rearm path'
+$boundaryFlush = Slice-Between $source 'static void cuda_q1_0_ssd_wrap_flush(void) {' `
+    'static void cuda_q1_0_ssd_wrap_release(int report)'
+Assert-Contains $boundaryFlush 'cuda_q1_0_ssd_wrap_poll_internal(1)' `
+    'request boundary does not force-publish ready rotations'
+Assert-Contains $boundaryFlush 'request-boundary-release' `
+    'request boundary does not use nonfatal release/rearm cleanup'
+Assert-Contains $source 'state.stop = 0;' `
+    'normal request-boundary cleanup does not explicitly re-arm the rotator'
 Assert-Contains $osThread 'os_cond_timedwait_ms(' 'rotator condition wait is not timed'
 Assert-Contains $source 'using preallocated exact terminal' 'missing never-refusing terminal fallback'
 foreach ($counter in @('out_of_mask_routes', 'served_transient',
@@ -146,6 +156,10 @@ Assert-Contains $source 'selftest-teardown-during-committing' `
     'self-test does not exercise teardown during COMMITTING publication'
 Assert-Contains $source 'teardown_during_committing=generation-abandon' `
     'self-test does not assert generation-abandon publication'
+Assert-Contains $source 'cross_request_rearm=%s' `
+    'self-test does not report the cross-request rotator assertion'
+Assert-Contains $source 'second-submit-promoted' `
+    'self-test does not assert second-request rotator submission and promotion'
 Assert-Contains $source 'os_pread_cancellable_timeout(' 'self-test does not exercise real pread timeout/cancel'
 Assert-Contains $osFileHeader 'unsigned char opaque[256];' `
     'POSIX cancellable state is not ABI-opaque'
