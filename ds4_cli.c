@@ -505,8 +505,24 @@ static int run_sampled_generation(ds4_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f &&
+            ds4_session_g134_specdec_enabled(session)) {
+            ntok = ds4_session_eval_g134_specdec_argmax(session,
+                                                        token,
+                                                        max_tokens - generated,
+                                                        ds4_token_eos(engine),
+                                                        toks,
+                                                        (int)(sizeof(toks) / sizeof(toks[0])),
+                                                        err,
+                                                        sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else if (cfg->gen.temperature <= 0.0f &&
+                   ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(session,
                                                        token,
                                                        max_tokens - generated,
@@ -967,8 +983,23 @@ static int run_chat_turn(ds4_engine *engine, cli_config *cfg, repl_chat *chat, c
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+        if (cfg->gen.temperature <= 0.0f &&
+            ds4_session_g134_specdec_enabled(chat->session)) {
+            ntok = ds4_session_eval_g134_specdec_argmax(chat->session,
+                                                        token,
+                                                        max_tokens - generated,
+                                                        ds4_token_eos(engine),
+                                                        toks,
+                                                        (int)(sizeof(toks) / sizeof(toks[0])),
+                                                        err,
+                                                        sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                return 1;
+            }
+        } else if (cfg->gen.temperature <= 0.0f &&
+                   ds4_engine_mtp_draft_tokens(engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
             ntok = ds4_session_eval_speculative_argmax(chat->session,
                                                        token,
                                                        max_tokens - generated,

@@ -7473,8 +7473,28 @@ static void generate_job(server *s, job *j) {
             request_phase_trace("first-eval-enter", t0, decode_t0);
         }
         if (temperature <= 0.0f &&
-            ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
+            ds4_session_g134_specdec_enabled(s->session))
+        {
+            ntok = ds4_session_eval_g134_specdec_argmax(s->session,
+                                                        token,
+                                                        max_tokens - completion,
+                                                        ds4_token_eos(s->engine),
+                                                        toks,
+                                                        (int)(sizeof(toks) / sizeof(toks[0])),
+                                                        err,
+                                                        sizeof(err));
+            if (ntok < 0) {
+#if !defined(DS4_NO_GPU) && !defined(DS4_G130_ATTRIB_COMPILED_OUT)
+                ds4_gpu_g130_attribution_token_end(
+                    attribution_first_token, 0u);
+#endif
+                finish = "error";
+                break;
+            }
+        }
+        else if (temperature <= 0.0f &&
+                 ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                 getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
             ntok = ds4_session_eval_speculative_argmax(s->session,
                                                        token,
