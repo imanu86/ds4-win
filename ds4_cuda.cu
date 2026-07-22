@@ -68,6 +68,7 @@ struct ds4_gpu_tensor {
 struct ds4_gpu_g133_epoch {
     uint64_t request_epoch;
     uint64_t position_epoch;
+    uint32_t speculative_position;
 };
 
 struct cuda_moe_route_request {
@@ -3119,6 +3120,35 @@ static int cuda_g133_tier_requested(void) {
 /* The decode thread owns this counter. Workers receive immutable copies in
  * cuda_moe_route_request and never read it directly. */
 static uint64_t g_cuda_g133_decode_position_epoch = 0u;
+
+enum cuda_speculative_observation_kind {
+    CUDA_SPEC_OBSERVATION_CALL,
+    CUDA_SPEC_OBSERVATION_SELECTED,
+    CUDA_SPEC_OBSERVATION_ROUTE,
+    CUDA_SPEC_OBSERVATION_IQ1_STAGE,
+};
+
+struct cuda_speculative_observation {
+    cuda_speculative_observation_kind kind;
+    uint32_t position;
+    uint32_t layer;
+    uint32_t expert;
+    uint32_t selected_count;
+    float weight;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+};
+
+/* Route work can finish on the route worker or the decode thread.  Both append
+ * immutable observations here; the decode thread replays accepted positions
+ * in ordinary position-major order after the verifier chooses its prefix. */
+static std::mutex g_speculative_observation_mutex;
+static std::vector<cuda_speculative_observation> g_speculative_observations;
+static uint32_t g_speculative_observation_positions = 0u;
+static int g_speculative_observation_active = 0;
 
 extern "C" int ds4_gpu_g133_enabled = 0;
 extern "C" ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void);
@@ -24088,11 +24118,16 @@ extern "C" ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void) {
         g_cuda_g133_decode_position_epoch++;
     }
     return ds4_gpu_g133_epoch{
-        g_cuda_request_epoch, g_cuda_g133_decode_position_epoch};
+        g_cuda_request_epoch, g_cuda_g133_decode_position_epoch, 0u};
 }
 
 static int cuda_g133_epoch_valid(const ds4_gpu_g133_epoch &epoch) {
     return epoch.request_epoch != 0u && epoch.position_epoch != 0u;
+}
+
+static int cuda_speculative_epoch_valid(const ds4_gpu_g133_epoch &epoch) {
+    return epoch.request_epoch == 0u && epoch.position_epoch == 0u &&
+           epoch.speculative_position != 0u;
 }
 
 extern "C" int ds4_gpu_g133_validate_context(uint32_t ctx_size) {
@@ -26802,12 +26837,75 @@ static int cuda_moe_tiering_load_to_ram(
     return 1;
 }
 
+static void cuda_speculative_observation_record_call(
+        const ds4_gpu_g133_epoch &epoch, uint32_t selected_count) {
+    if (!cuda_speculative_epoch_valid(epoch)) return;
+    std::lock_guard<std::mutex> guard(g_speculative_observation_mutex);
+    if (!g_speculative_observation_active ||
+        epoch.speculative_position > g_speculative_observation_positions) {
+        return;
+    }
+    g_speculative_observations.push_back(cuda_speculative_observation{
+        CUDA_SPEC_OBSERVATION_CALL, epoch.speculative_position,
+        0u, 0u, selected_count, 0.0f, 0u, 0u, 0u, 0u, 0u});
+}
+
+static void cuda_speculative_observation_record_route(
+        const ds4_gpu_g133_epoch &epoch, uint32_t layer,
+        uint32_t expert, float weight) {
+    if (!cuda_speculative_epoch_valid(epoch)) return;
+    std::lock_guard<std::mutex> guard(g_speculative_observation_mutex);
+    if (!g_speculative_observation_active ||
+        epoch.speculative_position > g_speculative_observation_positions) {
+        return;
+    }
+    g_speculative_observations.push_back(cuda_speculative_observation{
+        CUDA_SPEC_OBSERVATION_ROUTE, epoch.speculative_position,
+        layer, expert, 0u, weight, 0u, 0u, 0u, 0u, 0u});
+}
+
+static void cuda_speculative_observation_record_selected(
+        const ds4_gpu_g133_epoch &epoch, uint32_t selected_count) {
+    if (!cuda_speculative_epoch_valid(epoch) || selected_count == 0u) return;
+    std::lock_guard<std::mutex> guard(g_speculative_observation_mutex);
+    if (!g_speculative_observation_active ||
+        epoch.speculative_position > g_speculative_observation_positions) {
+        return;
+    }
+    g_speculative_observations.push_back(cuda_speculative_observation{
+        CUDA_SPEC_OBSERVATION_SELECTED, epoch.speculative_position,
+        0u, 0u, selected_count, 0.0f, 0u, 0u, 0u, 0u, 0u});
+}
+
+static void cuda_speculative_observation_record_iq1_stage(
+        const ds4_gpu_g133_epoch &epoch,
+        uint32_t layer, uint32_t expert, float weight,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!cuda_speculative_epoch_valid(epoch)) return;
+    std::lock_guard<std::mutex> guard(g_speculative_observation_mutex);
+    if (!g_speculative_observation_active ||
+        epoch.speculative_position > g_speculative_observation_positions) {
+        return;
+    }
+    g_speculative_observations.push_back(cuda_speculative_observation{
+        CUDA_SPEC_OBSERVATION_IQ1_STAGE, epoch.speculative_position,
+        layer, expert, 0u, weight,
+        gate_offset, up_offset, down_offset,
+        gate_expert_bytes, down_expert_bytes});
+}
+
 static cuda_moe_tier_state cuda_moe_tiering_observe_route(
         uint32_t layer, uint32_t expert, float weight,
         const ds4_gpu_g133_epoch &g133_epoch) {
     cuda_moe_tier_entry &entry =
         g_moe_tiering.entries[cuda_moe_tiering_entry_index(layer, expert)];
     const cuda_moe_tier_state prior = entry.state;
+    if (cuda_speculative_epoch_valid(g133_epoch)) {
+        cuda_speculative_observation_record_route(
+            g133_epoch, layer, expert, weight);
+        return prior;
+    }
     if (g_moe_tiering.g133_enabled && cuda_g133_epoch_valid(g133_epoch)) {
         cuda_g133_record_observation(entry, g133_epoch, (double)weight);
     }
@@ -26863,6 +26961,90 @@ static int cuda_moe_tiering_advance_call_tick(const char *site) {
         return 0;
     }
     g_moe_tiering.call_tick++;
+    return 1;
+}
+
+static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
+        uint32_t layer, uint32_t expert, float weight,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        const ds4_gpu_g133_epoch &g133_epoch);
+
+extern "C" int ds4_gpu_speculative_observation_begin(
+        uint32_t position_count) {
+    if (position_count == 0u) return 0;
+    if (!cuda_moe_route_worker_drain_completed(
+            "speculative-observation-begin")) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> guard(g_speculative_observation_mutex);
+    if (g_speculative_observation_active) {
+        fprintf(stderr,
+                "ds4: nested speculative observation scope is not supported\n");
+        return 0;
+    }
+    g_speculative_observations.clear();
+    g_speculative_observation_positions = position_count;
+    g_speculative_observation_active = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_speculative_observation_finish(
+        uint32_t committed_positions) {
+    if (!cuda_moe_route_worker_drain_completed(
+            "speculative-observation-finish")) {
+        return 0;
+    }
+
+    std::vector<cuda_speculative_observation> observations;
+    uint32_t position_count = 0u;
+    {
+        std::lock_guard<std::mutex> guard(g_speculative_observation_mutex);
+        if (!g_speculative_observation_active) return 1;
+        position_count = g_speculative_observation_positions;
+        if (committed_positions > position_count) {
+            fprintf(stderr,
+                    "ds4: speculative observation commit exceeds scope "
+                    "committed=%u positions=%u\n",
+                    committed_positions, position_count);
+            return 0;
+        }
+        observations.swap(g_speculative_observations);
+        g_speculative_observation_positions = 0u;
+        g_speculative_observation_active = 0;
+    }
+
+    /* The verifier executes layer-major.  Replay position-major so accepted
+     * policy history has exactly the epoch/call ordering of plain decode. */
+    for (uint32_t position = 1u; position <= committed_positions; position++) {
+        const ds4_gpu_g133_epoch epoch = ds4_gpu_g133_enabled
+            ? ds4_gpu_g133_decode_position_begin()
+            : ds4_gpu_g133_epoch{};
+        for (const cuda_speculative_observation &observation : observations) {
+            if (observation.position != position) continue;
+            if (observation.kind == CUDA_SPEC_OBSERVATION_CALL) {
+                if (!cuda_moe_tiering_advance_call_tick(
+                        "speculative-observation-commit")) {
+                    return 0;
+                }
+                g_moe_tiering.calls++;
+                g_moe_tiering.selected += observation.selected_count;
+            } else if (observation.kind == CUDA_SPEC_OBSERVATION_SELECTED) {
+                g_moe_tiering.selected += observation.selected_count;
+            } else if (observation.kind == CUDA_SPEC_OBSERVATION_IQ1_STAGE) {
+                (void)cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
+                    observation.layer, observation.expert,
+                    observation.weight,
+                    observation.gate_offset, observation.up_offset,
+                    observation.down_offset, observation.gate_expert_bytes,
+                    observation.down_expert_bytes, epoch);
+            } else {
+                (void)cuda_moe_tiering_observe_route(
+                    observation.layer, observation.expert,
+                    observation.weight, epoch);
+            }
+        }
+    }
     return 1;
 }
 
@@ -27229,6 +27411,13 @@ static int cuda_moe_tiering_stage_iq1_cold_to_2bit_ram(
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
         const ds4_gpu_g133_epoch &g133_epoch) {
+    if (cuda_speculative_epoch_valid(g133_epoch)) {
+        cuda_speculative_observation_record_iq1_stage(
+            g133_epoch, layer, expert, weight,
+            gate_offset, up_offset, down_offset,
+            gate_expert_bytes, down_expert_bytes);
+        return 1;
+    }
     if (g_iq1_promotion.requested_slots == 0u) return 1;
     if (g_moe_tiering.mode != CUDA_MOE_TIER_ENFORCE ||
         !g_moe_tiering.compose_prefill_mass_tiering ||
@@ -27991,7 +28180,8 @@ static int cuda_moe_prefill_vram_seed(
             cuda_g133_advisory_fields seed_fields =
                 cuda_g133_advisory_fields_from_epoch(ds4_gpu_g133_epoch{
                     g_cuda_request_epoch,
-                    g_cuda_g133_decode_position_epoch});
+                    g_cuda_g133_decode_position_epoch,
+                    0u});
             seed_fields.streak = seed_streak;
             seed_fields.promotion_age =
                 (uint32_t)CUDA_G133_PROMOTION_AGE_MAX;
@@ -29788,7 +29978,8 @@ static void *cuda_moe_route_worker(void *arg) {
             request.gate_expert_bytes == cache->gate_expert_bytes &&
             request.down_expert_bytes == cache->down_expert_bytes &&
             (!g_moe_tiering.g133_enabled ||
-             cuda_g133_epoch_valid(request.g133_epoch));
+             cuda_g133_epoch_valid(request.g133_epoch) ||
+             cuda_speculative_epoch_valid(request.g133_epoch));
         if (request_valid &&
             !cuda_sparse_bake_validate_selected(
                 request.layer_index, request.selected,
@@ -29816,13 +30007,19 @@ static void *cuda_moe_route_worker(void *arg) {
             request_valid = 0;
         }
         if (g_moe_tiering.mode != CUDA_MOE_TIER_OFF && request_valid) {
-            if (!cuda_moe_tiering_advance_call_tick("gpu-route-request")) {
+            if (cuda_speculative_epoch_valid(request.g133_epoch)) {
+                cuda_speculative_observation_record_call(
+                    request.g133_epoch, request.route_count);
+            } else if (!cuda_moe_tiering_advance_call_tick(
+                           "gpu-route-request")) {
                 request_valid = 0;
             }
         }
         if (g_moe_tiering.mode != CUDA_MOE_TIER_OFF && request_valid) {
-            g_moe_tiering.calls++;
-            g_moe_tiering.selected += request.route_count;
+            if (!cuda_speculative_epoch_valid(request.g133_epoch)) {
+                g_moe_tiering.calls++;
+                g_moe_tiering.selected += request.route_count;
+            }
             for (uint32_t route = 0;
                  route < request.route_count; route++) {
                 const int32_t expert_i = request.selected[route];
@@ -37705,12 +37902,20 @@ extern "C" int ds4_gpu_routed_moe_mixed_q1_0_one_tensor(
      * current token remains Q1 and performs no IQ2 SSD read. */
     if (g_moe_tiering.mode != CUDA_MOE_TIER_OFF) {
         if (hot_count == 0u) {
-            if (cuda_moe_tiering_advance_call_tick(
-                    "q1-0-mixed-cold-only")) {
+            if (cuda_speculative_epoch_valid(g133_epoch)) {
+                cuda_speculative_observation_record_call(
+                    g133_epoch, cold_count + cpu_count);
+            } else if (cuda_moe_tiering_advance_call_tick(
+                           "q1-0-mixed-cold-only")) {
                 g_moe_tiering.calls++;
             }
         }
-        g_moe_tiering.selected += cold_count + cpu_count;
+        if (!cuda_speculative_epoch_valid(g133_epoch)) {
+            g_moe_tiering.selected += cold_count + cpu_count;
+        } else if (hot_count != 0u) {
+            cuda_speculative_observation_record_selected(
+                g133_epoch, cold_count + cpu_count);
+        }
         for (uint32_t route = 0; route < cold_count; route++) {
             (void)cuda_moe_tiering_observe_route(
                 layer_index, (uint32_t)cold_selected[route],

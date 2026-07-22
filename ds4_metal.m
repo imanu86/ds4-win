@@ -35,7 +35,7 @@ static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 
 static ds4_gpu_g133_epoch ds4_gpu_g133_noop_position_begin(void) {
-    ds4_gpu_g133_epoch epoch = {0, 0};
+    ds4_gpu_g133_epoch epoch = {0, 0, 0};
     return epoch;
 }
 
@@ -43,6 +43,14 @@ ds4_gpu_g133_position_begin_fn ds4_gpu_g133_decode_position_begin =
     ds4_gpu_g133_noop_position_begin;
 int ds4_gpu_g133_validate_context(uint32_t ctx_size) {
     (void)ctx_size;
+    return 1;
+}
+int ds4_gpu_speculative_observation_begin(uint32_t position_count) {
+    (void)position_count;
+    return 1;
+}
+int ds4_gpu_speculative_observation_finish(uint32_t committed_positions) {
+    (void)committed_positions;
     return 1;
 }
 static id<MTLLibrary> g_library;

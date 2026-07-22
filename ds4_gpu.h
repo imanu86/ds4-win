@@ -20,11 +20,14 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 typedef struct ds4_gpu_async_read ds4_gpu_async_read;
 typedef struct ds4_gpu_dynamic_arena_txn ds4_gpu_dynamic_arena_txn;
 
-/* Decode-owned policy time.  A value is created once per target position and
- * copied into every route request produced for that position. */
+/* Decode-owned policy time.  A value is created once per committed target
+ * position and copied into every route request produced for that position.
+ * Speculative verifiers use a 1-based speculative_position instead; their
+ * advisory/tiering observations are buffered until that position commits. */
 typedef struct {
     uint64_t request_epoch;
     uint64_t position_epoch;
+    uint32_t speculative_position;
 } ds4_gpu_g133_epoch;
 
 typedef struct {
@@ -51,6 +54,8 @@ int ds4_gpu_init(void);
 extern int ds4_gpu_g133_enabled;
 ds4_gpu_g133_epoch ds4_gpu_g133_decode_position_begin(void);
 int ds4_gpu_g133_validate_context(uint32_t ctx_size);
+int ds4_gpu_speculative_observation_begin(uint32_t position_count);
+int ds4_gpu_speculative_observation_finish(uint32_t committed_positions);
 
 #ifndef DS4_G130_ATTRIB_COMPILED_OUT
 /* Decode-thread-only host attribution.  The server owns token/request

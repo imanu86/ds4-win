@@ -16226,10 +16226,11 @@ static bool metal_graph_verify_g134_exact(
     const bool saved_capture = g->spec_capture_prefix1;
     g->spec_capture_prefix1 = true;
     ds4_gpu_g133_epoch epochs[DS4_G134_VERIFY_MAX] = {{0}};
-    if (ds4_gpu_g133_enabled) {
-        for (uint32_t j = 0; j < n_inputs; j++) {
-            epochs[j] = ds4_gpu_g133_decode_position_begin();
-        }
+    for (uint32_t j = 0; j < n_inputs; j++) {
+        /* Policy time belongs only to committed target positions.  CUDA uses
+         * this mark to buffer route observations without advancing the G133
+         * epoch or tiering clocks during the speculative pass. */
+        epochs[j].speculative_position = j + 1u;
     }
 
     if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -16712,6 +16713,11 @@ static bool ds4_g134_specdec_env_enabled(void) {
     return env && strcmp(env, "1") == 0;
 }
 
+static bool ds4_g134_specdec_verify_env_enabled(void) {
+    const char *env = getenv("DS4_G134_SPECDEC_VERIFY");
+    return env && strcmp(env, "1") == 0;
+}
+
 static int g134_virtual_token(const int *prefix, int prefix_len,
                               int appended, int pos) {
     return pos == prefix_len ? appended : prefix[pos];
@@ -16751,10 +16757,18 @@ static int g134_greedy_accept_prefix(const int *drafts, int draft_n,
     return accepted;
 }
 
-/* Model-free startup contract for the host drafter and greedy acceptance.
- * The last case is the temp-0 exactness invariant on a synthetic vocabulary:
- * after the known target token, only the longest target-matching draft prefix
- * is committed, leaving the next plain target token as the current argmax. */
+static int g134_committed_draft_prefix(const int *drafts, int matched_drafts,
+                                        int eos_token, bool *accepted_eos) {
+    const bool eos = matched_drafts > 0 &&
+                     drafts[matched_drafts - 1] == eos_token;
+    if (accepted_eos) *accepted_eos = eos;
+    return matched_drafts - (eos ? 1 : 0);
+}
+
+/* Model-free startup contract for host lookup and prefix bookkeeping only.
+ * GPU logits, KV rollback, EOS and context-boundary behavior require a loaded
+ * model; DS4_G134_SPECDEC_VERIFY=1 checks those candidate passes at runtime by
+ * replaying their committed prefix through ordinary one-token decode. */
 static bool g134_prompt_lookup_self_test(void) {
     const int history[] = {9, 2, 3, 8, 2};
     int drafts[2] = {-1, -1};
@@ -16769,9 +16783,17 @@ static bool g134_prompt_lookup_self_test(void) {
     if (g134_prompt_lookup_n2k2(absent, 2, 3, drafts, 2) != 0) return false;
 
     const int synthetic_drafts[] = {8, 5};
-    const int synthetic_target_tops[] = {8, 9};
-    return g134_greedy_accept_prefix(synthetic_drafts, 2,
-                                      synthetic_target_tops) == 1;
+    const int accept0[] = {7, 5};
+    const int accept1[] = {8, 9};
+    const int accept2[] = {8, 5};
+    if (g134_greedy_accept_prefix(synthetic_drafts, 2, accept0) != 0 ||
+        g134_greedy_accept_prefix(synthetic_drafts, 2, accept1) != 1 ||
+        g134_greedy_accept_prefix(synthetic_drafts, 2, accept2) != 2) {
+        return false;
+    }
+    bool accepted_eos = false;
+    return g134_committed_draft_prefix(synthetic_drafts, 2, 5,
+                                        &accepted_eos) == 1 && accepted_eos;
 }
 
 void ds4_tokens_push(ds4_tokens *tv, int token) {
@@ -18231,6 +18253,9 @@ struct ds4_session {
     uint64_t g134_accepted;
     uint64_t g134_bonus;
     uint64_t g134_fallback_passes;
+    uint64_t g134_verify_passes;
+    uint64_t g134_verify_accept[DS4_G134_DRAFT_K + 1];
+    uint64_t g134_verify_eos;
     ds4_session_progress_fn progress;
     void *progress_ud;
     uint32_t prefill_cap;
@@ -18238,6 +18263,7 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool g134_specdec_enabled;
+    bool g134_specdec_verify;
 };
 
 /* =========================================================================
@@ -20446,10 +20472,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->ctx_size = ctx_size;
     s->prefill_cap = metal_graph_prefill_cap_for_prompt(ctx_size);
     s->g134_specdec_enabled = ds4_g134_specdec_env_enabled();
+    s->g134_specdec_verify = s->g134_specdec_enabled &&
+                             ds4_g134_specdec_verify_env_enabled();
     if (s->g134_specdec_enabled && !g134_prompt_lookup_self_test()) {
         fprintf(stderr, "ds4: G134 prompt-lookup self-test failed; refusing opt-in\n");
         free(s);
         return 1;
+    }
+    if (s->g134_specdec_verify) {
+        fprintf(stderr,
+                "ds4: G134 behavioral verify enabled; candidate passes replay "
+                "plain decode (acceptance-shape coverage is runtime-dependent)\n");
     }
     const uint32_t raw_cap = metal_graph_raw_cap_for_context(ctx_size, s->prefill_cap);
     if (!metal_graph_alloc_raw_cap(&s->graph, &e->model, &e->weights, &e->weights.layer[0],
@@ -20689,6 +20722,18 @@ void ds4_session_free(ds4_session *s) {
                 s->g134_bonus,
                 s->g134_fallback_passes,
                 accept_rate);
+        if (s->g134_specdec_verify) {
+            fprintf(stderr,
+                    "ds4: g134 behavioral_verify=enabled verified_passes=%" PRIu64
+                    " accept0=%" PRIu64 " accept1=%" PRIu64
+                    " accept2=%" PRIu64 " eos=%" PRIu64
+                    " runtime_pending=unobserved_acceptance_shapes_and_context_boundary\n",
+                    s->g134_verify_passes,
+                    s->g134_verify_accept[0],
+                    s->g134_verify_accept[1],
+                    s->g134_verify_accept[2],
+                    s->g134_verify_eos);
+        }
     }
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -21138,11 +21183,74 @@ static int ds4_session_g134_fallback(ds4_session *s, int first_token,
                                      int *accepted, int accepted_cap,
                                      char *err, size_t errlen) {
     if (!accepted || accepted_cap <= 0) return 0;
-    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+    /* G134 owns drafting for this session even on a lookup miss.  Do not let
+     * the ordinary eval helper launch an unused native-MTP draft. */
+    s->mtp_draft_valid = false;
+    if (ds4_session_eval_internal(s, first_token, false, err, errlen) != 0) return -1;
     accepted[0] = first_token;
     if (s->g134_specdec_enabled) s->g134_fallback_passes++;
     return 1;
 }
+
+#ifndef DS4_NO_GPU
+static void g134_behavioral_verify_assert(bool condition, const char *what,
+                                           int position, int expected,
+                                           int actual) {
+    if (condition) return;
+    fprintf(stderr,
+            "ds4: G134 behavioral verify assertion failed: %s "
+            "position=%d expected=%d actual=%d\n",
+            what, position, expected, actual);
+    abort();
+}
+
+/* Rebuild the accepted verifier frontier with the ordinary one-token path.
+ * This diagnostic mode deliberately leaves that replayed state live, making
+ * the post-call checkpoint/KV/logits state exactly the state being checked. */
+static bool g134_behavioral_verify_replay(ds4_session *s,
+                                           const int *inputs,
+                                           int committed_inputs,
+                                           const int *row_tops,
+                                           int verifier_rows,
+                                           const float *verifier_logits,
+                                           char *err, size_t errlen) {
+    float *plain_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(plain_logits[0]));
+    const float *plain_frontier_logits = s->logits;
+    const uint32_t start = (uint32_t)s->checkpoint.len;
+    for (int j = 0; j < committed_inputs; j++) {
+        const int plain_token = sample_argmax(plain_frontier_logits, DS4_N_VOCAB);
+        g134_behavioral_verify_assert(plain_token == inputs[j],
+                                      "plain token differs from committed token",
+                                      j, inputs[j], plain_token);
+        if (!metal_graph_eval_token_raw_swa(&s->graph,
+                                             &s->engine->model,
+                                             &s->engine->weights,
+                                             (uint32_t)inputs[j],
+                                             start + (uint32_t)j,
+                                             plain_logits)) {
+            free(plain_logits);
+            snprintf(err, errlen, "G134 behavioral plain-decode replay failed");
+            return false;
+        }
+        if (j < verifier_rows) {
+            const int plain_next = sample_argmax(plain_logits, DS4_N_VOCAB);
+            g134_behavioral_verify_assert(plain_next == row_tops[j],
+                                          "verifier top differs from plain decode",
+                                          j, row_tops[j], plain_next);
+        }
+        plain_frontier_logits = plain_logits;
+    }
+    g134_behavioral_verify_assert(
+        memcmp(plain_logits, verifier_logits,
+               (size_t)DS4_N_VOCAB * sizeof(plain_logits[0])) == 0,
+        "committed logits differ from plain decode",
+        committed_inputs - 1, 0, 0);
+    memcpy(s->logits, plain_logits,
+           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    free(plain_logits);
+    return true;
+}
+#endif
 
 /* G134 prompt-lookup speculative decoding.
  *
@@ -21217,11 +21325,17 @@ int ds4_session_eval_g134_specdec_argmax(ds4_session *s, int first_token,
     memset(&frontier, 0, sizeof(frontier));
     bool have_frontier = spec_frontier_snapshot(&frontier, s);
     bool verifier_mutated = false;
+    bool observations_deferred = false;
     int inputs[DS4_G134_VERIFY_MAX] = {first_token, 0, 0};
     int row_tops[DS4_G134_DRAFT_K] = {-1, -1};
     for (int i = 0; i < draft_n; i++) inputs[i + 1] = drafts[i];
 
     bool ok = have_frontier;
+    if (ok) {
+        observations_deferred =
+            ds4_gpu_speculative_observation_begin(n_inputs) != 0;
+        ok = observations_deferred;
+    }
     if (ok) {
         verifier_mutated = true;
         ok = metal_graph_verify_g134_exact(&s->graph,
@@ -21233,15 +21347,18 @@ int ds4_session_eval_g134_specdec_argmax(ds4_session *s, int first_token,
                                             row_tops);
     }
 
+    int matched_drafts = 0;
     int accepted_drafts = 0;
+    bool accepted_eos = false;
     int committed_inputs = 0;
     if (ok) {
-        accepted_drafts = g134_greedy_accept_prefix(drafts, draft_n, row_tops);
+        matched_drafts = g134_greedy_accept_prefix(drafts, draft_n, row_tops);
+        /* EOS is returned to the caller as the stop signal, but plain decode
+         * stops before evaluating it.  It must never enter KV/checkpoint or
+         * advance advisory policy time. */
+        accepted_drafts = g134_committed_draft_prefix(
+            drafts, matched_drafts, eos_token, &accepted_eos);
         committed_inputs = accepted_drafts + 1;
-        if (committed_inputs == 1) ok = spec_frontier_commit_prefix1(s);
-        else if (committed_inputs == 2 && n_inputs == 3) {
-            ok = spec_frontier_commit_prefix2(s);
-        }
     }
 
     float *committed_logits = NULL;
@@ -21253,6 +21370,10 @@ int ds4_session_eval_g134_specdec_argmax(ds4_session *s, int first_token,
     }
     if (!ok) {
         free(committed_logits);
+        if (observations_deferred) {
+            (void)ds4_gpu_speculative_observation_finish(0);
+            observations_deferred = false;
+        }
         bool restored = true;
         if (have_frontier && verifier_mutated) restored = spec_frontier_restore(&frontier, s);
         spec_frontier_free(&frontier);
@@ -21265,8 +21386,49 @@ int ds4_session_eval_g134_specdec_argmax(ds4_session *s, int first_token,
                                          accepted_cap, err, errlen);
     }
 
-    memcpy(s->logits, committed_logits,
-           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    if (s->g134_specdec_verify) {
+        if (observations_deferred) {
+            ok = ds4_gpu_speculative_observation_finish(0) != 0;
+            observations_deferred = false;
+        }
+        if (ok) ok = spec_frontier_restore(&frontier, s);
+        if (ok) {
+            ok = g134_behavioral_verify_replay(s, inputs, committed_inputs,
+                                                row_tops, (int)n_inputs - 1,
+                                                committed_logits, err, errlen);
+        }
+        if (!ok) {
+            free(committed_logits);
+            spec_frontier_free(&frontier);
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        s->g134_verify_passes++;
+        s->g134_verify_accept[accepted_drafts]++;
+        if (accepted_eos) s->g134_verify_eos++;
+    } else {
+        if (committed_inputs == 1) ok = spec_frontier_commit_prefix1(s);
+        else if (committed_inputs == 2 && n_inputs == 3) {
+            ok = spec_frontier_commit_prefix2(s);
+        }
+        if (ok && observations_deferred) {
+            ok = ds4_gpu_speculative_observation_finish(
+                     (uint32_t)committed_inputs) != 0;
+            observations_deferred = false;
+        }
+        if (!ok) {
+            free(committed_logits);
+            if (observations_deferred) {
+                (void)ds4_gpu_speculative_observation_finish(0);
+            }
+            spec_frontier_free(&frontier);
+            s->checkpoint_valid = false;
+            snprintf(err, errlen, "G134 speculative commit failed");
+            return -1;
+        }
+        memcpy(s->logits, committed_logits,
+               (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    }
     free(committed_logits);
     accepted[0] = first_token;
     token_vec_push(&s->checkpoint, first_token);
@@ -21274,6 +21436,7 @@ int ds4_session_eval_g134_specdec_argmax(ds4_session *s, int first_token,
         accepted[i + 1] = drafts[i];
         token_vec_push(&s->checkpoint, drafts[i]);
     }
+    if (accepted_eos) accepted[committed_inputs] = eos_token;
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     s->g134_spec_pass_count++;
@@ -21281,7 +21444,7 @@ int ds4_session_eval_g134_specdec_argmax(ds4_session *s, int first_token,
     s->g134_accepted += (uint64_t)accepted_drafts;
     s->g134_bonus++;
     spec_frontier_free(&frontier);
-    return committed_inputs;
+    return committed_inputs + (accepted_eos ? 1 : 0);
 #endif
 }
 
