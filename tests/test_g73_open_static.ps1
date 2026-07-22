@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $source = Get-Content -LiteralPath (Join-Path $root 'ds4_cuda.cu') -Raw
 $osFile = Get-Content -LiteralPath (Join-Path $root 'src\platform\os_file.c') -Raw
+$osFileHeader = Get-Content -LiteralPath (Join-Path $root 'src\platform\os_file.h') -Raw
 $osThread = Get-Content -LiteralPath (Join-Path $root 'src\platform\os_thread.h') -Raw
 $presetPath = Join-Path $root 'tests\g73_open.env.ps1'
 $preset = Get-Content -LiteralPath $presetPath -Raw
@@ -36,6 +37,8 @@ $pread = Slice-Between $osFile 'int64_t os_pread_cancellable_timeout(' `
     'int64_t os_pread_cancellable('
 Assert-Contains $pread 'const uint64_t max_chunk = 1024u * 1024u;' `
     'POSIX cancellable pread is not chunk-bounded'
+Assert-Contains $pread 'remaining > 0x100000ull' `
+    'Windows cancellable pread is not capped at 1 MiB'
 Assert-Contains $pread 'atomic_load_explicit(' 'POSIX cancellable pread ignores cancellation'
 Assert-Contains $pread 'os_monotonic_sec() >= deadline' 'POSIX cancellable pread ignores its deadline'
 Assert-Contains $pread 'WaitForSingleObject(state->event, 50u)' 'Windows post-cancel completion wait is not bounded'
@@ -46,12 +49,20 @@ $terminal = Slice-Between $source 'static int cuda_g73_terminal_exact_load(' `
     'static int cuda_g73_outcomes_conserved('
 Assert-Contains $terminal 'double absolute_deadline' 'terminal exact does not receive the token deadline'
 Assert-Contains $terminal 'cuda_g73_terminal_read_part(' 'terminal exact does not use bounded file reads'
+Assert-Contains $source 'os_pread_plain(' 'terminal exact lacks its plain synchronous read path'
+Assert-Contains $terminal 'cuda_g73_terminal_mutex_guard' 'terminal shared scratch is not serialized'
+Assert-Contains $terminal 'budget_overrun' 'terminal overruns are not explicitly logged'
+Assert-Contains $terminal 'WDDM offers' 'accepted WDDM bandwidth assumption is undocumented'
 Assert-Contains $terminal 'cudaMemcpy(' 'terminal exact does not perform its completing H2D'
 if ($terminal.Contains('cudaMalloc(') -or $terminal.Contains('.resize(') -or
     $terminal.Contains('model_map +')) {
     throw 'terminal exact performs serving-path acquisition or mmap access'
 }
 if ($terminal.Contains('cudaStreamSynchronize(')) { throw 'terminal exact has an unbounded stream wait' }
+if ($terminal.Contains('os_pread_cancellable') -or
+    $terminal.Contains('cuda_g73_terminal_claim_pinned_arena')) {
+    throw 'terminal exact depends on a shared serving resource'
+}
 Assert-Contains $source 'BOOT CONFIG ERROR: terminal' 'terminal preallocation failure is not a boot error'
 Assert-Contains $source 'os_pread_cancellable_pending(' 'persistent I/O slots do not prevent buffer reuse'
 $reservationFinish = Slice-Between $source `
@@ -63,7 +74,21 @@ if ($reservationFinish.Contains('cudaStreamSynchronize(')) {
 Assert-Contains $source 'cuda_g73_open_maybe_schedule_rotation(' 'missing G133-to-SSD-wrap rotator seam'
 Assert-Contains $source 'g73_open_rotation' 'SSD-wrap jobs must distinguish exact G73 rotation from Q1 promotion'
 Assert-Contains $source 'cuda_q1_0_ssd_wrap_fail_and_release_all_locked(' 'missing atomic rotator teardown'
-Assert-Contains $source 'RAM_COMMITTING is unreleasable' 'rotator commit ownership is not held through publication'
+$finishOne = Slice-Between $source 'static int cuda_q1_0_ssd_wrap_finish_one(' `
+    'static int cuda_q1_0_ssd_wrap_poll_internal('
+Assert-Contains $finishOne 'CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING;' `
+    'rotator does not mark publication before dropping its mutex'
+Assert-Contains $finishOne 'os_mutex_unlock(&state.mutex);' `
+    'rotator still holds its mutex through publication'
+$releaseAll = Slice-Between $source `
+    'static void cuda_q1_0_ssd_wrap_fail_and_release_all_locked(' `
+    'static void cuda_q1_0_ssd_wrap_disable('
+Assert-Contains $releaseAll 'job.state == CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING' `
+    'release-all does not skip committing jobs'
+Assert-Contains $releaseAll 'os_cond_timedwait_ms(' `
+    'release-all does not bounded-await committing jobs'
+Assert-Contains $releaseAll 'writer claim/slot safe-leaked ' `
+    'release-all lacks the permanent dead-slot terminal'
 $submit = Slice-Between $source 'static int cuda_q1_0_ssd_wrap_submit(' `
     'static void cuda_g73_open_maybe_schedule_rotation('
 Assert-Contains $submit 'if (state.failed || state.stop) {' `
@@ -88,6 +113,8 @@ if ($source -match 'g_cuda_g133_telemetry\.(clamped|request_refused)\s*[,\)]') {
 
 Assert-Contains $source 'g_cuda_routed_moe_launch_dispatch' 'missing init-time routed-MoE dispatch'
 Assert-Contains $source '&routed_moe_launch_impl<false>' 'OFF does not select the M1 specialization'
+Assert-Contains $source ': cudaStreamSynchronize(0);' `
+    'OFF resolver no longer uses its original synchronization'
 $routeImpl = Slice-Between $source 'static int routed_moe_launch_impl(' `
     'static auto g_cuda_routed_moe_launch_dispatch'
 if ($routeImpl.Contains('g_cuda_g73_open_enabled')) {
@@ -105,6 +132,11 @@ Assert-Contains $source 'cuda_g73_validate_hermetic_environment()' 'missing runt
 Assert-Contains $source 'ds4_gpu_g73_open_selftest(' 'missing real in-process G73 self-test'
 Assert-Contains $source 'selftest-stop-after-writer-claim' 'self-test does not exercise teardown versus submit'
 Assert-Contains $source 'os_pread_cancellable_timeout(' 'self-test does not exercise real pread timeout/cancel'
+Assert-Contains $osFileHeader 'unsigned char opaque[256];' `
+    'POSIX cancellable state is not ABI-opaque'
+if ($osFileHeader.Contains('_Atomic')) {
+    throw 'C/C++ header exposes incompatible atomic object views'
+}
 if (Test-Path -LiteralPath (Join-Path $root 'tests\test_g73_open_fault_model.ps1')) {
     throw 'fake PowerShell G73 state machine still exists'
 }

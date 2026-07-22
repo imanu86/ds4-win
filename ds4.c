@@ -13026,9 +13026,9 @@ static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_spex_queue_reset(g->spex_prefetch, g->spex_epoch);
     }
     g->spex_decode_active = true;
-    /* The added epoch parameter prevents literal instruction identity with the
-     * pre-G133 call graph. The OFF contract is behavioral: this one cached
-     * branch plus measured token-hash/performance equality at the M1 gate. */
+    /* Accepted OFF residual delta: one initialization-cached bool branch plus
+     * the zero epoch argument added to the pre-G133 call graph. The branch
+     * bypasses only position-epoch creation; M1 gates token-hash/performance. */
     ds4_gpu_g133_epoch g133_epoch = {0};
     if (ds4_gpu_g133_enabled) {
         g133_epoch = ds4_gpu_g133_decode_position_begin();

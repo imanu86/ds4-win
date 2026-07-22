@@ -9,20 +9,6 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#else
-#include <aio.h>
-#ifndef __cplusplus
-#include <stdatomic.h>
-#endif
-#include <unistd.h>
-#endif
-
-#ifndef _WIN32
-#ifdef __cplusplus
-typedef uint32_t os_atomic_uint32_t;
-#else
-typedef _Atomic uint32_t os_atomic_uint32_t;
-#endif
 #endif
 
 typedef struct {
@@ -33,19 +19,23 @@ typedef struct {
 #endif
 } os_file_t;
 
-typedef struct {
 #ifdef _WIN32
+typedef struct {
     HANDLE file;
     HANDLE event;
     OVERLAPPED overlapped;
     volatile LONG active;
     volatile LONG cancel_sequence;
-#else
-    struct aiocb aio;
-    os_atomic_uint32_t active;
-    os_atomic_uint32_t cancel_sequence;
-#endif
 } os_pread_cancellable_t;
+#else
+typedef union {
+    /* POSIX AIO state, including its C11 atomics, is private to os_file.c.
+     * Fixed opaque storage gives C and C++ consumers one ABI view. */
+    void *pointer_alignment;
+    long double scalar_alignment;
+    unsigned char opaque[256];
+} os_pread_cancellable_t;
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +50,10 @@ void os_file_close(os_file_t *f);
 int os_file_valid(const os_file_t *f);
 uint64_t os_file_size(const os_file_t *f);
 int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off);
+/* One plain synchronous positional read, capped at 1 MiB. On Windows the file
+ * must have been opened without FILE_FLAG_OVERLAPPED. */
+int64_t os_pread_plain(const os_file_t *f, void *buf, uint64_t len,
+                       uint64_t off);
 void os_pread_cancellable_init(os_pread_cancellable_t *state);
 int os_pread_cancellable_prepare(os_pread_cancellable_t *state);
 void os_pread_cancellable_reset(os_pread_cancellable_t *state);

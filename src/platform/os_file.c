@@ -16,6 +16,24 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
+
+typedef struct {
+    struct aiocb aio;
+    _Atomic uint32_t active;
+    _Atomic uint32_t cancel_sequence;
+} os_pread_cancellable_impl_t;
+
+_Static_assert(sizeof(os_pread_cancellable_impl_t) <=
+                   sizeof(((os_pread_cancellable_t *)0)->opaque),
+               "os_pread_cancellable_t opaque storage is too small");
+_Static_assert(_Alignof(os_pread_cancellable_impl_t) <=
+                   _Alignof(os_pread_cancellable_t),
+               "os_pread_cancellable_t opaque storage is under-aligned");
+
+static os_pread_cancellable_impl_t *os_pread_cancellable_impl(
+        os_pread_cancellable_t *state) {
+    return (os_pread_cancellable_impl_t *)(void *)state->opaque;
+}
 #endif
 
 #ifdef _WIN32
@@ -218,8 +236,9 @@ void os_pread_cancellable_init(os_pread_cancellable_t *state) {
 #ifdef _WIN32
     state->file = INVALID_HANDLE_VALUE;
 #else
-    atomic_init(&state->active, 0u);
-    atomic_init(&state->cancel_sequence, 0u);
+    os_pread_cancellable_impl_t *impl = os_pread_cancellable_impl(state);
+    atomic_init(&impl->active, 0u);
+    atomic_init(&impl->cancel_sequence, 0u);
 #endif
 }
 
@@ -254,13 +273,14 @@ int os_pread_cancellable_pending(os_pread_cancellable_t *state) {
     state->file = INVALID_HANDLE_VALUE;
     return 0;
 #else
-    if (atomic_load_explicit(&state->active, memory_order_acquire) == 0u) {
+    os_pread_cancellable_impl_t *impl = os_pread_cancellable_impl(state);
+    if (atomic_load_explicit(&impl->active, memory_order_acquire) == 0u) {
         return 0;
     }
-    const int status = aio_error(&state->aio);
+    const int status = aio_error(&impl->aio);
     if (status == EINPROGRESS) return 1;
-    (void)aio_return(&state->aio);
-    atomic_store_explicit(&state->active, 0u, memory_order_release);
+    (void)aio_return(&impl->aio);
+    atomic_store_explicit(&impl->active, 0u, memory_order_release);
     return 0;
 #endif
 }
@@ -280,14 +300,15 @@ void os_pread_cancellable_destroy(os_pread_cancellable_t *state) {
     if (state->event) CloseHandle(state->event);
     state->event = NULL;
 #else
-    if (atomic_load_explicit(&state->active, memory_order_acquire) != 0u) {
-        (void)aio_cancel(state->aio.aio_fildes, &state->aio);
-        while (aio_error(&state->aio) == EINPROGRESS) {
+    os_pread_cancellable_impl_t *impl = os_pread_cancellable_impl(state);
+    if (atomic_load_explicit(&impl->active, memory_order_acquire) != 0u) {
+        (void)aio_cancel(impl->aio.aio_fildes, &impl->aio);
+        while (aio_error(&impl->aio) == EINPROGRESS) {
             const struct timespec pause = {0, 1000000};
             (void)nanosleep(&pause, NULL);
         }
-        (void)aio_return(&state->aio);
-        atomic_store_explicit(&state->active, 0u, memory_order_release);
+        (void)aio_return(&impl->aio);
+        atomic_store_explicit(&impl->active, 0u, memory_order_release);
     }
 #endif
 }
@@ -296,8 +317,11 @@ void os_pread_cancellable_reset(os_pread_cancellable_t *state) {
 #ifdef _WIN32
     if (state) InterlockedExchange(&state->cancel_sequence, 0);
 #else
-    if (state) atomic_store_explicit(
-        &state->cancel_sequence, 0u, memory_order_release);
+    if (state) {
+        os_pread_cancellable_impl_t *impl = os_pread_cancellable_impl(state);
+        atomic_store_explicit(
+            &impl->cancel_sequence, 0u, memory_order_release);
+    }
 #endif
 }
 
@@ -313,10 +337,11 @@ int os_pread_cancel(os_pread_cancellable_t *state, uint32_t sequence) {
     return GetLastError() == ERROR_NOT_FOUND;
 #else
     if (!state) return 0;
+    os_pread_cancellable_impl_t *impl = os_pread_cancellable_impl(state);
     atomic_store_explicit(
-        &state->cancel_sequence, sequence, memory_order_release);
-    if (atomic_load_explicit(&state->active, memory_order_acquire) != 0u) {
-        (void)aio_cancel(state->aio.aio_fildes, &state->aio);
+        &impl->cancel_sequence, sequence, memory_order_release);
+    if (atomic_load_explicit(&impl->active, memory_order_acquire) != 0u) {
+        (void)aio_cancel(impl->aio.aio_fildes, &impl->aio);
     }
     return 1;
 #endif
@@ -343,7 +368,7 @@ int64_t os_pread_cancellable_timeout(
     const ULONGLONG started_tick = GetTickCount64();
     while (done < len) {
         const uint64_t remaining = len - done;
-        DWORD chunk = (DWORD)(remaining > 0x40000000ull ? 0x40000000ul : remaining);
+        DWORD chunk = (DWORD)(remaining > 0x100000ull ? 0x100000ul : remaining);
         memset(&state->overlapped, 0, sizeof(state->overlapped));
         const uint64_t cur = off + done;
         state->overlapped.Offset = (DWORD)(cur & 0xffffffffu);
@@ -443,6 +468,7 @@ int64_t os_pread_cancellable_timeout(
         done += got;
     }
 #else
+    os_pread_cancellable_impl_t *impl = os_pread_cancellable_impl(state);
     const double deadline = timeout_ms == UINT32_MAX ? 0.0 :
         os_monotonic_sec() + (double)timeout_ms * 0.001;
     const uint64_t max_chunk = 1024u * 1024u;
@@ -451,41 +477,41 @@ int64_t os_pread_cancellable_timeout(
         size_t chunk = remaining > max_chunk ? (size_t)max_chunk :
             (size_t)remaining;
         if (chunk > (size_t)SSIZE_MAX) chunk = (size_t)SSIZE_MAX;
-        memset(&state->aio, 0, sizeof(state->aio));
-        state->aio.aio_fildes = f->fd;
-        state->aio.aio_buf = (char *)buf + done;
-        state->aio.aio_nbytes = chunk;
-        state->aio.aio_offset = (off_t)(off + done);
-        atomic_store_explicit(&state->active, 1u, memory_order_release);
-        if (aio_read(&state->aio) != 0) {
-            atomic_store_explicit(&state->active, 0u, memory_order_release);
+        memset(&impl->aio, 0, sizeof(impl->aio));
+        impl->aio.aio_fildes = f->fd;
+        impl->aio.aio_buf = (char *)buf + done;
+        impl->aio.aio_nbytes = chunk;
+        impl->aio.aio_offset = (off_t)(off + done);
+        atomic_store_explicit(&impl->active, 1u, memory_order_release);
+        if (aio_read(&impl->aio) != 0) {
+            atomic_store_explicit(&impl->active, 0u, memory_order_release);
             return -1;
         }
         for (;;) {
             const int cancel_requested = atomic_load_explicit(
-                &state->cancel_sequence, memory_order_acquire) == sequence;
+                &impl->cancel_sequence, memory_order_acquire) == sequence;
             const int timed_out = deadline != 0.0 &&
                 os_monotonic_sec() >= deadline;
             if (cancel_requested || timed_out) {
-                (void)aio_cancel(f->fd, &state->aio);
-                const int status = aio_error(&state->aio);
+                (void)aio_cancel(f->fd, &impl->aio);
+                const int status = aio_error(&impl->aio);
                 if (status != EINPROGRESS) {
-                    (void)aio_return(&state->aio);
+                    (void)aio_return(&impl->aio);
                     atomic_store_explicit(
-                        &state->active, 0u, memory_order_release);
+                        &impl->active, 0u, memory_order_release);
                 }
                 errno = cancel_requested ? ECANCELED : ETIMEDOUT;
                 return -1;
             }
-            const int status = aio_error(&state->aio);
+            const int status = aio_error(&impl->aio);
             if (status == EINPROGRESS) {
                 const struct timespec pause = {0, 1000000};
                 (void)nanosleep(&pause, NULL);
                 continue;
             }
-            const ssize_t n = aio_return(&state->aio);
+            const ssize_t n = aio_return(&impl->aio);
             atomic_store_explicit(
-                &state->active, 0u, memory_order_release);
+                &impl->active, 0u, memory_order_release);
             if (status != 0 || n < 0) {
                 errno = status != 0 ? status : errno;
                 return -1;
@@ -504,6 +530,38 @@ int64_t os_pread_cancellable(const os_file_t *f, void *buf, uint64_t len,
                              uint32_t sequence) {
     return os_pread_cancellable_timeout(
         f, buf, len, off, state, sequence, UINT32_MAX);
+}
+
+int64_t os_pread_plain(const os_file_t *f, void *buf, uint64_t len,
+                       uint64_t off) {
+    const uint64_t max_chunk = 1024u * 1024u;
+    if (!os_file_valid(f) || (!buf && len != 0) || len > max_chunk) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (len == 0) return 0;
+#ifdef _WIN32
+    LARGE_INTEGER position;
+    position.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(f->h, position, NULL, FILE_BEGIN)) {
+        errno = os_win_error_to_errno(GetLastError());
+        return -1;
+    }
+    DWORD got = 0;
+    if (!ReadFile(f->h, buf, (DWORD)len, &got, NULL)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_HANDLE_EOF) return 0;
+        errno = os_win_error_to_errno(error);
+        return -1;
+    }
+    return (int64_t)got;
+#else
+    for (;;) {
+        const ssize_t got = pread(f->fd, buf, (size_t)len, (off_t)off);
+        if (got < 0 && errno == EINTR) continue;
+        return (int64_t)got;
+    }
+#endif
 }
 
 int64_t os_pread(const os_file_t *f, void *buf, uint64_t len, uint64_t off) {

@@ -604,6 +604,7 @@ static void cuda_q1_0_ssd_wrap_release(int report);
 static int cuda_q1_0_ssd_wrap_init(void);
 static void cuda_q1_0_ssd_wrap_flush(void);
 static void cuda_g73_terminal_release(void);
+static int g_cuda_dynamic_arena_storage_safe_leaked = 0;
 struct cuda_iq1_s_ram_cache_slot {
     uint32_t layer_index;
     uint32_t expert_id;
@@ -6828,7 +6829,9 @@ static cuda_dynamic_arena_copy_status cuda_dynamic_arena_copy_expert_async(
 }
 
 static void cuda_dynamic_arena_storage_release(void) {
+    if (g_cuda_dynamic_arena_storage_safe_leaked) return;
     cuda_q1_0_ssd_wrap_release(0);
+    if (g_cuda_dynamic_arena_storage_safe_leaked) return;
     if (g_dynamic_arena.txn) {
         ds4_gpu_dynamic_arena_abort(g_dynamic_arena.txn);
     }
@@ -6938,6 +6941,7 @@ static void cuda_q1_0_dynamic_arena_release(int report) {
 
 static void cuda_primary_dynamic_arena_release(int report) {
     cuda_q1_0_ssd_wrap_release(report);
+    if (g_cuda_dynamic_arena_storage_safe_leaked) return;
     if (report && g_dynamic_arena.host_base &&
         (g_dynamic_arena.hits || g_dynamic_arena.misses ||
          g_dynamic_arena.fatal_errors)) {
@@ -6968,6 +6972,7 @@ static void cuda_primary_dynamic_arena_release(int report) {
     cuda_reap_router_trace_release();
     cuda_dynamic_arena_observer_release();
     cuda_dynamic_arena_storage_release();
+    if (g_cuda_dynamic_arena_storage_safe_leaked) return;
     g_dynamic_arena.model_map = NULL;
     g_dynamic_arena.model_size = 0;
     g_dynamic_arena.slot_bytes = 0;
@@ -7000,14 +7005,14 @@ extern "C" void ds4_gpu_dynamic_arena_release(void) {
 
 struct cuda_g73_terminal_state {
     os_file_t file;
-    os_pread_cancellable_t pread;
+    os_mutex_t mutex;
     char *device_slots;
     char *host_bounce;
     uint64_t *host_route_ptrs;
     uint64_t *device_route_ptrs;
     uint64_t slot_bytes;
     uint64_t device_bytes;
-    uint32_t io_sequence;
+    int mutex_ready;
     int ready;
 };
 
@@ -7016,16 +7021,19 @@ static cuda_g73_terminal_state g_cuda_g73_terminal;
 
 static void cuda_g73_terminal_release(void) {
     cuda_g73_terminal_state &terminal = g_cuda_g73_terminal;
-    os_pread_cancellable_destroy(&terminal.pread);
+    if (terminal.mutex_ready) os_mutex_lock(&terminal.mutex);
     if (terminal.device_slots) (void)cudaFree(terminal.device_slots);
     if (terminal.host_bounce) (void)cudaFreeHost(terminal.host_bounce);
     if (terminal.host_route_ptrs) {
         (void)cudaFreeHost(terminal.host_route_ptrs);
     }
     if (os_file_valid(&terminal.file)) os_file_close(&terminal.file);
+    if (terminal.mutex_ready) {
+        os_mutex_unlock(&terminal.mutex);
+        os_mutex_destroy(&terminal.mutex);
+    }
     terminal = cuda_g73_terminal_state{};
     os_file_init(&terminal.file);
-    os_pread_cancellable_init(&terminal.pread);
 }
 
 static int cuda_g73_terminal_prepare(
@@ -7071,10 +7079,11 @@ static int cuda_g73_terminal_prepare(
     terminal.slot_bytes = slot_bytes;
     terminal.device_bytes = slot_bytes * CUDA_G73_TERMINAL_SLOTS;
     if (os_file_reopen_read_sequential(
-            &terminal.file, &g_model_file, 1) != 0 ||
-        os_pread_cancellable_prepare(&terminal.pread) != 0) {
+            &terminal.file, &g_model_file, 0) != 0 ||
+        os_mutex_init(&terminal.mutex) != 0) {
         goto allocation_failed;
     }
+    terminal.mutex_ready = 1;
     error = cudaMalloc(
         (void **)&terminal.device_slots, (size_t)terminal.device_bytes);
     if (error == cudaSuccess) {
@@ -7105,7 +7114,7 @@ static int cuda_g73_terminal_prepare(
     fprintf(stderr,
             "ds4: [g73-open] terminal ready slot_bytes=%llu "
             "device_slots=%u device_bytes=%llu host_bounce_bytes=%llu "
-            "acquisition=boot-only source=file-or-pinned-arena\n",
+            "acquisition=boot-only source=dedicated-plain-fd\n",
             (unsigned long long)slot_bytes, CUDA_G73_TERMINAL_SLOTS,
             (unsigned long long)terminal.device_bytes,
             (unsigned long long)slot_bytes);
@@ -7114,7 +7123,7 @@ static int cuda_g73_terminal_prepare(
 allocation_failed:
     fprintf(stderr,
             "ds4: [g73-open] BOOT CONFIG ERROR: terminal persistent "
-            "file/I/O-slot preallocation failed: %s\n", strerror(errno));
+            "file/mutex preallocation failed: %s\n", strerror(errno));
     cuda_g73_terminal_release();
     return 0;
 }
@@ -7842,6 +7851,11 @@ extern "C" int ds4_gpu_dynamic_arena_prepare(
     }
 
     cuda_dynamic_arena_storage_release();
+    if (g_cuda_dynamic_arena_storage_safe_leaked) {
+        fprintf(stderr,
+                "ds4: CUDA dynamic arena remains process-lifetime safe-leaked\n");
+        return 0;
+    }
     const uint64_t stage_bytes = cuda_model_copy_chunk_bytes() +
         (g_model_direct_align > 1 ? g_model_direct_align : 1);
     if (!cuda_model_stage_pool_alloc(stage_bytes)) {
@@ -26032,6 +26046,7 @@ struct cuda_q1_0_ssd_wrap_job {
     uint8_t destination_pageable;
     uint8_t writer_claimed;
     uint8_t g73_open_rotation;
+    uint8_t commit_safe_leaked;
 };
 
 struct cuda_q1_0_ssd_wrap_state {
@@ -26062,6 +26077,7 @@ struct cuda_q1_0_ssd_wrap_state {
     int thread_detached;
     int stop;
     int failed;
+    int commit_safe_leaked;
     uint64_t enqueue_sequence;
     uint64_t wave_sequence;
     uint64_t requested;
@@ -26660,22 +26676,49 @@ static void cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
     cuda_q1_0_ssd_wrap_state &state = g_q1_0_ssd_wrap;
     state.failed = 1;
     state.stop = 1;
-    /* Deterministic all-or-nothing teardown. A RAM_COMMITTING owner holds this
-     * mutex across its complete slot mutation/publication, so a concurrent
-     * release-all waits at mutex acquisition and can never observe or reclaim
-     * that unreleasable mid-commit job. */
-    for (uint32_t i = 0; i < state.jobs.size(); i++) {
-        cuda_q1_0_ssd_wrap_job &job = state.jobs[i];
-        if (job.state == CUDA_Q1_0_SSD_WRAP_FREE) continue;
-        job.failure_reason = reason ? reason : "rotator-disabled";
-        job.state = CUDA_Q1_0_SSD_WRAP_FAILED;
-        state.failures++;
-        state.dropped++;
-        cuda_q1_0_ssd_wrap_job_release_locked(&job);
+    const double commit_deadline = cuda_wall_sec() + 0.050;
+    for (;;) {
+        uint32_t committing = 0u;
+        for (uint32_t i = 0; i < state.jobs.size(); i++) {
+            cuda_q1_0_ssd_wrap_job &job = state.jobs[i];
+            if (job.state == CUDA_Q1_0_SSD_WRAP_FREE) continue;
+            if (job.state == CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING) {
+                if (!job.commit_safe_leaked) committing++;
+                continue;
+            }
+            job.failure_reason = reason ? reason : "rotator-disabled";
+            job.state = CUDA_Q1_0_SSD_WRAP_FAILED;
+            state.failures++;
+            state.dropped++;
+            cuda_q1_0_ssd_wrap_job_release_locked(&job);
+        }
+        if (committing == 0u) break;
+        const uint32_t remaining_ms =
+            cuda_deadline_remaining_ms(commit_deadline);
+        if (remaining_ms == 0u) {
+            for (uint32_t i = 0; i < state.jobs.size(); i++) {
+                cuda_q1_0_ssd_wrap_job &job = state.jobs[i];
+                if (job.state != CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING ||
+                    job.commit_safe_leaked) {
+                    continue;
+                }
+                /* The publisher may still hold a raw slot pointer. Preserve the
+                 * arena allocation and leave its writer claim set forever: this
+                 * slot is dead and can neither be served nor selected again. */
+                job.commit_safe_leaked = 1u;
+                state.commit_safe_leaked = 1;
+                g_cuda_dynamic_arena_storage_safe_leaked = 1;
+                fprintf(stderr,
+                        "ds4: [q1-0-ssd-wrap] commit deadline expired "
+                        "job=%u slot=%u; writer claim/slot safe-leaked "
+                        "permanently\n",
+                        i, job.slot);
+            }
+            break;
+        }
+        (void)os_cond_timedwait_ms(
+            &state.cond, &state.mutex, remaining_ms);
     }
-    std::fill(state.ring_busy.begin(), state.ring_busy.end(), 0u);
-    std::fill(g_q1_0_ssd_wrap_reserved_slots.begin(),
-              g_q1_0_ssd_wrap_reserved_slots.end(), 0u);
     os_cond_broadcast(&state.cond);
 }
 
@@ -26722,11 +26765,15 @@ static int cuda_q1_0_ssd_wrap_finish_one(
     }
     local = state.jobs[index];
     state.jobs[index].state = CUDA_Q1_0_SSD_WRAP_RAM_COMMITTING;
-    /* RAM_COMMITTING is unreleasable: retain the rotator mutex and the arena
-     * writer claim through byte copy, tier mutation, and final publication. */
+    /* Publication owns only the arena writer claim. Teardown can take the
+     * rotator mutex, release other jobs, and bounded-await this marker. */
+    os_mutex_unlock(&state.mutex);
 
     int ok = local.failure_reason == NULL;
     const char *reason = local.failure_reason;
+    uint64_t stale_delta = 0u;
+    uint64_t host_copy_bytes = 0u;
+    double host_copy_seconds = 0.0;
     if (ok && (local.slot >= g_dynamic_arena.slots.size() ||
         local.request_epoch == 0u ||
         local.record.request_epoch != local.request_epoch ||
@@ -26734,7 +26781,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
             local.record.observation_call)) {
         ok = 0;
         reason = "stale_or_epoch";
-        state.stale++;
+        stale_delta++;
     }
     cuda_dynamic_arena_slot *slot = ok ?
         &g_dynamic_arena.slots[local.slot] : NULL;
@@ -26744,7 +26791,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                        CUDA_DYNAMIC_ARENA_SLOT_WRITER)) {
         ok = 0;
         reason = "writer_claim_lost";
-        state.stale++;
+        stale_delta++;
     }
     if (ok && local.replacing) {
         if (local.victim_entry_index >= g_moe_tiering.entries.size()) {
@@ -26763,7 +26810,7 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                  slot->state != DS4_GPU_ARENA_STAGED)) {
                 ok = 0;
                 reason = "victim_stale";
-                state.stale++;
+                stale_delta++;
             }
         }
     } else if (ok &&
@@ -26771,14 +26818,14 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 slot->layer != local.layer || slot->expert != local.expert)) {
         ok = 0;
         reason = "destination_stale";
-        state.stale++;
+        stale_delta++;
     }
     if (ok) {
         const double copy_started = cuda_wall_sec();
         memcpy(slot->host_ptr, local.read_base,
                (size_t)g_dynamic_arena.slot_bytes);
-        state.host_copy_bytes += g_dynamic_arena.slot_bytes;
-        state.host_copy_seconds += cuda_wall_sec() - copy_started;
+        host_copy_bytes = g_dynamic_arena.slot_bytes;
+        host_copy_seconds = cuda_wall_sec() - copy_started;
     }
     if (ok && local.replacing) {
         cuda_moe_tier_entry &victim =
@@ -26853,9 +26900,6 @@ static int cuda_q1_0_ssd_wrap_finish_one(
             cuda_g133_telemetry_increment(
                 g_cuda_g133_telemetry.rotation_promotions);
         }
-        state.successes++;
-        if (slot->pageable) state.pageable_ready++;
-        else state.pinned_ready++;
         if (!local.g73_open_rotation) {
             cuda_q1_0_promotion_record_emit(
                 "success", "success", "staged", &local.record,
@@ -26885,7 +26929,29 @@ static int cuda_q1_0_ssd_wrap_finish_one(
                 &local.record, "exact_iq2_ram_failed", UINT32_MAX, 0u);
         }
     }
+    os_mutex_lock(&state.mutex);
+    state.stale += stale_delta;
+    state.host_copy_bytes += host_copy_bytes;
+    state.host_copy_seconds += host_copy_seconds;
+    if (ok) {
+        state.successes++;
+        if (slot->pageable) state.pageable_ready++;
+        else state.pinned_ready++;
+    }
+    if (index < state.jobs.size() &&
+        state.jobs[index].commit_safe_leaked) {
+        /* Teardown expired while publication was outside the mutex. Never
+         * release this writer claim; its process-lifetime slot remains dead. */
+        os_cond_broadcast(&state.cond);
+        os_mutex_unlock(&state.mutex);
+        return ok;
+    }
     if (!ok) {
+        if (index < state.jobs.size()) {
+            state.jobs[index].state = CUDA_Q1_0_SSD_WRAP_FAILED;
+            state.jobs[index].failure_reason =
+                reason ? reason : "ssd-wrap-commit-failure";
+        }
         cuda_q1_0_ssd_wrap_fail_and_release_all_locked(
             reason ? reason : "ssd-wrap-commit-failure");
     } else if (index < state.jobs.size()) {
@@ -26976,9 +27042,9 @@ static int cuda_q1_0_ssd_wrap_submit(
     uint32_t ring_slot = UINT32_MAX;
     uint32_t job_index = UINT32_MAX;
     os_mutex_lock(&state.mutex);
-    /* The writer claim is deliberately acquired outside this mutex, then
-     * revalidated here. fail_and_release_all_locked() and publication are thus
-     * mutually exclusive: teardown wins by making the new claim unpublishable. */
+    /* The writer claim is acquired outside this mutex, then revalidated here.
+     * Teardown wins before admission; after COMMITTING, it skips the writer and
+     * uses the bounded-await/safe-leak publication contract. */
     if (state.failed || state.stop) {
         cuda_dynamic_arena_slot_writer_release(&slot);
         os_mutex_unlock(&state.mutex);
@@ -27192,6 +27258,14 @@ static void cuda_q1_0_ssd_wrap_release(int report) {
         /* The process-lifetime state, file handle, events, and ring remain
          * valid until the cancelled read returns. All tier claims were already
          * released atomically by fail_and_release_all_locked(). */
+        return;
+    }
+    if (state.commit_safe_leaked) {
+        /* A publisher can still hold a raw slot pointer. Keep the mutex,
+         * job table, file/rings, and arena allocation alive for the process. */
+        fprintf(stderr,
+                "ds4: [q1-0-ssd-wrap] committing slot and rotator storage "
+                "safe-leaked after bounded teardown\n");
         return;
     }
     os_pread_cancellable_destroy(&state.pread);
@@ -34125,61 +34199,50 @@ static int cuda_g73_classify_fallback(
     return 1;
 }
 
-static cuda_dynamic_arena_slot *cuda_g73_terminal_claim_pinned_arena(
-        uint32_t layer, uint32_t expert) {
-    const uint32_t entry = layer * 256u + expert;
-    uint32_t snapshot_slot = UINT32_MAX;
-    if (entry < g_dynamic_arena.active.size()) {
-        snapshot_slot = g_dynamic_arena.active[entry].slot;
-    }
-    /* The active snapshot is immutable for the request. Rotated tier metadata
-     * can change concurrently, so find it by bounded arena scan and validate
-     * only after acquiring the slot's atomic reader claim. */
-    for (uint32_t probe = 0;
-         probe <= (uint32_t)g_dynamic_arena.slots.size(); probe++) {
-        const uint32_t slot_index = probe == 0u
-            ? snapshot_slot : probe - 1u;
-        if (slot_index >= g_dynamic_arena.slots.size() ||
-            (probe != 0u && slot_index == snapshot_slot)) {
-            continue;
-        }
-        cuda_dynamic_arena_slot &slot = g_dynamic_arena.slots[slot_index];
-        if (slot.pageable || !cuda_dynamic_arena_slot_reader_acquire(&slot)) {
-            continue;
-        }
-        if (slot.host_ptr && slot.layer == layer && slot.expert == expert &&
-            (slot.state == DS4_GPU_ARENA_READY ||
-             slot.state == DS4_GPU_ARENA_STAGED)) {
-            return &slot;
-        }
-        cuda_dynamic_arena_slot_reader_release(&slot);
-    }
-    return NULL;
-}
-
 static int cuda_g73_terminal_read_part(
         char *destination, uint64_t bytes, uint64_t offset,
-        double absolute_deadline) {
+        double absolute_deadline, uint32_t layer, uint32_t expert,
+        const char *part) {
     cuda_g73_terminal_state &terminal = g_cuda_g73_terminal;
-    uint32_t sequence = ++terminal.io_sequence;
-    if (sequence == 0u) sequence = ++terminal.io_sequence;
-    os_pread_cancellable_reset(&terminal.pread);
-    const uint32_t remaining_ms =
-        cuda_deadline_remaining_ms(absolute_deadline);
-    const int64_t got = os_pread_cancellable_timeout(
-        &terminal.file, destination, bytes, offset,
-        &terminal.pread, sequence, remaining_ms);
-    return got >= 0 && (uint64_t)got == bytes;
+    const uint64_t max_chunk = 1024u * 1024u;
+    uint64_t done = 0u;
+    int overrun_logged = 0;
+    while (done < bytes) {
+        /* The terminal is the completing last resort: the deadline is observed
+         * only between independent <=1 MiB synchronous reads (one-chunk overrun,
+         * about 1 ms at expected NVMe rates), never by refusing or cancelling. */
+        if (!overrun_logged && absolute_deadline > 0.0 &&
+            cuda_wall_sec() >= absolute_deadline) {
+            fprintf(stderr,
+                    "ds4: [g73-open] budget_overrun layer=%u expert=%u "
+                    "phase=terminal-plain-pread part=%s action=complete\n",
+                    layer, expert, part ? part : "unknown");
+            overrun_logged = 1;
+        }
+        const uint64_t remaining = bytes - done;
+        const uint64_t chunk = std::min(remaining, max_chunk);
+        const int64_t got = os_pread_plain(
+            &terminal.file, destination + done, chunk, offset + done);
+        if (got <= 0) return 0;
+        done += (uint64_t)got;
+    }
+    return 1;
 }
 
-/* Exact escape terminal: zero acquisition and zero mmap faults on the serving
- * path. Its formal two-phase bound is (1) either a reader-claimed pinned arena
- * slot, or deadline-checked <=1 MiB asynchronous file chunks into the one-slot
- * startup-pinned bounce; followed by (2) exactly one slot-sized synchronous H2D
- * into a startup-owned device slot. Phase 1 cannot touch an unfaulted mmap and
- * cannot outlive its persistent I/O state/buffer. Phase 2 is a fixed 6.75 MiB
- * bandwidth transfer which returns only after completion; no stream sync or
- * resource acquisition is involved. */
+struct cuda_g73_terminal_mutex_guard {
+    cuda_g73_terminal_state *terminal;
+    explicit cuda_g73_terminal_mutex_guard(cuda_g73_terminal_state *state)
+        : terminal(state) {
+        os_mutex_lock(&terminal->mutex);
+    }
+    ~cuda_g73_terminal_mutex_guard() { os_mutex_unlock(&terminal->mutex); }
+};
+
+/* Exact escape terminal: zero shared-resource dependency and zero mmap faults
+ * on the serving path. A dedicated startup-opened plain fd supplies <=1 MiB
+ * synchronous chunks; the absolute deadline is checked between chunks and an
+ * overrun is logged, but this last resort completes. One dedicated mutex owns
+ * the bounce, device slots, and route-pointer publication across direct callers. */
 static int cuda_g73_terminal_exact_load(
         const void *model_map, uint64_t model_size, uint32_t layer,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -34193,6 +34256,10 @@ static int cuda_g73_terminal_exact_load(
         route_count > CUDA_MOE_ROUTE_COUNT || n_total_expert != 256u) {
         return cuda_g73_contract_error(layer, "terminal-contract");
     }
+    if (!terminal.mutex_ready) {
+        return cuda_g73_contract_error(layer, "terminal-mutex");
+    }
+    cuda_g73_terminal_mutex_guard terminal_guard(&terminal);
     const uint64_t slot_bytes =
         gate_expert_bytes * 2u + down_expert_bytes;
     if (!terminal.ready || terminal.slot_bytes != slot_bytes ||
@@ -34234,36 +34301,46 @@ static int cuda_g73_terminal_exact_load(
             return cuda_g73_contract_error(
                 layer, "terminal-corrupt-model-range");
         }
-        cuda_dynamic_arena_slot *arena_slot =
-            cuda_g73_terminal_claim_pinned_arena(
-                layer, (uint32_t)expert);
-        const char *resident_source = arena_slot ? arena_slot->host_ptr : NULL;
-        if (!resident_source) {
-            if (!cuda_g73_terminal_read_part(
-                    terminal.host_bounce, gate_expert_bytes,
-                    gate_src, absolute_deadline) ||
-                !cuda_g73_terminal_read_part(
-                    terminal.host_bounce + gate_expert_bytes,
-                    gate_expert_bytes, up_src, absolute_deadline) ||
-                !cuda_g73_terminal_read_part(
-                    terminal.host_bounce + gate_expert_bytes * 2u,
-                    down_expert_bytes, down_src, absolute_deadline)) {
-                fprintf(stderr,
-                        "ds4: [g73-open] bounded terminal read unavailable "
-                        "layer=%u expert=%llu error=%s\n", layer,
-                        (unsigned long long)expert, strerror(errno));
-                return 0;
-            }
-            resident_source = terminal.host_bounce;
+        if (!cuda_g73_terminal_read_part(
+                terminal.host_bounce, gate_expert_bytes,
+                gate_src, absolute_deadline, layer, (uint32_t)expert,
+                "gate") ||
+            !cuda_g73_terminal_read_part(
+                terminal.host_bounce + gate_expert_bytes,
+                gate_expert_bytes, up_src, absolute_deadline, layer,
+                (uint32_t)expert, "up") ||
+            !cuda_g73_terminal_read_part(
+                terminal.host_bounce + gate_expert_bytes * 2u,
+                down_expert_bytes, down_src, absolute_deadline, layer,
+                (uint32_t)expert, "down")) {
+            fprintf(stderr,
+                    "ds4: [g73-open] terminal plain read failed "
+                    "layer=%u expert=%llu error=%s\n", layer,
+                    (unsigned long long)expert, strerror(errno));
+            return 0;
         }
         char *device_slot = terminal.device_slots +
             (uint64_t)slot * terminal.slot_bytes;
+        const double copy_started = cuda_wall_sec();
+        /* Accepted WDDM assumption: this one fixed 6.75 MiB copy starts from
+         * pinned memory and completes at available PCIe bandwidth. WDDM offers
+         * no formal wall-clock bound, so this is the system's sole accepted
+         * bandwidth-bound step and an over-deadline completion is explicit. */
         const cudaError_t copy_error = cudaMemcpy(
-            device_slot, resident_source, (size_t)terminal.slot_bytes,
+            device_slot, terminal.host_bounce, (size_t)terminal.slot_bytes,
             cudaMemcpyHostToDevice);
-        if (arena_slot) cuda_dynamic_arena_slot_reader_release(arena_slot);
+        const double copy_finished = cuda_wall_sec();
         if (copy_error != cudaSuccess) {
             cuda_g73_device_error(layer, "terminal-exact-h2d");
+        }
+        if (absolute_deadline > 0.0 && copy_finished > absolute_deadline) {
+            fprintf(stderr,
+                    "ds4: [g73-open] budget_overrun layer=%u expert=%llu "
+                    "phase=terminal-h2d bytes=%llu elapsed_ms=%.3f "
+                    "assumption=pinned-pcie-bandwidth action=complete\n",
+                    layer, (unsigned long long)expert,
+                    (unsigned long long)terminal.slot_bytes,
+                    (copy_finished - copy_started) * 1000.0);
         }
     }
     for (uint32_t route = 0; route < route_count; route++) {
@@ -35080,6 +35157,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_begin(
     return cache;
 }
 
+template <bool G73>
 static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
         cuda_moe_expert_cache *cache,
         uint32_t sequence,
@@ -35096,8 +35174,13 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
     } else {
         cache->route_default_sync_calls++;
         const double resolve_started = cuda_wall_sec();
-        const cudaError_t resolve_err = cuda_g73_finish_launched_copy(
-            0, absolute_deadline, layer_index, "route-resolver-default");
+        /* Preserve the original OFF synchronization exactly. Only the G73
+         * specialization polls to its serving deadline and falls through. */
+        const cudaError_t resolve_err = G73
+            ? cuda_g73_finish_launched_copy(
+                  0, absolute_deadline, layer_index,
+                  "route-resolver-default")
+            : cudaStreamSynchronize(0);
         const double resolve_seconds = cuda_wall_sec() - resolve_started;
         cache->route_resolve_sync_seconds += resolve_seconds;
         if (nested_profile) {
@@ -35109,7 +35192,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_finish(
             fprintf(stderr,
                     "ds4: CUDA GPU-resident route resolver sync failed: %s\n",
                     cudaGetErrorString(resolve_err));
-            if (resolve_err == cudaErrorNotReady) {
+            if (G73 && resolve_err == cudaErrorNotReady) {
                 if (cuda_moe_route_worker_cancel_and_join(
                         cache, sequence, absolute_deadline)) {
                     cuda_moe_expert_cache_invalidate();
@@ -35308,7 +35391,7 @@ static cuda_moe_expert_cache *cuda_moe_gpu_resident_routes_submit(
         gate_expert_bytes, down_expert_bytes, expert_in_dim,
         selected, weights, n_expert, n_tokens, spex_queue, g133_epoch,
         absolute_deadline, 0u, &sequence);
-    return cuda_moe_gpu_resident_routes_finish(
+    return cuda_moe_gpu_resident_routes_finish<G73>(
         cache, sequence, layer_index, 0, 0u, absolute_deadline);
 }
 
@@ -36630,7 +36713,7 @@ static int routed_moe_launch_impl(
                 ok = cuda_ok(cudaGetLastError(), "routed_moe split hit down launch");
             }
 
-            gpu_route_cache = cuda_moe_gpu_resident_routes_finish(
+            gpu_route_cache = cuda_moe_gpu_resident_routes_finish<G73>(
                 gpu_route_cache, gpu_route_sequence, layer_index,
                 use_split_fused ? 2 : 1, out_dim, route_io_deadline);
             if (!gpu_route_cache) ok = 0;

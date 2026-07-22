@@ -193,8 +193,9 @@ $decodeGate = Slice-TextBetween $core 'static bool metal_graph_encode_token_raw_
     'static bool metal_graph_eval_token_raw_swa('
 Assert-True (([regex]::Matches($decodeGate,
                  'if \(ds4_gpu_g133_enabled\)')).Count -eq 1 -and
-             $decodeGate.Contains('behavioral: this one cached') -and
-             $decodeGate.Contains('token-hash/performance equality')) `
+             $decodeGate.Contains('Accepted OFF residual delta') -and
+             $decodeGate.Contains('initialization-cached bool branch') -and
+             $decodeGate.Contains('token-hash/performance')) `
     'ordinary decode must use one cached branch and document the behavioral OFF gate'
 $tokenHook = Slice-Between 'extern "C" void ds4_gpu_g130_attribution_token_begin(' `
     'extern "C" void ds4_gpu_g130_attribution_token_end('
